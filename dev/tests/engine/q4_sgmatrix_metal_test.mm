@@ -75,11 +75,11 @@ Reference reference(const Q4Projection &p, const uint16_t *input, uint32_t row, 
   return {double(bf16ToFloat(floatToBf16(float(value)))),
           error + ulpBf16(float(value))};
 }
-void runCase(metal::MetalBackend &backend, uint32_t n, uint32_t k, uint32_t splits,
+void runCase(metal::MetalBackend &backend, LinearTile tile, uint32_t n, uint32_t k, uint32_t splits,
              LinearEpilogue epilogue, uint32_t fixture, uint32_t rows) {
   const LinearWorkload workload{{n, k}, rows, LinearPhase::Decode, epilogue};
   const auto plan = Q4Linear::plan(workload,
-      {LinearTile::Simdgroup, n / (epilogue == LinearEpilogue::GateUp ? 32 : 64), LinearSimdgroups::Four, splits});
+      {tile, n / (epilogue == LinearEpilogue::GateUp ? 32 : 64), LinearSimdgroups::Four, splits});
   const auto size = plan.scratchSize();
   Guarded input(backend, 2ULL * rows * k), output(backend, 2ULL * rows * n), residual(backend, 2ULL * rows * n);
   Guarded table(backend, size.input), sums(backend, size.sums), partials(backend, size.partials), counters(backend, size.counters);
@@ -147,6 +147,51 @@ void runCase(metal::MetalBackend &backend, uint32_t n, uint32_t k, uint32_t spli
   }
   for (auto *guard : {&input,&output,&residual,&table,&sums,&partials,&counters}) guard->check();
 }
+// The model shares one workspace across every projection of a command, so a
+// split reduction must never read partials left by an earlier projection.
+// Repeating one projection cannot expose that: stale partials equal fresh ones.
+void sharedWorkspace(metal::MetalBackend &backend, LinearTile tile, uint32_t n, uint32_t k,
+                     uint32_t splits, uint32_t rows) {
+  const LinearWorkload workload{{n, k}, rows, LinearPhase::Decode, LinearEpilogue::None};
+  const auto plan = Q4Linear::plan(workload, {tile, n / 64, LinearSimdgroups::Four, splits});
+  const auto size = plan.scratchSize();
+  auto table = backend.allocateBuffer(size.input), sums = backend.allocateBuffer(size.sums);
+  auto partials = backend.allocateBuffer(size.partials), counters = backend.allocateBuffer(size.counters);
+  std::memset(counters.contents(), 0, size.counters);
+  const LinearScratch scratch{table, sums, partials, counters};
+  constexpr uint32_t kProjections = 4;
+  std::vector<metal::MetalBuffer> inputs, outputs;
+  std::vector<Q4Projection> projections;
+  metal::CommandGraph graph;
+  Q4Linear linear(backend.capabilities());
+  for (uint32_t i = 0; i < kProjections; ++i) {
+    inputs.push_back(backend.allocateBuffer(2ULL * rows * k));
+    outputs.push_back(backend.allocateBuffer(2ULL * rows * n));
+    auto *x = static_cast<uint16_t *>(inputs.back().contents());
+    for (uint32_t j = 0; j < rows * k; ++j)
+      x[j] = floatToBf16(float(int(hash(j * 7 + i * 1013) % 257) - 128) / (4.0f + i));
+    projections.push_back(weights(backend, {n, k}, 97 + 131 * i, false));
+    linear.add(graph, {inputs.back(), outputs.back(), {}, {}, {}, {}, scratch},
+               projections.back(), plan, nullptr);
+  }
+  (void)backend.submitCommand(graph.dispatches());
+  for (uint32_t i = 0; i < kProjections; ++i) {
+    const auto *x = static_cast<const uint16_t *>(inputs[i].contents());
+    const auto *actual = static_cast<const uint16_t *>(outputs[i].contents());
+    for (uint32_t row = 0; row < rows; ++row)
+      for (uint32_t col = 0; col < n; ++col) {
+        const auto ref = reference(projections[i], x, row, col, splits);
+        const double value = bf16ToFloat(actual[row * n + col]);
+        if (!std::isfinite(value) ||
+            std::abs(value - ref.value) > ref.error + ulpBf16(float(value))) {
+          std::cerr << "shared workspace projection=" << i << " N=" << n << " K=" << k
+                    << " S=" << splits << " M=" << rows << " row=" << row << " col=" << col
+                    << " actual=" << value << " reference=" << ref.value << '\n';
+          throw std::runtime_error("simdgroup result depends on an earlier projection");
+        }
+      }
+  }
+}
 void fusedNorm(metal::MetalBackend &backend, uint32_t k, uint32_t rows) {
   auto input=backend.allocateBuffer(k*rows*2), weight=backend.allocateBuffer(k*2);
   auto output=backend.allocateBuffer(k*rows*2), fused=backend.allocateBuffer(k*rows*2);
@@ -204,13 +249,17 @@ int main(int argc,char **argv) {
       fusedAttentionGate(backend, 16, 2, lanes);
     }
     uint32_t cases=0;
-    for (auto [n,k] : std::array<std::array<uint32_t,2>,4>{{{256,256},{768,768},{512,5120},{512,17408}}})
-      for (uint32_t splits : {1U,2U,4U,8U}) {
-        if ((k/64)%splits) continue;
-        for (auto e : {LinearEpilogue::None,LinearEpilogue::Residual,LinearEpilogue::GateUp})
-          for (uint32_t fixture=0;fixture<4;++fixture)
-            for (uint32_t rows : {8U,16U,24U,32U}) { runCase(backend,n,k,splits,e,fixture,rows); ++cases; }
-      }
+    for (auto tile : {LinearTile::Simdgroup, LinearTile::SimdgroupF32}) {
+      for (auto [n,k] : std::array<std::array<uint32_t,2>,4>{{{256,256},{768,768},{512,5120},{512,17408}}})
+        for (uint32_t splits : {1U,2U,4U,8U}) {
+          if ((k/64)%splits) continue;
+          for (auto e : {LinearEpilogue::None,LinearEpilogue::Residual,LinearEpilogue::GateUp})
+            for (uint32_t fixture=0;fixture<4;++fixture)
+              for (uint32_t rows : {8U,16U,24U,32U}) { runCase(backend,tile,n,k,splits,e,fixture,rows); ++cases; }
+        }
+      for (uint32_t splits : {1U, 2U, 4U, 8U})
+        for (uint32_t rows : {8U, 32U}) sharedWorkspace(backend, tile, 6144, 5120, splits, rows);
+    }
     for (uint32_t width : {64U, 320U, 2048U, 5120U, 17408U})
       for (uint32_t rows : {8U,16U,24U,32U}) fusedNorm(backend, width, rows);
     std::cout << "Q4 simdgroup: PASS cases=" << cases << " (fp64, range, cancellation, guards, repeated dispatch, fused norm)\n";

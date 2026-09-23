@@ -56,9 +56,10 @@ enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
 // and split K into four partitions whose fp32 partial sums are reduced before
 // the bf16 rounding; they take one lane, K % 1024 == 0 and one threadgroup
 // per tile. Paired256 is the four-simdgroup N256 paired tile. Simdgroup
-// uses bf16 8x8 matrix operations and an explicit activation/split workspace.
+// uses bf16 8x8 matrix operations and an explicit activation/split workspace;
+// SimdgroupF32 is its fp32-operand form for GPUs without bfloat arithmetic.
 enum class LinearTile : uint8_t {
-  N128, N256, Paired128, Split32, Split64, Paired256, Simdgroup
+  N128, N256, Paired128, Split32, Split64, Paired256, Simdgroup, SimdgroupF32
 };
 enum class LinearSimdgroups : uint8_t { Four = 4, Eight = 8 };
 

@@ -123,6 +123,7 @@ std::string_view name(LinearTile tile) {
   case LinearTile::N256: return "LinearTile::N256";
   case LinearTile::Paired128: return "LinearTile::Paired128";
   case LinearTile::Simdgroup: return "Simdgroup";
+  case LinearTile::SimdgroupF32: return "SimdgroupF32";
   case LinearTile::Split32: return "LinearTile::Split32";
   case LinearTile::Split64: return "LinearTile::Split64";
   case LinearTile::Paired256: return "LinearTile::Paired256";

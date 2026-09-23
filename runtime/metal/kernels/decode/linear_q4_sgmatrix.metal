@@ -4,19 +4,22 @@
 // W X^T for 16 columns (8 for the two gate/up streams). The bfloat operand
 // 128+q is exact for every nibble; subtracting 128*sum(x) in fp32 recovers q*x.
 // This preserves the bf16 activation range without relying on half denormals.
+// Apple7/8 have no bfloat arithmetic; their float form multiplies q and x as
+// fp32 operands, where both and every product are exact, with no offset.
 namespace q4sg {
 enum class Epilogue { Affine, Residual, GateUp };
 
-template <Epilogue E>
+template <Epilogue E, typename T = bfloat>
 __attribute__((always_inline)) inline void decode(device const bfloat *table, device const uchar *w0,
                    device const bfloat *sc0, device const bfloat *bi0,
                    device bfloat *out, device const float *sums,
-                   device float *partials, device atomic_uint *counters,
+                   coherent(device) device float *partials, device atomic_uint *counters,
                    device const bfloat *residual, device const uchar *w1,
                    device const bfloat *sc1, device const bfloat *bi1,
                    constant Q4Params &p, uint3 tg, uint tid, uint sg, uint lane,
                    threadgroup uint *arrival) {
   constexpr bool gateUp = E == Epilogue::GateUp;
+  constexpr bool native = is_same_v<T, float>;
   constexpr uint tileN = gateUp ? 32 : 64;
   const uint N = p.output_size, groups = p.input_size / 64;
   const uint splits = p.persistent_groups;
@@ -62,15 +65,18 @@ __attribute__((always_inline)) inline void decode(device const bfloat *table, de
 #pragma unroll
       for (uint nf = 0; nf < 2; ++nf) {
         const uint word = j < 4 ? words[nf].x : words[nf].y;
-        const uint pair = ((word >> (4 * (j & 3))) & 0x000F000Fu) | 0x43004300u;
+        const uint nibbles = (word >> (4 * (j & 3))) & 0x000F000Fu;
         if (j < 2) dot[nf][j & 1] = float2(0);
-        mma_acc<bfloat>(dot[nf][j & 1], as_type<bfloat2>(pair), b);
+        if constexpr (native)
+          mma_acc<float>(dot[nf][j & 1], float2(nibbles & 0xFu, nibbles >> 16), float2(b));
+        else
+          mma_acc<bfloat>(dot[nf][j & 1], as_type<bfloat2>(nibbles | 0x43004300u), b);
       }
     }
     const ulong prm0 = (ulong(tile) * groups + g) * 256 + col0;
     const ulong prm1 = (ulong(tile) * groups + g) * 256 + col1;
-    const float2 d0 = fma(-128.0f, sum, dot[0][0] + dot[0][1]);
-    const float2 d1 = fma(-128.0f, sum, dot[1][0] + dot[1][1]);
+    const float2 d0 = native ? dot[0][0] + dot[0][1] : fma(-128.0f, sum, dot[0][0] + dot[0][1]);
+    const float2 d1 = native ? dot[1][0] + dot[1][1] : fma(-128.0f, sum, dot[1][0] + dot[1][1]);
     acc[0] = fma(d0, float(sc0[prm0]), acc[0]);
     acc[0] = fma(sum, float(bi0[prm0]), acc[0]);
     acc[1] = fma(d1, float(sc1[prm1]), acc[1]);
@@ -85,7 +91,7 @@ __attribute__((always_inline)) inline void decode(device const bfloat *table, de
 #pragma unroll
     for (uint nf = 0; nf < 2; ++nf) {
       const uint n = base + fm + (gateUp ? 0 : nf * 8);
-      device float *slot = partials + ulong(tg.y * 2 + nf) * 8 * N + n;
+      coherent(device) device float *slot = partials + ulong(tg.y * 2 + nf) * 8 * N + n;
       slot[fn * N] = acc[nf].x;
       slot[(fn + 1) * N] = acc[nf].y;
     }
@@ -107,7 +113,7 @@ __attribute__((always_inline)) inline void decode(device const bfloat *table, de
 #pragma unroll
       for (uint nf = 0; nf < 2; ++nf) {
         const uint n = base + fm + (gateUp ? 0 : nf * 8);
-        device const float *slot = partials + ulong(s * 2 + nf) * 8 * N + n;
+        coherent(device) device const float *slot = partials + ulong(s * 2 + nf) * 8 * N + n;
         total[nf] += s == tg.y ? acc[nf] : float2(slot[fn * N], slot[(fn + 1) * N]);
       }
     }
@@ -151,28 +157,33 @@ kernel void decode_linear_q4_prepare(
     device const bfloat *table [[buffer(0)]], device const uchar *weights [[buffer(1)]], \
     device const bfloat *scales [[buffer(2)]], device const bfloat *biases [[buffer(3)]], \
     device bfloat *output [[buffer(4)]], device const float *sums [[buffer(5)]], \
-    device float *partials [[buffer(6)]], device atomic_uint *counters [[buffer(7)]]
+    coherent(device) device float *partials [[buffer(6)]], device atomic_uint *counters [[buffer(7)]]
 #define Q4_SG_THREADS \
     uint3 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]], \
     uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]
 
-kernel void decode_linear_q4_sg(Q4_SG_INPUTS, constant Q4Params &p [[buffer(8)]], Q4_SG_THREADS) {
-  threadgroup uint arrival;
-  q4sg::decode<q4sg::Epilogue::Affine>(table, weights, scales, biases, output, sums,
-      partials, counters, output, weights, scales, biases, p, tg, tid, sg, lane, &arrival);
+// NAME uses bfloat operands (Apple9+); NAME_f the float operands (Apple7/8).
+#define Q4_SG_KERNELS(NAME, T) \
+kernel void NAME(Q4_SG_INPUTS, constant Q4Params &p [[buffer(8)]], Q4_SG_THREADS) { \
+  threadgroup uint arrival; \
+  q4sg::decode<q4sg::Epilogue::Affine, T>(table, weights, scales, biases, output, sums, \
+      partials, counters, output, weights, scales, biases, p, tg, tid, sg, lane, &arrival); \
+} \
+kernel void NAME##_residual(Q4_SG_INPUTS, \
+    device const bfloat *residual [[buffer(8)]], constant Q4Params &p [[buffer(9)]], Q4_SG_THREADS) { \
+  threadgroup uint arrival; \
+  q4sg::decode<q4sg::Epilogue::Residual, T>(table, weights, scales, biases, output, sums, \
+      partials, counters, residual, weights, scales, biases, p, tg, tid, sg, lane, &arrival); \
+} \
+kernel void NAME##_gate_up(Q4_SG_INPUTS, device const uchar *up [[buffer(8)]], \
+    device const bfloat *upScales [[buffer(9)]], device const bfloat *upBiases [[buffer(10)]], \
+    constant Q4Params &p [[buffer(11)]], Q4_SG_THREADS) { \
+  threadgroup uint arrival; \
+  q4sg::decode<q4sg::Epilogue::GateUp, T>(table, weights, scales, biases, output, sums, \
+      partials, counters, output, up, upScales, upBiases, p, tg, tid, sg, lane, &arrival); \
 }
-kernel void decode_linear_q4_sg_residual(Q4_SG_INPUTS,
-    device const bfloat *residual [[buffer(8)]], constant Q4Params &p [[buffer(9)]], Q4_SG_THREADS) {
-  threadgroup uint arrival;
-  q4sg::decode<q4sg::Epilogue::Residual>(table, weights, scales, biases, output, sums,
-      partials, counters, residual, weights, scales, biases, p, tg, tid, sg, lane, &arrival);
-}
-kernel void decode_linear_q4_sg_gate_up(Q4_SG_INPUTS, device const uchar *up [[buffer(8)]],
-    device const bfloat *upScales [[buffer(9)]], device const bfloat *upBiases [[buffer(10)]],
-    constant Q4Params &p [[buffer(11)]], Q4_SG_THREADS) {
-  threadgroup uint arrival;
-  q4sg::decode<q4sg::Epilogue::GateUp>(table, weights, scales, biases, output, sums,
-      partials, counters, output, up, upScales, upBiases, p, tg, tid, sg, lane, &arrival);
-}
+Q4_SG_KERNELS(decode_linear_q4_sg, bfloat)
+Q4_SG_KERNELS(decode_linear_q4_sgf, float)
+#undef Q4_SG_KERNELS
 #undef Q4_SG_INPUTS
 #undef Q4_SG_THREADS

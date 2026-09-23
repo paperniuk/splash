@@ -434,6 +434,48 @@ void baselinePlans() {
 
 // `widestCandidates` accumulates the largest candidate set seen, so main() can
 // check that the bound below is reached and not merely respected.
+// Apple7/8 have no bfloat arithmetic: every decode projection, wide batches
+// included, runs the fp32-operand register-matrix tile with Apple9's K
+// partitions, and no candidate offers the bfloat-operand form.
+void apple7Plans() {
+  for (const uint32_t family : {7U, 8U}) {
+    DeviceCapabilities device;
+    device.appleGpuFamily = family;
+    device.gpuCoreCount = 32;
+    DeviceCapabilities apple9 = device;
+    apple9.appleGpuFamily = 9;
+    const Q4Linear linear(device), reference(apple9);
+    for (const LinearMatrix matrix : {LinearMatrix{17408, 5120}, LinearMatrix{5120, 17408},
+                                      LinearMatrix{16640, 5120}, LinearMatrix{6144, 5120},
+                                      LinearMatrix{248320, 5120}, LinearMatrix{256, 5120}})
+      for (uint32_t lanes = 1; lanes <= 4; ++lanes)
+        for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
+                                    LinearEpilogue::GateUp}) {
+          const LinearWorkload workload{matrix, lanes * 8, LinearPhase::Decode, epilogue};
+          const auto plan = linear.plan(workload);
+          const auto config = plan.configuration();
+          const uint32_t columns = epilogue == LinearEpilogue::GateUp ? 32 : 64;
+          require(config.tile == LinearTile::SimdgroupF32 &&
+                      config.groups == matrix.outputSize / columns &&
+                      config.simdgroups == LinearSimdgroups::Four &&
+                      plan.pipeline().starts_with("decode_linear_q4_sgf"),
+                  "Apple7 decode does not use the fp32 register-matrix tile");
+          const auto apple9Config = reference.plan(workload).configuration();
+          require(apple9Config.tile != LinearTile::Simdgroup ||
+                      config.splits == apple9Config.splits,
+                  "Apple7 K partitions differ from Apple9");
+          for (const auto &candidate : linear.candidates(workload))
+            require(candidate.configuration().tile != LinearTile::Simdgroup,
+                    "Apple7 candidate uses bfloat simdgroup operands");
+        }
+    require(linear.plan({{5120, 17408}, 64, LinearPhase::Prefill, LinearEpilogue::None})
+                    .configuration() == LinearConfig{LinearTile::N128, 0} &&
+                linear.plan({{17408, 5120}, 64, LinearPhase::Prefill, LinearEpilogue::UpWithGate})
+                    .configuration() == LinearConfig{LinearTile::N128, 0, LinearSimdgroups::Four},
+            "Apple7 prefill policy changed");
+  }
+}
+
 void planContracts(uint32_t family, uint32_t cores, size_t &widestCandidates) {
   DeviceCapabilities device;
   device.appleGpuFamily = family;
@@ -1200,6 +1242,7 @@ int main(int argc, char **argv) {
   try {
     require(argc == 2, "usage: linear-plan <production.metallib|--cpu>");
     baselinePlans();
+    apple7Plans();
     narrowM24BoundaryPlans();
     scalingContracts();
     // Apple9 at the assumed core count reaches the expanded split set;
