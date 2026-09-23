@@ -57,7 +57,8 @@ enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
 // the bf16 rounding; they take one lane, K % 1024 == 0 and one threadgroup
 // per tile. Paired256 is the four-simdgroup N256 paired tile. Simdgroup
 // uses bf16 8x8 matrix operations and an explicit activation/split workspace;
-// SimdgroupF32 is its fp32-operand form for GPUs without bfloat arithmetic.
+// SimdgroupF32 is its form for GPUs without bfloat arithmetic (exact half
+// q x fp32 x products), with one threadgroup for every lane of a batch.
 // Mma64 is the four-simdgroup register-matrix prefill tile (64 columns, exact
 // half q x fp32 x products) for GPUs whose MPP path is slow (Apple7/8).
 enum class LinearTile : uint8_t {

@@ -233,11 +233,22 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config)
         !config.splits || config.splits > kMaximumSimdgroupSplits || (config.splits & (config.splits - 1)) ||
         groups % config.splits)
       throw std::invalid_argument("simdgroup Q4 requires full column grid and whole power-of-two K partitions");
-    const bool f32 = config.tile == LinearTile::SimdgroupF32;
-    pipeline_ = w.epilogue == LinearEpilogue::GateUp
-        ? (f32 ? "decode_linear_q4_sgf_gate_up" : "decode_linear_q4_sg_gate_up")
-        : residual ? (f32 ? "decode_linear_q4_sgf_residual" : "decode_linear_q4_sg_residual")
-                   : (f32 ? "decode_linear_q4_sgf" : "decode_linear_q4_sg");
+    if (config.tile == LinearTile::SimdgroupF32) {
+      // One threadgroup covers every lane, so each batch width has its kernel.
+      static_assert(SPLASH_MAXIMUM_BATCH_WIDTH == 4);
+      constexpr std::array gateUp{"decode_linear_q4_sgf_gate_up", "decode_linear_q4_sgf_gate_up_m16",
+          "decode_linear_q4_sgf_gate_up_m24", "decode_linear_q4_sgf_gate_up_m32"};
+      constexpr std::array affine{"decode_linear_q4_sgf", "decode_linear_q4_sgf_m16",
+          "decode_linear_q4_sgf_m24", "decode_linear_q4_sgf_m32"};
+      constexpr std::array withResidual{"decode_linear_q4_sgf_residual",
+          "decode_linear_q4_sgf_residual_m16", "decode_linear_q4_sgf_residual_m24",
+          "decode_linear_q4_sgf_residual_m32"};
+      pipeline_ = (w.epilogue == LinearEpilogue::GateUp ? gateUp
+                   : residual ? withResidual : affine)[lane];
+      return;
+    }
+    pipeline_ = w.epilogue == LinearEpilogue::GateUp ? "decode_linear_q4_sg_gate_up"
+        : residual ? "decode_linear_q4_sg_residual" : "decode_linear_q4_sg";
     return;
   }
   if (splitTile(config.tile)) {
@@ -418,9 +429,11 @@ LinearConfig Q4Linear::baseline(LinearWorkload w) const {
   // two-N256-tiles-per-core boundary rather than model-specific dimensions.
   const bool widePlain = lanes >= 3 && w.epilogue == LinearEpilogue::None &&
       tiles256 >= kWideDecodeTilesPerCore * gpuCores_;
-  // Apple7/8 (M1/M2) run the register-matrix tile with fp32 operands for every
-  // decode projection, wide batches included: on an M1 Max it measured 44-68%
-  // faster than every MPP tile, with the same K partitions as Apple9.
+  // Apple7/8 (M1/M2) run the register-matrix tile with exact half weights and
+  // fp32 activations for every decode projection, wide batches included: on an
+  // M1 Max it measured 44-68% faster than every MPP tile, with the same K
+  // partitions as Apple9. Covering all lanes in one threadgroup, it shortened
+  // two- to four-lane decode cycles a further 1.20-1.28x.
   if (appleGpuFamily_ < 9 || (appleGpuFamily_ == 9 && !widePlain)) {
     const uint32_t columns = w.epilogue == LinearEpilogue::GateUp ? 32 : 64;
     const uint32_t grid = w.matrix.outputSize / columns, groups = w.matrix.inputSize / 64;
@@ -592,10 +605,13 @@ void Q4Linear::add(metal::CommandGraph &graph, LinearBuffers b,
         b.scratch.partials, b.scratch.counters};
     if (gate) bindings.insert(bindings.end(), {p.weights, p.scales, p.biases});
     else if (w.epilogue == LinearEpilogue::Residual) bindings.push_back(b.residual);
+    // The bfloat tile runs a threadgroup per lane; the fp32 tile covers every
+    // lane in one threadgroup.
+    const uint32_t lanes = w.rows / SPLASH_TARGET_VERIFY_ROWS;
     graph.add(std::string(selected.pipeline()), std::move(bindings),
         Q4Params{n, k, selected.configuration().splits},
         {selected.configuration().groups, selected.configuration().splits,
-         w.rows / SPLASH_TARGET_VERIFY_ROWS}, {128, 1, 1});
+         selected.configuration().tile == LinearTile::SimdgroupF32 ? 1 : lanes}, {128, 1, 1});
     if (stats) account(*stats, w.rows / SPLASH_TARGET_VERIFY_ROWS, 1);
     return;
   }

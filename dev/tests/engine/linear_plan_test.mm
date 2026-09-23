@@ -455,10 +455,15 @@ void apple7Plans() {
           const auto plan = linear.plan(workload);
           const auto config = plan.configuration();
           const uint32_t columns = epilogue == LinearEpilogue::GateUp ? 32 : 64;
+          // One threadgroup covers every lane: each width has its own kernel.
+          constexpr std::array widths{"", "_m16", "_m24", "_m32"};
+          const std::string expected = std::string("decode_linear_q4_sgf") +
+              (epilogue == LinearEpilogue::GateUp ? "_gate_up"
+               : epilogue == LinearEpilogue::Residual ? "_residual" : "") + widths[lanes - 1];
           require(config.tile == LinearTile::SimdgroupF32 &&
                       config.groups == matrix.outputSize / columns &&
                       config.simdgroups == LinearSimdgroups::Four &&
-                      plan.pipeline().starts_with("decode_linear_q4_sgf"),
+                      plan.pipeline() == expected,
                   "Apple7 decode does not use the fp32 register-matrix tile");
           const auto apple9Config = reference.plan(workload).configuration();
           require(apple9Config.tile != LinearTile::Simdgroup ||
@@ -1072,6 +1077,12 @@ void numericalCase(metal::MetalBackend &backend, Q4Linear &linear,
       require(last.threadgroups.x == plan.configuration().groups &&
                   graph.dispatches().size() == dispatches,
               "Linear decode plan/graph geometry mismatch");
+      // The fp32 register-matrix tile covers every lane in one threadgroup.
+      if (plan.usesSimdgroup())
+        require(last.threadgroups.y == plan.configuration().splits &&
+                    last.threadgroups.z ==
+                        (plan.configuration().tile == LinearTile::SimdgroupF32 ? 1 : lanes),
+                "simdgroup Q4 lanes/partitions geometry mismatch");
       // These counters describe projection fusion, excluding input preparation.
       const uint32_t projections = plan.secondPipeline().empty() ? 1 : 2;
       require(stats.fusedSourceOperations == (lanes == 1 ? 0 : lanes * projections) &&
