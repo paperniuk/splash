@@ -1876,8 +1876,8 @@ def parse_args(argv=None):
         "shared input budget is max(512M, twice this limit)",
     )
     parser.add_argument("--max-image-pixels", type=int, default=image_input.MAX_PIXELS)
-    parser.add_argument("--max-new-tokens", type=int, default=32768)
-    parser.add_argument("--request-timeout", type=float, default=1800)
+    parser.add_argument("--max-new-tokens", type=int, default=65536)
+    parser.add_argument("--request-timeout", type=float, default=10000)
     parser.add_argument("--queue-size", type=int, default=32)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--allowed-host", action="append", default=[])

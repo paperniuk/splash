@@ -3023,8 +3023,8 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(
             api.parse_args([*required, "--max-memory", "32G"]).max_memory, 32 * 1024**3
         )
-        self.assertEqual(args.max_new_tokens, 32768)
-        self.assertEqual(args.request_timeout, 1800)
+        self.assertEqual(args.max_new_tokens, 65536)
+        self.assertEqual(args.request_timeout, 10000)
         self.assertEqual(args.model, model)
         self.assertEqual(Path(args.binary).name, "splash")
         tokenizer = FakeTokenizer()
