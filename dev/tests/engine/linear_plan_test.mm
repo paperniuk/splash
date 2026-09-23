@@ -468,11 +468,22 @@ void apple7Plans() {
             require(candidate.configuration().tile != LinearTile::Simdgroup,
                     "Apple7 candidate uses bfloat simdgroup operands");
         }
-    require(linear.plan({{5120, 17408}, 64, LinearPhase::Prefill, LinearEpilogue::None})
-                    .configuration() == LinearConfig{LinearTile::N128, 0} &&
-                linear.plan({{17408, 5120}, 64, LinearPhase::Prefill, LinearEpilogue::UpWithGate})
-                    .configuration() == LinearConfig{LinearTile::N128, 0, LinearSimdgroups::Four},
-            "Apple7 prefill policy changed");
+    // Every prefill projection runs the register-matrix tile.
+    for (const LinearMatrix matrix : {LinearMatrix{5120, 17408}, LinearMatrix{17408, 5120},
+                                      LinearMatrix{16640, 5120}, LinearMatrix{5120, 6144}})
+      for (const uint32_t rows : {1U, 33U, 2048U})
+        for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
+                                    LinearEpilogue::UpWithGate}) {
+          const auto plan = linear.plan({matrix, rows, LinearPhase::Prefill, epilogue});
+          require(plan.configuration() == LinearConfig{LinearTile::Mma64, 0, LinearSimdgroups::Four} &&
+                      plan.pipeline().starts_with("prefill_linear_q4_mma64") &&
+                      plan.tileColumns() == 64 && plan.threadsPerThreadgroup() == 128 &&
+                      plan.reassociates() && plan.scratchSize().input == 0,
+                  "Apple7 prefill does not use the register-matrix tile");
+          for (const auto &candidate : reference.candidates({matrix, rows, LinearPhase::Prefill, epilogue}))
+            require(candidate.configuration().tile != LinearTile::Mma64,
+                    "Apple9 prefill offers the Apple7 register-matrix tile");
+        }
   }
 }
 
@@ -1013,6 +1024,7 @@ void numericalCase(metal::MetalBackend &backend, Q4Linear &linear,
     bool simdgroup = false;
   };
   std::vector<SplitOutput> splitOutputs;
+  std::vector<uint16_t> gateValues;  // UpWithGate's stored gate, shared by all candidates
   for (const auto &plan : candidates) {
     const uint64_t outputBytes = uint64_t{storageRows} * p.outputSize * 2;
     const uint64_t guardBytes = uint64_t{8} * p.outputSize * 2;
@@ -1117,8 +1129,8 @@ void numericalCase(metal::MetalBackend &backend, Q4Linear &linear,
     try {
       checkReference(p, gate, workload, b,
                      inPlaceResidual ? immutableResidual.data() : nullptr,
-                     plan.partialSums() > 1 || plan.usesSimdgroup(),
-                     plan.usesSimdgroup() ? std::max(tuning::simdgroupSlack(workload, b.input, p),
+                     plan.reassociates(),
+                     plan.registerMatrix() ? std::max(tuning::simdgroupSlack(workload, b.input, p),
                          tuning::simdgroupSlack(workload, b.input, gate)) : 0);
     } catch (const std::exception &) {
       std::cerr << "matrix=" << p.outputSize << 'x' << p.inputSize
@@ -1133,10 +1145,17 @@ void numericalCase(metal::MetalBackend &backend, Q4Linear &linear,
     }
     const auto *output = static_cast<const uint16_t *>(b.output.contents());
     const uint64_t elements = uint64_t{storageRows} * p.outputSize;
-    if (plan.partialSums() > 1 || plan.usesSimdgroup()) {
-      splitOutputs.push_back({{output, output + elements}, immutableResidual, plan.pipeline(), plan.usesSimdgroup()});
+    if (workload.epilogue == LinearEpilogue::UpWithGate && gateValues.empty()) {
+      const auto *g = static_cast<const uint16_t *>(b.gateScratch.contents());
+      gateValues.assign(g, g + elements);
+    }
+    if (plan.reassociates()) {
+      splitOutputs.push_back({{output, output + elements}, immutableResidual, plan.pipeline(), plan.registerMatrix()});
     } else {
       if (baseline.empty()) baseline.assign(output, output + elements);
+      if (std::memcmp(baseline.data(), output, elements * 2) != 0)
+        std::cerr << "matrix=" << p.outputSize << 'x' << p.inputSize << " rows=" << workload.rows
+                  << " epilogue=" << uint32_t(workload.epilogue) << " pipeline=" << plan.pipeline() << '\n';
       require(std::memcmp(baseline.data(), output, elements * 2) == 0,
               "Linear candidate differs from baseline output bytes");
     }
@@ -1177,6 +1196,7 @@ void numericalCase(metal::MetalBackend &backend, Q4Linear &linear,
         reference.gate = fp32(gateReference[i]);
         reference.up = fp32(upReference[i]);
       }
+      if (workload.epilogue == LinearEpilogue::UpWithGate) reference.gate = fp32(gateValues[i]);
       if (!tuning::withinSplitTolerance(fp32(split.output[i]), workload.epilogue, reference, toleranceSlack)) {
         std::cerr << "split element=" << i << " actual=" << fp32(split.output[i])
                   << " reference=" << reference.value << " residual=" << reference.residual

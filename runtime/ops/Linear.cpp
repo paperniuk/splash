@@ -41,6 +41,7 @@ std::optional<LinearSimdgroups> fixedSimdgroups(LinearTile tile) noexcept {
   case LinearTile::Split32:
   case LinearTile::Simdgroup:
   case LinearTile::SimdgroupF32:
+  case LinearTile::Mma64:
   case LinearTile::Paired256: return LinearSimdgroups::Four;
   case LinearTile::Split64: return LinearSimdgroups::Eight;
   case LinearTile::N128:
@@ -104,6 +105,7 @@ LinearWorkload decode(LinearMatrix matrix, uint32_t lanes, LinearEpilogue epilog
 // Split32 (plain, residual and gate/up) and Paired256 (plain) tiles.
 bool supportsFourSimdgroups(LinearWorkload w, LinearTile tile) noexcept {
   if (simdgroupTile(tile)) return w.phase == LinearPhase::Decode;
+  if (tile == LinearTile::Mma64) return w.phase == LinearPhase::Prefill;
   if (tile == LinearTile::Split32)
     return w.phase == LinearPhase::Decode && w.rows == SPLASH_TARGET_VERIFY_ROWS;
   // Only the affine paired N256 kernel is instantiated: this tile is used
@@ -128,7 +130,8 @@ uint32_t LinearPlan::tileColumns() const noexcept {
   case LinearTile::Simdgroup:
   case LinearTile::SimdgroupF32: return workload_.epilogue == LinearEpilogue::GateUp ? 32 : 64;
   case LinearTile::Split32: return 32;
-  case LinearTile::Split64: return 64;
+  case LinearTile::Split64:
+  case LinearTile::Mma64: return 64;
   case LinearTile::N256:
   case LinearTile::Paired256: return 256;
   case LinearTile::N128:
@@ -143,6 +146,9 @@ uint32_t LinearPlan::partialSums() const noexcept {
   return usesSimdgroup() ? config_.splits : splitTile(config_.tile) ? kSplitPartitions : 1;
 }
 bool LinearPlan::usesSimdgroup() const noexcept { return simdgroupTile(config_.tile); }
+bool LinearPlan::registerMatrix() const noexcept {
+  return usesSimdgroup() || config_.tile == LinearTile::Mma64;
+}
 LinearScratchSize LinearPlan::scratchSize() const noexcept {
   if (!usesSimdgroup()) return {};
   const auto [n, k] = workload_.matrix;
@@ -175,7 +181,8 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config)
   if (!simdgroupTile(config.tile) && config.splits != 1)
     throw std::invalid_argument("K splits require the simdgroup Q4 tile");
   if (config.tile != LinearTile::N128 && config.tile != LinearTile::N256 &&
-      !simdgroupTile(config.tile) && !oneLaneTile(config.tile))
+      config.tile != LinearTile::Mma64 && !simdgroupTile(config.tile) &&
+      !oneLaneTile(config.tile))
     throw std::invalid_argument("invalid Q4 linear tile");
   if ((config.simdgroups != LinearSimdgroups::Four &&
        config.simdgroups != LinearSimdgroups::Eight) ||
@@ -191,7 +198,11 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config)
   if (w.phase == LinearPhase::Prefill) {
     if (config.groups || oneLaneTile(config.tile) || usesSimdgroup())
       throw std::invalid_argument("invalid Q4 prefill configuration");
-    if (four) {
+    if (config.tile == LinearTile::Mma64) {
+      pipeline_ = w.epilogue == LinearEpilogue::UpWithGate
+          ? "prefill_linear_q4_mma64_up_silu_sums"
+          : residual ? "prefill_linear_q4_mma64_residual" : "prefill_linear_q4_mma64";
+    } else if (four) {
       pipeline_ = w.epilogue == LinearEpilogue::UpWithGate
           ? "prefill_linear_q4_n128_up_silu_sums_sg4"
           : residual ? "prefill_linear_q4_n128_residual_sg4" : "prefill_linear_q4_n128_sg4";
@@ -209,6 +220,8 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config)
     }
     return;
   }
+  if (config.tile == LinearTile::Mma64)
+    throw std::invalid_argument("the Mma64 tile is prefill-only");
   if (!config.groups || config.groups > w.matrix.outputSize / tileColumns())
     throw std::invalid_argument("invalid Q4 decode group count");
   const uint32_t lane = w.rows / SPLASH_TARGET_VERIFY_ROWS - 1;
@@ -388,12 +401,9 @@ LinearConfig Q4Linear::baseline(LinearWorkload w) const {
   const uint32_t tiles128 = w.matrix.outputSize / 128;
   const uint32_t tiles256 = w.matrix.outputSize / 256;
   if (w.phase == LinearPhase::Prefill) {
-    // Apple7/8 (M1/M2): eight-simdgroup N128 measured 22-32% faster than four
-    // on an M1 Max. The fused up projection has no eight-simdgroup N128 kernel.
-    if (appleGpuFamily_ < 9)
-      return w.epilogue == LinearEpilogue::UpWithGate
-          ? LinearConfig{LinearTile::N128, 0, LinearSimdgroups::Four}
-          : LinearConfig{LinearTile::N128, 0};
+    // Apple7/8 (M1/M2): the register-matrix tile measured 2.2-3.2x faster
+    // than every MPP tile on an M1 Max, for all epilogues and row counts.
+    if (appleGpuFamily_ < 9) return {LinearTile::Mma64, 0, LinearSimdgroups::Four};
     if (appleGpuFamily_ >= 10 || gpuCores_ <= kApple9MeasuredPrefillCores)
       return {LinearTile::N128, 0, LinearSimdgroups::Four};
     const uint32_t rowTiles = (w.rows + kPrefillRows - 1) / kPrefillRows;

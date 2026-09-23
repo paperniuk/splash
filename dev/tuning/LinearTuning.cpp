@@ -63,7 +63,7 @@ Layout layout(const DeviceCapabilities &device,
   bool mixed = false;
   for (const auto &plan : plans)
     mixed |= plan.partialSums() != plans.front().partialSums() ||
-        plan.usesSimdgroup() || plans.front().usesSimdgroup();
+        plan.registerMatrix() || plans.front().registerMatrix();
   if (mixed && workload.epilogue == LinearEpilogue::GateUp)
     result.fields[ReferenceGate].bytes = result.fields[ReferenceUp].bytes =
         result.fields[Output].bytes;
@@ -276,8 +276,10 @@ LinearTuningResult tuneLinear(metal::MetalBackend &backend,
               {LinearTile::N128, workload.matrix.outputSize / 128})}
         : std::nullopt;
     float operandSlack = 0;
+    const bool registerMatrix = std::any_of(plans.begin(), plans.end(),
+        [](const LinearPlan &plan) { return plan.registerMatrix(); });
     auto referenceGateUp = [&](uint32_t representative) {
-      if (fields[PreparedInput]) {
+      if (registerMatrix) {
         operandSlack = simdgroupSlack(workload, buffers.input, input.weights[representative].projection);
         if (input.weights[representative].gate)
           operandSlack = std::max(operandSlack, simdgroupSlack(workload, buffers.input, *input.weights[representative].gate));
@@ -295,7 +297,7 @@ LinearTuningResult tuneLinear(metal::MetalBackend &backend,
       requireFinite(buffers.output, false);
       requireFinite(buffers.downSums, true);
       const bool mixed = plans[candidate].partialSums() != plans[0].partialSums() ||
-          plans[candidate].usesSimdgroup() || plans[0].usesSimdgroup();
+          plans[candidate].registerMatrix() || plans[0].registerMatrix();
       for (const auto pair : {std::pair{Output, ReferenceOutput},
                               std::pair{DownSums, ReferenceDownSums}}) {
         const auto &actual = fields[pair.first];
@@ -303,10 +305,15 @@ LinearTuningResult tuneLinear(metal::MetalBackend &backend,
         if (!actual) continue;
         if (baseline) std::memcpy(reference.contents(), actual.contents(), actual.sizeBytes());
         else if (mixed && pair.first == Output) {
-          const bool baselineExact = plans[0].partialSums() == 1 && !plans[0].usesSimdgroup();
+          const bool baselineExact = !plans[0].reassociates();
+          const bool upWithGate = workload.epilogue == LinearEpilogue::UpWithGate;
           requireWithinSplitTolerance(workload, baselineExact ? reference : actual,
                                       baselineExact ? actual : reference, buffers.residual,
-                                      fields[ReferenceGate], fields[ReferenceUp], operandSlack);
+                                      upWithGate ? buffers.gateScratch : fields[ReferenceGate],
+                                      fields[ReferenceUp], operandSlack);
+        } else if (mixed) {
+          // Output sums follow the candidate's own bf16 outputs, which the
+          // tolerance above admits one ulp apart from the baseline's.
         } else if (std::memcmp(reference.contents(), actual.contents(), actual.sizeBytes()))
           throw std::runtime_error("Linear tuning candidate output differs from baseline");
       }

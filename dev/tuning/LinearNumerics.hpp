@@ -106,6 +106,9 @@ inline float simdgroupSlack(LinearWorkload w, const metal::MetalBuffer &input,
 //             slack: |d(silu(g) u)| <= |u| max|silu'| dg + |silu(g)| du,
 //             max|silu'| = 1.0998 < 1.1, and the output rounding adds
 //             ulp(out).
+//   UpWithGate: out = bf16(silu(g) * bf16(p)) with the same stored g. The
+//             rounded p differ by ulp(p) + slack, and |silu(g)| ulp(p) is at
+//             most 2^-7 |silu(g) p| < 2 ulp(out) (bf16 ulp(v) > 2^-8 |v|).
 inline float splitTolerance(LinearEpilogue epilogue, SplitReference reference,
                             float slack) noexcept {
   float bound = ulpBf16(reference.value) + slack;
@@ -114,6 +117,8 @@ inline float splitTolerance(LinearEpilogue epilogue, SplitReference reference,
   if (epilogue == LinearEpilogue::GateUp)
     bound += 1.1f * (std::fabs(reference.up) + ulpBf16(reference.up) + slack) * (ulpBf16(reference.gate) + slack) +
         std::fabs(silu(reference.gate)) * (ulpBf16(reference.up) + slack);
+  if (epilogue == LinearEpilogue::UpWithGate)
+    bound += 2 * ulpBf16(reference.value) + std::fabs(silu(reference.gate)) * slack;
   return bound;
 }
 

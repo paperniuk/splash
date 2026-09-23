@@ -58,8 +58,10 @@ enum class LinearEpilogue : uint8_t { None, Residual, GateUp, UpWithGate };
 // per tile. Paired256 is the four-simdgroup N256 paired tile. Simdgroup
 // uses bf16 8x8 matrix operations and an explicit activation/split workspace;
 // SimdgroupF32 is its fp32-operand form for GPUs without bfloat arithmetic.
+// Mma64 is the four-simdgroup register-matrix prefill tile (64 columns, exact
+// half q x fp32 x products) for GPUs whose MPP path is slow (Apple7/8).
 enum class LinearTile : uint8_t {
-  N128, N256, Paired128, Split32, Split64, Paired256, Simdgroup, SimdgroupF32
+  N128, N256, Paired128, Split32, Split64, Paired256, Simdgroup, SimdgroupF32, Mma64
 };
 enum class LinearSimdgroups : uint8_t { Four = 4, Eight = 8 };
 
@@ -117,6 +119,13 @@ public:
   // also reassociates within each quantization group, even with one split.
   [[nodiscard]] uint32_t partialSums() const noexcept;
   [[nodiscard]] bool usesSimdgroup() const noexcept;
+  // Register-matrix tiles (Simdgroup, SimdgroupF32, Mma64) reassociate the
+  // fp32 sum within each quantization group.
+  [[nodiscard]] bool registerMatrix() const noexcept;
+  // Outputs may differ from the sequential tiles within fp32 rounding.
+  [[nodiscard]] bool reassociates() const noexcept {
+    return partialSums() > 1 || registerMatrix();
+  }
   [[nodiscard]] LinearScratchSize scratchSize() const noexcept;
   [[nodiscard]] uint64_t sumsBytes() const noexcept;
   [[nodiscard]] uint64_t gateScratchBytes() const noexcept;

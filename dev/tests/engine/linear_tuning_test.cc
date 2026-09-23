@@ -191,7 +191,7 @@ void gpuSweep(metal::MetalBackend &backend, std::span<const Q4Projection> projec
   // gate and up projections once per representative, outside the timing.
   bool mixed = false;
   for (const auto &plan : plans) mixed |= plan.partialSums() != plans.front().partialSums() ||
-      plan.usesSimdgroup() || plans.front().usesSimdgroup();
+      plan.registerMatrix() || plans.front().registerMatrix();
   const uint64_t referenceSubmissions =
       mixed && epilogue == LinearEpilogue::GateUp ? projections.size() : 0;
   const uint64_t before = backend.submissionCount();
