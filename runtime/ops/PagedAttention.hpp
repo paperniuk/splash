@@ -171,9 +171,15 @@ enum class VerifySplitCount : uint32_t {
   Sixteen = 16,
   ThirtyTwo = 32
 };
+// Mpp is the shipped tensor-operation tile. Register is the Apple7/8 tile
+// (exact half INT8 cache, fp32 queries and probabilities, one simdgroup per
+// eight fused rows); it applies to INT8 KV only and ignores scale placement.
+// The device policy sets it, the tuner does not.
+enum class VerifyAttentionTile : uint8_t { Mpp = 0, Register = 1 };
 struct VerifyAttentionConfig final {
   VerifySplitCount splitCount = VerifySplitCount::ThirtyTwo;
   AttentionScalePlacement scalePlacement = AttentionScalePlacement::Softmax;
+  VerifyAttentionTile tile = VerifyAttentionTile::Mpp;
   bool operator==(const VerifyAttentionConfig &) const = default;
 };
 
@@ -222,6 +228,7 @@ struct VerifyAttentionPlan final {
   const std::string_view splitPipeline;
   const std::string_view reducePipeline;
   const metal::DispatchSize splitGroups;
+  const metal::DispatchSize splitThreads;
   const metal::DispatchSize reduceGroups;
 
   // Compare resolved execution, including each lane's history partition.
@@ -236,13 +243,14 @@ private:
                       std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> laneSplits,
                       uint32_t splits, AttentionWorkspace workspace,
                       std::string_view splitPipeline, std::string_view reducePipeline,
-                      metal::DispatchSize splitGroups, metal::DispatchSize reduceGroups,
+                      metal::DispatchSize splitGroups, metal::DispatchSize splitThreads,
+                      metal::DispatchSize reduceGroups,
                       std::string_view storePipeline, metal::DispatchSize storeGroups,
                       metal::DispatchSize storeThreads, kv::Format format)
       : format(format), configuration(configuration), lanes(lanes), laneSplits(laneSplits),
         splits(splits), workspace(workspace),
         splitPipeline(splitPipeline), reducePipeline(reducePipeline),
-        splitGroups(splitGroups), reduceGroups(reduceGroups),
+        splitGroups(splitGroups), splitThreads(splitThreads), reduceGroups(reduceGroups),
         storePipeline_(storePipeline), storeGroups_(storeGroups), storeThreads_(storeThreads) {}
 };
 

@@ -9,6 +9,7 @@
 // usage: attention-sweep METALLIB [--histories 0,2048,...] [--shapes 27b,35b]
 //                        [--lanes 1,4] [--repeat N] [--phases both|verify|prefill]
 //                        [--compare-metallib PATH] [--kv-format int8|bf16]
+//                        [--verify-tile mpp|register]
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
 #include "ops/ExecutionPlans.hpp"
@@ -377,7 +378,8 @@ int main(int argc, const char *argv[]) {
     if (argc < 2) {
       std::cerr << "usage: attention-sweep METALLIB [--histories LIST] [--shapes 27b,35b] "
                    "[--lanes LIST] [--repeat N] [--phases both|verify|prefill] "
-                   "[--compare-metallib PATH] [--kv-format int8|bf16]\n";
+                   "[--compare-metallib PATH] [--kv-format int8|bf16] "
+                   "[--verify-tile mpp|register]\n";
       return 64;
     }
     std::vector<uint32_t> histories{0, 2048, 8192, 16384, 32768, 65536, 131072};
@@ -385,6 +387,7 @@ int main(int argc, const char *argv[]) {
     std::vector<std::string> shapes{"27b", "35b"};
     uint32_t repeat = 5;
     kv::Format format = kv::Format::Int8;
+    VerifyAttentionConfig verifyConfig;
     std::string comparisonLibrary, phases = "both";
     for (int index = 2; index < argc; index += 2) {
       const std::string option(argv[index]);
@@ -404,6 +407,13 @@ int main(int argc, const char *argv[]) {
         format = value == "int8" ? kv::Format::Int8 : kv::Format::BFloat16;
       }
       else if (option == "--compare-metallib") comparisonLibrary = argv[index + 1];
+      else if (option == "--verify-tile") {
+        const std::string_view value(argv[index + 1]);
+        if (value != "mpp" && value != "register")
+          throw std::invalid_argument("--verify-tile takes mpp or register");
+        verifyConfig.tile = value == "register" ? VerifyAttentionTile::Register
+                                                : VerifyAttentionTile::Mpp;
+      }
       else if (option == "--phases") {
         phases = argv[index + 1];
         if (phases != "both" && phases != "verify" && phases != "prefill")
@@ -444,7 +454,7 @@ int main(int argc, const char *argv[]) {
                 << geometry.kvHeads << " KV heads, d=" << geometry.headDimension << ")\n";
       for (uint32_t history : histories) {
         auto report = [&](bool prefill, uint32_t lane) {
-          const auto cases = measure(backends, makePlan(geometry, prefill, lane, history), repeat);
+          const auto cases = measure(backends, makePlan(geometry, prefill, lane, history, verifyConfig), repeat);
           for (size_t i = 0; i < cases.size(); ++i) {
             std::cout << (firstCase ? "" : ",")
                       << json(cases[i], name, history, prefill ? "prefill" : "verify", lane, i);

@@ -115,7 +115,11 @@ bool MoeWorkload::operator==(const MoeWorkload &other) const noexcept {
 ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device)
     : linear_(device), baselineLinear_(device),
       moeRouteWideRows_(moeRouteWideRows(device.gpuCoreCount)),
-      moeDecodeSimdgroups_(moeDecodeSimdgroups(device.appleGpuFamily)) {}
+      moeDecodeSimdgroups_(moeDecodeSimdgroups(device.appleGpuFamily)),
+      // Apple7/8 have no bfloat arithmetic; their verify attention uses the
+      // register tile whatever split configuration was measured or installed.
+      verifyTile_(device.appleGpuFamily < 9 ? VerifyAttentionTile::Register
+                                            : VerifyAttentionTile::Mpp) {}
 
 void ExecutionPlans::install(const OperatorChoices &choices) {
   OperatorChoices pending = choices;
@@ -171,9 +175,10 @@ VerifyAttentionPlan ExecutionPlans::verifyAttention(
     uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
     std::span<const uint32_t> historyTokens) const {
   const auto workload = verifyKey(lanes, queryHeads, layout, historyTokens);
-  return PagedAttention::verifyPlan(
-      lanes, queryHeads, layout, historyTokens,
-      configurationFor(choices_.verifyAttention, workload, VerifyAttentionConfig{}));
+  VerifyAttentionConfig config =
+      configurationFor(choices_.verifyAttention, workload, VerifyAttentionConfig{});
+  config.tile = verifyTile_;
+  return PagedAttention::verifyPlan(lanes, queryHeads, layout, historyTokens, config);
 }
 
 DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,

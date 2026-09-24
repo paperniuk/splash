@@ -47,6 +47,10 @@ float fp32(uint16_t value) {
   return std::bit_cast<float>(uint32_t{value} << 16);
 }
 
+bool sameGrid(metal::DispatchSize a, metal::DispatchSize b) {
+  return a.x == b.x && a.y == b.y && a.z == b.z;
+}
+
 void checkPrefillSlotOrientation(uint32_t queryHeads, kv::Layout layout,
                                 ops::PrefillAttentionConfig config) {
   bool unequalAxes = false, partialTile = false, multipleSplits = false;
@@ -161,6 +165,35 @@ void checkPlans(uint32_t queryHeads, kv::Layout layout) {
         require(plan.laneSplits[0] == 32 &&
                     (lanes < 4 || plan.laneSplits[3] == kv::kQ8VerifyMaximumSplits),
                 "default verify partition changed");
+      require(plan.splitThreads.x == 256 && plan.splitThreads.y == 1 &&
+                  plan.splitThreads.z == 1,
+              "MPP verify tile left its 256-thread threadgroup");
+      // The Apple7/8 register tile keeps the partition, scratch and reduce;
+      // only the split entry and its one-simdgroup-per-eight-rows width change.
+      auto registerConfig = config;
+      registerConfig.tile = ops::VerifyAttentionTile::Register;
+      const auto registerPlan = ops::PagedAttention::verifyPlan(
+          lanes, queryHeads, layout, histories, registerConfig);
+      const bool int8 = layout.format == kv::Format::Int8;
+      require(registerPlan.splitPipeline ==
+                      (int8 ? "verify_attention_q8_split_sgf" + geometrySuffix
+                            : splitPipeline) &&
+                  registerPlan.configuration.tile ==
+                      (int8 ? ops::VerifyAttentionTile::Register
+                            : ops::VerifyAttentionTile::Mpp) &&
+                  registerPlan.splitThreads.x ==
+                      (int8 ? 32 * queryHeads / layout.kvHeads : 256) &&
+                  registerPlan.reducePipeline == plan.reducePipeline &&
+                  registerPlan.laneSplits == plan.laneSplits &&
+                  registerPlan.splits == plan.splits &&
+                  registerPlan.workspace.partialsBytes == plan.workspace.partialsBytes &&
+                  registerPlan.workspace.statisticsBytes ==
+                      plan.workspace.statisticsBytes &&
+                  sameGrid(registerPlan.splitGroups, plan.splitGroups) &&
+                  sameGrid(registerPlan.reduceGroups, plan.reduceGroups),
+              "register verify tile changed more than its split entry");
+      require(int8 != registerPlan.sameExecutionAs(plan),
+              "verify plan equality ignored the split tile");
     }
   }
   rejects([&] { (void)ops::PagedAttention::prefillPlan(0, queryHeads, layout, 0); });
@@ -602,6 +635,7 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data,
     const auto &reduce = graph.dispatches()[2];
     require(split.pipelineName == plan.splitPipeline && reduce.pipelineName == plan.reducePipeline &&
                 split.threadgroups.y == plan.splits && split.threadgroups.z == plan.splitGroups.z &&
+                sameGrid(split.threadsPerThreadgroup, plan.splitThreads) &&
                 reduce.threadgroups.y == plan.reduceGroups.y &&
                 reduce.threadgroups.z == plan.reduceGroups.z,
             "production verify encoding departed from its plan");
@@ -686,13 +720,16 @@ void checkVerify(metal::MetalBackend &backend, uint32_t heads, kv::Layout layout
                   uint32_t history, uint32_t lanes) {
   auto data = makeCase(backend, heads, layout, lanes, 8, history, true);
   std::vector<uint16_t> baseline;
-  for (const auto config : ops::PagedAttention::verifyCandidates()) {
-    const auto output = run(backend, data, config, true);
-    checkReference(data, output);
-    if (baseline.empty())
-      baseline = output;
-    checkEquivalent(data, baseline, output);
-  }
+  for (const auto candidate : ops::PagedAttention::verifyCandidates())
+    for (auto tile : {ops::VerifyAttentionTile::Mpp, ops::VerifyAttentionTile::Register}) {
+      auto config = candidate;
+      config.tile = tile;
+      const auto output = run(backend, data, config, true);
+      checkReference(data, output);
+      if (baseline.empty())
+        baseline = output;
+      checkEquivalent(data, baseline, output);
+    }
   std::cout << "paged verify candidates: format=" << kv::formatName(layout.format) << " q=" << heads << " history=" << history
             << " lanes=" << lanes << " PASS\n";
 }
@@ -720,6 +757,9 @@ int main(int argc, char **argv) {
             checkReference(prefill, run(backend, prefill, ops::PrefillAttentionConfig{}, true));
             auto verify = makeCase(backend, heads, layout, 4, 8, history, true);
             checkReference(verify, run(backend, verify, ops::VerifyAttentionConfig{}, true));
+            ops::VerifyAttentionConfig registerTile;
+            registerTile.tile = ops::VerifyAttentionTile::Register;
+            checkReference(verify, run(backend, verify, registerTile, true));
             std::cout << "long attention: format=" << kv::formatName(format)
                       << " q=" << heads << " history=" << history << " PASS\n" << std::flush;
           }

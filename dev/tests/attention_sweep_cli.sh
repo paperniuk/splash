@@ -30,13 +30,15 @@ done
 for value in typo '' '27b,' '27b,typo' ',35b'; do
     reject '--shapes takes 27b or 35b' --shapes "$value"
 done
-for option in --histories --lanes --repeat --shapes --phases --compare-metallib; do
+for option in --histories --lanes --repeat --shapes --phases --compare-metallib \
+        --verify-tile; do
     reject "$option requires a value" "$option"
 done
 reject '--phases takes both, verify or prefill' --phases typo
+reject '--verify-tile takes mpp or register' --verify-tile typo
 reject 'unknown option --unknown' --unknown 1
 # Valid values must reach the final sentinel, still without opening Metal.
 reject 'unknown option --sentinel' \
     --lanes 1,2,3,4 --histories 0,2048,131072 --repeat 1 \
-    --shapes 27b,35b --sentinel 1
+    --shapes 27b,35b --verify-tile register --sentinel 1
 echo 'attention-sweep CLI validation: PASS'

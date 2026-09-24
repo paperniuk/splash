@@ -206,6 +206,37 @@ void moeDeviceTiles() {
   }
 }
 
+// Apple7/8 verify attention runs the register tile over INT8 KV whatever
+// split configuration is installed; BF16 KV and newer families keep MPP.
+void verifyDeviceTiles() {
+  for (uint32_t family : {7U, 8U, 9U, 10U}) {
+    const auto expected = family < 9 ? VerifyAttentionTile::Register
+                                     : VerifyAttentionTile::Mpp;
+    ExecutionPlans plans(device(family));
+    for (auto shape : attentionShapes) {
+      const std::array<uint32_t, 4> histories{31, 2048, 131072, 0};
+      for (auto config : PagedAttention::verifyCandidates()) {
+        OperatorChoices choices;
+        choices.verifyAttention.push_back({{shape, 3}, config});
+        plans.install(choices);
+        const auto selected =
+            plans.verifyAttention(3, shape.queryHeads, layout(shape), histories);
+        auto resolved = config;
+        resolved.tile = expected;
+        require(selected.configuration == resolved,
+                "verify plan departed from the device attention tile");
+        require(selected.sameExecutionAs(PagedAttention::verifyPlan(
+                    3, shape.queryHeads, layout(shape), histories, resolved)),
+                "device verify tile changed the installed split partition");
+        const kv::Layout bf16{1, shape.kvHeads, 256, kv::Format::BFloat16};
+        require(plans.verifyAttention(3, shape.queryHeads, bf16, histories)
+                        .configuration.tile == VerifyAttentionTile::Mpp,
+                "BF16 KV left the MPP verify tile");
+      }
+    }
+  }
+}
+
 void allCandidates() {
   ExecutionPlans plans(device());
   const ExecutionPlans shipped(device());
@@ -523,6 +554,7 @@ int main() {
   try {
     baselinePlans();
     moeDeviceTiles();
+    verifyDeviceTiles();
     allCandidates();
     policyKeysAndBounds();
     atomicInvalidChoices();

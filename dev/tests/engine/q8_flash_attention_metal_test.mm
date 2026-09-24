@@ -341,26 +341,39 @@ std::vector<BFloat16Bits> cpuReference(const Case &data, bool quantized) {
   return output;
 }
 
-// One scale placement of one geometry, with the shared reduction.
+// One split tile of one geometry, with the shared reduction: the MPP tile in
+// both scale placements, and the Apple7/8 register tile (32 x G threads).
+enum class Tile { Softmax, Cooperative, Register };
 struct Pipelines {
   std::string splitName;
   id<MTLComputePipelineState> split;
   id<MTLComputePipelineState> reduce;
+  uint32_t threads = 256;
 };
 
 Pipelines makePipelines(id<MTLDevice> device, id<MTLLibrary> library,
-                        Shape shape, bool cooperativeScale) {
+                        Shape shape, Tile tile) {
   const std::string variant =
-      std::string(cooperativeScale ? "_cooperative_scale" : "") + shape.suffix;
+      std::string(tile == Tile::Cooperative ? "_cooperative_scale"
+                  : tile == Tile::Register  ? "_sgf"
+                                            : "") +
+      shape.suffix;
   Pipelines result;
   result.splitName = "verify_attention_q8_split" + variant;
   result.split = makePipeline(device, library, result.splitName);
   result.reduce = makePipeline(
       device, library, std::string("verify_attention_q8_reduce") + shape.suffix);
+  if (tile == Tile::Register)
+    result.threads = 32 * shape.queryHeadsPerKvHead;
   const uint64_t scratch = result.split.staticThreadgroupMemoryLength;
   std::cout << "pipeline=" << result.splitName << " threadgroup_bytes=" << scratch
             << (shaderValidationEnabled() ? " (instrumented by shader validation)" : "")
             << '\n';
+  if (tile == Tile::Register) {
+    require(result.split.maxTotalThreadsPerThreadgroup >= result.threads,
+            "register verify tile cannot run one simdgroup per eight fused rows");
+    return result;
+  }
   require(scratch == makePipeline(device, library,
                                   "prefill_attention_q8_split" + variant)
                          .staticThreadgroupMemoryLength,
@@ -382,9 +395,10 @@ std::vector<uint8_t> copyOf(id<MTLBuffer> buffer) {
 }
 
 Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
-                  id<MTLComputePipelineState> split,
-                  id<MTLComputePipelineState> reduce, const Case &data,
+                  const Pipelines &pipelines, const Case &data,
                   uint32_t width) {
+  id<MTLComputePipelineState> split = pipelines.split;
+  id<MTLComputePipelineState> reduce = pipelines.reduce;
   const Shape shape = data.shape;
   const uint32_t splits = data.params.split_count;
   const uint64_t laneBytes = data.queries.length;
@@ -417,7 +431,7 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
               length:sizeof(Q8VerifyAttentionParams) * params.size()
              atIndex:11];
   [encoder dispatchThreadgroups:MTLSizeMake(shape.kvHeads, splits, width)
-          threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+          threadsPerThreadgroup:MTLSizeMake(pipelines.threads, 1, 1)];
   [encoder setComputePipelineState:reduce];
   [encoder setBuffer:partials offset:0 atIndex:0];
   [encoder setBuffer:statistics offset:0 atIndex:1];
@@ -576,10 +590,10 @@ void requireIdentical(const Pipelines &placement, const Case &data,
   }
 }
 
-// Keep the CPU reference gates for both scale placements and verify that a
+// Keep the CPU reference gates for every split tile and verify that a
 // second independent submission produces identical output and scratch.
 void runCase(id<MTLDevice> device, id<MTLCommandQueue> queue,
-             const std::array<Pipelines, 2> &pipelines, Shape shape,
+             const std::array<Pipelines, 3> &pipelines, Shape shape,
              uint32_t committed, uint32_t activeRows, uint32_t width,
              bool qualityGate = true, uint32_t splits = kQ8VerifySplits) {
   require(width >= 1 && width <= 4, "invalid verify batch width");
@@ -589,11 +603,11 @@ void runCase(id<MTLDevice> device, id<MTLCommandQueue> queue,
   const std::vector<BFloat16Bits> expectedBf16 = cpuReference(data, false);
   for (const Pipelines &placement : pipelines) {
     const Dispatch first =
-        dispatch(device, queue, placement.split, placement.reduce, data, width);
+        dispatch(device, queue, placement, data, width);
     checkOutput(data, width, expectedQ8, expectedBf16, first.output,
                 qualityGate, placement.splitName);
     const Dispatch repeat =
-        dispatch(device, queue, placement.split, placement.reduce, data, width);
+        dispatch(device, queue, placement, data, width);
     checkOutput(data, width, expectedQ8, expectedBf16, repeat.output,
                 qualityGate, placement.splitName + "_repeat");
     requireIdentical(placement, data, width, first, repeat);
@@ -714,9 +728,10 @@ void run(const char *libraryPath) {
     for (uint32_t splits : {1U, 3U, 7U, 32U, 65U, 128U})
       for (uint32_t activeRows : {1U, 8U})
         checkReduce(device, queue, library, shape, splits, activeRows);
-    const std::array<Pipelines, 2> pipelines{
-        makePipelines(device, library, shape, false),
-        makePipelines(device, library, shape, true)};
+    const std::array<Pipelines, 3> pipelines{
+        makePipelines(device, library, shape, Tile::Softmax),
+        makePipelines(device, library, shape, Tile::Cooperative),
+        makePipelines(device, library, shape, Tile::Register)};
     for (uint32_t width = 1; width <= 4; ++width)
       runCase(device, queue, pipelines, shape, 127, 8, width);
     runCase(device, queue, pipelines, shape, 0, 8, 4);

@@ -118,6 +118,7 @@ TEST_Q8_LIB := $(ENGINE_TEST_BUILD)/q8-paged-kv.metallib
 TEST_Q8_KERNEL_SOURCES := \
 	runtime/metal/kernels/prefill/attention_q8.metal \
 	runtime/metal/kernels/decode/attention_q8.metal \
+	runtime/metal/kernels/decode/attention_q8_sgf.metal \
 	runtime/metal/kernels/prefill/attention_q8_store.metal \
 	runtime/metal/kernels/decode/attention_q8_store.metal
 TEST_Q8_KERNEL_AIRS := $(patsubst runtime/metal/kernels/%.metal,$(ENGINE_TEST_BUILD)/kernels/%.air,$(TEST_Q8_KERNEL_SOURCES))
