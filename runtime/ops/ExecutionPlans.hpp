@@ -129,7 +129,7 @@ private:
   Q4Linear baselineLinear_;
   uint32_t moeRouteWideRows_ = kMoeRouteWideRows;
   MoeExpertSimdgroups moeDecodeSimdgroups_ = MoeExpertSimdgroups::Eight;
-  VerifyAttentionTile verifyTile_ = VerifyAttentionTile::Mpp;
+  AttentionTile attentionTile_ = AttentionTile::Mpp;
   OperatorChoices choices_;
 };
 

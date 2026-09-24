@@ -116,10 +116,11 @@ ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device)
     : linear_(device), baselineLinear_(device),
       moeRouteWideRows_(moeRouteWideRows(device.gpuCoreCount)),
       moeDecodeSimdgroups_(moeDecodeSimdgroups(device.appleGpuFamily)),
-      // Apple7/8 have no bfloat arithmetic; their verify attention uses the
-      // register tile whatever split configuration was measured or installed.
-      verifyTile_(device.appleGpuFamily < 9 ? VerifyAttentionTile::Register
-                                            : VerifyAttentionTile::Mpp) {}
+      // Apple7/8 have no bfloat arithmetic; their prefill and verify attention
+      // use the register tile whatever split configuration was measured or
+      // installed.
+      attentionTile_(device.appleGpuFamily < 9 ? AttentionTile::Register
+                                            : AttentionTile::Mpp) {}
 
 void ExecutionPlans::install(const OperatorChoices &choices) {
   OperatorChoices pending = choices;
@@ -165,10 +166,10 @@ PrefillAttentionPlan ExecutionPlans::prefillAttention(
     uint32_t historyTokens) const {
   validateHistory(historyTokens, rows);
   const PrefillAttentionPolicy workload{attentionShape(queryHeads, layout), rows};
-  return PagedAttention::prefillPlan(
-      rows, queryHeads, layout, historyTokens,
-      configurationFor(choices_.prefillAttention, workload,
-                       PrefillAttentionConfig{}));
+  PrefillAttentionConfig config =
+      configurationFor(choices_.prefillAttention, workload, PrefillAttentionConfig{});
+  config.tile = attentionTile_;
+  return PagedAttention::prefillPlan(rows, queryHeads, layout, historyTokens, config);
 }
 
 VerifyAttentionPlan ExecutionPlans::verifyAttention(
@@ -177,7 +178,7 @@ VerifyAttentionPlan ExecutionPlans::verifyAttention(
   const auto workload = verifyKey(lanes, queryHeads, layout, historyTokens);
   VerifyAttentionConfig config =
       configurationFor(choices_.verifyAttention, workload, VerifyAttentionConfig{});
-  config.tile = verifyTile_;
+  config.tile = attentionTile_;
   return PagedAttention::verifyPlan(lanes, queryHeads, layout, historyTokens, config);
 }
 

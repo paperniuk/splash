@@ -156,12 +156,19 @@ struct AttentionWorkspace final {
 // Both kernels use one full-K QK multiply. Only the key-scale placement differs.
 enum class AttentionScalePlacement : uint8_t { Softmax = 0, Cooperative = 1 };
 
+// Mpp is the shipped tensor-operation tile. Register is the Apple7/8 tile
+// (exact half INT8 cache, fp32 queries and probabilities, one simdgroup per
+// eight fused rows) for prefill and verify; it applies to INT8 KV only and
+// ignores scale placement. The device policy sets it, the tuner does not.
+enum class AttentionTile : uint8_t { Mpp = 0, Register = 1 };
+
 // One preserves the shipped row-dependent split count; Two offers additional
 // history parallelism with an explicitly larger scratch bound.
 enum class PrefillSplitMultiplier : uint32_t { One = 1, Two = 2 };
 struct PrefillAttentionConfig final {
   PrefillSplitMultiplier splitMultiplier = PrefillSplitMultiplier::One;
   AttentionScalePlacement scalePlacement = AttentionScalePlacement::Softmax;
+  AttentionTile tile = AttentionTile::Mpp;
   bool operator==(const PrefillAttentionConfig &) const = default;
 };
 
@@ -171,15 +178,10 @@ enum class VerifySplitCount : uint32_t {
   Sixteen = 16,
   ThirtyTwo = 32
 };
-// Mpp is the shipped tensor-operation tile. Register is the Apple7/8 tile
-// (exact half INT8 cache, fp32 queries and probabilities, one simdgroup per
-// eight fused rows); it applies to INT8 KV only and ignores scale placement.
-// The device policy sets it, the tuner does not.
-enum class VerifyAttentionTile : uint8_t { Mpp = 0, Register = 1 };
 struct VerifyAttentionConfig final {
   VerifySplitCount splitCount = VerifySplitCount::ThirtyTwo;
   AttentionScalePlacement scalePlacement = AttentionScalePlacement::Softmax;
-  VerifyAttentionTile tile = VerifyAttentionTile::Mpp;
+  AttentionTile tile = AttentionTile::Mpp;
   bool operator==(const VerifyAttentionConfig &) const = default;
 };
 
@@ -196,6 +198,7 @@ struct PrefillAttentionPlan final {
   const std::string_view splitPipeline;
   const std::string_view reducePipeline;
   const metal::DispatchSize splitGroups;
+  const metal::DispatchSize splitThreads;
   const metal::DispatchSize reduceGroups;
 
   // Policy provenance is irrelevant when its resolved execution is identical.
@@ -207,12 +210,12 @@ private:
                        uint32_t historyTokens, uint32_t splits,
                        AttentionWorkspace workspace,
                        std::string_view splitPipeline, std::string_view reducePipeline,
-                       metal::DispatchSize splitGroups, metal::DispatchSize reduceGroups,
-                       kv::Format format)
+                       metal::DispatchSize splitGroups, metal::DispatchSize splitThreads,
+                       metal::DispatchSize reduceGroups, kv::Format format)
       : format(format), configuration(configuration), rows(rows), historyTokens(historyTokens),
         splits(splits), workspace(workspace),
         splitPipeline(splitPipeline), reducePipeline(reducePipeline),
-        splitGroups(splitGroups), reduceGroups(reduceGroups) {}
+        splitGroups(splitGroups), splitThreads(splitThreads), reduceGroups(reduceGroups) {}
 };
 
 struct VerifyAttentionPlan final {

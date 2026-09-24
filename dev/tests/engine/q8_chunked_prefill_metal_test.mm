@@ -17,6 +17,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace splash::kv;
@@ -29,11 +30,15 @@ constexpr std::string_view kChunkedPrefillStorePipeline =
     "prefill_attention_q8_store";
 constexpr std::string_view kPrefillAttentionSplitPipeline =
     "prefill_attention_q8_split";
+constexpr std::string_view kPrefillAttentionRegisterSplitPipeline =
+    "prefill_attention_q8_split_sgf";
 constexpr std::string_view kPrefillAttentionReducePipeline =
     "prefill_attention_q8_reduce";
+// The MPP split or the Apple7/8 register split, with the shared reduce.
 struct AttentionPipelines {
   id<MTLComputePipelineState> split;
   id<MTLComputePipelineState> reduce;
+  splash::ops::AttentionTile tile = splash::ops::AttentionTile::Mpp;
 };
 
 uint64_t attentionIndex(uint32_t stride, uint32_t head, uint32_t row,
@@ -276,6 +281,7 @@ void encodeAttention(id<MTLComputeCommandEncoder> encoder,
                      const AttentionPipelines &pipelines, const Case &data,
                      splash::ops::PrefillAttentionConfig config = {},
                      const Q8PrefillAttentionParams *overrideParams = nullptr) {
+  config.tile = pipelines.tile;
   const auto plan = splash::ops::PagedAttention::prefillPlan(
       data.params.chunk_tokens, kQueryHeads, {1, kKvHeads, kHeadDimension},
       data.params.committed_tokens, config);
@@ -296,9 +302,12 @@ void encodeAttention(id<MTLComputeCommandEncoder> encoder,
   [encoder setBuffer:data.statistics offset:0 atIndex:6];
   [encoder setBuffer:data.pageTableBuffer offset:0 atIndex:7];
   [encoder setBytes:&params length:sizeof(params) atIndex:8];
+  require(plan.splitThreads.x <= pipelines.split.maxTotalThreadsPerThreadgroup,
+          "prefill split threadgroup exceeds its pipeline");
   [encoder dispatchThreadgroups:MTLSizeMake(plan.splitGroups.x, plan.splitGroups.y,
                                            plan.splitGroups.z)
-             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+             threadsPerThreadgroup:MTLSizeMake(plan.splitThreads.x, plan.splitThreads.y,
+                                               plan.splitThreads.z)];
   [encoder setComputePipelineState:pipelines.reduce];
   [encoder setBuffer:data.partials offset:0 atIndex:0];
   [encoder setBuffer:data.statistics offset:0 atIndex:1];
@@ -922,17 +931,24 @@ void run(const char *libraryPath) {
     throw std::runtime_error(error.localizedDescription.UTF8String);
   id<MTLComputePipelineState> store =
       makePipeline(device, library, kChunkedPrefillStorePipeline.data());
-  const AttentionPipelines attention{
-      makePipeline(device, library, kPrefillAttentionSplitPipeline.data()),
-      makePipeline(device, library, kPrefillAttentionReducePipeline.data())};
+  id<MTLComputePipelineState> reduce =
+      makePipeline(device, library, kPrefillAttentionReducePipeline.data());
   id<MTLComputePipelineState> verifyStore =
       makePipeline(device, library, "verify_attention_q8_store");
   id<MTLCommandQueue> queue = [device newCommandQueue];
   testContract();
-  testAttentionAndDirectStore(device, queue, store, attention);
-  testAttentionGeometries(device, queue, store, attention);
-  testChunkAndSplitReference(device, queue, store, attention);
-  testInvalidAttentionParams(device, queue, attention);
+  using splash::ops::AttentionTile;
+  for (const auto [name, tile] :
+       {std::pair{kPrefillAttentionSplitPipeline, AttentionTile::Mpp},
+        std::pair{kPrefillAttentionRegisterSplitPipeline, AttentionTile::Register}}) {
+    const AttentionPipelines attention{makePipeline(device, library, name.data()),
+                                       reduce, tile};
+    std::cout << "prefill attention tile: " << name << '\n';
+    testAttentionAndDirectStore(device, queue, store, attention);
+    testAttentionGeometries(device, queue, store, attention);
+    testChunkAndSplitReference(device, queue, store, attention);
+    testInvalidAttentionParams(device, queue, attention);
+  }
   testCommitIndexOverwrite(device, queue, store);
   testBatchedVerifyStore(device, queue, verifyStore);
   std::cout << "q8_chunked_prefill_metal_test: ok\n";

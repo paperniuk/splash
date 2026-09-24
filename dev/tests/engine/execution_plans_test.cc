@@ -206,12 +206,12 @@ void moeDeviceTiles() {
   }
 }
 
-// Apple7/8 verify attention runs the register tile over INT8 KV whatever
+// Apple7/8 prefill and verify attention run the register tile over INT8 KV whatever
 // split configuration is installed; BF16 KV and newer families keep MPP.
 void verifyDeviceTiles() {
   for (uint32_t family : {7U, 8U, 9U, 10U}) {
-    const auto expected = family < 9 ? VerifyAttentionTile::Register
-                                     : VerifyAttentionTile::Mpp;
+    const auto expected = family < 9 ? AttentionTile::Register
+                                     : AttentionTile::Mpp;
     ExecutionPlans plans(device(family));
     for (auto shape : attentionShapes) {
       const std::array<uint32_t, 4> histories{31, 2048, 131072, 0};
@@ -230,8 +230,26 @@ void verifyDeviceTiles() {
                 "device verify tile changed the installed split partition");
         const kv::Layout bf16{1, shape.kvHeads, 256, kv::Format::BFloat16};
         require(plans.verifyAttention(3, shape.queryHeads, bf16, histories)
-                        .configuration.tile == VerifyAttentionTile::Mpp,
+                        .configuration.tile == AttentionTile::Mpp,
                 "BF16 KV left the MPP verify tile");
+      }
+      for (auto config : PagedAttention::prefillCandidates()) {
+        OperatorChoices choices;
+        choices.prefillAttention.push_back({{shape, 2048}, config});
+        plans.install(choices);
+        const auto selected =
+            plans.prefillAttention(2048, shape.queryHeads, layout(shape), 131072);
+        auto resolved = config;
+        resolved.tile = expected;
+        require(selected.configuration == resolved,
+                "prefill plan departed from the device attention tile");
+        require(selected.sameExecutionAs(PagedAttention::prefillPlan(
+                    2048, shape.queryHeads, layout(shape), 131072, resolved)),
+                "device prefill tile changed the installed split partition");
+        const kv::Layout bf16{1, shape.kvHeads, 256, kv::Format::BFloat16};
+        require(plans.prefillAttention(2048, shape.queryHeads, bf16, 131072)
+                        .configuration.tile == AttentionTile::Mpp,
+                "BF16 KV left the MPP prefill tile");
       }
     }
   }
