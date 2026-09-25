@@ -1,3 +1,16 @@
+> **Unofficial fork: Splash on M1/M2 Macs.**
+> Splash is built by [Inco](https://github.com/incoai/splash): the engine, the models and the draft
+> models are theirs. This fork only adds support for Apple7/8 GPUs (M1, M2), which upstream Splash
+> does not run on: a kernel policy for those GPUs and register-matrix Metal kernels written for them.
+> This is a community port, not an official Inco release.
+>
+> - **M1/M2:** source in branch [`apple7-m1-kernels`](https://github.com/paperniuk/splash/tree/apple7-m1-kernels).
+> - **M3 and newer:** use official Splash, `brew install incoai/tap/splash`.
+> - **M1/M2 problems:** open an issue here, not upstream.
+>
+> If this port is useful to you, a star here helps, and please star
+> [the original Splash](https://github.com/incoai/splash) too: all of this is built on their work.
+
 # Splash
 
 [![CI](https://github.com/incoai/splash/actions/workflows/ci.yml/badge.svg)](https://github.com/incoai/splash/actions/workflows/ci.yml)
