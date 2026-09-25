@@ -89,6 +89,14 @@ struct ExpertPasses final {
 };
 
 ExpertPasses fusedExpertPasses(const MoeConfig &config) noexcept {
+  // Four simdgroups: gate/up 16 and down 32 columns each, arranged 2 x 2
+  // over the 32-row tile and 4 x 1 over the 8-row tile.
+  if (config.kernel == MoeExpertKernel::Register)
+    return config.expertTile == MoeExpertTile::M32
+               ? ExpertPasses{"moe_expert_gate_up_q4_mma_m32",
+                              "moe_expert_down_q4_mma_m32", 32, 64, 128}
+               : ExpertPasses{"moe_expert_gate_up_q4_mma_m8",
+                              "moe_expert_down_q4_mma_m8", 64, 128, 128};
   if (config.expertTile == MoeExpertTile::M32)
     return {"moe_expert_gate_up_q4_m32", "moe_expert_down_q4_m32", 128, 128,
             metal::CommandGraph::kDefaultThreads};
@@ -105,13 +113,17 @@ ExpertPasses fusedExpertPasses(const MoeConfig &config) noexcept {
 MoePlan::MoePlan(MoeShape shape, uint32_t rows, MoeConfig config,
                  bool prefill)
     : shape_(shape), rows_(rows), config_(config),
-      splitExperts_(prefill && config.expertTile == MoeExpertTile::M32) {
+      splitExperts_(prefill && config.expertTile == MoeExpertTile::M32 &&
+                    config.kernel == MoeExpertKernel::Mpp) {
   if (config.expertTile != MoeExpertTile::M8 &&
       config.expertTile != MoeExpertTile::M32)
     throw std::invalid_argument("invalid MoE expert tile configuration");
   if (config.m8Simdgroups != MoeExpertSimdgroups::Eight &&
       config.m8Simdgroups != MoeExpertSimdgroups::Four)
     throw std::invalid_argument("invalid MoE expert simdgroup configuration");
+  if (config.kernel != MoeExpertKernel::Mpp &&
+      config.kernel != MoeExpertKernel::Register)
+    throw std::invalid_argument("invalid MoE expert kernel configuration");
   workspace_ = workspaceFor(shape, rows, tileRows(), splitExperts_);
   maximumTiles_ = moeMaximumTiles(rows, shape, tileRows());
 }
@@ -243,18 +255,22 @@ MoePlan MoE::decodePlan(MoeShape shape, uint32_t lanes, MoeConfig config) {
 }
 
 std::array<MoePlan, 2> MoE::prefillCandidates(MoeShape shape, uint32_t rows,
-                                          uint32_t routeWideRows) {
-  return {prefillPlan(shape, rows, {MoeExpertTile::M32, routeWideRows}),
-          prefillPlan(shape, rows, {MoeExpertTile::M8, routeWideRows})};
+                                          uint32_t routeWideRows,
+                                          MoeExpertKernel kernel) {
+  return {prefillPlan(shape, rows, {MoeExpertTile::M32, routeWideRows,
+                                    MoeExpertSimdgroups::Eight, kernel}),
+          prefillPlan(shape, rows, {MoeExpertTile::M8, routeWideRows,
+                                    MoeExpertSimdgroups::Eight, kernel})};
 }
 
 std::array<MoePlan, 2> MoE::decodeCandidates(MoeShape shape, uint32_t lanes,
                                          uint32_t routeWideRows,
-                                         MoeExpertSimdgroups m8Simdgroups) {
+                                         MoeExpertSimdgroups m8Simdgroups,
+                                         MoeExpertKernel kernel) {
   return {decodePlan(shape, lanes,
-                     {MoeExpertTile::M8, routeWideRows, m8Simdgroups}),
+                     {MoeExpertTile::M8, routeWideRows, m8Simdgroups, kernel}),
           decodePlan(shape, lanes,
-                     {MoeExpertTile::M32, routeWideRows, m8Simdgroups})};
+                     {MoeExpertTile::M32, routeWideRows, m8Simdgroups, kernel})};
 }
 
 } // namespace splash::ops

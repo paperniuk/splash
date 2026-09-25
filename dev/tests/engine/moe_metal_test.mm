@@ -628,6 +628,18 @@ void checkEncoding(const CommandGraph &graph, const MoePlan &plan) {
                 dispatches[experts + 1].threadgroups.x == kIntermediate / 256 &&
                 dispatches[experts + 2].threadgroups.x == kHidden / 256,
             "split MoE plan chose inconsistent gate scratch or column tiles");
+  } else if (plan.config().kernel == splash::ops::MoeExpertKernel::Register) {
+    // Apple7/8 register tiles: four simdgroups, fused gate/up at both row
+    // counts, 16 gate/up and 32 down columns per simdgroup.
+    const std::string rows = m8 ? "m8" : "m32";
+    require(dispatches[experts].pipelineName == "moe_expert_gate_up_q4_mma_" + rows &&
+                dispatches[experts + 1].pipelineName == "moe_expert_down_q4_mma_" + rows,
+            "register MoE plan chose inconsistent expert pipelines");
+    require(dispatches[experts].threadgroups.x == kIntermediate / (m8 ? 64 : 32) &&
+                dispatches[experts + 1].threadgroups.x == kHidden / (m8 ? 128 : 64) &&
+                dispatches[experts].threadsPerThreadgroup.x == 128 &&
+                dispatches[experts + 1].threadsPerThreadgroup.x == 128,
+            "register MoE plan chose inconsistent column tiles or threadgroup width");
   } else {
     // Four-simdgroup 8-row tiles launch 128 threads and widen the down tile
     // to N256; every other fused pass keeps N128 at 256 threads.
@@ -902,6 +914,12 @@ void run(const std::string &metallibPath) {
                    label + " four-simdgroup M8");
       requireEqual(execute(narrow[1], label + " sg4"), baseline,
                    label + " four-simdgroup M32");
+      // Apple7/8 register tiles: checked against the CPU reference inside
+      // execute(); their summation order differs, so not bitwise.
+      for (const auto &plan : MoE::decodeCandidates(fixture.shape, lanes, kMoeRouteWideRows,
+                                                    MoeExpertSimdgroups::Eight,
+                                                    splash::ops::MoeExpertKernel::Register))
+        execute(plan, label + " register");
     }
     // 12 and 48 rows leave 16-row ragged tiles in every routing fixture; 9,
     // 33 and 263 leave 8-row ones next to full tiles; 511/512 straddle the
@@ -912,6 +930,11 @@ void run(const std::string &metallibPath) {
       const std::string label = "prefill rows=" + std::to_string(rows);
       const auto baseline = execute(candidates[0], label);
       requireEqual(execute(candidates[1], label), baseline, label);
+      for (const auto &plan : MoE::prefillCandidates(fixture.shape, rows, kMoeRouteWideRows,
+                                                     splash::ops::MoeExpertKernel::Register)) {
+        require(!plan.splitExperts(), label + ": register prefill plan split the experts");
+        execute(plan, label + " register");
+      }
     }
   }
   std::cout << "moe_metal_test: PASS cases=" << cases

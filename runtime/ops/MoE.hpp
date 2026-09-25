@@ -122,6 +122,14 @@ moeDecodeSimdgroups(uint32_t appleGpuFamily) noexcept {
                              : MoeExpertSimdgroups::Eight;
 }
 
+// Expert tile implementation: a device policy the execution plans set, not a
+// tuned choice. Mpp is the shipped tensor-operation tile. Register is the
+// Apple7/8 tile (moe_mma.metal: exact half Q4 weights, fp32 inputs and
+// accumulation, in-kernel input sums), whose gate/up pass is fused at either
+// row count, so its prefill plans never split the experts. Its outputs match
+// the MPP tiles up to summation order, not bitwise.
+enum class MoeExpertKernel : uint8_t { Mpp = 0, Register = 1 };
+
 struct MoeConfig final {
   MoeExpertTile expertTile = MoeExpertTile::M32;
   // Rows from which the router uses the 32-row scores tile; the execution
@@ -130,6 +138,7 @@ struct MoeConfig final {
   // Simdgroups of the 8-row expert tiles; the execution plans derive it from
   // the GPU family for decode plans and keep eight for prefill plans.
   MoeExpertSimdgroups m8Simdgroups = MoeExpertSimdgroups::Eight;
+  MoeExpertKernel kernel = MoeExpertKernel::Mpp;
   bool operator==(const MoeConfig &) const = default;
 };
 
@@ -192,10 +201,12 @@ struct MoE final {
   // supplies the device's router threshold to every expert-tile candidate
   // and its 8-row tile simdgroups to the decode candidates.
   [[nodiscard]] static std::array<MoePlan, 2>
-  prefillCandidates(MoeShape shape, uint32_t rows, uint32_t routeWideRows);
+  prefillCandidates(MoeShape shape, uint32_t rows, uint32_t routeWideRows,
+                    MoeExpertKernel kernel = MoeExpertKernel::Mpp);
   [[nodiscard]] static std::array<MoePlan, 2>
   decodeCandidates(MoeShape shape, uint32_t lanes, uint32_t routeWideRows,
-                   MoeExpertSimdgroups m8Simdgroups = MoeExpertSimdgroups::Eight);
+                   MoeExpertSimdgroups m8Simdgroups = MoeExpertSimdgroups::Eight,
+                   MoeExpertKernel kernel = MoeExpertKernel::Mpp);
   static void add(metal::CommandGraph &graph, const MoeBuffers &buffers,
                   const MoeWeights &weights, const MoePlan &plan);
 };

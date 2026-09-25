@@ -116,6 +116,9 @@ ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device)
     : linear_(device), baselineLinear_(device),
       moeRouteWideRows_(moeRouteWideRows(device.gpuCoreCount)),
       moeDecodeSimdgroups_(moeDecodeSimdgroups(device.appleGpuFamily)),
+      // Apple7/8 run the register expert tiles in both phases.
+      moeExpertKernel_(device.appleGpuFamily < 9 ? MoeExpertKernel::Register
+                                                 : MoeExpertKernel::Mpp),
       // Apple7/8 have no bfloat arithmetic; their prefill and verify attention
       // use the register tile whatever split configuration was measured or
       // installed.
@@ -199,6 +202,7 @@ MoePlan ExecutionPlans::moePrefill(MoeShape shape, uint32_t rows) const {
   // The four-simdgroup 8-row tiles are measured at decode occupancy only; a
   // prefill chunk's much larger expert grid keeps the shipped tile.
   config.m8Simdgroups = MoeExpertSimdgroups::Eight;
+  config.kernel = moeExpertKernel_;
   return MoE::prefillPlan(shape, rows, config);
 }
 
@@ -211,16 +215,19 @@ MoePlan ExecutionPlans::moeDecode(MoeShape shape, uint32_t lanes) const {
       MoeConfig{MoeExpertTile::M8});
   config.routeWideRows = moeRouteWideRows_;
   config.m8Simdgroups = moeDecodeSimdgroups_;
+  config.kernel = moeExpertKernel_;
   return MoE::decodePlan(shape, lanes, config);
 }
 
 std::array<MoePlan, 2> ExecutionPlans::moeCandidates(const MoeWorkload &workload) const {
   if (workload.phase == MoePhase::Prefill)
-    return MoE::prefillCandidates(workload.shape, workload.rows, moeRouteWideRows_);
+    return MoE::prefillCandidates(workload.shape, workload.rows, moeRouteWideRows_,
+                                  moeExpertKernel_);
   if (workload.phase != MoePhase::Decode || workload.rows % kDecodeRows)
     throw std::invalid_argument("invalid MoE candidate workload");
   return MoE::decodeCandidates(workload.shape, workload.rows / kDecodeRows,
-                               moeRouteWideRows_, moeDecodeSimdgroups_);
+                               moeRouteWideRows_, moeDecodeSimdgroups_,
+                               moeExpertKernel_);
 }
 
 AttentionWorkspace ExecutionPlans::prefillAttentionWorkspace(
