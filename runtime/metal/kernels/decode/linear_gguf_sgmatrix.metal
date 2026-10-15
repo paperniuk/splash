@@ -144,6 +144,17 @@ inline vec<OperandType<F, true>, 2> operand_f32(typename F::Chunk ch, uint f, th
   }
 }
 
+// MLX affine 4-bit over whole spans, whose F32 chains take nibble_operand.
+template <class F> struct NibbleSpan { static constexpr constant bool value = false; };
+template <uint Groups> struct NibbleSpan<FmtAffine<4, Groups>> { static constexpr constant bool value = Groups >= 2; };
+// The exact half operand 1 + code / 64 of pair f of a 4-bit chunk word: the codes at bits 4-7 of each halfword
+// below half 1's bits, where pair 1's already sit, which takes a shift, a mask and an or per pair (operand_f32
+// adds a subtraction), and a span chain whose min part (64 s against codes to 15) is half operand_f32's.
+inline half2 nibble_operand(uint word, uint f) {
+  const uint at = f == 0 ? word << 4 : f == 1 ? word : word >> (4 * (f - 1));
+  return as_type<half2>((at & 0x00F000F0u) | 0x3C003C00u);
+}
+
 // The exact bf16 operand of pair f of a chunk.
 template <class F>
 inline bfloat2 operand(typename F::Chunk ch, uint f, threadgroup const bfloat2 *lut) {
@@ -309,7 +320,10 @@ inline void decode(device const TableElem<F32> *table, device const float *sums,
 #pragma unroll
           for (uint nf = 0; nf < 2; ++nf)
 #pragma unroll
-            for (uint f = 0; f < 4; ++f) a[nf][f] = operand_f32<F>(cur[nf][q], f, lut);
+            for (uint f = 0; f < 4; ++f) {
+              if constexpr (NibbleSpan<F>::value) a[nf][f] = nibble_operand(cur[nf][q], f);
+              else a[nf][f] = operand_f32<F>(cur[nf][q], f, lut);
+            }
 #pragma unroll
           for (uint r = 0; r < L; ++r) {
             const vec<T, 8> bq = xt[ulong(r) * K + (8 * q + fm) * 4 + c];
@@ -330,8 +344,14 @@ inline void decode(device const TableElem<F32> *table, device const float *sums,
           const float2 sum = *(device const float2 *)rs + *(device const float2 *)(rs + 8);
 #pragma unroll
           for (uint nf = 0; nf < 2; ++nf) {
-            acc[r][nf] = fma(dot[r][nf], cs[nf].x, acc[r][nf]);
-            acc[r][nf] = fma(sum, cs[nf].y, acc[r][nf]);
+            if constexpr (NibbleSpan<F>::value) {
+              // code = 64 (operand - 1): s code + m = 64 s operand + m - 64 s.
+              acc[r][nf] = fma(dot[r][nf], 64 * cs[nf].x, acc[r][nf]);
+              acc[r][nf] = fma(sum, fma(64.0f, cs[nf].x, cs[nf].y), acc[r][nf]);
+            } else {
+              acc[r][nf] = fma(dot[r][nf], cs[nf].x, acc[r][nf]);
+              acc[r][nf] = fma(sum, cs[nf].y, acc[r][nf]);
+            }
           }
         }
       } else
