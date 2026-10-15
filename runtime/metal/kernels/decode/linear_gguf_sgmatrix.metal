@@ -112,8 +112,9 @@ template <class F, bool F32>
 using OperandType = metal::conditional_t<!F32, bfloat, metal::conditional_t<F::Kind == QuantFloat16, float, half>>;
 // The pair table's entries: as the operand, half for fp32 operands (no codebook format has them).
 template <class F, bool F32> using LutPair = vec<metal::conditional_t<F32, half, bfloat>, 2>;
-// The activation operand: the table's bf16, widened to fp32 on Apple7/8.
+// The activation operand: the table's bf16, or on Apple7/8 its fp32 (Table16F), which enters the MMA as it is.
 template <bool F32> using InputType = metal::conditional_t<F32, float, bfloat>;
+template <bool F32> using TableElem = InputType<F32>;
 
 // The exact half operand of pair f of a chunk, as operand<F> but for Apple7/8: linear codes or-ed into half 1024
 // (whose ulp is 1) less 1024 minus the bf16 tile's offset, so the chains are that tile's.
@@ -216,7 +217,7 @@ template <class F, bool F32 = false> inline Coef<F> coefficient(CoefSource<F> sr
 // L request lanes of eight rows, one K partition (tg.y) of `splits`, into a destination of type Out; F32 widens the
 // operands for Apple7/8.
 template <class F, uint L, GgufEpilogue Ep, bool F32 = false, class Out>
-inline void decode(device const bfloat *table, device const float *sums, device uchar *w0,
+inline void decode(device const TableElem<F32> *table, device const float *sums, device uchar *w0,
                    device uchar *w1, device uchar *meta, device Out *out,
                    device coherent(device) float *partials, device atomic_uint *counters,
                    device const bfloat *aux, const GgufDecodeParams p, uint2 tg, uint tid, uint sg,
@@ -246,6 +247,9 @@ inline void decode(device const bfloat *table, device const float *sums, device 
     p0[nf] = w0 + at * F::P0;
     p1[nf] = w1 + at * F::P1;
   }
+  // Apple7/8 load each span's chunks as it starts: without the next span's in
+  // flight more simdgroups fit a core, 3-5% faster at one to four lanes on
+  // an M1 Max.
   typename F::Chunk cur[2][2], nxt[2][2];
   const auto load = [&](thread typename F::Chunk (&ch)[2][2]) __attribute__((always_inline)) {
 #pragma unroll
@@ -254,8 +258,9 @@ inline void decode(device const bfloat *table, device const float *sums, device 
       ch[nf][1] = F::loadChunk(p0[nf] + QUANT_TILE_ROWS * F::P0, p1[nf] + QUANT_TILE_ROWS * F::P1, c);
     }
   };
-  device const vec<bfloat, 8> *xt =
-      reinterpret_cast<device const vec<bfloat, 8> *>(table + ulong(first) * GGUF_TABLE16_SPAN_VALUES);
+  typedef TableElem<F32> T;
+  device const vec<T, 8> *xt =
+      reinterpret_cast<device const vec<T, 8> *>(table + ulong(first) * GGUF_TABLE16_SPAN_VALUES);
   device const float *seeds = sums + ulong(first) * GGUF_TABLE16_SPAN_SEEDS;
   device const float *s32 = sums + table16_sums32_offset(K) + ulong(first) * GGUF_TABLE16_SPAN_SUMS;
 
@@ -291,7 +296,9 @@ inline void decode(device const bfloat *table, device const float *sums, device 
         p0[nf] += 2 * QUANT_TILE_ROWS * F::P0;
         p1[nf] += 2 * QUANT_TILE_ROWS * F::P1;
       }
-      if (more) load(nxt);
+      if constexpr (!F32) {
+        if (more) load(nxt);
+      }
       if constexpr (F32 && S::SpanChain) {
         float2 dot[L][2];
 #pragma unroll
@@ -305,10 +312,10 @@ inline void decode(device const bfloat *table, device const float *sums, device 
             for (uint f = 0; f < 4; ++f) a[nf][f] = operand_f32<F>(cur[nf][q], f, lut);
 #pragma unroll
           for (uint r = 0; r < L; ++r) {
-            const vec<bfloat, 8> bq = xt[ulong(r) * K + (8 * q + fm) * 4 + c];
+            const vec<T, 8> bq = xt[ulong(r) * K + (8 * q + fm) * 4 + c];
 #pragma unroll
             for (uint f = 0; f < 4; ++f) {
-              const float2 b = float2(reinterpret_cast<thread const bfloat2 *>(&bq)[f]);
+              const float2 b = reinterpret_cast<thread const float2 *>(&bq)[f];
 #pragma unroll
               for (uint nf = 0; nf < 2; ++nf) sgmatrix::mma_mixed(dot[r][nf], a[nf][f], b);
             }
@@ -346,11 +353,11 @@ inline void decode(device const bfloat *table, device const float *sums, device 
         const bool closes = ((us * 2 + q) * S::CG + S::CG) % S::MinChains == 0;
 #pragma unroll
         for (uint r = 0; r < L; ++r) {
-          const vec<bfloat, 8> bq = xt[ulong(r) * K + (8 * q + fm) * 4 + c];
+          const vec<T, 8> bq = xt[ulong(r) * K + (8 * q + fm) * 4 + c];
           vec<InputType<F32>, 2> b[4];   // F32: the activation pairs as the F32 MMA takes them
           if constexpr (F32) {
 #pragma unroll
-            for (uint f = 0; f < 4; ++f) b[f] = vec<InputType<F32>, 2>(reinterpret_cast<thread const bfloat2 *>(&bq)[f]);
+            for (uint f = 0; f < 4; ++f) b[f] = reinterpret_cast<thread const vec<T, 2> *>(&bq)[f];
           }
           float2 sum = float2(0), seed[S::CG];
           if ((S::HasMin || S::Seeded) && S::CG == 1 && closes) {
@@ -389,7 +396,9 @@ inline void decode(device const bfloat *table, device const float *sums, device 
       xt += GGUF_TABLE16_SPAN_VALUES / 8;
       seeds += GGUF_TABLE16_SPAN_SEEDS;
       s32 += GGUF_TABLE16_SPAN_SUMS;
-      if (more) {
+      if constexpr (F32) {
+        if (more) load(cur);
+      } else if (more) {
 #pragma unroll
         for (uint nf = 0; nf < 2; ++nf) cur[nf][0] = nxt[nf][0], cur[nf][1] = nxt[nf][1];
       }
@@ -449,6 +458,22 @@ kernel void decode_linear_gguf_prepare(device const bfloat *input [[buffer(0)]],
   gguf_sg::write_input(table + ulong(tg.y) * width * 8, sums + ulong(tg.y) * table16_sums_per_tile(width), width,
                      span, row, lane, input[row * width + k], input[row * width + k + 1]);
 }
+// Table16F, the fp32 table of Apple7/8, as above.
+inline void prepare_table_f(device const bfloat *input, device float *table, device float *sums, uint width, uint2 tg,
+                            uint sg, uint lane) {
+  const uint span = (tg.x * 4 + sg) / 8, row = (tg.x * 4 + sg) % 8;
+  input += ulong(tg.y) * width * 8;
+  const uint k = span * GGUF_TABLE16_SPAN_INPUTS + 2 * lane;
+  gguf_sg::write_input(table + ulong(tg.y) * width * 8, sums + ulong(tg.y) * table16_sums_per_tile(width), width,
+                       span, row, lane, input[row * width + k], input[row * width + k + 1]);
+}
+kernel void decode_linear_gguf_prepare_f(device const bfloat *input [[buffer(0)]], device float *table [[buffer(1)]],
+                                         device float *sums [[buffer(2)]], constant uint &width [[buffer(3)]],
+                                         uint2 tg [[threadgroup_position_in_grid]],
+                                         uint sg [[simdgroup_index_in_threadgroup]],
+                                         uint lane [[thread_index_in_simdgroup]]) {
+  prepare_table_f(input, table, sums, width, tg, sg, lane);
+}
 
 #define GGUF_SG_KERNEL(Name, F, L, EP, Out)                                                                   \
   kernel void Name(device const bfloat *table [[buffer(0)]], device const float *sums [[buffer(1)]],       \
@@ -481,7 +506,7 @@ QUANT_REGISTER_FORMATS(GGUF_SG_FORMAT)
 
 // Apple7/8's F32 instances (gguf_decode_sgf_*) of each format, with each epilogue as above.
 #define GGUF_SGF_KERNEL(Name, F, L, EP, Out)                                                                    \
-  kernel void Name(device const bfloat *table [[buffer(0)]], device const float *sums [[buffer(1)]],            \
+  kernel void Name(device const float *table [[buffer(0)]], device const float *sums [[buffer(1)]],             \
                    device uchar *w0 [[buffer(2)]], device uchar *w1 [[buffer(3)]],                              \
                    device uchar *meta [[buffer(4)]], device Out *out [[buffer(5)]],                             \
                    device coherent(device) float *partials [[buffer(6)]],                                       \
