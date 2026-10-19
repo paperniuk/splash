@@ -131,6 +131,39 @@ inline half2 nibble_operand(uint word, uint f) {
   return as_type<half2>((at & 0x00F000F0u) | 0x3C003C00u);
 }
 
+// Apple7/8's (F32) view of Q4_0 and Q5_0: the zero point taken as a min, m = -zero d, so their chains close once per
+// 32 inputs against the table's sums, as Q4_1's and Q5_1's do, instead of once per 16 against the seeds. On an M2
+// Max this takes 8-14% off Q4_0's 17408 x 5120 gate/up at one to four lanes (Q5_0's 2-8%), and the 27B in Q4_0,
+// MLX 4-bit's size, decodes 3-7% below MLX 4-bit instead of 10-14%.
+template <class F> struct ZeroAsMin {
+  enum : uint { Id = F::Id, P0 = F::P0, P1 = F::P1, MetaBytes = F::MetaBytes };
+  enum : ushort { MetaGroups = F::MetaGroups, Zero = 0, Group = F::Group };
+  static constexpr constant QuantKind Kind = F::Kind;
+  static constexpr constant bool ScaleInChunk = F::ScaleInChunk;
+  typedef typename F::Payload Payload; typedef typename F::Chunk Chunk; typedef typename F::Meta Meta;
+  static Payload load(device uchar *p0, device uchar *p1) { return F::load(p0, p1); }
+  static Meta loadMeta(device uchar *m) { return F::loadMeta(m); }
+  static Chunk chunk(Payload w, ushort c) { return F::chunk(w, c); }
+  static Chunk loadChunk(device uchar *p0, device uchar *p1, ushort c) { return F::loadChunk(p0, p1, c); }
+  static uint4 codes(Chunk q) { return F::codes(q); }
+  static QuantCoef coef(Meta mt, ushort j) {
+    QuantCoef k = F::coef(mt, j);
+    k.m = -float(F::Zero) * k.s;
+    return k;
+  }
+};
+// The format an F32 instance decodes F as.
+template <class F> struct F32Format { typedef F type; };
+template <> struct F32Format<FmtQ40> { typedef ZeroAsMin<FmtQ40> type; };
+template <> struct F32Format<FmtQ50> { typedef ZeroAsMin<FmtQ50> type; };
+// Formats with a min per 32 inputs whose chunk is one word of 4-bit codes in Q4_K's order (Q4_K, Q4_1, Q4_0 as
+// ZeroAsMin, MLX affine 4-bit in groups of 32): their F32 chains per 32 inputs take nibble_operand too.
+template <class F> struct NibbleChunk { static constexpr constant bool value = false; };
+template <> struct NibbleChunk<FmtQ4K> { static constexpr constant bool value = true; };
+template <> struct NibbleChunk<FmtQ41> { static constexpr constant bool value = true; };
+template <> struct NibbleChunk<ZeroAsMin<FmtQ40>> { static constexpr constant bool value = true; };
+template <> struct NibbleChunk<FmtAffine<4, 1>> { static constexpr constant bool value = true; };
+
 // The exact bf16 operand of pair f of a chunk.
 template <class F>
 inline bfloat2 operand(typename F::Chunk ch, uint f, threadgroup const bfloat2 *lut) {
@@ -330,13 +363,16 @@ inline void decode(device const TableElem<F32> *table, device const float *sums,
       } else
 #pragma unroll
       for (uint q = 0; q < 2; ++q) {
+        constexpr bool nibbles = F32 && NibbleChunk<F>::value;
+        static_assert(!nibbles || (S::HasMin && !S::Seeded && !S::Wide), "nibble chains close against a min");
         vec<OperandType<F, F32>, 2> a[2][4];
         C cs[S::CG][2];
 #pragma unroll
         for (uint nf = 0; nf < 2; ++nf) {
 #pragma unroll
           for (uint f = 0; f < 4; ++f) {
-            if constexpr (F32) a[nf][f] = operand_f32<F>(cur[nf][q], f, lut);
+            if constexpr (nibbles) a[nf][f] = nibble_operand(cur[nf][q], f);
+            else if constexpr (F32) a[nf][f] = operand_f32<F>(cur[nf][q], f, lut);
             else a[nf][f] = operand<F>(cur[nf][q], f, lut);
           }
 #pragma unroll
@@ -362,7 +398,11 @@ inline void decode(device const TableElem<F32> *table, device const float *sums,
 #pragma unroll
               for (uint f = h * FG; f < (h + 1) * FG; ++f)
                 sgmatrix::mma_mixed(dot, a[nf][f], b[f]);
-              if constexpr (S::HasMin) {
+              if constexpr (nibbles) {
+                // code = 64 (operand - 1): s code + m = 64 s operand + m - 64 s, cs.y being m - 128 s.
+                acc[r][nf] = fma(dot, 64 * cs[h][nf].x, acc[r][nf]);
+                acc[r][nf] = fma(sum, fma(64.0f, cs[h][nf].x, cs[h][nf].y), acc[r][nf]);
+              } else if constexpr (S::HasMin) {
                 acc[r][nf] = fma(dot, cs[h][nf].x, acc[r][nf]);
                 acc[r][nf] = fma(S::Seeded ? seed[h] : sum, cs[h][nf].y, acc[r][nf]);
               } else {
@@ -473,7 +513,7 @@ GGUF_PREPARE(decode_linear_gguf_prepare_f, float)
 #define GGUF_SG_LANES(F, f, sg, F32)                                                                          \
   GGUF_SG_EPILOGUES(F, f, 1, sg, F32) GGUF_SG_EPILOGUES(F, f, 2, sg, F32) GGUF_SG_EPILOGUES(F, f, 3, sg, F32) \
   GGUF_SG_EPILOGUES(F, f, 4, sg, F32)
-#define GGUF_SG_FORMAT(F, f) GGUF_SG_LANES(F, f, sg, false) GGUF_SG_LANES(F, f, sgf, true)
+#define GGUF_SG_FORMAT(F, f) GGUF_SG_LANES(F, f, sg, false) GGUF_SG_LANES(gguf_sg::F32Format<F>::type, f, sgf, true)
 QUANT_REGISTER_FORMATS(GGUF_SG_FORMAT)
 #undef GGUF_SG_FORMAT
 #undef GGUF_SG_LANES

@@ -948,6 +948,18 @@ int main(int argc, char **argv) {
         for (const bool spread : {false, true}) oneGateUpPass(backend, linear, spread);
       prefill(backend, linear);
       leadingInputs(backend, linear);
+      if (!fp32RegisterTable) {
+        // Apple7/8's register tile instances (gguf_decode_sgf_*: fp32 table, zero points as mins, nibble operands) run
+        // on any later GPU too.
+        DeviceCapabilities apple7 = backend.capabilities();
+        apple7.appleGpuFamily = 7;
+        const Linear m1(apple7);
+        fp32RegisterTable = true;
+        decodeTile(backend, m1, LinearTile::GgufRegister, false);
+        gateUpPairs(backend, m1, LinearTile::GgufRegister);
+        fp32RegisterTable = false;
+        section("register decode again on Apple7/8's F32 instances");
+      }
       // The 27B out_proj then down, and gdn_in then gate/up: K 6144, 17408 and 5120.
       const SplitOperand out = splitOperand(backend, Q4K, {5120, 6144}, LinearEpilogue::Residual);
       const SplitOperand down = splitOperand(backend, Q6K, {5120, 17408}, LinearEpilogue::Residual);
