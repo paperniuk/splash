@@ -163,6 +163,17 @@ inline half2 nibble_operand(uint2 chunk, uint f) {
   return as_type<half2>((at & 0x00F000F0u) | ((chunk.y << (8 - 2 * f)) & 0x01000100u) | 0x3C003C00u);
 }
 
+// The exact half operand (code - 32) / 64 of pair f of a Q6_K chunk (uint2: the 4-bit word, then the high bits as
+// quant_spread2 places them, pair p's at bits 4p and 16 + 4p): the high bits at bits 8-9 of each halfword above the
+// nibble, 1 + code / 64, less 1.5, so a chain of Q6_K's zero point 32 needs no seed. On an M2 Max this takes 3-4%
+// off the 27B's Q6_K projections at one lane and 6-18% at two to four, and the 27B in UD-Q6_K_M, 60% Q6_K, decodes
+// 1.4%, 5.3% and 5.7% faster at one, two and four lanes.
+inline half2 nibble6_operand(uint2 chunk, uint f) {
+  const uint at = f == 0 ? chunk.x << 4 : f == 1 ? chunk.x : chunk.x >> (4 * (f - 1));
+  const uint high = f == 3 ? chunk.y >> 4 : chunk.y << (8 - 4 * f);
+  return as_type<half2>((at & 0x00F000F0u) | (high & 0x03000300u) | 0x3C003C00u) - half2(1.5h);
+}
+
 // Apple7/8's (F32) view of Q4_0 and Q5_0: the zero point taken as a min, m = -zero d, so their chains close once per
 // 32 inputs against the table's sums, as Q4_1's and Q5_1's do, instead of once per 16 against the seeds. On an M2
 // Max this takes 8-14% off Q4_0's 17408 x 5120 gate/up at one to four lanes (Q5_0's 2-8%), and the 27B in Q4_0,
@@ -199,6 +210,9 @@ template <> struct NibbleChunk<FmtAffine<4, 1>> { static constexpr constant bool
 template <> struct NibbleChunk<FmtQ5K> { static constexpr constant bool value = true; };
 template <> struct NibbleChunk<FmtQ51> { static constexpr constant bool value = true; };
 template <> struct NibbleChunk<ZeroAsMin<FmtQ50>> { static constexpr constant bool value = true; };
+// Q6_K, whose F32 chains per 16 inputs take nibble6_operand, unseeded.
+template <class F> struct CenteredChunk { static constexpr constant bool value = false; };
+template <> struct CenteredChunk<FmtQ6K> { static constexpr constant bool value = true; };
 
 // The exact bf16 operand of pair f of a chunk.
 template <class F>
@@ -404,6 +418,8 @@ inline void decode(device const TableElem<F32> *table, device const float *sums,
       for (uint q = 0; q < 2; ++q) {
         constexpr bool nibbles = F32 && NibbleChunk<F>::value;
         static_assert(!nibbles || (S::HasMin && !S::Seeded && !S::Wide), "nibble chains close against a min");
+        constexpr bool centered = F32 && CenteredChunk<F>::value;
+        static_assert(!centered || (!S::HasMin && S::Seeded), "centered chains take a zero point");
         vec<OperandType<F, F32>, 2> a[2][4];
         C cs[S::CG][2];
 #pragma unroll
@@ -411,6 +427,7 @@ inline void decode(device const TableElem<F32> *table, device const float *sums,
 #pragma unroll
           for (uint f = 0; f < 4; ++f) {
             if constexpr (nibbles) a[nf][f] = nibble_operand(cur[nf][q], f);
+            else if constexpr (centered) a[nf][f] = nibble6_operand(cur[nf][q], f);
             else if constexpr (F32) a[nf][f] = operand_f32<F>(cur[nf][q], f, lut);
             else a[nf][f] = operand<F>(cur[nf][q], f, lut);
           }
@@ -439,7 +456,7 @@ inline void decode(device const TableElem<F32> *table, device const float *sums,
           }
 #pragma unroll
           for (uint h = 0; h < S::CG; ++h)   // a 16-input chain's seed from the table, a term's once from its sum
-            seed[h] = !S::Seeded ? float2(0)
+            seed[h] = !S::Seeded || centered ? float2(0)
                       : S::CG == 2 ? *(device const float2 *)(seeds + ulong(r) * tileSums + (2 * q + h) * 8 + fn)
                                    : -float(kZeroPointOffset) * sum;
 #pragma unroll
@@ -458,6 +475,9 @@ inline void decode(device const TableElem<F32> *table, device const float *sums,
               } else if constexpr (S::HasMin) {
                 acc[r][nf] = fma(dot, cs[h][nf].x, acc[r][nf]);
                 if (S::Seeded || closes) acc[r][nf] = fma(S::Seeded ? seed[h] : sum, cs[h][nf].y, acc[r][nf]);
+              } else if constexpr (centered) {
+                // code - 32 = 64 operand.
+                acc[r][nf] = fma(dot, 64 * float(cs[h][nf]), acc[r][nf]);
               } else {
                 acc[r][nf] = fma(dot, float(cs[h][nf]), acc[r][nf]);
               }
