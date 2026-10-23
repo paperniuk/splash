@@ -182,7 +182,7 @@ inline half2 q3_operand(uint2 chunk, uint f) {
   return as_type<half2>((low & 0x01800180u) | ((chunk.y << (9 - 2 * f)) & 0x02000200u) | 0x3C003C00u) - half2(1.5h);
 }
 
-// Apple7/8's (F32) view of Q4_0 and Q5_0: the zero point taken as a min, m = -zero d, so their chains close once per
+// Apple7/8's (F32) view of Q4_0, Q5_0 and PQ2_0: the zero point taken as a min, m = -zero d, so their chains close once per
 // 32 inputs against the table's sums, as Q4_1's and Q5_1's do, instead of once per 16 against the seeds. On an M2
 // Max this takes 8-14% off Q4_0's 17408 x 5120 gate/up at one to four lanes (Q5_0's 2-8%), and the 27B in Q4_0,
 // MLX 4-bit's size, decodes 3-7% below MLX 4-bit instead of 10-14%.
@@ -207,6 +207,7 @@ template <class F> struct ZeroAsMin {
 template <class F> struct F32Format { typedef F type; };
 template <> struct F32Format<FmtQ40> { typedef ZeroAsMin<FmtQ40> type; };
 template <> struct F32Format<FmtQ50> { typedef ZeroAsMin<FmtQ50> type; };
+template <> struct F32Format<FmtPQ20> { typedef ZeroAsMin<FmtPQ20> type; };
 // Formats with a min per 32 inputs whose chunk is one word of 4-bit codes in Q4_K's order (Q4_K, Q4_1, Q4_0 as
 // ZeroAsMin, MLX affine 4-bit in groups of 32), or 5-bit codes in Q5_K's planes (Q5_K, Q5_1, Q5_0 as ZeroAsMin):
 // their F32 chains per 32 inputs take nibble_operand too.
