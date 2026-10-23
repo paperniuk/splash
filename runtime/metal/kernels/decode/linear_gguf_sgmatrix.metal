@@ -560,6 +560,247 @@ inline void decode(device const TableElem<F32> *table, device const float *sums,
     }
 }
 
+// Gate and up in one pass: grid {columns / 32, splits}, each simdgroup's fragment nf=0 is 8 gate columns,
+// nf=1 the same 8 up columns. All 4 simdgroups compute SwiGLU in registers and store out with no threadgroup barrier.
+template <class F, uint L, bool F32, class Out>
+inline void decode_fragment_paired(device const TableElem<F32> *table, device const float *sums,
+                                   device uchar *g0, device uchar *g1, device uchar *gm,
+                                   device uchar *u0, device uchar *u1, device uchar *um,
+                                   device Out *out, device coherent(device) float *partials,
+                                   device atomic_uint *counters, const GgufDecodeParams p,
+                                   uint2 tg, uint tid, uint sg, uint lane,
+                                   threadgroup const LutPair<F, F32> *lut,
+                                   threadgroup Coef<F> *coefs, threadgroup uint *arrival) {
+  typedef Shape<F, F32> S;
+  typedef Coef<F> C;
+  constexpr uint FG = 4 / S::CG;  // fragments per coefficient group
+  const uint K = p.input_size, spans = K / GGUF_TABLE16_SPAN_INPUTS, groups = K / 32, splits = p.splits;
+  const ulong tileSums = table16_sums_per_tile(K);
+  const uint units = spans / S::UnitSpans;
+  const uint u0_split = tg.y * units / splits, u1_split = (tg.y + 1) * units / splits;
+  const sgmatrix::Lane l = sgmatrix::lane_map(lane);
+  const uint fm = l.fm, fn = l.fn, c = fn / 2;
+  const uint col_base = tg.x * 32 + sg * 8;
+  const uint plane_tile = col_base / QUANT_TILE_ROWS, plane_row = col_base % QUANT_TILE_ROWS;
+  constexpr uint NC = GGUF_REGISTER_COLUMNS;
+  threadgroup C *cu = coefs + sg * NC * S::J;
+
+  // Weight streams: fragment 0 reads gate, fragment 1 reads up.
+  const uint first = u0_split * S::UnitSpans;
+  const ulong at = (ulong(plane_tile) * groups + 2 * first) * QUANT_TILE_ROWS + plane_row + fm;
+  device uchar *p0[2] = {g0 + at * F::P0, u0 + at * F::P0};
+  device uchar *p1[2] = {g1 + at * F::P1, u1 + at * F::P1};
+
+  typename F::Chunk cur[2][2], nxt[2][2];
+  const auto load = [&](thread typename F::Chunk (&ch)[2][2]) __attribute__((always_inline)) {
+#pragma unroll
+    for (uint nf = 0; nf < 2; ++nf) {
+      ch[nf][0] = F::loadChunk(p0[nf], p1[nf], c);
+      ch[nf][1] = F::loadChunk(p0[nf] + QUANT_TILE_ROWS * F::P0, p1[nf] + QUANT_TILE_ROWS * F::P1, c);
+    }
+  };
+  typedef TableElem<F32> T;
+  device const vec<T, 8> *xt = reinterpret_cast<device const vec<T, 8> *>(table + ulong(first) * GGUF_TABLE16_SPAN_VALUES);
+  device const float *seeds = sums + ulong(first) * GGUF_TABLE16_SPAN_SEEDS;
+  device const float *s32 = sums + table16_sums32_offset(K) + ulong(first) * GGUF_TABLE16_SPAN_SUMS;
+
+  float2 acc[L][2];
+#pragma unroll
+  for (uint r = 0; r < L; ++r) acc[r][0] = acc[r][1] = float2(0);
+  load(cur);
+  for (uint u = u0_split; u < u1_split; ++u) {
+    constexpr uint JS = F32 && S::SpanChain ? 2 : 1;
+    constexpr uint I = (NC * S::J / JS + 31) / 32;
+    CoefSource<F> src[I];
+#pragma unroll
+    for (uint i = 0; i < I; ++i) {
+      const uint e = lane + 32 * i;
+      if (e < NC * S::J / JS) {
+        const bool is_up = (e % NC) >= 8;
+        device uchar *mw0 = is_up ? u0 : g0;
+        device uchar *mw1 = is_up ? u1 : g1;
+        device uchar *mm = is_up ? um : gm;
+        const uint col = plane_row + (is_up ? (e % NC - 8) : (e % NC));
+        src[i] = coefficient_source<F, F32>(mw0, mw1, mm, plane_tile, groups, col, u, JS * (e / NC));
+      }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+#pragma unroll
+    for (uint i = 0; i < I; ++i) {
+      const uint e = lane + 32 * i;
+      if (e < NC * S::J / JS) {
+        C k = coefficient<F, F32>(src[i], u, JS * (e / NC));
+        if constexpr (F32 && NibbleChunk<F>::value) k = float2(64 * k.x, fma(64.0f, k.x, k.y));
+        if constexpr (F32 && CenteredChunk<F>::value) k = CenteredChunk<F>::Scale * k;
+        cu[JS * (e / NC) * NC + e % NC] = k;
+      }
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+#pragma unroll
+    for (uint us = 0; us < S::UnitSpans; ++us) {
+      const bool more = us + 1 < S::UnitSpans || u + 1 < u1_split;
+#pragma unroll
+      for (uint nf = 0; nf < 2; ++nf) {
+        p0[nf] += 2 * QUANT_TILE_ROWS * F::P0;
+        p1[nf] += 2 * QUANT_TILE_ROWS * F::P1;
+      }
+      if constexpr (!F32) {
+        if (more) load(nxt);
+      }
+      if constexpr (F32 && S::SpanChain) {
+        float2 dot[L][2];
+#pragma unroll
+        for (uint r = 0; r < L; ++r) dot[r][0] = dot[r][1] = float2(0);
+#pragma unroll
+        for (uint q = 0; q < 2; ++q) {
+          vec<OperandType<F, F32>, 2> a[2][4];
+#pragma unroll
+          for (uint nf = 0; nf < 2; ++nf)
+#pragma unroll
+            for (uint f = 0; f < 4; ++f) {
+              if constexpr (NibbleSpan<F>::value) a[nf][f] = nibble_operand(cur[nf][q], f);
+              else a[nf][f] = operand_f32<F>(cur[nf][q], f, lut);
+            }
+#pragma unroll
+          for (uint r = 0; r < L; ++r) {
+            const vec<T, 8> bq = xt[ulong(r) * K + (8 * q + fm) * 4 + c];
+#pragma unroll
+            for (uint f = 0; f < 4; ++f) {
+              const float2 b = reinterpret_cast<thread const float2 *>(&bq)[f];
+#pragma unroll
+              for (uint nf = 0; nf < 2; ++nf) sgmatrix::mma_mixed(dot[r][nf], a[nf][f], b);
+            }
+          }
+        }
+        C cs[2];
+#pragma unroll
+        for (uint nf = 0; nf < 2; ++nf) cs[nf] = cu[us * 2 * NC + nf * 8 + fm];
+#pragma unroll
+        for (uint r = 0; r < L; ++r) {
+          device const float *rs = s32 + ulong(r) * tileSums + fn;
+          const float2 sum = *(device const float2 *)rs + *(device const float2 *)(rs + 8);
+#pragma unroll
+          for (uint nf = 0; nf < 2; ++nf) {
+            if constexpr (NibbleSpan<F>::value) {
+              acc[r][nf] = fma(dot[r][nf], 64 * cs[nf].x, acc[r][nf]);
+              acc[r][nf] = fma(sum, fma(64.0f, cs[nf].x, cs[nf].y), acc[r][nf]);
+            } else {
+              acc[r][nf] = fma(dot[r][nf], cs[nf].x, acc[r][nf]);
+              acc[r][nf] = fma(sum, cs[nf].y, acc[r][nf]);
+            }
+          }
+        }
+      } else
+#pragma unroll
+      for (uint q = 0; q < 2; ++q) {
+        constexpr bool nibbles = F32 && NibbleChunk<F>::value;
+        static_assert(!nibbles || (S::HasMin && !S::Seeded && !S::Wide), "nibble chains close against a min");
+        constexpr bool centered = F32 && CenteredChunk<F>::value;
+        static_assert(!centered || (!S::HasMin && S::Seeded), "centered chains take a zero point");
+        vec<OperandType<F, F32>, 2> a[2][4];
+        C cs[S::CG][2];
+#pragma unroll
+        for (uint nf = 0; nf < 2; ++nf) {
+#pragma unroll
+          for (uint f = 0; f < 4; ++f) {
+            if constexpr (nibbles) a[nf][f] = nibble_operand(cur[nf][q], f);
+            else if constexpr (centered) a[nf][f] = CenteredChunk<F>::operand(cur[nf][q], f);
+            else if constexpr (F32) a[nf][f] = operand_f32<F>(cur[nf][q], f, lut);
+            else a[nf][f] = operand<F>(cur[nf][q], f, lut);
+          }
+#pragma unroll
+          for (uint h = 0; h < S::CG; ++h) cs[h][nf] = cu[((us * 2 + q) * S::CG + h) * NC + nf * 8 + fm];
+        }
+#pragma unroll
+        for (uint r = 0; r < L; ++r) {
+          const vec<T, 8> bq = xt[ulong(r) * K + (8 * q + fm) * 4 + c];
+          vec<InputType<F32>, 2> b[4];
+#pragma unroll
+          for (uint f = 0; f < 4; ++f) b[f] = reinterpret_cast<thread const vec<T, 2> *>(&bq)[f];
+          float2 sum = float2(0), seed[S::CG];
+          if (S::HasMin && !S::Seeded) sum = *(device const float2 *)(s32 + ulong(r) * tileSums + q * 8 + fn);
+#pragma unroll
+          for (uint h = 0; h < S::CG; ++h)
+            seed[h] = S::Seeded && !centered ? *(device const float2 *)(seeds + ulong(r) * tileSums + (2 * q + h) * 8 + fn)
+                                : float2(0);
+#pragma unroll
+          for (uint h = 0; h < S::CG; ++h) {
+#pragma unroll
+            for (uint nf = 0; nf < 2; ++nf) {
+              float2 dot = seed[h];
+#pragma unroll
+              for (uint f = h * FG; f < (h + 1) * FG; ++f)
+                sgmatrix::mma_mixed(dot, a[nf][f], b[f]);
+              if constexpr (nibbles) {
+                acc[r][nf] = fma(dot, cs[h][nf].x, acc[r][nf]);
+                acc[r][nf] = fma(sum, cs[h][nf].y, acc[r][nf]);
+              } else if constexpr (S::HasMin) {
+                acc[r][nf] = fma(dot, cs[h][nf].x, acc[r][nf]);
+                acc[r][nf] = fma(S::Seeded ? seed[h] : sum, cs[h][nf].y, acc[r][nf]);
+              } else if constexpr (centered) {
+                acc[r][nf] = fma(dot, float(cs[h][nf]), acc[r][nf]);
+              } else {
+                acc[r][nf] = fma(dot, float(cs[h][nf]), acc[r][nf]);
+              }
+            }
+          }
+        }
+      }
+      xt += GGUF_TABLE16_SPAN_VALUES / 8;
+      seeds += GGUF_TABLE16_SPAN_SEEDS;
+      s32 += GGUF_TABLE16_SPAN_SUMS;
+      if constexpr (F32) {
+        if (more) load(cur);
+      } else if (more) {
+#pragma unroll
+        for (uint nf = 0; nf < 2; ++nf) cur[nf][0] = nxt[nf][0], cur[nf][1] = nxt[nf][1];
+      }
+    }
+  }
+
+  // Cross-split reduction and SwiGLU in registers:
+  const uint stride = p.out_stride, slots = 2 * splits;
+  const uint column = p.out_offset + col_base + fm;
+  device atomic_uint *counter = counters + (p.out_offset + tg.x * 32) / 32;
+  const auto slot = [&](uint r, uint s) {
+    return partials + ((ulong(r) * slots + s) * 8 + fn) * stride + column;
+  };
+  if (splits > 1) {
+#pragma unroll
+    for (uint r = 0; r < L; ++r) {
+      device coherent(device) float *at_g = slot(r, tg.y);
+      at_g[0] = acc[r][0].x;
+      at_g[stride] = acc[r][0].y;
+      device coherent(device) float *at_u = slot(r, splits + tg.y);
+      at_u[0] = acc[r][1].x;
+      at_u[stride] = acc[r][1].y;
+    }
+    if (!split_arrive_last(counter, splits, tid, arrival)) return;
+#pragma unroll
+    for (uint r = 0; r < L; ++r) {
+      acc[r][0] = split_sum(acc[r][0], tg.y, splits, [&](uint s) {
+        device coherent(device) float *at = slot(r, s);
+        return float2(at[0], at[stride]);
+      });
+      acc[r][1] = split_sum(acc[r][1], tg.y, splits, [&](uint s) {
+        device coherent(device) float *at = slot(r, splits + s);
+        return float2(at[0], at[stride]);
+      });
+    }
+    split_release(counter, tid);
+  }
+#pragma unroll
+  for (uint r = 0; r < L; ++r) {
+    const float2 gate = float2(float(bfloat(acc[r][0].x)), float(bfloat(acc[r][0].y)));
+    const float2 up = float2(float(bfloat(acc[r][1].x)), float(bfloat(acc[r][1].y)));
+#pragma unroll
+    for (uint i = 0; i < 2; ++i) {
+      const ulong at_out = ulong(r * 8 + fn + i) * p.out_stride + column;
+      out[at_out] = Out(up[i] * splash_silu(gate[i]));
+    }
+  }
+}
+
 } // namespace gguf_sg
 
 // Table16 for `lanes` eight-row tiles of `width` inputs: one simdgroup per (span, row).
@@ -621,7 +862,9 @@ QUANT_REGISTER_FORMATS(GGUF_SG_FORMAT)
 #undef GGUF_SG_EPILOGUES
 #undef GGUF_SG_KERNEL
 
-// Apple7/8's F32 instances (gguf_decode_sgf_*) of each format in F32Format's view, with each epilogue as above.
+// Apple7/8's F32 instances (gguf_decode_sgf_*) of each format in F32Format's view, with each epilogue as above, and
+// their one-pass gate/up (_gu): grid {columns / 32, splits}, each simdgroup's fragment nf=0 is 8 gate columns, nf=1
+// the same 8 up columns.
 #define GGUF_SGF_KERNEL(Name, F, L, EP, Out)                                                                    \
   kernel void Name(device const float *table [[buffer(0)]], device const float *sums [[buffer(1)]],             \
                    device uchar *w0 [[buffer(2)]], device uchar *w1 [[buffer(3)]],                              \
@@ -638,18 +881,36 @@ QUANT_REGISTER_FORMATS(GGUF_SG_FORMAT)
     gguf_sg::decode<F, L, EP, true>(table, sums, w0, w1, meta, out, partials, counters, aux, p, tg, tid, sg,    \
                                     lane, lut, coefs, &arrival);                                                \
   }
+#define GGUF_SGF_GATE_UP_KERNEL(Name, F, L)                                                                     \
+  kernel void Name(device const float *table [[buffer(0)]], device const float *sums [[buffer(1)]],             \
+                   device uchar *g0 [[buffer(2)]], device uchar *g1 [[buffer(3)]], device uchar *gm [[buffer(4)]], \
+                   device uchar *u0 [[buffer(5)]], device uchar *u1 [[buffer(6)]], device uchar *um [[buffer(7)]], \
+                   device bfloat *out [[buffer(8)]], device coherent(device) float *partials [[buffer(9)]],     \
+                   device atomic_uint *counters [[buffer(10)]], constant GgufDecodeParams &p [[buffer(11)]],    \
+                   uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],         \
+                   uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {       \
+    threadgroup gguf_sg::LutPair<F, true> lut[F::Kind == QuantCodebook ? kQuantPairTableEntries : 1];           \
+    threadgroup gguf_sg::Coef<F> coefs[gguf_sg::kCoefs<F, true>];                                               \
+    threadgroup uint arrival;                                                                                   \
+    quant_pair_table<F>(lut, tid, GGUF_REGISTER_THREADS);                                                       \
+    gguf_sg::decode_fragment_paired<F, L, true, bfloat>(table, sums, g0, g1, gm, u0, u1, um, out, partials,     \
+                                                        counters, p, tg, tid, sg, lane, lut, coefs, &arrival);  \
+  }
 #define GGUF_SGF_EPILOGUES(F, f, L)                                                                             \
   GGUF_SGF_KERNEL(gguf_decode_sgf_##f##_l##L##_a, F, L, EpNone, bfloat)                                         \
   GGUF_SGF_KERNEL(gguf_decode_sgf_##f##_l##L##_a_f32, F, L, EpNone, float)                                      \
   GGUF_SGF_KERNEL(gguf_decode_sgf_##f##_l##L##_r, F, L, EpResidual, bfloat)                                     \
   GGUF_SGF_KERNEL(gguf_decode_sgf_##f##_l##L##_g, F, L, EpUpWithGate, bfloat)
 #define GGUF_SGF_LANES(F, f)                                                                                    \
-  GGUF_SGF_EPILOGUES(F, f, 1) GGUF_SGF_EPILOGUES(F, f, 2) GGUF_SGF_EPILOGUES(F, f, 3) GGUF_SGF_EPILOGUES(F, f, 4)
+  GGUF_SGF_EPILOGUES(F, f, 1) GGUF_SGF_EPILOGUES(F, f, 2) GGUF_SGF_EPILOGUES(F, f, 3) GGUF_SGF_EPILOGUES(F, f, 4) \
+  GGUF_SGF_GATE_UP_KERNEL(gguf_decode_sgf_##f##_l1_gu, F, 1) GGUF_SGF_GATE_UP_KERNEL(gguf_decode_sgf_##f##_l2_gu, F, 2) \
+  GGUF_SGF_GATE_UP_KERNEL(gguf_decode_sgf_##f##_l3_gu, F, 3) GGUF_SGF_GATE_UP_KERNEL(gguf_decode_sgf_##f##_l4_gu, F, 4)
 #define GGUF_SGF_FORMAT(F, f) GGUF_SGF_LANES(gguf_sg::F32Format<F>::type, f)
 QUANT_REGISTER_FORMATS(GGUF_SGF_FORMAT)
 #undef GGUF_SGF_FORMAT
 #undef GGUF_SGF_LANES
 #undef GGUF_SGF_EPILOGUES
+#undef GGUF_SGF_GATE_UP_KERNEL
 #undef GGUF_SGF_KERNEL
 
 // Fused projections (qkv|z|ab, q|k|v): up to three column segments of any
