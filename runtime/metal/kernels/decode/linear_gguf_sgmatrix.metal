@@ -243,12 +243,36 @@ template <class F> struct ZeroAsMin {
     return k;
   }
 };
+// Apple7/8's (F32) view of IQ3_XXS: each chunk's signs from kQuantSigns7 rather than quant_signs7's popcount and
+// parity per sign index. On an M2 Max this takes another 4-5% off the 27B's IQ3_XXS projections at one lane and
+// 1% at two and three.
+struct IQ3XXSSignTable {
+  typedef FmtIQ3XXS F;
+  enum : uint { Id = F::Id, P0 = F::P0, P1 = F::P1, MetaBytes = F::MetaBytes };
+  enum : ushort { MetaGroups = F::MetaGroups, Zero = F::Zero, Group = F::Group };
+  static constexpr constant QuantKind Kind = F::Kind;
+  static constexpr constant bool ScaleInChunk = F::ScaleInChunk;
+  typedef F::Payload Payload; typedef F::Chunk Chunk; typedef F::Meta Meta;
+  static Payload load(device uchar *p0, device uchar *p1) { return F::load(p0, p1); }
+  static Meta loadMeta(device uchar *m) { return F::loadMeta(m); }
+  static Chunk chunk(Payload w, ushort c) {
+    const uint l = 7u * (c >> 1), h = 4u * (c & 1);
+    const uint s = ((uint(kQuantSigns7[(w.b >> l) & 127]) >> h) & 0xF) |
+                   ((uint(kQuantSigns7[(w.b >> (l + 14)) & 127]) >> h) & 0xF) << 4;
+    return ((w.a.x >> (8 * c)) & 0xFF) | ((w.a.y >> (8 * c)) & 0xFF) << 8 | s << 16 | (w.b >> 28) << 26;
+  }
+  static Chunk loadChunk(device uchar *p0, device uchar *p1, ushort c) { return chunk(F::load(p0, p1), c); }
+  static uint2 grid(Chunk q) { return F::grid(q); }
+  static uint signs(Chunk q) { return F::signs(q); }
+  static QuantCoef coef(Meta mt, Chunk q) { return F::coef(mt, q); }
+};
 // The format an F32 instance decodes F as.
 template <class F> struct F32Format { typedef F type; };
 template <> struct F32Format<FmtQ40> { typedef ZeroAsMin<FmtQ40> type; };
 template <> struct F32Format<FmtQ50> { typedef ZeroAsMin<FmtQ50> type; };
 template <> struct F32Format<FmtPQ20> { typedef ZeroAsMin<FmtPQ20> type; };
 template <> struct F32Format<FmtQ20> { typedef ZeroAsMin<FmtQ20> type; };
+template <> struct F32Format<FmtIQ3XXS> { typedef IQ3XXSSignTable type; };
 // Formats with a min per 32 inputs whose chunk is one word of 4-bit codes in Q4_K's order (Q4_K, Q4_1, Q4_0 as
 // ZeroAsMin, MLX affine 4-bit in groups of 32), or 5-bit codes in Q5_K's planes (Q5_K, Q5_1, Q5_0 as ZeroAsMin):
 // their F32 chains per 32 inputs take nibble_operand too.
