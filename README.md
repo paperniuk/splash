@@ -15,7 +15,7 @@
 >   on an M1 Max. `--disable-ane` keeps everything on the GPU.
 > - **Decode on an M1 Max** (27B MLX 4-bit): about 61 tok/s on a code prompt, 46-60 across code
 >   and prose prompts; chat prose is slower than code because fewer draft tokens hit.
-> - **Contributors:** Alexander Fedora ([@ghisguth](https://github.com/ghisguth)) tested the port on
+> - **Contributors:** [@ghisguth](https://github.com/ghisguth) tested the port on
 >   an M2 Max and contributed GGUF and MLX decode speedups; [@sady4850](https://github.com/sady4850)
 >   contributed the faster long-context attention; [@abssoul](https://github.com/abssoul),
 >   [@airiclenz](https://github.com/airiclenz) and [@UtmostMaker](https://github.com/UtmostMaker) contributed
