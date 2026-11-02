@@ -1,12 +1,58 @@
-# Qwen3.8-27B quants on M1
+# Choosing a quant
 
 [Back to the docs](README.md)
 
-Which 4- and 5-bit Qwen3.8-27B checkpoint to run on an M1 Pro with 32 GB, and
-how close each one stays to the bf16 model when Splash runs it. All numbers
-come from this fork's runtime on one M1 Pro (32 GB), text only.
+Which checkpoint of a model to run comes down to three questions, in this
+order:
 
-## Which one
+1. **Does it fit** your Mac's memory with the context you need? This depends
+   on the file size and the context, and you can check it before measuring
+   anything.
+2. **How close to bf16** does it stay? This depends on the model and the quant,
+   hardly on the Mac, so it is measured once per model.
+3. **How fast** is it? This depends on the model, the quant and the chip.
+
+This fork runs on M1 and M2, so everything here was measured on them. The
+closeness numbers carry over to other Macs; the speed numbers do not.
+
+Measured so far: [Qwen3.8-27B](#qwen38-27b). For other models, the
+[model table](../README.md#models) lists the usual checkpoints.
+
+## 1. Does it fit
+
+Splash sizes memory and context when it starts: the weights first, then as
+much context as its Metal budget holds beside them, up to the model's native
+window ([memory and context](server.md#memory-and-context)). `--max-context`
+asks for a size, and a size the budget cannot hold stops startup with the most
+it allows, so a start with the context you need answers the question.
+`--max-memory` lowers the budget to leave room for other applications,
+`--language-only` leaves out the vision tower and frees memory for context, and
+`--max-cache-disk 0` gives back the SSD cache's staging. Coding agents need
+about 100K tokens of context. For 24 GB Macs, see
+[smaller GGUFs](performance.md#smaller-ggufs-on-24-gb-macs).
+
+## 2. How close to bf16
+
+Two numbers, both against the bf16 model on the same text:
+
+- **KL**: KL(bf16 || quant) per position, averaged. Lower is closer.
+- **EAR@10**: the overlap of the two distributions over bf16's 10 most likely
+  tokens, both renormalized to those 10. 100 means identical there.
+
+Do not compare quants by perplexity: some 4-bit quants score below bf16's own
+perplexity on chat text while being far from it.
+
+## 3. How fast
+
+Speed is given as decode time against the model's MLX 4-bit on the same chip,
+positive is slower. On M1 every GGUF we measured decoded slower than the MLX
+4-bit, the 5-bit and IQ3_S files most.
+
+## Qwen3.8-27B
+
+Measured on an M1 Pro (32 GB), text only.
+
+### Which one
 
 - **Default: [`sady4850/Qwen3.8-27B-4bit-GPTQ`](https://huggingface.co/sady4850/Qwen3.8-27B-4bit-GPTQ).**
   Same layout, size and speed as `mlx-community/Qwen3.8-27B-4bit`, only
@@ -19,20 +65,19 @@ come from this fork's runtime on one M1 Pro (32 GB), text only.
 - **Short on memory: `ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF:IQ3_S`.** 3.4 GB
   smaller, about as close to bf16 as the MLX 4-bit, but slower.
 
+On this M1 Pro the MLX 4-bit serves with
+`--language-only --max-context 64K --max-memory 21G`.
+
 ```bash
 splash serve --model sady4850/Qwen3.8-27B-4bit-GPTQ
 splash serve --model unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M
 ```
 
-## Results
+### Results
 
-KL is KL(bf16 || quant) per position, averaged. EAR@10 is the overlap of the
-two distributions over bf16's 10 most likely tokens, both renormalized to
-those 10 (100 means identical there). Size is the text weights in GB
-(10^9 bytes). Decode is the decode time of the same teacher-forced windows
-against the MLX 4-bit; positive is slower.
+Size is the text weights in GB (10^9 bytes).
 
-| Quant | Size | KL wiki | KL chat | EAR@10 wiki | EAR@10 chat | Decode |
+| Quant | Size | KL wiki | KL chat | EAR@10 wiki | EAR@10 chat | Decode, M1 Pro |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `mlx-community/Qwen3.8-27B-4bit` | 15.13 | 0.0562 | 0.1906 | 92.69 | 88.66 | base |
 | `sady4850/Qwen3.8-27B-4bit-GPTQ` | 15.13 | 0.0399 | 0.1002 | 94.36 | 92.22 | -0.2% |
@@ -47,10 +92,13 @@ against the MLX 4-bit; positive is slower.
 - The wiki mean depends on one token in one window. Without that window:
   MLX 4-bit 0.0436, GPTQ 0.0280, Q4_0 0.0264, UD-Q4_K_M 0.0075, UD-Q5_K_S
   0.0036, SLQ EAR98 0.0036, GSQ IQ3_S 0.0500.
-- Perplexity ranks these quants wrongly: the MLX 4-bit and the GSQ IQ3_S score
-  below bf16's chat perplexity. Compare quants by KL.
+- The MLX 4-bit and the GSQ IQ3_S score below bf16's chat perplexity.
+- Independent agent check: Alexander Fedora replayed 78 recorded agent turns
+  against Q8_0 on an M2 Max; the share of turns with the same tool call was
+  MLX 4-bit 31%, GPTQ 44%, Q4_0 44%, UD-Q4_K_M 51%, UD-Q5_K_M 56%, GSQ IQ3_S
+  44% ([discussion #34](https://github.com/paperniuk/splash/discussions/34#discussioncomment-19226461)).
 
-## How it was measured
+### How it was measured
 
 - **Texts.** wiki: wikitext-2 test. chat: the first 300 conversations of
   UltraChat test as plain text. Each is tokenized with the model's tokenizer
@@ -72,7 +120,7 @@ against the MLX 4-bit; positive is slower.
   bit-identical and its decode 8% faster (+18.2% here, +27.5% on 1.4.0-m1).
   The MLX 4-bit stayed within noise.
 
-## Limits
+### Limits
 
 - The texts are prompt text, not the model's own answers or agent sessions.
   KL to bf16 measures closeness, not task success.
@@ -81,8 +129,3 @@ against the MLX 4-bit; positive is slower.
   the cleaner comparison.
 - Speed is one request at short context. At long context the gaps get
   smaller.
-- One model, one Mac.
-- Independent agent check: Alexander Fedora replayed 78 recorded agent turns
-  against Q8_0 on an M2 Max; the share of turns with the same tool call was
-  MLX 4-bit 31%, GPTQ 44%, Q4_0 44%, UD-Q4_K_M 51%, UD-Q5_K_M 56%, GSQ IQ3_S
-  44% ([discussion #34](https://github.com/paperniuk/splash/discussions/34#discussioncomment-19226461)).
