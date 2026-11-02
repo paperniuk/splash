@@ -123,6 +123,27 @@ class KernelIdentityTests(unittest.TestCase):
         status, lines = self.run_main(baseline, retyped)
         self.assertEqual((status, lines[0]), (1, "different: moe_expert"))
 
+    def test_numbered_classes_are_compared_in_order(self):
+        # Two instances of a class template, which LLVM numbers for every
+        # instance compiled before, so another kernel compiled first renumbers
+        # them.
+        module = (
+            'source_filename = "gguf_decode"\n\n'
+            '%"struct.gguf_sg::CoefSource{0}" = type {{ <4 x i32>, {2} }}\n'
+            "%struct.Coef{1} = type {{ float }}\n\n"
+            'define void @gguf_decode(%"struct.gguf_sg::CoefSource{0}"* %0, '
+            "%struct.Coef{1}* %1) {{\n"
+            "  ret void\n}}\n"
+        )
+        baseline = {"gguf_decode": module.format(".245", ".3", "i32")}
+        renamed = {"gguf_decode": module.format(".99", ".12", "i32")}
+        status, lines = self.run_main(baseline, renamed)
+        self.assertEqual((status, lines[0]), (0, "identical: gguf_decode"))
+        # Another member is another function.
+        retyped = {"gguf_decode": module.format(".99", ".12", "i16")}
+        status, lines = self.run_main(baseline, retyped)
+        self.assertEqual((status, lines[0]), (1, "different: gguf_decode"))
+
     def test_by_default_kernels_named_for_other_paths_are_left_out(self):
         baseline = {
             name: MODULE.format(name)

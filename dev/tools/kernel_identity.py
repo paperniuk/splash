@@ -14,7 +14,11 @@ classes (%class.anon.N), and the mangled names of its classes in the
 type-based alias metadata (!"_ZTS..."). C++ names the symbols for their
 signatures and numbers the lambdas across the source file, so a template
 value added with its old value renames all three without changing any code;
-each is compared in the order it first appears.
+each is compared in the order it first appears. So are the numbers LLVM
+gives the other classes whose names clash (%"struct.gguf_sg::CoefSource.N",
+one per instance of a class template, and the linker's where two modules
+take one name): they count every such class compiled before, so a kernel
+compiled after other instances than before renames them.
 
 By default it compares the kernels the decode path may run: every function
 but those named for prefill (prefill_*, gguf_prefill_*), the vision encoder
@@ -46,9 +50,17 @@ DEFINITION = re.compile(
 )
 SYMBOL = re.compile(r"@([-\w$.]+)")
 # The names the frontend gives a module's types, which the module's own
-# definitions and metadata spell out: a lambda's anonymous class, and a
-# class's mangled name in the type-based alias metadata.
+# definitions and metadata spell out: a class whose name clashes, numbered
+# by LLVM, a lambda's anonymous class, and a class's mangled name in the
+# type-based alias metadata.
 TYPE_NAMES = (
+    (
+        re.compile(
+            r'%"(?:struct|class|union)\.(?!anon\b)[^"]*\.\d+"'
+            r"|%(?:struct|class|union)\.(?!anon\b)[-\w.$]*\.\d+(?![-\w.$])"
+        ),
+        '%"struct.numbered.{}"',
+    ),
     (re.compile(r"%class\.anon(?:\.\d+)*"), "%class.anon.defined.{}"),
     (re.compile(r'!"_ZTS[^"]*"'), '!"_ZTS.defined.{}"'),
 )
@@ -67,8 +79,9 @@ def library(path: Path) -> Path:
 
 def normalized(name: str, module: str) -> str:
     """Function `name`'s module with every other symbol it defines, and the
-    names of its anonymous classes and of its classes' alias metadata
-    (TYPE_NAMES), renamed for the order in which each first appears."""
+    names of its numbered and anonymous classes and of its classes' alias
+    metadata (TYPE_NAMES), renamed for the order in which each first
+    appears."""
     defined = {
         function or variable for function, variable in DEFINITION.findall(module)
     } - {name}
