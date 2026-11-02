@@ -5,17 +5,11 @@
 Which checkpoint of a model to run comes down to three questions, in this
 order:
 
-1. **Does it fit** your Mac's memory with the context you need? This depends
-   on the file size and the context, and you can check it before measuring
-   anything.
-2. **How close to bf16** does it stay? This depends on the model and the quant,
-   hardly on the Mac, so it is measured once per model.
-3. **How fast** is it? This depends on the model, the quant and the chip.
+1. **Does it fit** your Mac's memory with the context you need?
+2. **How close to bf16** does it stay?
+3. **How fast** is it?
 
-This fork runs on M1 and M2, so everything here was measured on them. The
-closeness numbers carry over to other Macs; the speed numbers do not.
-
-Measured so far: [Qwen3.8-27B](#qwen38-27b). For other models, the
+Measured so far: [Qwen3.8-27B](#qwen38-27b) on an M1 Pro. For other models, the
 [model table](../README.md#models) lists the usual checkpoints.
 
 ## 1. Does it fit
@@ -27,8 +21,7 @@ asks for a size, and a size the budget cannot hold stops startup with the most
 it allows, so a start with the context you need answers the question.
 `--max-memory` lowers the budget to leave room for other applications,
 `--language-only` leaves out the vision tower and frees memory for context, and
-`--max-cache-disk 0` gives back the SSD cache's staging. Coding agents need
-about 100K tokens of context. For 24 GB Macs, see
+`--max-cache-disk 0` gives back the SSD cache's staging. For 24 GB Macs, see
 [smaller GGUFs](performance.md#smaller-ggufs-on-24-gb-macs).
 
 ## 2. How close to bf16
@@ -38,9 +31,6 @@ Two numbers, both against the bf16 model on the same text:
 - **KL**: KL(bf16 || quant) per position, averaged. Lower is closer.
 - **EAR@10**: the overlap of the two distributions over bf16's 10 most likely
   tokens, both renormalized to those 10. 100 means identical there.
-
-Do not compare quants by perplexity: some 4-bit quants score below bf16's own
-perplexity on chat text while being far from it.
 
 ## 3. How fast
 
@@ -125,7 +115,5 @@ Size is the text weights in GB (10^9 bytes).
 - The texts are prompt text, not the model's own answers or agent sessions.
   KL to bf16 measures closeness, not task success.
 - `sady4850/Qwen3.8-27B-4bit-GPTQ` is the author's checkpoint. Part of its
-  calibration is UltraChat train, so its chat number may be optimistic; wiki is
-  the cleaner comparison.
-- Speed is one request at short context. At long context the gaps get
-  smaller.
+  calibration is UltraChat train; the chat text is UltraChat test.
+- Speed is one request at short context.
