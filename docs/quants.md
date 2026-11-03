@@ -44,7 +44,7 @@ Speed is reported per Mac, with that Mac's method, against the model's MLX
 
 ### Which one
 
-- **Default: [`sady4850/Qwen3.8-27B-4bit-GPTQ`](https://huggingface.co/sady4850/Qwen3.8-27B-4bit-GPTQ).**
+- **Default: [`mlx-community/Qwen3.8-27B-GPTQ-4bit`](https://huggingface.co/mlx-community/Qwen3.8-27B-GPTQ-4bit).**
   Same layout, size and speed as `mlx-community/Qwen3.8-27B-4bit`, only
   GPTQ-rounded: KL to bf16 29% lower on wiki, 47% lower on chat.
 - **More quality for 1.3 GB more: `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M`.**
@@ -60,7 +60,7 @@ On the M1 Pro (32 GB) the MLX 4-bit serves with
 `--language-only --max-context 64K --max-memory 21G`.
 
 ```bash
-splash serve --model sady4850/Qwen3.8-27B-4bit-GPTQ
+splash serve --model mlx-community/Qwen3.8-27B-GPTQ-4bit
 splash serve --model unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M
 ```
 
@@ -72,7 +72,7 @@ weights in GB (10^9 bytes).
 | Quant | Size | KL wiki | KL chat | EAR@10 wiki | EAR@10 chat |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | `mlx-community/Qwen3.8-27B-4bit` | 15.13 | 0.0562 | 0.1906 | 92.69 | 88.66 |
-| `sady4850/Qwen3.8-27B-4bit-GPTQ` | 15.13 | 0.0399 | 0.1002 | 94.36 | 92.22 |
+| `mlx-community/Qwen3.8-27B-GPTQ-4bit` | 15.13 | 0.0399 | 0.1002 | 94.36 | 92.22 |
 | `unsloth/Qwen3.8-27B-GGUF:Q4_0` | 16.06 | 0.0325 | 0.1412 | 94.64 | 91.26 |
 | `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M` | 16.46 | 0.0144 | 0.0831 | 97.18 | 93.90 |
 | `unsloth/Qwen3.8-27B-GGUF:UD-Q5_K_S` | 18.67 | 0.0065 | 0.0574 | 97.92 | 95.24 |
@@ -115,8 +115,9 @@ Limits:
 
 - The texts are prompt text, not the model's own answers or agent sessions.
   KL to bf16 measures closeness, not task success.
-- `sady4850/Qwen3.8-27B-4bit-GPTQ` is the author's checkpoint. Part of its
-  calibration is UltraChat train; the chat text is UltraChat test.
+- `mlx-community/Qwen3.8-27B-GPTQ-4bit` was quantized by the author of these
+  measurements. Part of its calibration is UltraChat train; the chat text is
+  UltraChat test.
 
 ### Speed: M1 Pro, 32 GB
 
