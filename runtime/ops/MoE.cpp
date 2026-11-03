@@ -85,8 +85,13 @@ std::string routingKernel(std::string name, MoeShape shape, std::string_view Com
 
 // Whether a plan runs gate and up in one pass
 // (moe_expert_gguf_m<rows>_gate_up[_mixed]): on the staged tile, whose simdgroups
-// each decode their own pass's formats. The register tile runs two passes.
-bool oneGateUpPass(const MoePlan &plan) noexcept { return plan.configuration().ggufTile == MoeGgufTile::Staged; }
+// each decode their own pass's formats, and in decode on Apple7/8's MMA tile
+// (moe_expert_gguf_mma_m8_gate_up[_mixed]), whose prefill tiles keep two
+// passes. The register tile runs two passes.
+bool oneGateUpPass(const MoePlan &plan) noexcept {
+  const MoeGgufTile tile = plan.configuration().ggufTile;
+  return tile == MoeGgufTile::Staged || (tile == MoeGgufTile::Mma && plan.phase() == MoePhase::Decode);
+}
 
 // The expert passes over grouped tiles, each on the grid of the live
 // tiles that the grouping wrote (MoeTileCount), within the column tiles of
