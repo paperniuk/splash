@@ -28,6 +28,16 @@ ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device)
       gpuCores_(plannedGpuCores(device)),
       attentionTile_(family_ == GpuFamilyClass::Apple7 ? AttentionTile::Register : AttentionTile::Mpp) {}
 
+bool ExecutionPlans::hyperNormStaged(uint32_t rows) const noexcept {
+  // Apple7/8 only, and only while the rows' threadgroups have the cores to
+  // themselves: past that the staged kernel runs a second wave where the
+  // quarters kernel doesn't slow down. Its 96 norms of a Flash-Next Q2_0 step
+  // on an M2 Max (38 cores), quarters -> staged ms: 16 rows 2.73 -> 2.10,
+  // 32 rows 2.80 -> 2.27, 33 rows 2.82 -> 2.24, 34 rows 2.80 -> 3.01, 64 rows
+  // 2.90 -> 3.13. Three quarters of the cores keeps a margin below that edge.
+  return family_ == GpuFamilyClass::Apple7 && rows * 4 <= gpuCores_ * 3;
+}
+
 PrefillAttentionPlan ExecutionPlans::prefillAttention(
     uint32_t rows, uint32_t queryHeads, kv::Layout layout, AttentionVariant variant) const {
   return PagedAttention::prefillPlan(rows, queryHeads, layout, variant, attentionTile_, gpuCores_);

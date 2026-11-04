@@ -280,11 +280,12 @@ void hyperTableTest(MetalBackend &backend) {
 // HYPER_CONNECTION_NORM_QUARTER_ROWS rows on the quarters kernel and the rest
 // on the loaded one, which sum alike: at decode's row counts and past them,
 // the two write bit for bit the same normalized rows and injection weights,
-// and a mix that injects nothing the same normalized rows. Shader
-// validation's instrumentation compiles the kernels apart, which can move a
-// bf16 value by its last bit; under it (`exact` false) they agree within
-// that, and test-engine-metal runs the exact comparison uninstrumented
-// (`qwen4-kernels METALLIB bitwise`).
+// and a mix that injects nothing the same normalized rows. Apple7/8's staged
+// kernel (addNorm's `staged`, run here on every family) writes the quarters
+// kernel's bits. Shader validation's instrumentation compiles the kernels
+// apart, which can move a bf16 value by its last bit; under it (`exact`
+// false) they agree within that, and test-engine-metal runs the exact
+// comparison uninstrumented (`qwen4-kernels METALLIB bitwise`).
 void hyperNormKernelsTest(MetalBackend &backend, bool exact) {
   std::mt19937 rng(13);
   const uint32_t hidden = kHidden, streams = kStreams, rank = kRank, width = hidden * streams;
@@ -318,7 +319,7 @@ void hyperNormKernelsTest(MetalBackend &backend, bool exact) {
     std::memset(buffer.contents(), 0, bytes);
     return buffer;
   };
-  bool okKernels = true, okPlain = true;
+  bool okKernels = true, okPlain = true, okStaged = true;
   for (const uint32_t rows : {1u, 3u, 8u, 16u, 24u, 32u, 64u, 65u, 128u, 136u, 256u, 512u}) {
     // addNorm's kernel, and the other one on the same rows.
     const bool quarters = rows <= HYPER_CONNECTION_NORM_QUARTER_ROWS;
@@ -328,8 +329,10 @@ void hyperNormKernelsTest(MetalBackend &backend, bool exact) {
     MetalBuffer normalized = zeroed(rows * width * 2), weights = zeroed(rows * streams * 4);
     MetalBuffer normalizedOther = zeroed(rows * width * 2), weightsOther = zeroed(rows * streams * 4);
     MetalBuffer normalizedPlain = zeroed(rows * width * 2);
+    MetalBuffer normalizedStaged = zeroed(rows * width * 2), weightsStaged = zeroed(rows * streams * 4);
     CommandGraph graph;
     ops::HyperConnection::addNorm(graph, xs, nw, inject, normalized, weights, shape, rows);
+    ops::HyperConnection::addNorm(graph, xs, nw, inject, normalizedStaged, weightsStaged, shape, rows, true);
     graph.add(other, {xs, nw.buffer, inject, normalizedOther, weightsOther}, params, {rows, 1, 1},
               {otherThreads, 1, 1});
     ops::HyperConnection::addNorm(graph, xs, nw, MetalBuffer{}, normalizedPlain, MetalBuffer{}, shape, rows);
@@ -341,10 +344,14 @@ void hyperNormKernelsTest(MetalBackend &backend, bool exact) {
     const bool plain = same(normalizedPlain, normalized, rowBytes);
     okPlain &= plain;
     if (!plain) std::cout << "  a mix without injection differs at " << rows << " rows\n";
+    const bool staged = same(normalizedStaged, normalized, rowBytes) && same(weightsStaged, weights, weightBytes, true);
+    okStaged &= staged;
+    if (!staged) std::cout << "  the staged norm differs at " << rows << " rows\n";
   }
   const std::string how = exact ? "bit for bit" : "close to (instrumented)";
   check(okKernels, "hyper norm: the quarters and loaded kernels' output and weights " + how);
   check(okPlain, "hyper norm without injection: normalized rows " + how + " the injecting mix's");
+  check(okStaged, "hyper norm: the staged kernel's output and weights " + how + " the quarters kernel's");
 }
 
 void pleTest(MetalBackend &backend) {

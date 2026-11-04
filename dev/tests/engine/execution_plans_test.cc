@@ -1,4 +1,5 @@
 #include "TestChecks.hpp"
+#include "metal/abi/HyperConnection.h"
 #include "ops/ExecutionPlans.hpp"
 
 #include <algorithm>
@@ -246,6 +247,26 @@ void unknownCoreCount() {
   }
 }
 
+// Apple7/8 run the injecting hyper-connection norm on the staged kernel while
+// its rows fit in three quarters of the cores; other families never do.
+void hyperNormPlans() {
+  // A GPU family, the cores its device reports (none: kAssumedGpuCores) and
+  // the most rows it stages.
+  struct Device final {
+    uint32_t family, reportedCores, stagedRows;
+  };
+  for (const auto [family, reportedCores, stagedRows] :
+       {Device{7, 38, 28}, Device{8, 38, 28}, Device{8, 10, 7}, Device{8, 0, kAssumedGpuCores * 3 / 4},
+        Device{9, 38, 0}, Device{10, 38, 0}}) {
+    DeviceCapabilities capabilities = device(family);
+    capabilities.gpuCoreCount = reportedCores;
+    const ExecutionPlans plans(capabilities);
+    for (uint32_t r = 1; r <= HYPER_CONNECTION_NORM_QUARTER_ROWS; ++r)
+      require(plans.hyperNormStaged(r) == (r <= stagedRows),
+              "the staged hyper norm is not gated on Apple7/8 and three quarters of the cores");
+  }
+}
+
 void apple7PrefillAttentionPlans() {
   for (uint32_t family : {7U, 8U}) {
     for (uint32_t cores : {32U, 38U, 76U}) {
@@ -352,6 +373,7 @@ int main() {
     ggufMoePlans();
     unknownCoreCount();
     apple7PrefillAttentionPlans();
+    hyperNormPlans();
     workspaceBounds();
     invalidLookupsAndContextEdges();
     std::cout << "PASS execution plans: device policies, device MoE tiles, B1-B4 "
