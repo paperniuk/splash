@@ -165,11 +165,14 @@ constexpr double kIntermediateFloor = 0x1p-9;
 static_assert(ANE_FFN_INT8_PEAK / kIntermediateFloor <= 65504.0,
               "the int8 peak over the floor fits fp16");
 
-// The rows of the program's functions, ascending.
+// The rows of the program's functions, ascending: the step's from
+// kMinimumRows, as many as leave the budget's own within kMaximumFunctions.
 std::vector<uint32_t> functionRows() {
   std::vector<uint32_t> rows;
-  for (uint32_t row = AneFfn::kMinimumRows; row <= AneFfn::kMaximumRows; row += AneFfn::kProgramStep)
+  for (uint32_t row = AneFfn::kMinimumRows;
+       row < AneFfn::kMaximumRows && rows.size() + 1 < AneFfn::kMaximumFunctions; row += AneFfn::kProgramStep)
     rows.push_back(row);
+  rows.push_back(AneFfn::kMaximumRows);
   return rows;
 }
 

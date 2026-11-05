@@ -19,9 +19,15 @@ namespace splash::engine {
 struct AneFfnSetting final {
   // The ANE takes the whole channel units nearest `share` of them
   // (ops::ane_ffn::nearestUnits), over chunks of `minimumRows` rows or more.
+  // A given share without its least chunk keeps 256 rows, where the program
+  // started before its 128-row functions: Macs whose split loses below that
+  // (M1 Max, M2 Max) keep their given split, and smaller chunks take it only
+  // as calibration or --ane-ffn-minimum-rows chooses.
+  static constexpr uint32_t kGivenMinimumRows = 256;
+  static_assert(kGivenMinimumRows >= ops::AneFfn::kMinimumRows && kGivenMinimumRows <= ops::AneFfn::kMaximumRows);
   struct Given final {
     double share = 0.0;
-    uint32_t minimumRows = ops::AneFfn::kMinimumRows;
+    uint32_t minimumRows = kGivenMinimumRows;
   };
   bool enabled = true;
   std::optional<Given> given;

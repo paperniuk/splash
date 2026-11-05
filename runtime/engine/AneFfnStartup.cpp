@@ -281,7 +281,7 @@ AneFfnSetting AneFfnSetting::fromGiven(std::optional<double> share, std::optiona
     return {};
   }
   if (*share == 0.0) return {.enabled = false};
-  return {.given = Given{*share, minimumRows.value_or(ops::AneFfn::kMinimumRows)}};
+  return {.given = Given{*share, minimumRows.value_or(kGivenMinimumRows)}};
 }
 
 AneFfnStart startAneFfn(const AneFfnModel &model, const AneFfnSetting &setting, RequestedContext requested,
