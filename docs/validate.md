@@ -204,7 +204,8 @@ a kernel's module defines are compared in the order they appear there, not by
 name: C++ names them for their template values, which a kernel template that
 gains a value renames without changing their code. So are the numbers of its
 lambdas' anonymous classes and its classes' names in the alias metadata, which
-the same change renames.
+the same change renames, and the numbers LLVM gives classes whose names clash,
+which count every such class compiled before the kernel.
 
 Two pairs of constants in `runtime/engine/Protocol.hpp` and `server/protocol.py`
 version what the server and the engine exchange. When the native wire layout
