@@ -81,8 +81,9 @@ PAGED_VERIFY_SPLIT(verify_attention_bf16_split_kv4_g8_d128_w512, 4, 8, 128, 512,
 
 // Apple7/8 register tile (paged_attention_sgf.h): the bindings and grid of
 // the split above, one simdgroup per eight fused rows of the tile's part
-// (32 x Group / Parts threads).
-#define SGF_VERIFY_SPLIT(Name, Heads, Group, CacheElement)                     \
+// (32 x Group / Parts threads). HeadDim 128 is Flint's layouts', and Window,
+// as the MPP split's, a sliding-window layer's.
+#define SGF_VERIFY_SPLIT(Name, Heads, Group, CacheElement, HeadDim, Window)     \
   kernel void Name(                                                            \
       device bfloat *queries [[buffer(0)]],                                    \
       device float *partials [[buffer(1)]],                                    \
@@ -97,17 +98,18 @@ PAGED_VERIFY_SPLIT(verify_attention_bf16_split_kv4_g8_d128_w512, 4, 8, 128, 512,
       uint lane [[thread_index_in_simdgroup]]) {                               \
     constexpr uint Parts = SPLASH_ATTENTION_TILE_PARTS(Group);                 \
     constexpr uint Simdgroups = Group / Parts;                                 \
-    threadgroup uint query_stage[Simdgroups * 32 * 32];                        \
+    threadgroup uint query_stage[Simdgroups * 32 * (HeadDim / 8)];             \
     const uint kv_head = group.x / Parts;                                      \
     const SplashAttentionTile tile =                                           \
         splash_attention_tile_part<Group, SPLASH_TARGET_VERIFY_ROWS, Parts,    \
-                                   SPLASH_KV_HEAD_DIMENSION>(                     \
-            splash_verify_attention_tile<Heads, Group, SPLASH_KV_HEAD_DIMENSION>( \
+                                   HeadDim>(                                   \
+            splash_verify_attention_tile<Heads, Group, HeadDim>(               \
                 params[group.z], kv_head, group.z),                            \
             group.x % Parts, params[group.z].slot_splits);                     \
     if (!tile.active || group.y >= tile.splits || sg >= Simdgroups)            \
       return;                                                                  \
-    q8sgf::tile<Heads, Group, CacheElement, SPLASH_TARGET_VERIFY_ROWS / Parts>( \
+    q8sgf::tile<Heads, Group, CacheElement, SPLASH_TARGET_VERIFY_ROWS / Parts, \
+                HeadDim, Window>(                                              \
         queries + tile.offset,                                                 \
         SPLASH_LANE_BINDING(group.z, page_table0, page_table1, page_table2,    \
                             page_table3),                                      \
@@ -116,12 +118,16 @@ PAGED_VERIFY_SPLIT(verify_attention_bf16_split_kv4_g8_d128_w512, 4, 8, 128, 512,
         sg, lane, query_stage);                                                \
   }
 
-SGF_VERIFY_SPLIT(verify_attention_q8_split_sgf, 4, 6, int8_t)
-SGF_VERIFY_SPLIT(verify_attention_q8_split_sgf_kv2_g8, 2, 8, int8_t)
-SGF_VERIFY_SPLIT(verify_attention_q8_split_sgf_kv2_g16, 2, 16, int8_t)
-SGF_VERIFY_SPLIT(verify_attention_bf16_split_sgf, 4, 6, bfloat)
-SGF_VERIFY_SPLIT(verify_attention_bf16_split_sgf_kv2_g8, 2, 8, bfloat)
-SGF_VERIFY_SPLIT(verify_attention_bf16_split_sgf_kv2_g16, 2, 16, bfloat)
+SGF_VERIFY_SPLIT(verify_attention_q8_split_sgf, 4, 6, int8_t, SPLASH_KV_HEAD_DIMENSION, 0)
+SGF_VERIFY_SPLIT(verify_attention_q8_split_sgf_kv2_g8, 2, 8, int8_t, SPLASH_KV_HEAD_DIMENSION, 0)
+SGF_VERIFY_SPLIT(verify_attention_q8_split_sgf_kv2_g16, 2, 16, int8_t, SPLASH_KV_HEAD_DIMENSION, 0)
+SGF_VERIFY_SPLIT(verify_attention_q8_split_sgf_kv4_g8_d128, 4, 8, int8_t, 128, 0)
+SGF_VERIFY_SPLIT(verify_attention_q8_split_sgf_kv4_g8_d128_w512, 4, 8, int8_t, 128, 512)
+SGF_VERIFY_SPLIT(verify_attention_bf16_split_sgf, 4, 6, bfloat, SPLASH_KV_HEAD_DIMENSION, 0)
+SGF_VERIFY_SPLIT(verify_attention_bf16_split_sgf_kv2_g8, 2, 8, bfloat, SPLASH_KV_HEAD_DIMENSION, 0)
+SGF_VERIFY_SPLIT(verify_attention_bf16_split_sgf_kv2_g16, 2, 16, bfloat, SPLASH_KV_HEAD_DIMENSION, 0)
+SGF_VERIFY_SPLIT(verify_attention_bf16_split_sgf_kv4_g8_d128, 4, 8, bfloat, 128, 0)
+SGF_VERIFY_SPLIT(verify_attention_bf16_split_sgf_kv4_g8_d128_w512, 4, 8, bfloat, 128, 512)
 #undef SGF_VERIFY_SPLIT
 #undef PAGED_VERIFY_TILE_AT
 #undef PAGED_VERIFY_SCRATCH

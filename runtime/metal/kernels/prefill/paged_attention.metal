@@ -100,8 +100,9 @@ PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv4_g8_d128_w512, 4, 8, 128, 51
 // Apple7/8 register tile (paged_attention_sgf.h): the bindings and grid of
 // the split above, one simdgroup per eight fused rows of the tile's part
 // (32 x Group / Parts threads). Slots, partials and statistics are the MPP
-// tile's, so the reduce below combines them unchanged.
-#define SGF_PREFILL_SPLIT(Name, Heads, Group, CacheElement)                    \
+// tile's, so the reduce below combines them unchanged. HeadDim 128 is Flint's
+// layouts', and Window, as the MPP split's, a sliding-window layer's.
+#define SGF_PREFILL_SPLIT(Name, Heads, Group, CacheElement, HeadDim, Window)    \
   kernel void Name(                                                            \
       device bfloat *queries [[buffer(0)]],                                    \
       device float *partials [[buffer(1)]],                                    \
@@ -113,29 +114,33 @@ PAGED_PREFILL_SPLIT(prefill_attention_bf16_split_kv4_g8_d128_w512, 4, 8, 128, 51
       uint lane [[thread_index_in_simdgroup]]) {                               \
     constexpr uint Parts = SPLASH_ATTENTION_TILE_PARTS(Group);                 \
     constexpr uint Simdgroups = Group / Parts;                                 \
-    threadgroup uint query_stage[Simdgroups * 32 * 32];                        \
+    threadgroup uint query_stage[Simdgroups * 32 * (HeadDim / 8)];             \
     const uint split = group.z, kv_head = group.x / Parts;                     \
     const SplashAttentionTile tile =                                           \
         splash_attention_tile_part<Group, SPLASH_PREFILL_ATTENTION_TILE_ROWS,  \
-                                   Parts, SPLASH_KV_HEAD_DIMENSION>(              \
-            splash_prefill_attention_tile<Heads, Group, SPLASH_KV_HEAD_DIMENSION>( \
+                                   Parts, HeadDim>(                            \
+            splash_prefill_attention_tile<Heads, Group, HeadDim>(              \
                 params, kv_head, group.y),                                     \
             group.x % Parts, params.split_count);                              \
     if (!tile.active || split >= tile.splits || sg >= Simdgroups)              \
       return;                                                                  \
     q8sgf::tile<Heads, Group, CacheElement,                                    \
-                SPLASH_PREFILL_ATTENTION_TILE_ROWS / Parts>(                   \
+                SPLASH_PREFILL_ATTENTION_TILE_ROWS / Parts, HeadDim, Window>(  \
         queries + tile.offset, page_table, params.kv, kv_head,                 \
         tile.first_position, tile.active_rows, tile.splits, split, partials,   \
         statistics, tile.first_slot + split, sg, lane, query_stage);           \
   }
 
-SGF_PREFILL_SPLIT(prefill_attention_q8_split_sgf, 4, 6, int8_t)
-SGF_PREFILL_SPLIT(prefill_attention_q8_split_sgf_kv2_g8, 2, 8, int8_t)
-SGF_PREFILL_SPLIT(prefill_attention_q8_split_sgf_kv2_g16, 2, 16, int8_t)
-SGF_PREFILL_SPLIT(prefill_attention_bf16_split_sgf, 4, 6, bfloat)
-SGF_PREFILL_SPLIT(prefill_attention_bf16_split_sgf_kv2_g8, 2, 8, bfloat)
-SGF_PREFILL_SPLIT(prefill_attention_bf16_split_sgf_kv2_g16, 2, 16, bfloat)
+SGF_PREFILL_SPLIT(prefill_attention_q8_split_sgf, 4, 6, int8_t, SPLASH_KV_HEAD_DIMENSION, 0)
+SGF_PREFILL_SPLIT(prefill_attention_q8_split_sgf_kv2_g8, 2, 8, int8_t, SPLASH_KV_HEAD_DIMENSION, 0)
+SGF_PREFILL_SPLIT(prefill_attention_q8_split_sgf_kv2_g16, 2, 16, int8_t, SPLASH_KV_HEAD_DIMENSION, 0)
+SGF_PREFILL_SPLIT(prefill_attention_q8_split_sgf_kv4_g8_d128, 4, 8, int8_t, 128, 0)
+SGF_PREFILL_SPLIT(prefill_attention_q8_split_sgf_kv4_g8_d128_w512, 4, 8, int8_t, 128, 512)
+SGF_PREFILL_SPLIT(prefill_attention_bf16_split_sgf, 4, 6, bfloat, SPLASH_KV_HEAD_DIMENSION, 0)
+SGF_PREFILL_SPLIT(prefill_attention_bf16_split_sgf_kv2_g8, 2, 8, bfloat, SPLASH_KV_HEAD_DIMENSION, 0)
+SGF_PREFILL_SPLIT(prefill_attention_bf16_split_sgf_kv2_g16, 2, 16, bfloat, SPLASH_KV_HEAD_DIMENSION, 0)
+SGF_PREFILL_SPLIT(prefill_attention_bf16_split_sgf_kv4_g8_d128, 4, 8, bfloat, 128, 0)
+SGF_PREFILL_SPLIT(prefill_attention_bf16_split_sgf_kv4_g8_d128_w512, 4, 8, bfloat, 128, 512)
 #undef SGF_PREFILL_SPLIT
 
 #define PAGED_PREFILL_REDUCE(Name, Heads, Group, HeadDim, Window)              \

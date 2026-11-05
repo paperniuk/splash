@@ -172,7 +172,7 @@ ATTENTION_GATE_TABLE(verify_attention_gate_table16f_kv2_g16, 32, 2, 256, gguf_sg
   kernel void Name( \
       device const bfloat *attention [[buffer(0)]], \
       device bfloat *hidden [[buffer(1)]], \
-      device bfloat *table [[buffer(2)]], device float *sums [[buffer(3)]], \
+      device Layout::Elem *table [[buffer(2)]], device float *sums [[buffer(3)]], \
       uint index [[thread_position_in_grid]], \
       uint lane [[thread_index_in_simdgroup]]) { \
     constexpr uint width = QHeads * HeadDim; \
@@ -185,4 +185,5 @@ ATTENTION_GATE_TABLE(verify_attention_gate_table16f_kv2_g16, 32, 2, 256, gguf_sg
                   width, (element % width) / 64, row % 8, lane, a, b); \
   }
 ATTENTION_GATHER_TABLE(verify_attention_gather_table16_kv4_g8_d128, 32, 4, 128, gguf_sg::Table16)
+ATTENTION_GATHER_TABLE(verify_attention_gather_table16f_kv4_g8_d128, 32, 4, 128, gguf_sg::Table16F)
 #undef ATTENTION_GATHER_TABLE
