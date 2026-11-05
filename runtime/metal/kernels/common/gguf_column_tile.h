@@ -65,6 +65,66 @@ inline void column_dot(device const bfloat *x, uint rows, uint input_size, devic
   }
 }
 
+// column_dot of two weight sets over the same activations, as a gate/up pass needs them (moe_gguf_mma.metal): each
+// set's chain runs in column_dot's order, so `first` and `second` are bitwise column_dot's sums, but the two chains
+// run interleaved, so their FMAs overlap, and each activation load serves both.
+template <class F, ushort Rows>
+inline void column_dot_pair(device const bfloat *x, uint rows, uint input_size, device uchar *a0, device uchar *a1,
+                            device uchar *ameta, device uchar *b0, device uchar *b1, device uchar *bmeta, uint column,
+                            threadgroup half2 *tl, thread float (&first)[Rows], thread float (&second)[Rows]) {
+  const uint groups = input_size / 32, units = groups / F::MetaGroups;
+  const uint plane_tile = column / QUANT_TILE_ROWS, plane_row = column % QUANT_TILE_ROWS;
+  const ulong at = ulong(plane_tile) * groups * QUANT_TILE_ROWS + plane_row;
+  const ulong meta_at = ulong(plane_tile) * units * QUANT_TILE_ROWS + plane_row;
+  device uchar *ta0 = a0 + at * F::P0, *ta1 = a1 + at * F::P1, *tameta = ameta + meta_at * F::MetaBytes;
+  device uchar *tb0 = b0 + at * F::P0, *tb1 = b1 + at * F::P1, *tbmeta = bmeta + meta_at * F::MetaBytes;
+#pragma unroll
+  for (ushort r = 0; r < Rows; ++r) first[r] = second[r] = 0.0f;
+  typename F::Payload wa = F::load(ta0, ta1), wb = F::load(tb0, tb1);
+  typename F::Meta ma = F::loadMeta(tameta), mb = F::loadMeta(tbmeta);
+  for (uint g = 0; g < groups; ++g) {
+    half4 va[8], vb[8];
+    dequant32_chunks<F>(wa, ma, ushort(g % F::MetaGroups), tl,
+                        [&](ushort c, half4 lo, half4 hi) __attribute__((always_inline)) {
+                          va[c] = lo;
+                          va[4 + c] = hi;
+                        });
+    dequant32_chunks<F>(wb, mb, ushort(g % F::MetaGroups), tl,
+                        [&](ushort c, half4 lo, half4 hi) __attribute__((always_inline)) {
+                          vb[c] = lo;
+                          vb[4 + c] = hi;
+                        });
+    if (g + 1 < groups) {
+      wa = F::load(ta0 + ulong(g + 1) * QUANT_TILE_ROWS * F::P0, ta1 + ulong(g + 1) * QUANT_TILE_ROWS * F::P1);
+      wb = F::load(tb0 + ulong(g + 1) * QUANT_TILE_ROWS * F::P0, tb1 + ulong(g + 1) * QUANT_TILE_ROWS * F::P1);
+      if ((g + 1) / F::MetaGroups != g / F::MetaGroups) {
+        ma = F::loadMeta(tameta + ulong((g + 1) / F::MetaGroups) * QUANT_TILE_ROWS * F::MetaBytes);
+        mb = F::loadMeta(tbmeta + ulong((g + 1) / F::MetaGroups) * QUANT_TILE_ROWS * F::MetaBytes);
+      }
+    }
+#pragma unroll
+    for (ushort r = 0; r < Rows; ++r) {
+      if (r >= rows) break;
+      device const uint4 *xr = reinterpret_cast<device const uint4 *>(x + ulong(r) * input_size + g * 32);
+      float sa = 0.0f, sb = 0.0f;
+#pragma unroll
+      for (ushort i = 0; i < 8; ++i) {
+        const uint4 q = xr[i / 2];
+        const float4 xv = float4(as_type<bfloat4>(i % 2 ? q.zw : q.xy)), av = float4(va[i]), bv = float4(vb[i]);
+        sa = sa + av.x * xv.x;
+        sb = sb + bv.x * xv.x;
+        sa = sa + av.y * xv.y;
+        sb = sb + bv.y * xv.y;
+        sa = sa + av.z * xv.z;
+        sb = sb + bv.z * xv.z;
+        sa = sa + av.w * xv.w;
+        sb = sb + bv.w * xv.w;
+      }
+      first[r] += sa;
+      second[r] += sb;
+    }
+  }
+}
 // column_dot in the run-time format `format` (uniform per threadgroup), after its pair table, which every thread of
 // the threadgroup fills.
 template <ushort Rows>

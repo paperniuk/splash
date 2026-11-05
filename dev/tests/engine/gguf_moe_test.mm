@@ -24,8 +24,8 @@
 //   chunks) for every format the tile takes (the register tile all but F16,
 //   in rows it takes: quant_register_tensor), gate, up and down in three of
 //   those formats and the shared expert in three more, and on the staged
-//   tiles, which run gate and up in one pass, also with up in the gate's
-//   formats; routes and weights against the fp64 router, each pass inside the
+//   tiles, which run gate and up in one pass (Apple7/8's MMA tiles in
+//   decode), also with up in the gate's formats; routes and weights against the fp64 router, each pass inside the
 //   fp64 interval its numerics allow, the block's output, a row's output
 //   bitwise equal at every lane count and chunk of one tile where its routes
 //   run the same tile kinds (the staged expert passes run an expert's only
@@ -94,6 +94,7 @@ using splash::ops::MoeConfig;
 using splash::ops::MoeScratch;
 using splash::ops::MoeExpertTile;
 using splash::ops::MoeGgufTile;
+using splash::ops::MoePhase;
 using splash::ops::MoePlan;
 using splash::ops::MoeShape;
 using splash::ops::LinearEpilogue;
@@ -164,8 +165,9 @@ bool inside(float got, double exact, double bound) {
   return got >= bf16(exact - bound) && got <= bf16(exact + bound);
 }
 
-// Apple7/8 run the staged plans on their MMA kernels (MoeGgufTile::Mma), in two gate/up passes, and neither the
-// Apple9 register tile nor the neural accelerator tiles, whose MPP matmuls run far below their MMA rate.
+// Apple7/8 run the staged plans on their MMA kernels (MoeGgufTile::Mma), gate and up in one pass in decode and in two
+// in prefill, and neither the Apple9 register tile nor the neural accelerator tiles, whose MPP matmuls run far below
+// their MMA rate.
 bool mmaTiles(const MetalBackend &backend) { return backend.capabilities().appleGpuFamily < 9; }
 std::vector<MoeGgufTile> moeTiles(const MetalBackend &backend) {
   return mmaTiles(backend) ? std::vector<MoeGgufTile>{MoeGgufTile::Mma}
@@ -880,8 +882,10 @@ MoeRun runPlan(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan 
     gateUpPasses += pass.ends_with("_gate_up") || pass.ends_with("_gate_up_mixed");
     upPasses += pass.ends_with("_g");
   }
-  // Only the staged tile fuses gate and up; Apple7/8's MMA tile runs two passes like the register tile.
-  const bool oneGateUp = plan.configuration().ggufTile == MoeGgufTile::Staged;
+  // The staged tile fuses gate and up, and Apple7/8's MMA tile in decode; the register tile runs two passes.
+  const MoeGgufTile tile = plan.configuration().ggufTile;
+  const bool oneGateUp =
+      tile == MoeGgufTile::Staged || (tile == MoeGgufTile::Mma && plan.phase() == MoePhase::Decode);
   require(gateUpPasses == oneGateUp && upPasses == !oneGateUp,
           label + (oneGateUp ? ": gate and up run in two passes" : ": gate and up run in one pass"));
   for (uint32_t r = 0; r < rows; ++r) {
