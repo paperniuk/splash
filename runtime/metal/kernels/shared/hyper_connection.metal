@@ -85,12 +85,19 @@ inline void hyper_norm_loaded_row(device const float *streams, device const floa
 // loaded row's threadgroup in stream q's sum and in injection weight q's dot:
 // each of its threads sums its values of stream q, then runs injection dot q
 // over every stream's values in order, and writes stream q's normalized
-// values.
+// values. Staged (Apple7/8's, hyper_connection_norm_staged) works out each
+// stream's values once instead of in every quarter: stream s's quarter leaves
+// them in threadgroup memory, kStagedStreams streams at a time (all four would
+// be 40 KB, over the 32 KB a threadgroup has), where each quarter's thread tid
+// reads the values at its own positions. The dots run in the same order, so
+// both kernels' outputs are bit for bit the same.
+constant constexpr uint kStagedStreams = 2;
+template <bool Staged>
 inline void hyper_norm_quarter_row(device const float *streams, device const float *norm,
                                    device const float *inject, device bfloat *normalized,
                                    device float *weights, constant HyperConnectionParams &p, uint row,
                                    uint thread_id, uint lane, uint simdgroup, threadgroup float *scratch,
-                                   threadgroup float *scales) {
+                                   threadgroup float *scales, threadgroup float *staged) {
   if (row >= p.rows) return;
   const uint q = thread_id / kRowThreads, tid = thread_id % kRowThreads;
   const uint width = kStreams * kNormHidden;
@@ -120,6 +127,26 @@ inline void hyper_norm_quarter_row(device const float *streams, device const flo
     for (uint i = 0; i < kNormValues; ++i) {
       const uint c = q * kNormHidden + tid + i * kRowThreads;
       out[c] = bfloat(x[c] * scales[q] * norm[c]);
+    }
+  } else if constexpr (Staged) {
+    device const float *w = inject + ulong(q) * width;
+    for (uint first = 0; first < kStreams; first += kStagedStreams) {
+      if (q - first < kStagedStreams) {
+        threadgroup float *values = staged + (q - first) * kNormHidden;
+        for (uint i = 0; i < kNormValues; ++i) {
+          const uint c = q * kNormHidden + tid + i * kRowThreads;
+          const float v = x[c] * scales[q] * norm[c];
+          out[c] = bfloat(v);
+          values[tid + i * kRowThreads] = v;
+        }
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (uint s = first; s < first + kStagedStreams; ++s) {
+        threadgroup const float *values = staged + (s - first) * kNormHidden;
+        for (uint i = 0; i < kNormValues; ++i)
+          dot += w[s * kNormHidden + tid + i * kRowThreads] * values[tid + i * kRowThreads];
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
     }
   } else {
     device const float *w = inject + ulong(q) * width;
@@ -165,8 +192,19 @@ kernel void hyper_connection_norm_loaded(HYPER_NORM_ARGUMENTS, constant HyperCon
                                            uint simdgroup [[simdgroup_index_in_threadgroup]]) {
   threadgroup float scratch[kStreams * kSimdgroups];
   threadgroup float scales[kStreams];
-  hyper_norm_quarter_row(streams, norm, inject, normalized, weights, p, row, thread_id, lane, simdgroup, scratch,
-                         scales);
+  hyper_norm_quarter_row<false>(streams, norm, inject, normalized, weights, p, row, thread_id, lane, simdgroup,
+                                scratch, scales, nullptr);
+}
+
+[[max_total_threads_per_threadgroup(HYPER_CONNECTION_NORM_QUARTER_THREADS)]] kernel void hyper_connection_norm_staged(
+    HYPER_NORM_ARGUMENTS, constant HyperConnectionParams &p [[buffer(5)]], uint row [[threadgroup_position_in_grid]],
+    uint thread_id [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+    uint simdgroup [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float scratch[kStreams * kSimdgroups];
+  threadgroup float scales[kStreams];
+  threadgroup float staged[kStagedStreams * kNormHidden];
+  hyper_norm_quarter_row<true>(streams, norm, inject, normalized, weights, p, row, thread_id, lane, simdgroup,
+                               scratch, scales, staged);
 }
 
 #undef HYPER_NORM_ARGUMENTS
