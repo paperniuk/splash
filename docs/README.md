@@ -17,6 +17,8 @@ These documents run from using Splash to working on it:
 - [Package](package.md): the release archive and bottle, the desktop app, its
   updates and releases, and private test releases.
 - [Performance](performance.md): measurements and how they were made.
+- [Quants](quants.md): choosing a quant by memory, closeness to bf16 and
+  speed, with measurements per model.
 
 Building from source needs Apple Silicon with macOS 26.4+, Xcode 26 or newer,
 Python 3.12–3.14, and a Metal 4 compiler with `uint4b_format` tensor support.
