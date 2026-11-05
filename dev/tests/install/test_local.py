@@ -455,6 +455,27 @@ class LocalModelTest(unittest.TestCase):
         ):
             assembly.hold(prepared)
 
+    def test_finders_files_beside_the_assemblies_are_left_alone(self):
+        # Finder writes .DS_Store into any directory a user opens; a file is
+        # no assembly, and collecting garbage must not stop on one (#42).
+        target = self.gguf(self.root / "model" / "model-Q4_K_M.gguf")
+        draft = draft_dir(self.root / "draft", MOE)
+        prepared = self.prepare(target, draft)
+        strays = [
+            self.models / ".resolved" / ".DS_Store",
+            self.models / ".metadata" / ".DS_Store",
+        ]
+        for stray in strays:
+            stray.parent.mkdir(parents=True, exist_ok=True)
+            stray.write_bytes(b"Bud1")
+        (draft / "model.safetensors").write_bytes(b"retrained")
+        again = self.prepare(target, draft)
+        self.assertNotEqual(again, prepared)
+        assembly.verify(again, full=True)
+        self.assertFalse(prepared.exists())
+        for stray in strays:
+            self.assertEqual(stray.read_bytes(), b"Bud1")
+
     def test_a_files_digest_is_read_before_the_installation_lock(self):
         # A file's first digest is read before the installation lock, which
         # installations and starting servers wait for; its record is taken
