@@ -2201,6 +2201,13 @@ void hostStepSpinFallsBack(const std::string &metallibPath) {
 // started after their release: a later check spins.
 void hostStepSpinEndedEarlyDecidesNothing(const std::string &metallibPath) {
     MetalBackend backend(metallibPath);
+    if (!spinsOnThisGpu(backend)) {
+        // Apple7/8 decide without spinning: awake host steps run as plain ones.
+        require(BackendInstrumentation::awakeHostStepsSpin(backend) == false,
+                "awake host steps on Apple7/8 checked their spin");
+        std::cout << "PASS a spin check on Apple7/8 decides without spinning\n";
+        return;
+    }
     std::optional<bool> decision;
     std::string warnings;
     {
@@ -2251,6 +2258,10 @@ CFTimeInterval recordSpinRun(id command, SEL selector) {
 // once (endedEarly), so the check runs all of them.
 void hostStepCheckSpinsOutlastTheirRelease(const std::string &metallibPath) {
     MetalBackend backend(metallibPath);
+    if (!spinsOnThisGpu(backend)) {
+        std::cout << "PASS a spin check on Apple7/8 runs no spins to outlast their release\n";
+        return;
+    }
     checker = std::this_thread::get_id();
     spinBounds.clear();
     spinRuns.clear();

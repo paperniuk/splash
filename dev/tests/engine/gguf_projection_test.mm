@@ -748,9 +748,12 @@ void prefill(MetalBackend &backend, const Linear &linear, uint32_t K, const std:
         fail(name + ": simdgroups past the chunk write their rows");
       if (tileOutput.empty()) tileOutput = whole.output;
     }
+    // Apple7/8's MMA decode tiles stop at 32 rows: their prefill takes the
+    // staged tile up to 32 rows (kApple7Projection) and the 64-row MMA tile past.
+    const uint32_t mostStagedRows = backend.capabilities().appleGpuFamily < 9 ? 32 : splash::ops::kMaximumStagedPrefillRows;
     for (const uint32_t rows : {8u, 16u, 24u, 32u, 33u, 40u, 48u, 57u, 64u})
       for (const uint32_t splits : {1u, splitChunk, 8u}) {
-        if (splits == 8 && (rows <= 32 || (K / 32) % 8))
+        if (rows > mostStagedRows || (splits == 8 && (rows <= 32 || (K / 32) % 8)))
           continue;
         const LinearWorkload chunk{{columns, K}, rows, LinearPhase::Prefill, epilogue};
         const LinearPlan plan =
