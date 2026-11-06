@@ -556,7 +556,7 @@ void split(MetalBackend &backend, const Linear &linear, const Model &model, cons
            "% RMS from the GPU alone" + (got.usable ? "" : ", unusable: " + split->reason()));
   }
   section("split: " + model.name + " layers at share 0.5 from layers gone before it runs, its planned memory, "
-          "chunks of 2048, 256 and 700 rows");
+          "chunks of 2048, " + std::to_string(AneFfn::kMinimumRows) + " and 700 rows");
 
   // A least chunk of more rows leaves the smaller ones to the GPU; one of rows no function holds is refused.
   split->setMinimumRows(640);
@@ -859,7 +859,7 @@ void split(MetalBackend &backend) {
 }
 
 // ---------------------------------------------------------------- faults
-// Each fault of an evaluation at layer 0, 1 and 2 of chunks of 256, 700 and 2048 rows stops the split (stops()); an
+// Each fault of an evaluation at layer 0, 1 and 2 of chunks of kMinimumRows, 700 and 2048 rows stops the split (stops()); an
 // evaluation that signals the event below its value leaves it there.
 void faults(MetalBackend &backend) {
   using Faults = ane::ProgramInstrumentation::Faults;
@@ -886,7 +886,8 @@ void faults(MetalBackend &backend) {
       for (const uint32_t count : {AneFfn::kMinimumRows, 700u, AneFfn::kMaximumRows})
         stops(backend, linear, model, buffers, kind.arm(layer + 1),
               std::string(kind.name) + " at layer " + std::to_string(layer), count, kind.reason);
-    section(std::string("faults: ") + kind.name + " at each layer of chunks of 256, 700 and 2048 rows");
+    section(std::string("faults: ") + kind.name + " at each layer of chunks of " + std::to_string(AneFfn::kMinimumRows) +
+            ", 700 and 2048 rows");
   }
 
   // A program that does not load again after the idle release.

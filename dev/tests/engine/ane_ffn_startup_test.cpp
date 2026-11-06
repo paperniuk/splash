@@ -604,14 +604,16 @@ void testGivenShare() {
   require(started.start.outcome.kind == Kind::Split && !fake.timings && fake.prepared == std::pair(7u, false) &&
               !fake.recalled && !fake.remembered && started.start.plan &&
               started.start.plan->breakdown().aneFfnBytes == fake.bytes(7) &&
-              has(started.log, "Neural Engine FFN split at the given share 0.21 for chunks of 256 rows or more, 2.5% "
-                               "from the GPU alone on the Neural Engine's part"),
+              has(started.log, "Neural Engine FFN split at the given share 0.21 for chunks of " +
+                                   std::to_string(AneFfnSetting::kGivenMinimumRows) +
+                                   " rows or more, 2.5% from the GPU alone on the Neural Engine's part"),
           "the given share did not run as given: " + started.log);
   started = start(fake, {.given = AneFfnSetting::Given{0.2, 832}});
   require(started.start.outcome.kind == Kind::Split && has(started.log, "for chunks of 832 rows or more"),
           "the given least chunk did not run as given: " + started.log);
   for (const AneFfnSetting::Given given : {AneFfnSetting::Given{0.0}, AneFfnSetting::Given{1.0},
-                                           AneFfnSetting::Given{0.2, 255}, AneFfnSetting::Given{0.2, 2049}})
+                                           AneFfnSetting::Given{0.2, ops::AneFfn::kMinimumRows - 1},
+                                           AneFfnSetting::Given{0.2, 2049}})
     rejects([&] { static_cast<void>(start(fake, {.given = given})); }, "ANE FFN",
             "a given split of share " + std::to_string(given.share) + " from " + std::to_string(given.minimumRows) +
                 " rows ran");
@@ -620,7 +622,7 @@ void testGivenShare() {
                       off = AneFfnSetting::fromGiven(0.0, 832), given = AneFfnSetting::fromGiven(0.3, 832);
   require(calibrated.enabled && !calibrated.given && !off.enabled && given.enabled && given.given &&
               given.given->share == 0.3 && given.given->minimumRows == 832 &&
-              AneFfnSetting::fromGiven(0.3, std::nullopt).given->minimumRows == ops::AneFfn::kMinimumRows,
+              AneFfnSetting::fromGiven(0.3, std::nullopt).given->minimumRows == AneFfnSetting::kGivenMinimumRows,
           "a dev tool's options did not give their setting");
   rejects([] { static_cast<void>(AneFfnSetting::fromGiven(std::nullopt, 832)); }, "without a share",
           "least rows without a share were taken");
