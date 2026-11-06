@@ -458,10 +458,54 @@ extension LaunchOption {
             help: "Reads long prompts faster on models that can use it.",
             section: .requests, kind: .toggle(on: false)),
         LaunchOption(
+            flag: "--ane-ffn-share", title: "Neural Engine share",
+            help: "The Neural Engine’s share of a dense model’s prefill FFN, instead of the one calibration finds; 0 prefills on the GPU alone.",
+            section: .requests,
+            kind: .choice(standard: "Calibrated", choices: [],
+                          custom: Value(prompt: "0.6", message: "A number from 0 up to, not including, 1.",
+                                        parse: { Double($0).flatMap { (0..<1).contains($0) ? String($0) : nil } })),
+            requires: [neuralEngine]),
+        LaunchOption(
+            flag: "--ane-ffn-minimum-rows", title: "Neural Engine least rows",
+            help: "The least rows of a prefill chunk that splits at the Neural Engine share.",
+            section: .requests,
+            kind: .choice(standard: "256", choices: [], custom: Value(prompt: "512", message: "Rows, a whole number.", parse: whole)),
+            requires: [neuralEngine]),
+        LaunchOption(
+            flag: "--prefill-mode", title: "Prefill commands",
+            help: "Bounded keeps each prefill GPU command within a few seconds, so macOS does not abort long prompts; Full sends whole 2048-token chunks.",
+            section: .requests, kind: .choice(standard: "Bounded", choices: [("full", "Full")], custom: nil)),
+        LaunchOption(
+            flag: "--prefill-bound-ms", title: "Prefill bound",
+            help: "The longest bounded prefill GPU command, halved after each macOS display-stall abort.",
+            section: .requests,
+            kind: .choice(standard: "2000 ms", choices: [],
+                          custom: Value(prompt: "1000", message: "Milliseconds, a whole number.", parse: whole)),
+            requires: [boundedPrefill]),
+        LaunchOption(
+            flag: "--prefill-bound-scope", title: "Prefill bound holds",
+            help: "What the prefill bound holds: each GPU command buffer, or each whole command, which some Macs need at long context.",
+            section: .requests,
+            kind: .choice(standard: "Each Buffer", choices: [("command", "Each Command")], custom: nil),
+            requires: [boundedPrefill]),
+        LaunchOption(
+            flag: "--contended-prefill-rows", title: "Prefill rows while answering",
+            help: "The smallest prefill command, in rows, while other requests are answered.",
+            section: .requests,
+            kind: .choice(standard: "256 on M1/M2, 512 Otherwise",
+                          choices: [("64", "64"), ("128", "128"), ("256", "256"), ("512", "512"), ("1024", "1024"), ("2048", "2048")],
+                          custom: nil)),
+        LaunchOption(
             flag: "--allow-idle-sleep", title: "Keep Mac awake while answering",
             help: "The Mac doesn’t sleep in the middle of an answer; the display still may.",
             section: .requests, kind: .toggle(on: false)),
     ]
+
+    /// What the Neural Engine split's options need: the split itself.
+    private static let neuralEngine = Requirement("Needs Neural Engine for long prompts on.") { $0["--disable-ane"] != "true" }
+
+    /// What the prefill bound's options need: bounded prefill commands.
+    private static let boundedPrefill = Requirement("Needs bounded prefill commands.") { $0["--prefill-mode"] != "full" }
 
     /// What the options of the SSD cache need: the cache itself.
     private static let ssdCache = Requirement("Needs the SSD cache (SSD Cache Size not Off).") { $0["--max-cache-disk"] != "0" }
