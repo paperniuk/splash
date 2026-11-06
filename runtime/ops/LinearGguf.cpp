@@ -283,8 +283,11 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
     // A fused projection's chunk runs its segments in one dispatch, as decode
     // does: a dispatch costs about 0.045 ms however narrow, and at 8 to 32
     // rows the 27B's and 35B's fused inputs take 16-56% less time in one
-    // dispatch than in one per segment (32-core M5 Max).
-    if (segments.size() > 1 && w.epilogue == LinearEpilogue::None) {
+    // dispatch than in one per segment (32-core M5 Max). Apple7/8 keep one
+    // dispatch per segment: there the fused chunk runs the run-time-format
+    // gguf_decode_mma_fused_m32, and a 17- to 32-row chunk hangs the engine
+    // (Flash-Next Q2_0 and UD-IQ1_S on an M2 Max, issue #51).
+    if (segments.size() > 1 && w.epilogue == LinearEpilogue::None && !mma()) {
       fused();
       return;
     }
