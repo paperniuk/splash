@@ -2,7 +2,7 @@ import Foundation
 import Observation
 
 /// A message of a conversation, as the app keeps it.
-struct ChatMessage: Codable, Identifiable, Equatable {
+struct ChatMessage: Codable, Identifiable, Equatable, Sendable {
     enum Role: String, Codable { case user, assistant }
 
     var id = UUID()
@@ -36,7 +36,7 @@ struct Conversation: Codable, Identifiable, Equatable {
 
 /// The model a message goes to: the server's address, the model it serves and whether it sees
 /// images, and the reasoning effort to ask for.
-struct ChatTarget {
+struct ChatTarget: Equatable, Sendable {
     let url: URL
     let model: String
     let acceptsImages: Bool
@@ -50,29 +50,47 @@ struct ChatTarget {
 /// The conversations, one JSON file each in the app's folder, and the one reply that streams.
 @MainActor @Observable
 final class ChatStore {
-    /// The reply that streams: its conversation, when it was asked for, when the model began to
-    /// think, and how much of the prompt it has read, while it reads.
+    /// The reply that streams: when it was asked for, when the model began to think, and how much
+    /// of the prompt it has read, while it reads.
     struct Live: Equatable {
-        let conversation: UUID
         let asked: Date
         var thinking: Date?
         var read: Double?
     }
 
+    /// The reply that streams as it stands, apart from the conversations, which hold it empty until
+    /// it ends and goes into its conversation, once: an object of its own, which the transcript
+    /// alone reads, so that each flush of it draws the transcript and nothing else, not the list of
+    /// conversations and its search, nor the composer, which read the conversations.
+    @MainActor @Observable
+    final class Reply {
+        let conversation: UUID
+        fileprivate(set) var message: ChatMessage
+        fileprivate(set) var live: Live
+
+        fileprivate init(_ message: ChatMessage, in conversation: UUID) {
+            self.conversation = conversation
+            self.message = message
+            live = Live(asked: .now)
+        }
+    }
+
     private(set) var conversations: [Conversation] = []
     /// The open conversation; nil is a new one, saved once it has a message.
     var selection: UUID?
-    private(set) var live: Live?
+    private(set) var reply: Reply?
 
     /// The conversation whose reply streams now, the open one or another.
-    var streaming: UUID? { live?.conversation }
-
-    static let folder = URL.applicationSupportDirectory.appending(path: "Splash/Chats")
+    var streaming: UUID? { reply?.conversation }
 
     private let folder: URL
-    private var reply: Task<Void, Never>?
+    private var replying: Task<Void, Never>?
+    /// Writes and removes the conversations' files in the order they change, off the main thread:
+    /// a conversation with images takes milliseconds to encode and write, which a send and a
+    /// reply's end would otherwise wait for.
+    private let files = DispatchQueue(label: "ChatStore.files", qos: .utility)
 
-    init(folder: URL = ChatStore.folder) {
+    init(folder: URL) {
         self.folder = folder
         let files = (try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? []
         conversations = files.filter { $0.pathExtension == "json" }
@@ -92,7 +110,8 @@ final class ChatStore {
     func delete(_ id: UUID) {
         if streaming == id { stop() }
         conversations.removeAll { $0.id == id }
-        try? FileManager.default.removeItem(at: file(id))
+        let file = file(id)
+        files.async { try? FileManager.default.removeItem(at: file) }
         if selection == id { selection = nil }
     }
 
@@ -124,7 +143,7 @@ final class ChatStore {
 
     /// Stops the reply; what it said so far stays.
     func stop() {
-        reply?.cancel()
+        replying?.cancel()
     }
 
     private func stream(_ conversation: Conversation, to server: ChatTarget) {
@@ -135,8 +154,9 @@ final class ChatStore {
         conversation.updated = .now
         put(conversation)
         selection = conversation.id
-        live = Live(conversation: conversation.id, asked: .now)
-        reply = Task { [weak self] in
+        let reply = Reply(answer, in: conversation.id)
+        self.reply = reply
+        replying = Task { [weak self] in
             var shown = ContinuousClock.now
             var thinking: Date?
             var read: Double?
@@ -144,7 +164,7 @@ final class ChatStore {
                 for try await delta in ChatClient.stream(history, with: server) {
                     if !delta.reasoning.isEmpty, thinking == nil {
                         thinking = .now
-                        self?.live?.thinking = thinking
+                        reply.live.thinking = thinking
                     }
                     if !delta.text.isEmpty, answer.text.isEmpty, let thinking {
                         answer.thinkingTime = Date.now.timeIntervalSince(thinking)
@@ -156,11 +176,12 @@ final class ChatStore {
                     read = delta.read ?? read
                     // Asked for no limit, a reply runs to the end of the context.
                     if delta.cut { answer.error = "The reply reached the end of the model’s context." }
-                    // A redraw of the whole reply per token would be wasted work.
+                    // A redraw per token would be wasted work: the page lets out what comes at an
+                    // even pace (page.js).
                     if ContinuousClock.now - shown > .milliseconds(50) {
                         shown = .now
-                        self?.live?.read = read
-                        self?.update(conversation.id, answer, save: false)
+                        reply.live.read = read
+                        reply.message = answer
                     }
                 }
                 // Cancelled, the stream just ends; what it said stays.
@@ -170,22 +191,20 @@ final class ChatStore {
             }
             // A reply that ended while the model still thought.
             if let thinking, answer.thinkingTime == nil { answer.thinkingTime = Date.now.timeIntervalSince(thinking) }
-            self?.update(conversation.id, answer, save: true)
-            self?.live = nil
+            self?.finish(answer, in: conversation.id)
+            self?.reply = nil
         }
     }
 
-    private func update(_ conversation: UUID, _ message: ChatMessage, save: Bool) {
+    /// Puts the reply that ended, `message`, in its conversation, which it brings to the top, and
+    /// writes it.
+    private func finish(_ message: ChatMessage, in conversation: UUID) {
         guard var updated = conversations.first(where: { $0.id == conversation }),
               let index = updated.messages.firstIndex(where: { $0.id == message.id })
         else { return }
         updated.messages[index] = message
-        if save {
-            updated.updated = .now
-            put(updated)
-        } else if let position = conversations.firstIndex(where: { $0.id == conversation }) {
-            conversations[position] = updated
-        }
+        updated.updated = .now
+        put(updated)
     }
 
     /// Keeps `conversation` first, the most recent, and writes it.
@@ -196,8 +215,16 @@ final class ChatStore {
     }
 
     private func write(_ conversation: Conversation) {
-        try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        try? JSONEncoder().encode(conversation).write(to: file(conversation.id), options: .atomic)
+        let (folder, file) = (folder, file(conversation.id))
+        files.async {
+            try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            try? JSONEncoder().encode(conversation).write(to: file, options: .atomic)
+        }
+    }
+
+    /// Returns once every change made so far is on disk, as the app quits.
+    func flush() {
+        files.sync {}
     }
 
     private func file(_ id: UUID) -> URL {
@@ -240,17 +267,46 @@ enum ChatClient {
         let errorDescription: String?
     }
 
+    /// The tokens `messages` take as the model reads them, its template, images and earlier
+    /// thinking included, counted without inference and without waking a sleeping engine.
+    static func countTokens(_ messages: [ChatMessage], with server: ChatTarget, session: URLSession = .shared) async throws -> Int {
+        let request = try countRequest(messages, with: server)
+        let (data, response) = try await session.data(for: request)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard status == 200 else {
+            throw Failure(errorDescription: message(of: data, for: messages, server: server)
+                ?? HTTPURLResponse.localizedString(forStatusCode: status))
+        }
+        struct Count: Decodable { let input_tokens: Int }
+        guard let count = try? JSONDecoder().decode(Count.self, from: data), count.input_tokens >= 0 else {
+            throw Failure(errorDescription: "The model returned an invalid token count.")
+        }
+        return count.input_tokens
+    }
+
+    /// The request counting `messages`: the prompt `stream` sends, as it sends it.
+    static func countRequest(_ messages: [ChatMessage], with server: ChatTarget) throws -> URLRequest {
+        let json = try JSONSerialization.data(withJSONObject: prompt(messages, effort: server.effort, images: server.acceptsImages))
+        return request("v1/chat/completions/count_tokens", json, to: server, timeout: 30)
+    }
+
+    /// A POST of the JSON `body` to `path` on `server`, with the key it asks for.
+    private static func request(_ path: String, _ body: Data, to server: ChatTarget, timeout: TimeInterval) -> URLRequest {
+        var request = URLRequest(url: server.url.appending(path: path))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let key = server.apiKey { request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization") }
+        request.httpBody = body
+        request.timeoutInterval = timeout
+        return request
+    }
+
     static func stream(_ messages: [ChatMessage], with server: ChatTarget) -> AsyncThrowingStream<Delta, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    var request = URLRequest(url: server.url.appending(path: "v1/chat/completions"))
-                    request.httpMethod = "POST"
-                    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-                    if let key = server.apiKey { request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization") }
-                    request.httpBody = try body(messages, effort: server.effort, images: server.acceptsImages)
-                    request.timeoutInterval = 3600
-                    let (bytes, response) = try await URLSession.shared.bytes(for: request)
+                    let json = try body(messages, effort: server.effort, images: server.acceptsImages)
+                    let (bytes, response) = try await URLSession.shared.bytes(for: request("v1/chat/completions", json, to: server, timeout: 3600))
                     if let status = (response as? HTTPURLResponse)?.statusCode, status != 200 {
                         var data = Data()
                         for try await byte in bytes { data.append(byte) }
@@ -273,11 +329,19 @@ enum ChatClient {
         }
     }
 
-    /// The request for `messages`: images as data URLs, or a note in their place for a model that
-    /// cannot see them; earlier answers with what the model thought, empty ones left out; the
-    /// reasoning effort unless it is the model's default; and the prompt's progress and the usage
-    /// asked for.
+    /// The request for `messages`: the prompt, streamed, with its progress and the usage asked for.
     static func body(_ messages: [ChatMessage], effort: String, images: Bool) throws -> Data {
+        var body = prompt(messages, effort: effort, images: images)
+        body["stream"] = true
+        body["stream_options"] = ["include_usage": true]
+        body["return_progress"] = true
+        return try JSONSerialization.data(withJSONObject: body)
+    }
+
+    /// The prompt of `messages`: images as data URLs, or a note in their place for a model that
+    /// cannot see them; earlier answers with what the model thought, empty ones left out; and the
+    /// reasoning effort unless it is the model's default.
+    private static func prompt(_ messages: [ChatMessage], effort: String, images: Bool) -> [String: Any] {
         let wire: [[String: Any]] = messages.compactMap { message in
             switch message.role {
             case .user where !message.images.isEmpty && images:
@@ -296,10 +360,9 @@ enum ChatClient {
                 return ["role": "assistant", "content": message.text, "reasoning_content": message.reasoning]
             }
         }
-        var body: [String: Any] = ["messages": wire, "stream": true, "stream_options": ["include_usage": true],
-                                   "return_progress": true]
+        var body: [String: Any] = ["messages": wire]
         if !effort.isEmpty { body["reasoning_effort"] = effort }
-        return try JSONSerialization.data(withJSONObject: body)
+        return body
     }
 
     /// The event a line of the event stream carries, nil for a line that carries none (a

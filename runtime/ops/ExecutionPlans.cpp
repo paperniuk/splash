@@ -8,7 +8,6 @@ namespace {
 
 constexpr uint32_t kMaximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
 constexpr uint32_t kDecodeRows = SPLASH_TARGET_VERIFY_ROWS;
-static_assert(kMaximumLanes == 4);
 
 template <typename Workspace, size_t N>
 void include(Workspace &bound, const Workspace &required,
@@ -24,9 +23,8 @@ void include(Workspace &bound, const Workspace &required,
 } // namespace
 
 ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device)
-    : linear_(device), family_(gpuFamilyClass(device.appleGpuFamily)),
-      gpuCores_(plannedGpuCores(device)),
-      attentionTile_(family_ == GpuFamilyClass::Apple7 ? AttentionTile::Register : AttentionTile::Mpp) {}
+    : linear_(device),
+      attentionTile_(linear_.calibration().simdgroupMma ? AttentionTile::Register : AttentionTile::Mpp) {}
 
 bool ExecutionPlans::hyperNormStaged(uint32_t rows) const noexcept {
   // Apple7/8 only, and only while the rows' threadgroups have the cores to
@@ -35,12 +33,15 @@ bool ExecutionPlans::hyperNormStaged(uint32_t rows) const noexcept {
   // on an M2 Max (38 cores), quarters -> staged ms: 16 rows 2.73 -> 2.10,
   // 32 rows 2.80 -> 2.27, 33 rows 2.82 -> 2.24, 34 rows 2.80 -> 3.01, 64 rows
   // 2.90 -> 3.13. Three quarters of the cores keeps a margin below that edge.
-  return family_ == GpuFamilyClass::Apple7 && rows * 4 <= gpuCores_ * 3;
+  return calibration().simdgroupMma && rows * 4 <= calibration().cores * 3;
 }
 
 PrefillAttentionPlan ExecutionPlans::prefillAttention(
-    uint32_t rows, uint32_t queryHeads, kv::Layout layout, AttentionVariant variant) const {
-  return PagedAttention::prefillPlan(rows, queryHeads, layout, variant, attentionTile_, gpuCores_);
+    uint32_t rows, uint32_t historyTokens, uint32_t queryHeads, kv::Layout layout,
+    AttentionVariant variant) const {
+  return PagedAttention::prefillPlan(rows, historyTokens, queryHeads, layout,
+                                     calibration().attention.prefillPagesPerSplit, variant, attentionTile_,
+                                     calibration().cores);
 }
 
 VerifyAttentionPlan ExecutionPlans::verifyAttention(
@@ -54,30 +55,21 @@ DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,
   return DraftAttention::plan(shape, lanes);
 }
 
-// The expert tiles and their rows, and the router's tile.
-MoeConfig ExecutionPlans::moeConfig(MoeShape shape, uint32_t rows, MoePhase phase) const {
-  MoeConfig config;
-  config.ggufTile = moeGgufTile(family_, gpuCores_, shape);
-  config.expertTile =
-      phase == MoePhase::Prefill ? moeGgufPrefillTile(shape, rows, config.ggufTile) : MoeExpertTile::M8;
-  config.ggufRouterTile = linear_.ggufFloatTile(rows, shape.experts, shape.routerFormat);
-  return config;
+MoePlan ExecutionPlans::moePrefill(MoeShape shape, const MoeFormats &formats, uint32_t rows) const {
+  return MoE::prefillPlan(shape, rows, selectMoe(calibration(), shape, formats, rows, MoePhase::Prefill));
 }
 
-MoePlan ExecutionPlans::moePrefill(MoeShape shape, uint32_t rows) const {
-  return MoE::prefillPlan(shape, rows, moeConfig(shape, rows, MoePhase::Prefill));
-}
-
-MoePlan ExecutionPlans::moeDecode(MoeShape shape, uint32_t lanes) const {
+MoePlan ExecutionPlans::moeDecode(MoeShape shape, const MoeFormats &formats, uint32_t lanes) const {
   // Validate before multiplying an untrusted width into the plan's rows.
   if (!lanes || lanes > kMaximumLanes)
     throw std::invalid_argument("invalid MoE decode width");
-  return MoE::decodePlan(shape, lanes, moeConfig(shape, lanes * kDecodeRows, MoePhase::Decode));
+  return MoE::decodePlan(shape, lanes,
+                         selectMoe(calibration(), shape, formats, lanes * kDecodeRows, MoePhase::Decode));
 }
 
 AttentionWorkspace ExecutionPlans::prefillAttentionWorkspace(
     uint32_t maximumRows, uint32_t queryHeads, kv::Layout layout) const {
-  return PagedAttention::prefillWorkspace(maximumRows, queryHeads, layout, attentionTile_, gpuCores_);
+  return PagedAttention::prefillWorkspace(maximumRows, queryHeads, layout);
 }
 
 // The verify bound is linear in the lanes: one lane's is every width's share.
@@ -93,20 +85,20 @@ DraftAttentionWorkspace ExecutionPlans::draftAttentionWorkspacePerLane(
   return DraftAttention::plan(shape, 1).workspace();
 }
 
-MoeWorkspace ExecutionPlans::moePrefillWorkspace(MoeShape shape,
-                                               uint32_t maximumRows) const {
+MoeWorkspace ExecutionPlans::moePrefillWorkspace(MoeShape shape, const MoeFormats &formats,
+                                                 uint32_t maximumRows) const {
   // Validate the bound before iterating; every row is included even if a
   // future grouped layout's largest field is not monotone in row count.
-  auto bound = moePrefill(shape, maximumRows).workspace();
+  auto bound = moePrefill(shape, formats, maximumRows).workspace();
   for (uint32_t rows = 1; rows <= maximumRows; ++rows)
-    include(bound, moePrefill(shape, rows).workspace(), kMoeWorkspaceFields);
+    include(bound, moePrefill(shape, formats, rows).workspace(), kMoeWorkspaceFields);
   return bound;
 }
 
-MoeWorkspace ExecutionPlans::moeDecodeWorkspacePerLane(MoeShape shape) const {
+MoeWorkspace ExecutionPlans::moeDecodeWorkspacePerLane(MoeShape shape, const MoeFormats &formats) const {
   MoeWorkspace bound;
   for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes)
-    include(bound, moeDecode(shape, lanes).workspace(), kMoeWorkspaceFields, lanes);
+    include(bound, moeDecode(shape, formats, lanes).workspace(), kMoeWorkspaceFields, lanes);
   return bound;
 }
 

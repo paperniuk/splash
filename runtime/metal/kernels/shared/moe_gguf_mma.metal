@@ -11,18 +11,18 @@ using namespace gguf_mma;
 
 template <ushort Rows, GgufEpilogue Ep, uint Shared>
 kernel void moe_expert_gguf_mma(device bfloat *input [[buffer(0)]], device const MoeTileDescriptor *tiles [[buffer(1)]],
-                                device const uint *tile_count [[buffer(2)]], device uchar *w0 [[buffer(3)]],
-                                device uchar *w1 [[buffer(4)]], device uchar *meta [[buffer(5)]], device uchar *sw0 [[buffer(6)]],
-                                device uchar *sw1 [[buffer(7)]], device uchar *smeta [[buffer(8)]],
-                                device bfloat *output [[buffer(9)]], device bfloat *aux [[buffer(10)]],
-                                device const uint *slots [[buffer(11)]], constant MoeGgufExpertParams &p [[buffer(12)]],
+                                device const uint *tile_count [[buffer(2)]], device uchar *sw0 [[buffer(3)]],
+                                device uchar *sw1 [[buffer(4)]], device uchar *smeta [[buffer(5)]],
+                                device bfloat *output [[buffer(6)]], device bfloat *aux [[buffer(7)]],
+                                device const uint *slots [[buffer(8)]], constant MoeGgufExpertParams &p [[buffer(9)]],
+                                constant ulong *chunks [[buffer(10)]],
                                 uint2 group [[threadgroup_position_in_grid]],
                                 uint simd_lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]) {
   threadgroup half stage[GGUF_TILE_COLUMNS * kStride];
   threadgroup half2 tl[kQuantPairTableEntries];
   if (group.y >= *tile_count) return;
   const MoeTileDescriptor tile = tiles[group.y];
-  const MoeGgufSegment s = moe_gguf_segment<Shared>(tile.expert, p, slots, w0, w1, meta, sw0, sw1, smeta);
+  const MoeGgufSegment s = moe_gguf_segment<Shared>(tile.expert, p, slots, chunks, sw0, sw1, smeta);
   device bfloat *x = input + ulong(group.y) * Rows * p.input_size;
   const ulong out = ulong(group.y) * Rows * p.output_size;
   const uint origin = group.x * GGUF_TILE_COLUMNS + simd_group * kColumns, thread_index = simd_group * 32 + simd_lane;
@@ -73,15 +73,13 @@ kernel void moe_expert_gguf_mma(device bfloat *input [[buffer(0)]], device const
 template <ushort Rows, ushort Tables, uint Shared>
 kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
                                         device const MoeTileDescriptor *tiles [[buffer(1)]],
-                                        device const uint *tile_count [[buffer(2)]], device uchar *gw0 [[buffer(3)]],
-                                        device uchar *gw1 [[buffer(4)]], device uchar *gmeta [[buffer(5)]],
-                                        device uchar *gsw0 [[buffer(6)]], device uchar *gsw1 [[buffer(7)]],
-                                        device uchar *gsmeta [[buffer(8)]], device uchar *uw0 [[buffer(9)]],
-                                        device uchar *uw1 [[buffer(10)]], device uchar *umeta [[buffer(11)]],
-                                        device uchar *usw0 [[buffer(12)]], device uchar *usw1 [[buffer(13)]],
-                                        device uchar *usmeta [[buffer(14)]], device bfloat *output [[buffer(15)]],
-                                        device const uint *slots [[buffer(16)]],
-                                        constant MoeGgufGateUpParams &p [[buffer(17)]],
+                                        device const uint *tile_count [[buffer(2)]], device uchar *gsw0 [[buffer(3)]],
+                                        device uchar *gsw1 [[buffer(4)]], device uchar *gsmeta [[buffer(5)]],
+                                        device uchar *usw0 [[buffer(6)]], device uchar *usw1 [[buffer(7)]],
+                                        device uchar *usmeta [[buffer(8)]], device bfloat *output [[buffer(9)]],
+                                        device const uint *slots [[buffer(10)]],
+                                        constant MoeGgufGateUpParams &p [[buffer(11)]],
+                                        constant ulong *chunks [[buffer(12)]],
                                         uint2 group [[threadgroup_position_in_grid]],
                                         uint simd_lane [[thread_index_in_simdgroup]],
                                         uint simd_group [[simdgroup_index_in_threadgroup]]) {
@@ -90,11 +88,11 @@ kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
   if (group.y >= *tile_count) return;
   const MoeTileDescriptor tile = tiles[group.y];
   const MoeGgufSegment gs = moe_gguf_segment<Shared>(tile.expert, p.experts, p.input_size, p.output_size,
-                                                     p.gate_routed_format, p.gate_shared_format, slots, gw0, gw1,
-                                                     gmeta, gsw0, gsw1, gsmeta);
+                                                     p.gate_routed_format, p.gate_shared_format, slots, chunks,
+                                                     p.floor_slots, p.chunk_slots, 0, gsw0, gsw1, gsmeta);
   const MoeGgufSegment us = moe_gguf_segment<Shared>(tile.expert, p.experts, p.input_size, p.output_size,
-                                                     p.up_routed_format, p.up_shared_format, slots, uw0, uw1, umeta,
-                                                     usw0, usw1, usmeta);
+                                                     p.up_routed_format, p.up_shared_format, slots, chunks,
+                                                     p.floor_slots, p.chunk_slots, 1, usw0, usw1, usmeta);
   const uint K = p.input_size, N = p.output_size;
   device bfloat *x = input + ulong(group.y) * Rows * K;
   const ulong out = ulong(group.y) * Rows * N;
@@ -165,10 +163,8 @@ kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
 }
 using MoeExpertGgufMmaGateUpKernel = void(device bfloat *, device const MoeTileDescriptor *, device const uint *,
                                           device uchar *, device uchar *, device uchar *, device uchar *,
-                                          device uchar *, device uchar *, device uchar *, device uchar *,
-                                          device uchar *, device uchar *, device uchar *, device uchar *,
-                                          device bfloat *, device const uint *, constant MoeGgufGateUpParams &, uint2,
-                                          uint, uint);
+                                          device uchar *, device uchar *, device bfloat *, device const uint *,
+                                          constant MoeGgufGateUpParams &, constant ulong *, uint2, uint, uint);
 template [[host_name("moe_expert_gguf_mma_m8_gate_up")]] kernel MoeExpertGgufMmaGateUpKernel
     moe_expert_gguf_mma_gate_up<8, 1, 1>;
 template [[host_name("moe_expert_gguf_mma_m8_gate_up_mixed")]] kernel MoeExpertGgufMmaGateUpKernel
@@ -178,9 +174,8 @@ template [[host_name("moe_expert_gguf_mma_m8_gate_up_s2")]] kernel MoeExpertGguf
 template [[host_name("moe_expert_gguf_mma_m8_gate_up_mixed_s2")]] kernel MoeExpertGgufMmaGateUpKernel
     moe_expert_gguf_mma_gate_up<8, 2, 2>;
 using MoeExpertGgufMmaKernel = void(device bfloat *, device const MoeTileDescriptor *, device const uint *, device uchar *,
-                                    device uchar *, device uchar *, device uchar *, device uchar *, device uchar *,
-                                    device bfloat *, device bfloat *, device const uint *, constant MoeGgufExpertParams &,
-                                    uint2, uint, uint);
+                                    device uchar *, device uchar *, device bfloat *, device bfloat *, device const uint *,
+                                    constant MoeGgufExpertParams &, constant ulong *, uint2, uint, uint);
 template [[host_name("moe_expert_gguf_mma_m8_a")]] kernel MoeExpertGgufMmaKernel moe_expert_gguf_mma<8, EpNone, 1>;
 template [[host_name("moe_expert_gguf_mma_m8_g")]] kernel MoeExpertGgufMmaKernel moe_expert_gguf_mma<8, EpUpWithGate, 1>;
 template [[host_name("moe_expert_gguf_mma_m32_a")]] kernel MoeExpertGgufMmaKernel moe_expert_gguf_mma<32, EpNone, 1>;
