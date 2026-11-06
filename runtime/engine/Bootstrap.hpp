@@ -122,7 +122,9 @@ struct RuntimeBootstrapConfig {
     // A relaunch serves its context (RuntimeResourcesConfig::relaunchContext)
     // as far as the memory plan holds it. Otherwise a zero engine maxContext
     // is what the plan holds, as serve's default, and another one larger
-    // than the plan holds fails the bootstrap.
+    // than the plan holds fails the bootstrap. A zero engine
+    // contendedPrefillRows is the default floor of this Mac's GPU family
+    // (defaultContendedFloorRows); another one runs as given.
     NativeLoopConfig nativeLoop;
 };
 

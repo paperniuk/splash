@@ -5,9 +5,9 @@
 > This is a community port, not an official Inco release.
 >
 > - **M1/M2:** prebuilt releases on [the releases page](https://github.com/paperniuk/splash/releases);
->   source in branch [`apple7-m1-1.5`](https://github.com/paperniuk/splash/tree/apple7-m1-1.5)
->   (upstream 1.5.0 plus the M1/M2 commits).
-> - **On M1/M2 this build runs** the models upstream 1.5.0 loads (GGUF, including Prism ML's Ternary
+>   source in branch [`apple7-m1-1.6`](https://github.com/paperniuk/splash/tree/apple7-m1-1.6)
+>   (upstream 1.6.0 plus the M1/M2 commits).
+> - **On M1/M2 this build runs** the models upstream 1.6.0 loads (GGUF, including Prism ML's Ternary
 >   Bonsai `PQ2_0` and Qwen3.8-Flash-Next, and MLX checkpoints) on its own kernels, the vision
 >   encoder included. Flash-Next `Q2_0` runs on a 64 GB Mac, about 77 tok/s on an M1 Max.
 >   Models you already downloaded run from their folder with `--model-dir`.
@@ -17,7 +17,7 @@
 >   and prose prompts; chat prose is slower than code because fewer draft tokens hit.
 > - **Contributors:** [@ghisguth](https://github.com/ghisguth) tested the port on
 >   an M2 Max and contributed GGUF and MLX decode speedups; [@sady4850](https://github.com/sady4850)
->   contributed the faster long-context attention; [@abssoul](https://github.com/abssoul),
+>   contributed the faster long-context attention and Neural Engine prefill from 128 rows; [@abssoul](https://github.com/abssoul),
 >   [@airiclenz](https://github.com/airiclenz) and [@UtmostMaker](https://github.com/UtmostMaker) contributed
 >   MoE, scheduler and upstream 1.4.1 work.
 > - **M3 and newer:** use official Splash, `brew install incoai/tap/splash`.
