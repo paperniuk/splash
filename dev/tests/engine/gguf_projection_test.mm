@@ -765,11 +765,12 @@ void prefill(MetalBackend &backend, const Linear &linear, uint32_t K, const std:
         checkValues(out, dots, {}, chunkAux, chunk, rows, covered, true, name);
         if (splits == 1 && !sameRows(out.output, 0, tileOutput, 0, rows, columns))
           fail(name + ": differs from the 128-row tiles");
-        // A fused chunk runs its segments in one dispatch, each segment's columns bitwise its own chunk's at the
-        // same split.
+        // A fused chunk runs its segments in one dispatch (on Apple7/8's MMA tiles one per segment, issue #51), each
+        // segment's columns bitwise its own chunk's at the same split.
         if (parts.size() > 1) {
-          if (out.dispatches != 1)
-            fail(name + ": ran " + std::to_string(out.dispatches) + " dispatches, not one");
+          const size_t expected = linear.calibration().simdgroupMma ? parts.size() : 1;
+          if (out.dispatches != expected)
+            fail(name + ": ran " + std::to_string(out.dispatches) + " dispatches, not " + std::to_string(expected));
           uint32_t offset = 0;
           for (const Tensor *t : parts) {
             const LinearWorkload alone{{t->N, K}, rows, LinearPhase::Prefill, epilogue};
