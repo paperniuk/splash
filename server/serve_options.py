@@ -896,6 +896,7 @@ SERVE_OPTIONS = (
             "instead of the one calibration finds (default: calibrated; 0 "
             "prefills on the GPU alone, as --disable-ane does whatever this says)",
         ),
+        needs="dense_ffn",
     ),
     ServeOption(
         "--ane-ffn-minimum-rows",
@@ -907,6 +908,7 @@ SERVE_OPTIONS = (
             help="the least rows of a prefill chunk that splits at "
             "--ane-ffn-share (default: 256)",
         ),
+        needs="dense_ffn",
     ),
     ServeOption(
         "--verify-rows",
