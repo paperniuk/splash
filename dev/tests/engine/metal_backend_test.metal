@@ -20,6 +20,18 @@ kernel void test_add_u32(device uint *values [[buffer(0)]],
     }
 }
 
+// Adds 100 x constant 0 + constant 1 to each value: the specialized pipelines
+// of one function (specializedPipelineName).
+constant uint kTestHundreds [[function_constant(0)]];
+constant uint kTestOnes [[function_constant(1)]];
+kernel void test_add_constants_u32(device uint *values [[buffer(0)]],
+                                   constant uint &count [[buffer(1)]],
+                                   uint gid [[thread_position_in_grid]]) {
+    if (gid < count) {
+        values[gid] += 100 * kTestHundreds + kTestOnes;
+    }
+}
+
 // Row r of the grid writes word x of the buffer at table[r], which no
 // dispatch binds; addressed_check_u32 reads it back the same way.
 kernel void addressed_write_u32(device const ulong *table [[buffer(0)]],

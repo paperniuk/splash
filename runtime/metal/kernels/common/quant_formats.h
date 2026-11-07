@@ -603,6 +603,16 @@ inline void quant_register_format_switch(uint format, Body body) {
   }
 }
 #undef QUANT_FORMAT_CASE
+// quant_format_switch for a `format` among the three of `among`. With `among` function constants, a pipeline holds
+// only their paths, where quant_format_switch's holds every format's: the fused 32-row MMA decode kernel took 161 s
+// to compile with every format's path on an M2 Pro, 0.26 s with one format's and 1.1 s with three.
+template <class Body>
+inline void quant_format_switch_among(uint format, uint3 among, Body body) {
+  quant_format_switch(format, [&](auto f) {
+    typedef decltype(f) F;
+    if (F::Id == among.x || F::Id == among.y || F::Id == among.z) body(f);
+  });
+}
 
 // QUANT_FORMATS lists every format, by its kQuantFormats name, and so does the switch above; QUANT_REGISTER_FORMATS
 // lists exactly those of quant_register_format.

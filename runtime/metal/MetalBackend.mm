@@ -17,6 +17,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -1215,13 +1216,52 @@ struct MetalBackend::Impl {
         return result;
     }
 
-    id<MTLComputePipelineState> newPipeline(id<MTLLibrary> source, std::string_view name) {
-        NSString *key = checkedNSString(name, "pipeline name");
+    // The function pipeline `name` runs: a library function, specialized with
+    // the uint function constants its name lists after a ':'
+    // (specializedPipelineName), which must be all of the function's, as
+    // Metal runs a function with a constant left unset.
+    static id<MTLFunction> pipelineFunction(id<MTLLibrary> source, std::string_view name) {
+        const size_t separator = name.find(':');
+        NSString *key = checkedNSString(name.substr(0, separator), "pipeline name");
         id<MTLFunction> function = [source newFunctionWithName:key];
-        if (!function) {
-            throw MetalBackendError(
-                "missing Metal function: " + std::string(name));
+        if (!function)
+            throw MetalBackendError("missing Metal function: " + std::string(name));
+        if (separator == std::string_view::npos)
+            return function;
+        MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
+        std::string_view constants = name.substr(separator + 1);
+        NSUInteger listed = 0;
+        for (NSUInteger index = 0;; ++index) {
+            const size_t comma = constants.find(',');
+            const std::string_view field = constants.substr(0, comma);
+            uint32_t value = 0;
+            const auto [end, failure] = std::from_chars(field.data(), field.data() + field.size(), value);
+            if (failure != std::errc() || end != field.data() + field.size())
+                throw MetalBackendError("malformed function constants in pipeline " + std::string(name));
+            [values setConstantValue:&value type:MTLDataTypeUInt atIndex:index];
+            listed = index + 1;
+            if (comma == std::string_view::npos)
+                break;
+            constants.remove_prefix(comma + 1);
         }
+        NSDictionary<NSString *, MTLFunctionConstant *> *declared = function.functionConstantsDictionary;
+        bool covered = declared.count == listed;
+        for (MTLFunctionConstant *constant in declared.allValues)
+            covered = covered && constant.index < listed && constant.type == MTLDataTypeUInt;
+        if (!covered)
+            throw MetalBackendError("pipeline " + std::string(name) + " sets " + std::to_string(listed) +
+                                    " uint function constants of the function's " +
+                                    std::to_string(declared.count));
+        NSError *error = nil;
+        id<MTLFunction> specialized = [source newFunctionWithName:key constantValues:values error:&error];
+        if (!specialized)
+            throw MetalBackendError("unable to specialize Metal function " + std::string(name) + ": " +
+                                    errorDescription(error));
+        return specialized;
+    }
+
+    id<MTLComputePipelineState> newPipeline(id<MTLLibrary> source, std::string_view name) {
+        id<MTLFunction> function = pipelineFunction(source, name);
         NSError *error = nil;
         id<MTLComputePipelineState> result =
             [device newComputePipelineStateWithFunction:function error:&error];

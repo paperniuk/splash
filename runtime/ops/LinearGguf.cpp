@@ -84,10 +84,12 @@ GgufDecodeFusedParams fusedSegments(const LinearPlan &plan, std::span<const Quan
   GgufDecodeFusedParams params{w.matrix.inputSize, config.splits, w.matrix.outputSize,
                                {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, config.spread};
   for (size_t i = 0; i < kFusedSegments; ++i) {
+    // Slots past the last segment take its planes and format, which no tile
+    // reads, so they add no format to a specialized pipeline.
     const QuantizedSegment &s = *order[std::min(i, order.size() - 1)];
+    params.fmt[i] = s.formatId;
     if (i < order.size()) {
       params.cols[i] = s.outputSize;
-      params.fmt[i] = s.formatId;
       params.offset[i] = s.columnOffset;
     }
     bindings.insert(bindings.end(), {s.plane0, s.plane1Slot(), s.meta});
@@ -275,8 +277,13 @@ void Linear::addGgufStaged(metal::CommandGraph &graph, const LinearBuffers &b,
     std::vector<metal::MetalBuffer> bindings{b.input};
     const GgufDecodeFusedParams params = fusedSegments(plan, order, bindings);
     bindings.insert(bindings.end(), {b.output, partials, counters});
-    graph.add(std::string(mma() ? "gguf_decode_mma_fused_m" : "gguf_decode_fused_m") + std::to_string(rows),
-              std::move(bindings), params,
+    // The MMA kernel compiles only its segments' formats (function constants
+    // 0-2): with every format's path its 32-row pipeline took 161 s to build
+    // on an M2 Pro, on the thread that first submits it.
+    std::string kernel =
+        mma() ? metal::specializedPipelineName("gguf_decode_mma_fused_m" + std::to_string(rows), params.fmt)
+              : "gguf_decode_fused_m" + std::to_string(rows);
+    graph.add(std::move(kernel), std::move(bindings), params,
               {segmentColumns(p) / GGUF_TILE_COLUMNS, splits, 1}, {GGUF_STAGED_THREADS, 1, 1});
   };
   if (w.phase == LinearPhase::Prefill) {

@@ -53,7 +53,12 @@ QUANT_FORMATS(GGUF_DECODE_MMA_FORMAT)
 #undef GGUF_DECODE_MMA_ROWS
 #undef GGUF_DECODE_MMA
 
-// Fused projections: up to three column segments of any formats in one dispatch, as gguf_decode_fused_m*.
+// Fused projections: up to three column segments of any formats in one dispatch, as gguf_decode_fused_m*. The
+// segments' formats are function constants (ops::Linear names the pipeline with specializedPipelineName), so a
+// pipeline compiles only their paths; a slot past the last segment repeats its format.
+constant uint kFusedFormat0 [[function_constant(0)]];
+constant uint kFusedFormat1 [[function_constant(1)]];
+constant uint kFusedFormat2 [[function_constant(2)]];
 #define GGUF_SEGMENT(i, w0, w1, m) device uchar *w0 [[buffer(i)]], device uchar *w1 [[buffer(i + 1)]], device uchar *m [[buffer(i + 2)]]
 #define GGUF_DECODE_MMA_FUSED(R)                                                                                   \
   kernel void gguf_decode_mma_fused_m##R(device bfloat *input [[buffer(0)]], GGUF_SEGMENT(1, w0a, w1a, ma),      \
@@ -77,8 +82,10 @@ QUANT_FORMATS(GGUF_DECODE_MMA_FORMAT)
     const uint thread_index = simd_group * 32 + simd_lane;                                                        \
     float2 acc[FN][R / 8];                                                                                        \
     zero(acc);                                                                                                    \
-    accumulate_any<R / 8>(p.fmt[s], input, w0, w1, meta, p.input_size, origin, stage + simd_group * kSimdgroupStage, \
-                          tl, thread_index, GGUF_STAGED_THREADS, simd_lane, group.y * per, (group.y + 1) * per, acc); \
+    const uint3 formats(kFusedFormat0, kFusedFormat1, kFusedFormat2);                                             \
+    accumulate_any<R / 8>(formats[s], formats, input, w0, w1, meta, p.input_size, origin,                         \
+                          stage + simd_group * kSimdgroupStage, tl, thread_index, GGUF_STAGED_THREADS, simd_lane,  \
+                          group.y * per, (group.y + 1) * per, acc);                                               \
     store_sums<R>(acc, sgmatrix::lane_map(simd_lane), p.splits, group.y, partials,                                \
                   counters + p.offset[s] / GGUF_TILE_COLUMNS + local, p.out_stride, column0, thread_index, &arrival, \
                   [&](uint row, uint column, float v) { output[ulong(row) * p.out_stride + column0 + column] = bfloat(v); }); \
