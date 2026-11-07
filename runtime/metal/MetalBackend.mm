@@ -1210,9 +1210,40 @@ struct MetalBackend::Impl {
         }
         if (const auto cached = pipelines.find(name); cached != pipelines.end())
             return cached->second;
-        id<MTLComputePipelineState> result = newPipeline(library, name);
+        id<MTLComputePipelineState> result = timedNewPipeline(library, name);
         pipelines.emplace(name, result);
         sampleDeviceMemory();
+        return result;
+    }
+
+    // A pipeline's compile runs on the thread that first needs it and can
+    // take minutes, so one that outlasts kSlowPipelineSeconds is named while
+    // it still runs, and again with its time once it is done. Only a cache
+    // miss pays for the check.
+    static constexpr double kSlowPipelineSeconds = 5.0;
+
+    id<MTLComputePipelineState> timedNewPipeline(id<MTLLibrary> source,
+                                                 std::string_view name) {
+        auto done = std::make_shared<std::atomic<bool>>(false);
+        const auto start = AwakeClock::now();
+        std::string label(name);
+        dispatch_after(
+            dispatch_time(DISPATCH_TIME_NOW,
+                          static_cast<int64_t>(kSlowPipelineSeconds * NSEC_PER_SEC)),
+            dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                if (!done->load(std::memory_order_acquire))
+                    logLine("metal: compiling pipeline ", label, " for over ",
+                            kSlowPipelineSeconds, " s");
+            });
+        struct Finish {
+            std::atomic<bool> &done;
+            ~Finish() { done.store(true, std::memory_order_release); }
+        } finish{*done};
+        id<MTLComputePipelineState> result = newPipeline(source, name);
+        const double seconds = std::chrono::duration<double>(
+            AwakeClock::now() - start).count();
+        if (seconds >= kSlowPipelineSeconds)
+            logLine("metal: compiled pipeline ", name, " in ", seconds, " s");
         return result;
     }
 
