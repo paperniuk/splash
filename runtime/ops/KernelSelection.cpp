@@ -189,10 +189,13 @@ LinearConfig selectProjection(const KernelCalibration &calibration, LinearWorklo
   // every format, a gate/up pair of one GGUF format as one dispatch of both
   // tensors' K partitions, the last to arrive applying the gate: the 27B pair
   // takes 4-8% less time than as a gate pass and an up pass on an M2 Max.
+  // MLX affine formats (af4g64) take it at one and two lanes only: at three
+  // and four 17408x5120 takes 2-4% more, and at one a 32-core M1 Max decodes
+  // 1.2% more cycles a second.
   if (calibration.simdgroupMma && unit.registerTakes)
     return {.tile = LinearTile::GgufRegister,
             .splits = splitsFor(p.registerSplits, n, k, w.rows, unit.weightBits16, cores).splits,
-            .oneGateUpPass = gateUp && unit.oneFormat && !unit.affine,
+            .oneGateUpPass = gateUp && unit.oneFormat && (!unit.affine || lanes <= 2),
             .fp32Table = true};
   if (unit.registerTakes &&
       registers(p.decodeRegister, unit.formatClass, lanes, (onePass ? 2 : 1) * uint64_t{n / GGUF_TILE_COLUMNS},
