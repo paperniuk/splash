@@ -127,6 +127,8 @@ void LinearPlan::requireConfiguration() const {
     throw std::invalid_argument("only a staged or F32 register block gate/up decode runs gate and up in one pass");
   if (c.sixteenRows && (c.tile != LinearTile::GgufStaged || !decode || workload_.rows != SPLASH_TARGET_VERIFY_ROWS))
     throw std::invalid_argument("only a staged one-lane block decode runs the 16-row tile");
+  if (c.twentyFourRows && (c.tile != LinearTile::GgufStaged || decode || workload_.rows <= 16 || workload_.rows > 24))
+    throw std::invalid_argument("only a staged block prefill chunk of 17 to 24 rows runs the 24-row tile");
   if (c.tile == LinearTile::GgufRegister) {
     // Split boundaries fall on coefficient units, of 64 inputs at the fewest
     // (quant_register_unit); addGgufRegister checks each segment's.
@@ -150,7 +152,7 @@ uint32_t LinearPlan::storageRows() const noexcept {
   if (config_.tile == LinearTile::GgufRegister) return workload_.rows;
   if (config_.tile == LinearTile::GgufPrefill)
     return (workload_.rows + GGUF_PREFILL_ROWS - 1) / GGUF_PREFILL_ROWS * GGUF_PREFILL_ROWS;
-  return config_.sixteenRows ? 16 : stagedTileRows(workload_.rows);
+  return config_.sixteenRows ? 16 : config_.twentyFourRows ? 24 : stagedTileRows(workload_.rows);
 }
 
 LinearScratchSize LinearPlan::scratchSize() const noexcept {

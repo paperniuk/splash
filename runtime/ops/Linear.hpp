@@ -126,6 +126,9 @@ struct LinearConfig final {
   // (LinearPlan::storageRows), whose padding lane's rows it computes and
   // discards, instead of the 8-row tile.
   bool sixteenRows = false;
+  // GgufStaged prefill chunk of 17 to 24 rows on Apple7/8: the 24-row MMA
+  // tile, three matrix operations a step where the 32-row tile runs four.
+  bool twentyFourRows = false;
   [[nodiscard]] constexpr bool validSplits() const noexcept {
     return splits && splits <= kMaximumSplits && !(splits & (splits - 1));
   }

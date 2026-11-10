@@ -425,12 +425,14 @@ bool sameRows(const std::vector<uint16_t> &a, uint64_t aRow, const std::vector<u
 
 // The configuration of `tile` for a decode workload, or of the staged tile for a prefill chunk of up to 64 rows; the
 // staged tile walks K spread or in lockstep.
-// Apple7/8's register tile reads an fp32 table (LinearConfig::fp32Table); main sets it from the device.
+// Apple7/8's register tile reads an fp32 table (LinearConfig::fp32Table) and its staged tile holds a prefill chunk of
+// 17 to 24 rows in 24 (LinearConfig::twentyFourRows); main sets it from the device.
 bool fp32RegisterTable = false;
 LinearConfig config(LinearTile tile, const LinearWorkload &w, uint32_t splits, bool spread = false) {
   const LinearTile t = w.phase == LinearPhase::Prefill ? LinearTile::GgufStaged : tile;
   return {.tile = t, .splits = splits, .spread = spread,
-          .fp32Table = fp32RegisterTable && t == LinearTile::GgufRegister};
+          .fp32Table = fp32RegisterTable && t == LinearTile::GgufRegister,
+          .twentyFourRows = fp32RegisterTable && w.phase == LinearPhase::Prefill && w.rows > 16 && w.rows <= 24};
 }
 // The formats whose weights `tile` takes, in id order: the register tile takes those of quant_register_format.
 std::vector<Fmt> tileFormats(LinearTile tile) {

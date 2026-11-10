@@ -179,9 +179,14 @@ LinearConfig selectProjection(const KernelCalibration &calibration, LinearWorklo
   const auto [n, k] = w.matrix;
   const ProjectionCalibration &p = calibration.projection;
   const uint32_t cores = calibration.cores;
-  if (w.phase == LinearPhase::Prefill)
-    return w.rows <= p.stagedPrefillRows ? staged(p, n, k, w.rows, unit.weightBits16, cores, Passes::Two)
-                                         : LinearConfig{.tile = LinearTile::GgufPrefill};
+  if (w.phase == LinearPhase::Prefill) {
+    if (w.rows > p.stagedPrefillRows) return LinearConfig{.tile = LinearTile::GgufPrefill};
+    LinearConfig config = staged(p, n, k, w.rows, unit.weightBits16, cores, Passes::Two);
+    // Apple7/8's MMA tile also holds 24 rows: a chunk of 17 to 24 took the
+    // 32-row tile's time, 330 ms against 260 on a 32-core M1 Max (27B).
+    config.twentyFourRows = calibration.simdgroupMma && w.rows > 16 && w.rows <= 24;
+    return config;
+  }
   const uint32_t lanes = w.rows / SPLASH_TARGET_VERIFY_ROWS;
   const bool gateUp = w.epilogue == LinearEpilogue::GateUp,
              onePass = gateUp && unit.oneFormat && cores >= p.onePassFromCores;

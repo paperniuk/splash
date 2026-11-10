@@ -1,7 +1,7 @@
 // GGUF quantized GEMMs for Apple7/8 (M1/M2) on simdgroup MMAs (kernels/common/gguf_mma_tile.h): the bindings,
 // grids and outputs of the staged kernels of gguf_linear.metal, which run MPP matmul2d there. Decode tiles hold 8, 16
-// or 32 rows in two simdgroups of 32 columns, each over its own stage; prefill chunks of more than 32 rows run 64-row
-// tiles of four simdgroups over a shared stage.
+// or 32 rows (and 24, for prefill chunks of 17 to 24 rows) in two simdgroups of 32 columns, each over its own stage;
+// prefill chunks of more than 32 rows run 64-row tiles of four simdgroups over a shared stage.
 #pragma clang fp reassociate(off)
 #include "metal/kernels/common/gguf_mma_tile.h"
 
@@ -43,8 +43,9 @@ using GgufDecodeMmaKernel = void(device bfloat *, device uchar *, device uchar *
 #define GGUF_DECODE_MMA(F, f, R, ep, Ep, Out)                                                                    \
   template [[host_name("gguf_decode_mma_" #f "_m" #R "_" #ep)]] kernel GgufDecodeMmaKernel<Out>                 \
       gguf_decode_mma<F, R, Ep, Out>;
-#define GGUF_DECODE_MMA_ROWS(F, f, ep, Ep, Out) \
-  GGUF_DECODE_MMA(F, f, 8, ep, Ep, Out) GGUF_DECODE_MMA(F, f, 16, ep, Ep, Out) GGUF_DECODE_MMA(F, f, 32, ep, Ep, Out)
+#define GGUF_DECODE_MMA_ROWS(F, f, ep, Ep, Out)                                                                   \
+  GGUF_DECODE_MMA(F, f, 8, ep, Ep, Out) GGUF_DECODE_MMA(F, f, 16, ep, Ep, Out) GGUF_DECODE_MMA(F, f, 24, ep, Ep, Out) \
+  GGUF_DECODE_MMA(F, f, 32, ep, Ep, Out)
 #define GGUF_DECODE_MMA_FORMAT(F, f)                                                                           \
   GGUF_DECODE_MMA_ROWS(F, f, a, EpNone, bfloat) GGUF_DECODE_MMA_ROWS(F, f, a_f32, EpNone, float)               \
   GGUF_DECODE_MMA_ROWS(F, f, r, EpResidual, bfloat) GGUF_DECODE_MMA_ROWS(F, f, g, EpUpWithGate, bfloat)
@@ -90,7 +91,7 @@ constant uint kFusedFormat2 [[function_constant(2)]];
                   counters + p.offset[s] / GGUF_TILE_COLUMNS + local, p.out_stride, column0, thread_index, &arrival, \
                   [&](uint row, uint column, float v) { output[ulong(row) * p.out_stride + column0 + column] = bfloat(v); }); \
   }
-GGUF_DECODE_MMA_FUSED(8) GGUF_DECODE_MMA_FUSED(16) GGUF_DECODE_MMA_FUSED(32)
+GGUF_DECODE_MMA_FUSED(8) GGUF_DECODE_MMA_FUSED(16) GGUF_DECODE_MMA_FUSED(24) GGUF_DECODE_MMA_FUSED(32)
 #undef GGUF_DECODE_MMA_FUSED
 #undef GGUF_SEGMENT
 
