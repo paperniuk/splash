@@ -454,8 +454,9 @@ public:
   // wrote, in `kv`, and a sequence whose history holds Index pages reads its
   // K/V through `spilled` (the command's SpilledKvReads, the null one for
   // none). The dense FFN of a command of one chunk the split takes
-  // (AneFfn::splits) runs split with the Neural Engine on `aneFfn`, when
-  // given. Of the command, this runs `layers`, all of them or a pass's:
+  // (AneFfn::splits), or of two it takes as a pair (AneFfn::pairs), runs
+  // split with the Neural Engine on `aneFfn`, when given. Of the command,
+  // this runs `layers`, all of them or a pass's:
   // what the layers before left in the chunks' buffers and the target's
   // prefill scratch the layers after read on, from another command, with no
   // other prefill between. With the last layer, returns each chunk's buffer
@@ -587,7 +588,7 @@ protected:
     std::vector<Step> steps;
     steps.reserve(chunks.size());
     for (const QwenTargetPrefillChunk &chunk : chunks)
-      steps.push_back(Step{prefillStep(graph, chunk, kv, spilled, aneFfn)});
+      steps.push_back(Step{prefillStep(graph, chunk, kv, spilled, aneFfn, chunks.size() > 1)});
     return steps;
   }
   // A prefill's layers `range` over its steps (addPrefill), through a
@@ -729,9 +730,10 @@ protected:
 private:
   void requirePrefill(std::span<const QwenTargetPrefillChunk> chunks, const kv::PageStorage &kv,
                       QwenPrefillLayers layers, const ops::AneFfn *aneFfn) const;
+  // `paired`: the chunk is one of its command's two.
   [[nodiscard]] PrefillStep prefillStep(metal::CommandGraph &graph, const QwenTargetPrefillChunk &chunk,
-                                        const kv::PageStorage &kv, SpilledKvReads &spilled,
-                                        ops::AneFfn *aneFfn) const;
+                                        const kv::PageStorage &kv, SpilledKvReads &spilled, ops::AneFfn *aneFfn,
+                                        bool paired) const;
 };
 
 // The target of a Qwen3.5-architecture family's weights (Qwen3.8-27B,
