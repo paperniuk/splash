@@ -1023,6 +1023,42 @@ GGUF_SG_FUSED(1)
 GGUF_SG_FUSED(2)
 GGUF_SG_FUSED(3)
 GGUF_SG_FUSED(4)
+
+// Apple7/8's fused projections whose segments share one format (the 27B's qkv|z|ab and q|k|v in MLX 4-bit): one
+// dispatch of that format's F32 decode, the threadgroup's tile picking its segment as above. As dispatches of their
+// own the small segments are latency-bound: on a 32-core M1 Max the three of the 27B's 12288 x 5120 projection took
+// 285 us at one lane, one tensor of those columns 176. The format is the kernel's, so it holds one decode, where the
+// run-time-format kernel's F32 instance held every format's (the top of this file).
+#define GGUF_SGF_FUSED_KERNEL(Name, F, L)                                                                         \
+  kernel void Name(device const float *table [[buffer(0)]], device const float *sums [[buffer(1)]],               \
+                   GGUF_SG_SEGMENT(2, w0a, w1a, ma), GGUF_SG_SEGMENT(5, w0b, w1b, mb),                            \
+                   GGUF_SG_SEGMENT(8, w0c, w1c, mc), device bfloat *out [[buffer(11)]],                           \
+                   device coherent(device) float *partials [[buffer(12)]],                                        \
+                   device atomic_uint *counters [[buffer(13)]], constant GgufDecodeFusedParams &p [[buffer(14)]], \
+                   uint2 tg [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],           \
+                   uint sg [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {         \
+    threadgroup gguf_sg::LutPair<F, true> lut[gguf_sg::kLutEntries<F, true>];                                     \
+    threadgroup gguf_sg::Coef<F> coefs[gguf_sg::kCoefs<F, true>];                                                 \
+    threadgroup uint arrival;                                                                                     \
+    gguf_sg::lut_table<F, true>(lut, tid, GGUF_REGISTER_THREADS);                                                 \
+    const uint t0 = p.cols[0] / GGUF_TILE_COLUMNS, t1 = t0 + p.cols[1] / GGUF_TILE_COLUMNS;                       \
+    const uint s = tg.x < t0 ? 0 : tg.x < t1 ? 1 : 2;                                                             \
+    device uchar *w0 = s == 0 ? w0a : s == 1 ? w0b : w0c;                                                         \
+    device uchar *w1 = s == 0 ? w1a : s == 1 ? w1b : w1c;                                                         \
+    device uchar *meta = s == 0 ? ma : s == 1 ? mb : mc;                                                          \
+    const GgufDecodeParams q{p.input_size, p.splits, p.out_stride, p.offset[s], 0};                               \
+    const uint2 local(tg.x - (s == 0 ? 0 : s == 1 ? t0 : t1), tg.y);                                              \
+    gguf_sg::decode<F, L, EpNone, true>(table, sums, w0, w1, meta, out, partials, counters, out, q, local, tid,   \
+                                        sg, lane, lut, coefs, &arrival);                                          \
+  }
+#define GGUF_SGF_FUSED(F, f)                                                                                      \
+  GGUF_SGF_FUSED_KERNEL(gguf_decode_sgf_##f##_l1_fused, gguf_sg::F32Format<F>::type, 1)                           \
+  GGUF_SGF_FUSED_KERNEL(gguf_decode_sgf_##f##_l2_fused, gguf_sg::F32Format<F>::type, 2)                           \
+  GGUF_SGF_FUSED_KERNEL(gguf_decode_sgf_##f##_l3_fused, gguf_sg::F32Format<F>::type, 3)                           \
+  GGUF_SGF_FUSED_KERNEL(gguf_decode_sgf_##f##_l4_fused, gguf_sg::F32Format<F>::type, 4)
+QUANT_REGISTER_FORMATS(GGUF_SGF_FUSED)
+#undef GGUF_SGF_FUSED
+#undef GGUF_SGF_FUSED_KERNEL
 #undef GGUF_SG_FUSED
 #undef GGUF_SG_SEGMENT
 

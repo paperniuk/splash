@@ -438,16 +438,28 @@ void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
               {s.outputSize / GGUF_TILE_COLUMNS, config.splits, 1}, {GGUF_REGISTER_THREADS, 1, 1});
   };
   if (segments.size() > 1) {
-    // Apple7/8 run each segment as a dispatch of its own
-    // (kernels/decode/linear_gguf_sgmatrix.metal), their counters and partials
-    // apart by column.
-    if (mma()) {
-      for (const QuantizedSegment &s : segments) tensor(s, 'a', b.output, b.output);
-      return;
-    }
     std::vector<const QuantizedSegment *> order;
     for (const QuantizedSegment &s : segments) order.push_back(&s);
     std::vector<metal::MetalBuffer> bindings{b.scratch.input, b.scratch.sums};
+    if (mma()) {
+      // Apple7/8 have no run-time-format fused kernel
+      // (kernels/decode/linear_gguf_sgmatrix.metal). Segments of one format
+      // run that format's fused kernel; others as dispatches of their own,
+      // their counters and partials apart by column.
+      const bool oneFormat = segments.size() <= kFusedSegments &&
+                             std::all_of(segments.begin(), segments.end(), [&](const QuantizedSegment &s) {
+                               return s.formatId == segments.front().formatId;
+                             });
+      if (!oneFormat) {
+        for (const QuantizedSegment &s : segments) tensor(s, 'a', b.output, b.output);
+        return;
+      }
+      const GgufDecodeFusedParams params = fusedSegments(plan, order, bindings);
+      bindings.insert(bindings.end(), {b.output, partials, counters});
+      graph.add(prefix + segments.front().name() + suffix + "_fused", std::move(bindings), params, grid,
+                {GGUF_REGISTER_THREADS, 1, 1});
+      return;
+    }
     const GgufDecodeFusedParams params = fusedSegments(plan, order, bindings);
     bindings.insert(bindings.end(), {b.output, partials, counters});
     graph.add("gguf_decode_sg_fused" + suffix, std::move(bindings), params, grid, {GGUF_REGISTER_THREADS, 1, 1});
