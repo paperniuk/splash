@@ -26,10 +26,6 @@ using splash::test::HostKvExtents;
 
 namespace {
 
-// The pages per prefill attention split these plans take: the Apple10 row's
-// (KernelCalibration.hpp).
-constexpr uint32_t kPagesPerSplit = splash::ops::kAttention.prefillPagesPerSplit;
-
 constexpr uint32_t kStride = 32;
 constexpr uint32_t kQueryStride = kStride;
 constexpr uint32_t kRows = kVerifyRows;
@@ -41,7 +37,8 @@ static_assert(kStride == SPLASH_VERIFY_CHUNK_STRIDE);
 // attend through block lists, bound before their parameters, and read
 // token-major values; a group of more than eight runs each tile in parts,
 // each a threadgroup of the split with partial slots of its own
-// (splash_attention_tile_part). The register tile (paged_attention_sgf.h,
+// (splash_attention_tile_part). A dense geometry also runs its INT8-query
+// entries (q8q) on the Mpp tile. The register tile (paged_attention_sgf.h,
 // sparse_attention_sgf.h), which Apple7/8 run, takes the same bindings and
 // grids with 32 threads per eight fused rows of a part.
 struct Shape {
@@ -49,6 +46,7 @@ struct Shape {
   uint32_t queryHeadsPerKvHead;
   splash::kv::Reads reads;
   bool registerTile = false;
+  bool int8Queries = false;
   uint32_t queryHeads() const { return kvHeads * queryHeadsPerKvHead; }
   uint32_t fusedRows() const { return kRows * queryHeadsPerKvHead; }
   bool sparse() const { return reads == splash::kv::Reads::SelectedBlocks; }
@@ -77,20 +75,29 @@ private:
   splash::ops::AttentionTile tile() const {
     return registerTile ? splash::ops::AttentionTile::Register : splash::ops::AttentionTile::Mpp;
   }
+  // The plans' attention row: INT8 queries in every split, or none.
+  splash::ops::AttentionCalibration attention() const {
+    return splash::test::attentionRow(int8Queries ? 1U : splash::ops::kNever);
+  }
   splash::ops::PrefillAttentionPlan prefillPlan() const {
-    return splash::ops::PagedAttention::prefillPlan(kRows, 0, queryHeads(), layout(), kPagesPerSplit, {}, tile());
+    return splash::ops::PagedAttention::prefillPlan(kRows, 0, queryHeads(), layout(), attention(),
+                                                    splash::ops::Int8Activations::On, {}, tile());
   }
   splash::ops::VerifyAttentionPlan verifyPlan() const {
     const std::array<uint32_t, 1> history{0};
-    return splash::ops::PagedAttention::verifyPlan(1, queryHeads(), layout(), history, {}, tile());
+    return splash::ops::PagedAttention::verifyPlan(1, queryHeads(), layout(), history, attention(),
+                                                   splash::ops::Int8Activations::On, {}, tile());
   }
 };
 // Every geometry on both tiles.
 const std::vector<Shape> kShapes = [] {
   std::vector<Shape> shapes;
   for (const bool registerTile : {false, true})
-    for (const splash::test::AttentionGeometry &geometry : splash::test::familyAttentionGeometries())
+    for (const splash::test::AttentionGeometry &geometry : splash::test::familyAttentionGeometries()) {
       shapes.push_back({geometry.kvHeads, geometry.queryHeads / geometry.kvHeads, geometry.reads, registerTile});
+      if (!registerTile && geometry.reads == splash::kv::Reads::EveryPage)
+        shapes.push_back({geometry.kvHeads, geometry.queryHeads / geometry.kvHeads, geometry.reads, false, true});
+    }
   return shapes;
 }();
 
@@ -517,8 +524,9 @@ Pipelines makePipelines(id<MTLDevice> device, id<MTLLibrary> library,
 }
 
 // The split, reduce and every scratch buffer of one production-sized
-// dispatch: partials and statistics exactly cover [lane][KV head][split]
-// (verify) or [tile][KV head][split] (prefill, one tile).
+// dispatch: partials and statistics are the workspace production allocates,
+// which holds [lane][KV head][split] (verify) or [tile][KV head][split]
+// (prefill, one tile) at every split count.
 struct Dispatch {
   std::vector<uint8_t> output;
   std::vector<uint8_t> partials;
@@ -541,11 +549,12 @@ Dispatch dispatch(id<MTLDevice> device, id<MTLCommandQueue> queue,
   const uint64_t laneBytes = data.queries.length;
   id<MTLBuffer> queries = makeBuffer(device, width * laneBytes);
   id<MTLBuffer> output = makeBuffer(device, width * laneBytes);
-  const uint64_t slots = uint64_t{width} * shape.kvHeads * splits;
-  id<MTLBuffer> partials = makeBuffer(
-      device, slots * shape.fusedRows() * kHeadDimension * sizeof(float));
-  id<MTLBuffer> statistics =
-      makeBuffer(device, slots * shape.fusedRows() * 2 * sizeof(float));
+  // The workspace production allocates for `width` lanes, which holds every
+  // split count's slots.
+  const splash::ops::AttentionWorkspace workspace =
+      splash::ops::PagedAttention::verifyWorkspace(width, shape.queryHeads(), shape.layout());
+  id<MTLBuffer> partials = makeBuffer(device, workspace.partialsBytes);
+  id<MTLBuffer> statistics = makeBuffer(device, workspace.statisticsBytes);
   for (uint32_t lane = 0; lane < width; ++lane) {
     std::memcpy(static_cast<uint8_t *>(queries.contents) + lane * laneBytes,
                 data.queries.contents, laneBytes);
@@ -606,11 +615,12 @@ Dispatch dispatchPrefill(id<MTLDevice> device, id<MTLCommandQueue> queue,
   const Shape shape = data.shape;
   const uint32_t splits = data.params.split_count;
   id<MTLBuffer> output = makeBuffer(device, data.queries.length);
-  const uint64_t slots = uint64_t{shape.kvHeads} * splits;
-  id<MTLBuffer> partials = makeBuffer(
-      device, slots * shape.fusedRows() * kHeadDimension * sizeof(float));
-  id<MTLBuffer> statistics =
-      makeBuffer(device, slots * shape.fusedRows() * 2 * sizeof(float));
+  // The workspace production allocates for chunks of the tile's rows, which
+  // holds every split count's slots.
+  const splash::ops::AttentionWorkspace workspace =
+      splash::ops::PagedAttention::prefillWorkspace(kRows, shape.queryHeads(), shape.layout());
+  id<MTLBuffer> partials = makeBuffer(device, workspace.partialsBytes);
+  id<MTLBuffer> statistics = makeBuffer(device, workspace.statisticsBytes);
   // With QSA masks the tile attends through list kQsaJunkLists.
   const BlockLists blocks = data.maskWords ? qsaBlockLists(device, data, 1) : BlockLists{partials, partials, 0};
   PrefillAttentionParams params = data.params;
@@ -959,15 +969,16 @@ void run(const char *libraryPath) {
   // Apple7/8 run the register tile; the MPP sparse tile never runs there.
   const bool registerDevice = ![device supportsFamily:MTLGPUFamilyApple9];
   for (const Shape shape : kShapes) {
-    // Both tiles share the reduce, which runs no tensor ops.
-    if (!shape.registerTile) {
+    // Both tiles and the INT8-query entries share their geometry's reduce,
+    // which runs no tensor ops.
+    if (!shape.registerTile && !shape.int8Queries)
       for (uint32_t splits : {1U, 3U, 7U, 32U, 65U, 128U}) {
         checkReduce(device, queue, library, shape, splits, kRows);
         if (splits <= SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS)
           checkReduce(device, queue, library, shape, splits, 1);
       }
-    }
-    if (registerDevice && shape.sparse() && !shape.registerTile)
+    // Apple7/8 run neither INT8 queries nor the sparse Mpp tile.
+    if (registerDevice && (shape.int8Queries || (shape.sparse() && !shape.registerTile)))
       continue;
     const Pipelines pipelines = makePipelines(device, library, shape);
     for (uint32_t width = 1; width <= 4; ++width)

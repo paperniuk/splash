@@ -5,9 +5,9 @@
 > This is a community port, not an official Inco release.
 >
 > - **M1/M2:** prebuilt releases on [the releases page](https://github.com/paperniuk/splash/releases);
->   source in branch [`apple7-m1-1.6`](https://github.com/paperniuk/splash/tree/apple7-m1-1.6)
->   (upstream 1.6.0 plus the M1/M2 commits).
-> - **On M1/M2 this build runs** the models upstream 1.6.0 loads (GGUF, including Prism ML's Ternary
+>   source in branch [`apple7-m1-1.6.1`](https://github.com/paperniuk/splash/tree/apple7-m1-1.6.1)
+>   (upstream 1.6.1 plus the M1/M2 commits).
+> - **On M1/M2 this build runs** the models upstream 1.6.1 loads (GGUF, including Prism ML's Ternary
 >   Bonsai `PQ2_0` and Qwen3.8-Flash-Next, and MLX checkpoints) on its own kernels, the vision
 >   encoder included. Flash-Next `Q2_0` runs on a 64 GB Mac, about 77 tok/s on an M1 Max.
 >   Models you already downloaded run from their folder with `--model-dir`.
@@ -149,6 +149,7 @@ window. To set your own limits or cache options, add these to `splash serve`:
 | `--kv-format bf16` | Use BF16 KV cache. Default: 8-bit (INT8). |
 | `--state-format bf16` | Use BF16 recurrent states, half the size. Default: FP32. |
 | `--prefill-bound-ms 1000` | Longest prefill GPU command buffer. Prefill ends a buffer at every layer, so 2048-token chunks still fit at most context lengths. Default: 2000 (`SPLASH_PREFILL_BOUND_MS`), so macOS does not abort long-context prefill for stalling the display (`ImpactingInteractivity`); after such an abort the restarted engine halves it, down to 500. `--prefill-mode full` always sends whole 2048-token chunks. `/status` reports it as `scheduler.prefill_bound_ms`. |
+| `--activations bf16` | Use BF16 activations. Default: auto. |
 | `--disable-ane` | Prefill on the GPU alone. Default: the 27B also uses the Neural Engine. |
 | `--ane-ffn-share 0.35 --ane-ffn-minimum-rows 520` | Fix the Neural Engine's share of the prefill FFN, and the least chunk rows it splits, instead of calibrating them at start. Default: calibrated; `0` keeps the FFN on the GPU. |
 | `--max-cache-disk 16G` | Cap the SSD cache (default: auto, up to 32 GiB; `0` turns it off). |

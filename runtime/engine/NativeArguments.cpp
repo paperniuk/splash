@@ -217,6 +217,10 @@ NativeArguments parseNativeArguments(int argc, const char *const *argv) {
         throw UsageError("--contended-prefill-rows requires a power of two in [" +
                          std::to_string(kMinimumContendedPrefillRows) + ", " +
                          std::to_string(model::ExecutionLimits::prefillTokenBudget) + "]");
+    } else if (option == "--activations") {
+      if (value != "auto" && value != "bf16")
+        throw UsageError("--activations requires auto or bf16");
+      result.int8Activations = value == "auto" ? ops::Int8Activations::On : ops::Int8Activations::Off;
     } else if (option == "--verify-rows") {
       if (value != "auto" && value != "all")
         throw UsageError("--verify-rows requires auto or all");

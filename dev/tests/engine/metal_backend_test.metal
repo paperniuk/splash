@@ -20,16 +20,10 @@ kernel void test_add_u32(device uint *values [[buffer(0)]],
     }
 }
 
-// Adds 100 x constant 0 + constant 1 to each value: the specialized pipelines
-// of one function (specializedPipelineName).
-constant uint kTestHundreds [[function_constant(0)]];
-constant uint kTestOnes [[function_constant(1)]];
-kernel void test_add_constants_u32(device uint *values [[buffer(0)]],
-                                   constant uint &count [[buffer(1)]],
-                                   uint gid [[thread_position_in_grid]]) {
-    if (gid < count) {
-        values[gid] += 100 * kTestHundreds + kTestOnes;
-    }
+// Adds function constant 0 to the first word: a pipeline per value.
+constant uint kTestIncrement [[function_constant(0)]];
+kernel void test_add_constant_u32(device uint *values [[buffer(0)]]) {
+    values[0] += kTestIncrement;
 }
 
 // Row r of the grid writes word x of the buffer at table[r], which no

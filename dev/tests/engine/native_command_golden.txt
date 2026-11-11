@@ -35,6 +35,8 @@ ane_ffn_disabled | --disable-ane --ane-ffn-share 0.35 --ane-ffn-minimum-rows 520
 prefill_full | --prefill-mode full | auto auto --prefill-mode full
 prefill_bound | --prefill-bound-ms 3000 | auto auto --prefill-bound-ms 3000
 prefill_bound_command | --prefill-bound-scope command | auto auto --prefill-bound-scope command
+activations_bf16 | --activations bf16 | auto auto --activations bf16
+activations_auto | --activations auto | auto auto
 verify_rows_all | --verify-rows all | auto auto --verify-rows all
 verify_rows_auto | --verify-rows auto | auto auto
 kv_format_default | --kv-format int8 | auto auto

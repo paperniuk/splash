@@ -9,9 +9,11 @@ namespace splash {
 // The GPU classes kernel policy tells apart, by how a core runs matrix
 // operations: Apple7 (families 7 and 8: M1, M2) fp32-only, where the MPP path
 // runs far below the simdgroup MMA rate; Apple9 (family 9: M3, M4) on the FP32
-// pipe; Apple10 (family 10 and later: M5, M6) on a per-core neural
-// accelerator. This fork accepts families from 7; upstream refuses below 9.
-enum class GpuClass : uint8_t { Apple7, Apple9, Apple10 };
+// pipe; Apple10 (family 10: M5) on a per-core neural accelerator; Apple11
+// (family 11 and later: M6) likewise, its accelerator no faster on 16 rows
+// than on 8 from 4.5 bits per weight. This fork accepts families from 7;
+// upstream refuses below 9.
+enum class GpuClass : uint8_t { Apple7, Apple9, Apple10, Apple11 };
 
 // Device features and memory limits used by runtime planning.
 struct DeviceCapabilities {
@@ -44,8 +46,10 @@ struct DeviceCapabilities {
     bool hasUnifiedMemory = false;
 
     [[nodiscard]] constexpr GpuClass gpuClass() const noexcept {
-        if (appleGpuFamily >= 10) return GpuClass::Apple10;
-        return appleGpuFamily >= 9 ? GpuClass::Apple9 : GpuClass::Apple7;
+        return appleGpuFamily >= 11   ? GpuClass::Apple11
+               : appleGpuFamily == 10 ? GpuClass::Apple10
+               : appleGpuFamily == 9  ? GpuClass::Apple9
+                                      : GpuClass::Apple7;
     }
     // The GPU core count kernel policy plans for: the reported one, or
     // kAssumedGpuCores when the device does not report it.

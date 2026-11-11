@@ -109,6 +109,9 @@ OPTIONS = {
             *values("--ane-ffn-minimum-rows", {}, ("0", "-1", "1.5", "rows"))[1],
         ],
     ),
+    "--activations": values(
+        "--activations", {"auto": "auto", "bf16": "bf16"}, ("", "on", "off", "BF16")
+    ),
     "--verify-rows": values(
         "--verify-rows",
         {"auto": "auto", "all": "all"},
