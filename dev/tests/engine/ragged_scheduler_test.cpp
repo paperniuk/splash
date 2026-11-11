@@ -1741,16 +1741,22 @@ void testIsolatedPrefillStaysWithinItsBound() {
 
 // With tail alignment a prompt's last command a few rows past a multiple of
 // it ends on the multiple: 288 rows run as 256, leaving 32. More than 32
-// past (300), at most two multiples (256 + 16 is 272, past two: 256; 200 is
-// not), and no alignment keep their rows, as does a command whose trim would
-// fall below the model's least rows (the Neural Engine split's 280 here).
+// past (300), at most two multiples (256 + 16 is 272, past two: 256), and no
+// alignment keep their rows, as does a command whose trim would fall below
+// the model's least rows (the Neural Engine split's 280 here). Below those
+// least rows a last command also leaves up to 16 rows past 32 and up to 24
+// past a multiple of 64 (40 run as 32, 200 as 192, 150 as 128 under a split
+// from 304 rows), which one the split takes (328) does not.
 void testAlignedPrefillLeavesItsTail() {
   struct Case final {
     uint32_t prompt, alignment, leastRows, rows;
   };
   for (const auto [prompt, alignment, leastRows, rows] :
-       {Case{288, 128, 1, 256}, Case{272, 128, 1, 256}, Case{300, 128, 1, 300}, Case{200, 128, 1, 200},
-        Case{288, 0, 1, 288}, Case{288, 128, 280, 288}, Case{2048 + 300, 128, 1, kChunk}}) {
+       {Case{288, 128, 1, 256}, Case{272, 128, 1, 256}, Case{300, 128, 1, 300}, Case{200, 128, 1, 192},
+        Case{288, 0, 1, 288}, Case{288, 128, 280, 288}, Case{2048 + 300, 128, 1, kChunk},
+        Case{40, 128, 1, 32}, Case{48, 128, 1, 32}, Case{49, 128, 1, 49}, Case{32, 128, 1, 32},
+        Case{70, 128, 1, 64}, Case{88, 128, 1, 64}, Case{89, 128, 1, 89}, Case{136, 128, 1, 128},
+        Case{150, 128, 304, 128}, Case{40, 0, 1, 40}, Case{70, 0, 1, 70}, Case{328, 128, 304, 328}}) {
     model::CommandLimits commandLimits = limits();
     commandLimits.minimumUnitRows = leastRows;
     Sim sim(test::kDense27B, {.limits = commandLimits, .tailAlignment = alignment});

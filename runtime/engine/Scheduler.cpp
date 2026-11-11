@@ -16,6 +16,17 @@ constexpr uint32_t kMinimumPrefillRows = 64;
 // takes the command below the model's least rows (the Neural Engine FFN
 // split's least chunk), where it would run its FFN on the GPU alone.
 constexpr uint32_t kPrefillTailRows = 32;
+// The rows a last chunk on Apple7/8's GPU alone leaves to a command of their
+// own. Its 64-row MMA prefill tile and the staged tiles of up to 32 rows take
+// a part-filled tile's time whatever rows it holds: on a 32-core M1 Max with
+// Qwen3.8-27B an append of 33 to 64 rows took 595 ms and one of 65 to 96
+// 930, where 32 rows take 325, 24 take 260 and 16 take 205. So up to 16 rows
+// past 32 and up to 24 past a multiple of 64 run after the whole tiles.
+constexpr uint32_t shortTailRows(uint32_t rows) noexcept {
+  if (rows > 32 && rows <= 48) return rows - 32;
+  const uint32_t tail = rows % 64;
+  return rows > 64 && tail <= 24 ? tail : 0;
+}
 // A request yields to later arrivals of its priority at most this many
 // prefill commands in a row: the other lanes of a full batch, each finishing
 // one short prompt.
@@ -527,7 +538,7 @@ uint32_t Scheduler::trimmedTail(const Lane &leader, uint32_t rows) const {
   const uint32_t align = config_.tailAlignment, least = config_.limits.minimumUnitRows;
   const uint32_t tail = align ? rows % align : 0;
   if (rows != leader.remaining() || rows <= 2 * align || !tail || tail > kPrefillTailRows)
-    return rows;
+    return align && rows == leader.remaining() && !(least > 1 && rows >= least) ? rows - shortTailRows(rows) : rows;
   // Apple7/8 run a chunk's projections in 128-row tiles and the Neural
   // Engine split in functions every 128 rows: on an M1 Max with Qwen3.8-27B,
   // a 288-row append took 2153 ms in one command and 1907 ms as 256 rows and
