@@ -127,6 +127,8 @@ void LinearPlan::requireConfiguration() const {
     throw std::invalid_argument("only a staged or F32 register block gate/up decode runs gate and up in one pass");
   if (c.sixteenRows && (c.tile != LinearTile::GgufStaged || !decode || workload_.rows != SPLASH_TARGET_VERIFY_ROWS))
     throw std::invalid_argument("only a staged one-lane block decode runs the 16-row tile");
+  if (c.twentyFourRows && (c.tile != LinearTile::GgufStaged || decode || workload_.rows <= 16 || workload_.rows > 24))
+    throw std::invalid_argument("only a staged block prefill chunk of 17 to 24 rows runs the 24-row tile");
   if (c.tile == LinearTile::GgufRegister) {
     // Split boundaries fall on coefficient units, of 64 inputs at the fewest
     // (quant_register_unit); addGgufRegister checks each segment's.
@@ -150,7 +152,7 @@ uint32_t LinearPlan::storageRows() const noexcept {
   if (config_.tile == LinearTile::GgufRegister) return workload_.rows;
   if (config_.tile == LinearTile::GgufPrefill)
     return (workload_.rows + GGUF_PREFILL_ROWS - 1) / GGUF_PREFILL_ROWS * GGUF_PREFILL_ROWS;
-  return config_.sixteenRows ? 16 : stagedTileRows(workload_.rows);
+  return config_.sixteenRows ? 16 : config_.twentyFourRows ? 24 : stagedTileRows(workload_.rows);
 }
 
 LinearScratchSize LinearPlan::scratchSize() const noexcept {
@@ -436,16 +438,28 @@ void Linear::addGgufRegister(metal::CommandGraph &graph, const LinearBuffers &b,
               {s.outputSize / GGUF_TILE_COLUMNS, config.splits, 1}, {GGUF_REGISTER_THREADS, 1, 1});
   };
   if (segments.size() > 1) {
-    // Apple7/8 run each segment as a dispatch of its own
-    // (kernels/decode/linear_gguf_sgmatrix.metal), their counters and partials
-    // apart by column.
-    if (mma()) {
-      for (const QuantizedSegment &s : segments) tensor(s, 'a', b.output, b.output);
-      return;
-    }
     std::vector<const QuantizedSegment *> order;
     for (const QuantizedSegment &s : segments) order.push_back(&s);
     std::vector<metal::MetalBuffer> bindings{b.scratch.input, b.scratch.sums};
+    if (mma()) {
+      // Apple7/8 have no run-time-format fused kernel
+      // (kernels/decode/linear_gguf_sgmatrix.metal). Segments of one format
+      // run that format's fused kernel; others as dispatches of their own,
+      // their counters and partials apart by column.
+      const bool oneFormat = segments.size() <= kFusedSegments &&
+                             std::all_of(segments.begin(), segments.end(), [&](const QuantizedSegment &s) {
+                               return s.formatId == segments.front().formatId;
+                             });
+      if (!oneFormat) {
+        for (const QuantizedSegment &s : segments) tensor(s, 'a', b.output, b.output);
+        return;
+      }
+      const GgufDecodeFusedParams params = fusedSegments(plan, order, bindings);
+      bindings.insert(bindings.end(), {b.output, partials, counters});
+      graph.add(prefix + segments.front().name() + suffix + "_fused", std::move(bindings), params, grid,
+                {GGUF_REGISTER_THREADS, 1, 1});
+      return;
+    }
     const GgufDecodeFusedParams params = fusedSegments(plan, order, bindings);
     bindings.insert(bindings.end(), {b.output, partials, counters});
     graph.add("gguf_decode_sg_fused" + suffix, std::move(bindings), params, grid, {GGUF_REGISTER_THREADS, 1, 1});

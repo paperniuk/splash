@@ -425,12 +425,14 @@ bool sameRows(const std::vector<uint16_t> &a, uint64_t aRow, const std::vector<u
 
 // The configuration of `tile` for a decode workload, or of the staged tile for a prefill chunk of up to 64 rows; the
 // staged tile walks K spread or in lockstep.
-// Apple7/8's register tile reads an fp32 table (LinearConfig::fp32Table); main sets it from the device.
+// Apple7/8's register tile reads an fp32 table (LinearConfig::fp32Table) and its staged tile holds a prefill chunk of
+// 17 to 24 rows in 24 (LinearConfig::twentyFourRows); main sets it from the device.
 bool fp32RegisterTable = false;
 LinearConfig config(LinearTile tile, const LinearWorkload &w, uint32_t splits, bool spread = false) {
   const LinearTile t = w.phase == LinearPhase::Prefill ? LinearTile::GgufStaged : tile;
   return {.tile = t, .splits = splits, .spread = spread,
-          .fp32Table = fp32RegisterTable && t == LinearTile::GgufRegister};
+          .fp32Table = fp32RegisterTable && t == LinearTile::GgufRegister,
+          .twentyFourRows = fp32RegisterTable && w.phase == LinearPhase::Prefill && w.rows > 16 && w.rows <= 24};
 }
 // The formats whose weights `tile` takes, in id order: the register tile takes those of quant_register_format.
 std::vector<Fmt> tileFormats(LinearTile tile) {
@@ -536,15 +538,16 @@ void decodeTile(MetalBackend &backend, const Linear &linear, LinearTile tile, bo
 // it takes with the formats three and five further on of those: at every lane count and K split the tile takes in
 // all three, within fp64 and equal to the projections of each segment alone; one lane on the staged 16-row tile equal
 // to the 8-row tile. The register tile's K holds a 256-input unit per partition at the most splits, so that every
-// triple takes every split.
-void fusedDecode(MetalBackend &backend, const Linear &linear, LinearTile tile, bool spread) {
+// triple takes every split. With `oneFormat` the three segments share a format, which Apple7/8's register tile runs
+// as one dispatch (gguf_decode_sgf_<format>_l<lanes>_fused) and as dispatches of their own otherwise.
+void fusedDecode(MetalBackend &backend, const Linear &linear, LinearTile tile, bool spread, bool oneFormat = false) {
   const uint32_t K = tile == LinearTile::GgufRegister ? 256 * LinearConfig::kMaximumSplits : decodeInputs(spread);
   const std::vector<Fmt> formats = tileFormats(tile);
   uint32_t mostSplits = 1;
   for (size_t i = 0; i < formats.size(); ++i) {
     const Tensor a = tensor(backend, formats[i], 512, K),
-                 b = tensor(backend, formats[(i + 3) % formats.size()], 256, K),
-                 c = tensor(backend, formats[(i + 5) % formats.size()], 256, K);
+                 b = tensor(backend, formats[oneFormat ? i : (i + 3) % formats.size()], 256, K),
+                 c = tensor(backend, formats[oneFormat ? i : (i + 5) % formats.size()], 256, K);
     const std::vector<const Tensor *> parts{&a, &b, &c};
     const uint32_t covered = segmentColumns(parts), columns = covered + kPadding;
     const Projection fused = projection(parts, columns);
@@ -593,7 +596,8 @@ void fusedDecode(MetalBackend &backend, const Linear &linear, LinearTile tile, b
     }
   }
   section(walkName(tile, spread) + " fused: three segments in " + std::to_string(formats.size()) +
-          " format triples, K " + std::to_string(K) + ", 1-4 lanes, S 1-" + std::to_string(mostSplits) +
+          (oneFormat ? " formats, one each" : " format triples") + ", K " + std::to_string(K) + ", 1-4 lanes, S 1-" +
+          std::to_string(mostSplits) +
           " within fp64 and equal to each segment's projection" +
           (tile == LinearTile::GgufStaged ? ", one lane on the 16-row tile equal to the 8-row tile" : ""));
 }
@@ -1138,6 +1142,7 @@ int main(int argc, char **argv) {
       for (const LinearTile tile : {LinearTile::GgufRegister, LinearTile::GgufStaged}) {
         decodeTile(backend, linear, tile, false, decodeInputs(false), tileFormats(tile));
         fusedDecode(backend, linear, tile, false);
+        if (tile == LinearTile::GgufRegister) fusedDecode(backend, linear, tile, false, true);
         gateUpPairs(backend, linear, tile);
       }
       decodeTile(backend, linear, LinearTile::GgufStaged, true, decodeInputs(true), tileFormats(LinearTile::GgufStaged));
@@ -1160,6 +1165,7 @@ int main(int argc, char **argv) {
         decodeTile(backend, m1, LinearTile::GgufRegister, false, decodeInputs(false),
                    tileFormats(LinearTile::GgufRegister));
         gateUpPairs(backend, m1, LinearTile::GgufRegister);
+        fusedDecode(backend, m1, LinearTile::GgufRegister, false, true);
         registerOneGateUpPass(backend, m1);
         fp32RegisterTable = false;
         section("register decode again on Apple7/8's F32 instances");
