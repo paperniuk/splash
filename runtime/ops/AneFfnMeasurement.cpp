@@ -137,7 +137,7 @@ Timings Measurement::time() {
 
 double Measurement::split(uint32_t aneUnits, double gpuAlone) {
   const std::vector<SwiGluProjections> sampled = this->sampled();
-  AneFfn split(backend_, sampled, aneUnits, interrupted_, std::array{kRows});
+  AneFfn split(backend_, linear_, sampled, aneUnits, interrupted_, std::array{kRows});
   return layer(sampled, kCount, kRows, &split, gpuAlone);
 }
 

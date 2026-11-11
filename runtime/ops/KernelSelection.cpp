@@ -292,7 +292,7 @@ std::vector<LinearConfig> decodeConfigurations(const KernelCalibration &calibrat
     configurations.push_back(staged(p, n, k, w.rows, 0, cores, Passes::One));
   // Apple7/8's register tile also runs a gate/up pair of one format in one pass.
   if (w.epilogue == LinearEpilogue::GateUp && calibration.simdgroupMma && registerTakes)
-    configurations.push_back(selectProjection(calibration, w, {.registerTakes = true, .oneFormat = true}));
+    configurations.push_back(bf16Projection(calibration, w, {.registerTakes = true, .oneFormat = true}, {}));
   return configurations;
 }
 
