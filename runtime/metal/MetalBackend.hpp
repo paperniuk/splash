@@ -153,7 +153,26 @@ struct AddressTable {
   bool writes = false;
 };
 
+// The pipeline name of library function `function` specialized with uint
+// function constants 0, 1, ... set to `constants`: "<function>:<c0>,<c1>,...".
+// The backend builds one pipeline per distinct name, so a kernel whose
+// run-time branches turn on function constants compiles only the branches a
+// dispatch takes.
+[[nodiscard]] inline std::string specializedPipelineName(std::string_view function,
+                                                         std::span<const uint32_t> constants) {
+  std::string name(function);
+  char separator = ':';
+  for (const uint32_t constant : constants) {
+    name += separator;
+    name += std::to_string(constant);
+    separator = ',';
+  }
+  return name;
+}
+
 struct ComputeDispatch {
+  // A library function's name, or a specialized one
+  // (specializedPipelineName).
   std::string pipelineName;
   std::vector<BufferBinding> buffers;
   std::vector<BytesBinding> bytes;

@@ -17,6 +17,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -1209,19 +1210,89 @@ struct MetalBackend::Impl {
         }
         if (const auto cached = pipelines.find(name); cached != pipelines.end())
             return cached->second;
-        id<MTLComputePipelineState> result = newPipeline(library, name);
+        id<MTLComputePipelineState> result = timedNewPipeline(library, name);
         pipelines.emplace(name, result);
         sampleDeviceMemory();
         return result;
     }
 
-    id<MTLComputePipelineState> newPipeline(id<MTLLibrary> source, std::string_view name) {
-        NSString *key = checkedNSString(name, "pipeline name");
+    // A pipeline's compile runs on the thread that first needs it and can
+    // take minutes, so one that outlasts kSlowPipelineSeconds is named while
+    // it still runs, and again with its time once it is done. Only a cache
+    // miss pays for the check.
+    static constexpr double kSlowPipelineSeconds = 5.0;
+
+    id<MTLComputePipelineState> timedNewPipeline(id<MTLLibrary> source,
+                                                 std::string_view name) {
+        auto done = std::make_shared<std::atomic<bool>>(false);
+        const auto start = AwakeClock::now();
+        std::string label(name);
+        dispatch_after(
+            dispatch_time(DISPATCH_TIME_NOW,
+                          static_cast<int64_t>(kSlowPipelineSeconds * NSEC_PER_SEC)),
+            dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                if (!done->load(std::memory_order_acquire))
+                    logLine("metal: compiling pipeline ", label, " for over ",
+                            kSlowPipelineSeconds, " s");
+            });
+        struct Finish {
+            std::atomic<bool> &done;
+            ~Finish() { done.store(true, std::memory_order_release); }
+        } finish{*done};
+        id<MTLComputePipelineState> result = newPipeline(source, name);
+        const double seconds = std::chrono::duration<double>(
+            AwakeClock::now() - start).count();
+        if (seconds >= kSlowPipelineSeconds)
+            logLine("metal: compiled pipeline ", name, " in ", seconds, " s");
+        return result;
+    }
+
+    // The function pipeline `name` runs: a library function, specialized with
+    // the uint function constants its name lists after a ':'
+    // (specializedPipelineName), which must be all of the function's, as
+    // Metal runs a function with a constant left unset.
+    static id<MTLFunction> pipelineFunction(id<MTLLibrary> source, std::string_view name) {
+        const size_t separator = name.find(':');
+        NSString *key = checkedNSString(name.substr(0, separator), "pipeline name");
         id<MTLFunction> function = [source newFunctionWithName:key];
-        if (!function) {
-            throw MetalBackendError(
-                "missing Metal function: " + std::string(name));
+        if (!function)
+            throw MetalBackendError("missing Metal function: " + std::string(name));
+        if (separator == std::string_view::npos)
+            return function;
+        MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
+        std::string_view constants = name.substr(separator + 1);
+        NSUInteger listed = 0;
+        for (NSUInteger index = 0;; ++index) {
+            const size_t comma = constants.find(',');
+            const std::string_view field = constants.substr(0, comma);
+            uint32_t value = 0;
+            const auto [end, failure] = std::from_chars(field.data(), field.data() + field.size(), value);
+            if (failure != std::errc() || end != field.data() + field.size())
+                throw MetalBackendError("malformed function constants in pipeline " + std::string(name));
+            [values setConstantValue:&value type:MTLDataTypeUInt atIndex:index];
+            listed = index + 1;
+            if (comma == std::string_view::npos)
+                break;
+            constants.remove_prefix(comma + 1);
         }
+        NSDictionary<NSString *, MTLFunctionConstant *> *declared = function.functionConstantsDictionary;
+        bool covered = declared.count == listed;
+        for (MTLFunctionConstant *constant in declared.allValues)
+            covered = covered && constant.index < listed && constant.type == MTLDataTypeUInt;
+        if (!covered)
+            throw MetalBackendError("pipeline " + std::string(name) + " sets " + std::to_string(listed) +
+                                    " uint function constants of the function's " +
+                                    std::to_string(declared.count));
+        NSError *error = nil;
+        id<MTLFunction> specialized = [source newFunctionWithName:key constantValues:values error:&error];
+        if (!specialized)
+            throw MetalBackendError("unable to specialize Metal function " + std::string(name) + ": " +
+                                    errorDescription(error));
+        return specialized;
+    }
+
+    id<MTLComputePipelineState> newPipeline(id<MTLLibrary> source, std::string_view name) {
+        id<MTLFunction> function = pipelineFunction(source, name);
         NSError *error = nil;
         id<MTLComputePipelineState> result =
             [device newComputePipelineStateWithFunction:function error:&error];

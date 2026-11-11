@@ -57,6 +57,7 @@ using splash::metal::IndirectGrid;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBackendError;
 using splash::metal::SharedEvent;
+using splash::metal::specializedPipelineName;
 using splash::test::EncoderUses;
 using splash::test::MethodReplacement;
 using splash::test::QueueSets;
@@ -738,6 +739,46 @@ void preparedPipelinesCompileAhead(const std::string &metallibPath) {
                 BackendInstrumentation::submittedCommands(backend) == 1,
             "a rejected preparation poisoned the backend or submitted work");
     std::cout << "PASS prepared pipelines compile ahead\n";
+}
+
+// A specialized pipeline name builds its function with the uint constants it
+// lists, in order, one pipeline per distinct name; a name whose constants do
+// not parse or do not cover the function's is refused.
+void specializedPipelinesTakeTheirConstants(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath);
+    auto buffer = sharedBuffer(backend, sizeof(uint32_t));
+    auto *value = static_cast<uint32_t *>(buffer.contents());
+    *value = 0;
+    const uint32_t count = 1;
+    const auto dispatch = [&](std::string name) {
+        return ComputeDispatch{std::move(name), {{0, buffer}}, {{1, &count, sizeof(count)}},
+                               {1, 1, 1}, {1, 1, 1}};
+    };
+    const std::array<uint32_t, 2> first{3, 4}, second{5, 6};
+    const std::string firstName = specializedPipelineName("test_add_constants_u32", first);
+    require(firstName == "test_add_constants_u32:3,4",
+            "a specialized pipeline name is " + firstName);
+    (void)backend.submit(dispatch(firstName));
+    (void)backend.submit(dispatch(specializedPipelineName("test_add_constants_u32", second)));
+    (void)backend.submit(dispatch(firstName));
+    require(*value == 304 + 506 + 304 && BackendInstrumentation::cachedPipelines(backend) == 2,
+            "specialized pipelines ran " + std::to_string(*value) + " over " +
+                std::to_string(BackendInstrumentation::cachedPipelines(backend)) + " pipelines");
+    const ComputeDispatch malformed = dispatch("test_add_constants_u32:3,x");
+    rejects([&] { backend.preparePipelines({&malformed, 1}); },
+            "malformed function constants in pipeline test_add_constants_u32:3,x",
+            "a pipeline name with a malformed constant was prepared");
+    const ComputeDispatch uncovered = dispatch("test_add_constants_u32:3");
+    rejects([&] { backend.preparePipelines({&uncovered, 1}); },
+            "pipeline test_add_constants_u32:3 sets 1 uint function constants of the function's 2",
+            "a pipeline name short of the function's constants was prepared");
+    const ComputeDispatch extra = dispatch("test_add_constants_u32:3,4,5");
+    rejects([&] { backend.preparePipelines({&extra, 1}); },
+            "pipeline test_add_constants_u32:3,4,5 sets 3 uint function constants of the function's 2",
+            "a pipeline name past the function's constants was prepared");
+    require(backend.healthy() && BackendInstrumentation::cachedPipelines(backend) == 2,
+            "a refused specialization poisoned the backend or cached a pipeline");
+    std::cout << "PASS specialized pipelines take their constants\n";
 }
 
 std::atomic<unsigned> blitEncoders{0};
@@ -2993,6 +3034,7 @@ std::span<const splash::test::TestCase> behaviourTests() {
         {"dispatchProfilingCoversEveryCommand", [] { dispatchProfilingCoversEveryCommand(metallib); }},
         {"commandBreaksSplitBuffers", [] { commandBreaksSplitBuffers(metallib); }},
         {"preparedPipelinesCompileAhead", [] { preparedPipelinesCompileAhead(metallib); }},
+        {"specializedPipelinesTakeTheirConstants", [] { specializedPipelinesTakeTheirConstants(metallib); }},
         {"buffersStayResident", [] { buffersStayResident(metallib); }},
         {"infiniteKeepAliveHoldsResidency", [] { infiniteKeepAliveHoldsResidency(metallib); }},
         {"releasedMemory", [] { releasedMemory(metallib); }},

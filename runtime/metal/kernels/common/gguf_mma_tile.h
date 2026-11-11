@@ -142,14 +142,15 @@ inline void accumulate(device const bfloat *x, device uchar *w0, device uchar *w
   }
 }
 
-// accumulate in run-time format `fmt` (uniform per threadgroup), after every thread of the threadgroup fills its
-// pair table.
+// accumulate in run-time format `fmt` (uniform per threadgroup), one of the three of `among`, after every thread of
+// the threadgroup fills its pair table. A pipeline holds only the paths of `among` where they are function constants
+// (quant_format_switch_among).
 template <uint FM>
-inline void accumulate_any(uint fmt, device const bfloat *x, device uchar *w0, device uchar *w1, device uchar *meta,
-                           uint input_size, uint origin, threadgroup half *stage, threadgroup half2 *tl,
-                           uint thread_index, uint threads, uint lane, uint step_begin, uint step_end,
-                           thread float2 (&acc)[FN][FM]) {
-  quant_format_switch(fmt, [&](auto format) {
+inline void accumulate_any(uint fmt, uint3 among, device const bfloat *x, device uchar *w0, device uchar *w1,
+                           device uchar *meta, uint input_size, uint origin, threadgroup half *stage,
+                           threadgroup half2 *tl, uint thread_index, uint threads, uint lane, uint step_begin,
+                           uint step_end, thread float2 (&acc)[FN][FM]) {
+  quant_format_switch_among(fmt, among, [&](auto format) {
     typedef decltype(format) F;
     quant_pair_table<F>(tl, thread_index, threads);
     accumulate<F, FM>(x, w0, w1, meta, input_size, origin, stage, tl, lane, step_begin, step_end, acc);

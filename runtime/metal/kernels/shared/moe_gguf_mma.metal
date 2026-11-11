@@ -46,8 +46,11 @@ kernel void moe_expert_gguf_mma(device bfloat *input [[buffer(0)]], device const
     constexpr uint FM = decltype(fragments)::value;
     float2 acc[FN][FM];
     zero(acc);
-    accumulate_any<FM>(s.format, x, s.w0, s.w1, s.meta, p.input_size, origin, stage + simd_group * kSimdgroupStage, tl,
-                       thread_index, GGUF_STAGED_THREADS, simd_lane, 0, p.input_size / kStep, acc);
+    // Among the run-time format alone, so the pipeline keeps every format's path: these compile in under 1 s on an
+    // M2 Pro, against 161 s for the fused 32-row decode kernel before its formats became function constants.
+    accumulate_any<FM>(s.format, uint3(s.format), x, s.w0, s.w1, s.meta, p.input_size, origin,
+                       stage + simd_group * kSimdgroupStage, tl, thread_index, GGUF_STAGED_THREADS, simd_lane, 0,
+                       p.input_size / kStep, acc);
     elements(acc, sgmatrix::lane_map(simd_lane), [&](uint row, uint column, float v) {
       const ulong o = out + ulong(row) * p.output_size + origin + column;
       if constexpr (Ep == EpUpWithGate) v = float(bfloat(v)) * splash_silu(float(aux[o]));
