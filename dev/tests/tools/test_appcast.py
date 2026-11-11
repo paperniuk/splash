@@ -163,7 +163,12 @@ class AppcastTests(unittest.TestCase):
         ]
         self.assertEqual(
             self.generate_command(None),
-            [f"{tool}/generate_appcast", "--account", "io.github.paperniuk.splash-m1", *options],
+            [
+                f"{tool}/generate_appcast",
+                "--account",
+                "io.github.paperniuk.splash-m1",
+                *options,
+            ],
         )
         self.assertEqual(
             self.generate_command(Path("/keys/release")),

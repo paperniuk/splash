@@ -318,7 +318,12 @@ class PackageAppTests(unittest.TestCase):
         self.assertEqual(
             self.signing_commands("-"),
             [
-                [*adhoc, "--identifier", "io.github.paperniuk.splash-m1.engine", "engine/splash"],
+                [
+                    *adhoc,
+                    "--identifier",
+                    "io.github.paperniuk.splash-m1.engine",
+                    "engine/splash",
+                ],
                 [
                     *adhoc,
                     "--identifier",
@@ -344,7 +349,12 @@ class PackageAppTests(unittest.TestCase):
         self.assertEqual(
             self.signing_commands(identity)[:7],
             [
-                [*signed, "--identifier", "io.github.paperniuk.splash-m1.engine", "engine/splash"],
+                [
+                    *signed,
+                    "--identifier",
+                    "io.github.paperniuk.splash-m1.engine",
+                    "engine/splash",
+                ],
                 [
                     *signed,
                     "--identifier",
@@ -399,7 +409,11 @@ class PackageAppTests(unittest.TestCase):
             [
                 *built,
                 ["codesign", "--force", "--sign", identity, "--timestamp"]
-                + ["--identifier", "io.github.paperniuk.splash-m1.dmg", "FOLDER/Splash-1.5.0.dmg"],
+                + [
+                    "--identifier",
+                    "io.github.paperniuk.splash-m1.dmg",
+                    "FOLDER/Splash-1.5.0.dmg",
+                ],
             ],
         )
 

@@ -306,7 +306,7 @@ void hyperNormPlans() {
         Device{9, 38, 0}, Device{10, 38, 0}}) {
     DeviceCapabilities capabilities = device(family);
     capabilities.gpuCoreCount = reportedCores;
-    const ExecutionPlans plans(capabilities);
+    const ExecutionPlans plans(capabilities, Int8Activations::On);
     for (uint32_t r = 1; r <= HYPER_CONNECTION_NORM_QUARTER_ROWS; ++r)
       require(plans.hyperNormStaged(r) == (r <= stagedRows),
               "the staged hyper norm is not gated on Apple7/8 and three quarters of the cores");
@@ -318,7 +318,7 @@ void apple7PrefillAttentionPlans() {
     for (uint32_t cores : {32U, 38U, 76U}) {
       DeviceCapabilities dev = device(family);
       dev.gpuCoreCount = cores;
-      const ExecutionPlans plans(dev);
+      const ExecutionPlans plans(dev, Int8Activations::On);
       for (uint32_t kvHeads : {2U, 4U}) {
         const uint32_t queryHeads = kvHeads == 2 ? 16U : 24U;
         const kv::Layout layout{1, kvHeads, 256};
