@@ -15,7 +15,8 @@ sys.path.insert(0, str(ROOT))
 
 from dev.tools import package  # noqa: E402
 
-BUNDLE_ID = "ai.inco.splash"
+# The M1/M2 port's own identifier, apart from upstream's ai.inco.splash.
+BUNDLE_ID = "io.github.paperniuk.splash-m1"
 # Where Splash is released: each release carries the app's disk image and the
 # appcast that offers it (docs/package.md, Updates).
 RELEASES = f"https://github.com/{package.REPOSITORY}/releases"
@@ -26,7 +27,10 @@ APPCAST_URL = f"{RELEASES}/latest/download/appcast.xml"
 # (docs/package.md, Updates): the app takes an update whose disk image the
 # private half signed or, to replace a lost key, one signed with the app's
 # Developer ID. Without it, the app checks for no update.
-SPARKLE_PUBLIC_KEY = "QAOqAR9iWlOPmkqq0XgbaAPjP8Y/X0lJwfd+W4a9kSc="
+# The M1/M2 port has no release key, so its app checks for no update and never
+# reads the appcast: upstream's updates would replace it with a build that does
+# not run on Apple7/8 GPUs.
+SPARKLE_PUBLIC_KEY = ""
 # The code Sparkle.framework holds besides its library, which installs an
 # update: the installer and the app that shows its progress.
 SPARKLE_HELPERS = ("Versions/B/Autoupdate", "Versions/B/Updater.app")

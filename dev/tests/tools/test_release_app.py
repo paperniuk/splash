@@ -453,7 +453,7 @@ class ReleaseAppTests(unittest.TestCase):
         app = volume / "Splash.app"
         (app / "Contents").mkdir(parents=True, exist_ok=True)
         right = {
-            "CFBundleIdentifier": "ai.inco.splash",
+            "CFBundleIdentifier": "io.github.paperniuk.splash-m1",
             "CFBundleShortVersionString": "1.5.0",
             "CFBundleVersion": "1700",
             "SUFeedURL": package_app.APPCAST_URL,
@@ -471,7 +471,7 @@ class ReleaseAppTests(unittest.TestCase):
                     command,
                     0,
                     "",
-                    f"Identifier=ai.inco.splash\nTeamIdentifier={team}\n",
+                    f"Identifier=io.github.paperniuk.splash-m1\nTeamIdentifier={team}\n",
                 )
             if command[0] == "spctl":
                 return subprocess.CompletedProcess(
@@ -527,11 +527,11 @@ class ReleaseAppTests(unittest.TestCase):
         for field, value in (
             ("CFBundleShortVersionString", "1.4.1"),
             ("CFBundleVersion", "1699"),
-            ("CFBundleIdentifier", "ai.inco.splash.beta"),
+            ("CFBundleIdentifier", "io.github.paperniuk.splash-m1.beta"),
             ("SUPublicEDKey", None),
         ):
             info = {
-                "CFBundleIdentifier": "ai.inco.splash",
+                "CFBundleIdentifier": "io.github.paperniuk.splash-m1",
                 "CFBundleShortVersionString": "1.5.0",
                 "CFBundleVersion": "1700",
                 "SUFeedURL": package_app.APPCAST_URL,
@@ -607,17 +607,17 @@ class ReleaseAppTests(unittest.TestCase):
 
   app "Splash.app"
 
-  uninstall quit: "ai.inco.splash"
+  uninstall quit: "io.github.paperniuk.splash-m1"
 
   zap trash: [
     "~/Library/Application Support/Splash/Chats",
-    "~/Library/Caches/ai.inco.splash",
+    "~/Library/Caches/io.github.paperniuk.splash-m1",
     "~/Library/Caches/Splash",
-    "~/Library/HTTPStorages/ai.inco.splash",
+    "~/Library/HTTPStorages/io.github.paperniuk.splash-m1",
     "~/Library/Logs/Splash",
-    "~/Library/Preferences/ai.inco.splash.plist",
-    "~/Library/Saved Application State/ai.inco.splash.savedState",
-    "~/Library/WebKit/ai.inco.splash",
+    "~/Library/Preferences/io.github.paperniuk.splash-m1.plist",
+    "~/Library/Saved Application State/io.github.paperniuk.splash-m1.savedState",
+    "~/Library/WebKit/io.github.paperniuk.splash-m1",
   ]
 
   caveats "Splash needs an Apple M3 or newer and macOS 26.4 or later."
@@ -857,7 +857,7 @@ end
             f"--timestamp --options runtime {self.root}/dist/Splash.app",
             "Would sign Splash-1.5.0.dmg:",
             "  codesign --force --sign 'Developer ID Application: NAME (TEAMID)' "
-            f"--timestamp --identifier ai.inco.splash.dmg {release}/Splash-1.5.0.dmg",
+            f"--timestamp --identifier io.github.paperniuk.splash-m1.dmg {release}/Splash-1.5.0.dmg",
             "Skipped appcast.xml: SPARKLE_PUBLIC_KEY in dev/tools/package_app.py "
             "is empty.",
             "Publishing release 1.5.0, made without DRY_RUN, would take:",

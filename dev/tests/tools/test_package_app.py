@@ -13,9 +13,9 @@ from unittest import mock
 from dev.tools import package_app
 
 THIN_ARM64 = bytes.fromhex("cffaedfe0c000001")
-# The release key's public half, SPARKLE_PUBLIC_KEY, as generate_keys printed
-# it once (docs/package.md, Updates).
-RELEASE_KEY = "QAOqAR9iWlOPmkqq0XgbaAPjP8Y/X0lJwfd+W4a9kSc="
+# The release key's public half, SPARKLE_PUBLIC_KEY: none on the M1/M2 port,
+# whose app checks for no update (upstream's would not run on Apple7/8).
+RELEASE_KEY = ""
 SPARKLE = "APP/Contents/Frameworks/Sparkle.framework"
 
 
@@ -83,7 +83,7 @@ class PackageAppTests(unittest.TestCase):
         self.assertEqual(
             info,
             {
-                "CFBundleIdentifier": "ai.inco.splash",
+                "CFBundleIdentifier": "io.github.paperniuk.splash-m1",
                 "CFBundleName": "Splash",
                 "CFBundleDisplayName": "Splash",
                 "CFBundleExecutable": "Splash",
@@ -318,11 +318,11 @@ class PackageAppTests(unittest.TestCase):
         self.assertEqual(
             self.signing_commands("-"),
             [
-                [*adhoc, "--identifier", "ai.inco.splash.engine", "engine/splash"],
+                [*adhoc, "--identifier", "io.github.paperniuk.splash-m1.engine", "engine/splash"],
                 [
                     *adhoc,
                     "--identifier",
-                    "ai.inco.splash.python",
+                    "io.github.paperniuk.splash-m1.python",
                     "python/bin/python3.13",
                 ],
                 [*adhoc, "python/lib/x.so"],
@@ -344,11 +344,11 @@ class PackageAppTests(unittest.TestCase):
         self.assertEqual(
             self.signing_commands(identity)[:7],
             [
-                [*signed, "--identifier", "ai.inco.splash.engine", "engine/splash"],
+                [*signed, "--identifier", "io.github.paperniuk.splash-m1.engine", "engine/splash"],
                 [
                     *signed,
                     "--identifier",
-                    "ai.inco.splash.python",
+                    "io.github.paperniuk.splash-m1.python",
                     "python/bin/python3.13",
                 ],
                 [*signed, "python/lib/x.so"],
@@ -399,7 +399,7 @@ class PackageAppTests(unittest.TestCase):
             [
                 *built,
                 ["codesign", "--force", "--sign", identity, "--timestamp"]
-                + ["--identifier", "ai.inco.splash.dmg", "FOLDER/Splash-1.5.0.dmg"],
+                + ["--identifier", "io.github.paperniuk.splash-m1.dmg", "FOLDER/Splash-1.5.0.dmg"],
             ],
         )
 
