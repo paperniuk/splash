@@ -1650,10 +1650,15 @@ int verifiedRows(MetalBackend &backend) {
     if (!std::equal(at(output), at(output) + kHidden, at(allOutput)))
       fail("verified row " + std::to_string(row) + " differs from the all-rows run");
   }
-  if (compared != expected || column != kVerify.size())
+  // Each lane's first verify row has an expert of its own, whose tile is a
+  // column tile; Apple7/8's MMA passes run one only for a Q2_0 expert
+  // (columnTile), which this model has none of.
+  const bool columnKinds = moeTile(backend) == MoeGgufTile::Staged ||
+                           std::find(m.formats.begin(), m.formats.end(), gguf_reference::Q20) != m.formats.end();
+  const uint32_t columnRows = columnKinds ? kVerify.size() : 0;
+  if (compared != expected || column != columnRows)
     fail(std::to_string(compared) + " of " + std::to_string(expected) + " verified rows kept their tile kinds, " +
-         std::to_string(column) + " of them on the column tile, not every one and " +
-         std::to_string(kVerify.size()));
+         std::to_string(column) + " of them on the column tile, not every one and " + std::to_string(columnRows));
   printf("%-20s staged   every row verified: %s; verify rows 8/5/2/1: %u rows bitwise, %u with a column-tile route: "
          "%s\n",
          formatNames(m).c_str(), fullBitwise ? "bitwise" : "differs", compared, column, failures ? "FAIL" : "ok");
