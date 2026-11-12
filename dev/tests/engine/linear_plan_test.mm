@@ -858,6 +858,14 @@ void ggufPlans() {
     require(storage(7, 8) == 8 && storage(7, 16) == 16 && storage(7, 17) == 24 && storage(7, 24) == 24 &&
                 storage(7, 25) == 32 && storage(7, 32) == 32 && storage(10, 20) == 32,
             "Apple7/8 staged prefill tile rows");
+    // A part of a 24-row chunk (a prefill's last rows) keeps the 24-row tile at 17 rows or more and runs the tile
+    // of its own height below.
+    const Linear m1 = gpu(7, 32);
+    for (const uint32_t rows : {1U, 4U, 16U, 17U, 20U}) {
+      const LinearPlan part = m1.prefillPlan(down, rows, LinearEpilogue::Residual, 24);
+      require(part.configuration().twentyFourRows == (rows > 16) && part.storageRows() == (rows > 16 ? 24 : rows <= 8 ? 8 : 16),
+              "Apple7/8 part of a 24-row chunk at " + std::to_string(rows) + " rows");
+    }
   }
   // The 27B's pair, 17408 x 5120 in MLX 4-bit, runs in one pass where its 544 one-pass threadgroups fill whole waves
   // of 16 per core or nearly (20 and 40 cores: 27.2 and 13.6 per core), in two where one pass leaves a second wave of

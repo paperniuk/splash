@@ -192,7 +192,11 @@ LinearPlan Linear::prefillPlan(const Projection &p, uint32_t rows, LinearEpilogu
   if (!chunkRows || chunkRows == rows) return plan(w, p);
   if (rows > chunkRows) throw std::invalid_argument("a prefill plan takes rows of its chunk");
   const LinearPlan chunk = plan({w.matrix, chunkRows, LinearPhase::Prefill, epilogue}, p);
-  LinearPlan part(w, chunk.configuration(), chunk.destination());
+  // Apple7/8's 24-row tile holds 17 to 24 rows; fewer of its chunk's rows run
+  // the staged tile of their own height.
+  LinearConfig config = chunk.configuration();
+  if (rows <= 16) config.twentyFourRows = false;
+  LinearPlan part(w, config, chunk.destination());
   part.rotated_ = chunk.rotated_;
   return part;
 }
