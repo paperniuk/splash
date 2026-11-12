@@ -777,7 +777,10 @@ void prefill(MetalBackend &backend, const Linear &linear, uint32_t K, const std:
     const auto lastRows = [&](const LinearPlan &plan, const Outcome &out, const std::string &name) {
       const uint32_t chunk = plan.workload().rows;
       for (const uint32_t rows : {1u, 4u}) {
-        const LinearPlan part = Linear::plan(workload(rows), plan.configuration(), FloatOutput::BFloat16);
+        // Apple7/8's 24-row tile holds 17 to 24 rows only; fewer run the tile of their own height.
+        LinearConfig lastConfig = plan.configuration();
+        lastConfig.twentyFourRows = false;
+        const LinearPlan part = Linear::plan(workload(rows), lastConfig, FloatOutput::BFloat16);
         const auto last = [&](const std::vector<float> &values, uint32_t width) {
           const auto end = values.begin() + uint64_t{chunk} * width;
           return storageRows(std::vector<float>(end - uint64_t{rows} * width, end), width, rows, part.storageRows());
