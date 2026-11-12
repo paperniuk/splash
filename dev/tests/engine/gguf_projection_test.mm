@@ -1749,7 +1749,7 @@ int main(int argc, char **argv) {
         // on any later GPU too.
         DeviceCapabilities apple7 = backend.capabilities();
         apple7.appleGpuFamily = 7;
-        const Linear m1(apple7);
+        const Linear m1(apple7, Int8Activations::On);
         fp32RegisterTable = true;
         decodeTile(backend, m1, LinearTile::GgufRegister, false, decodeInputs(false),
                    tileFormats(LinearTile::GgufRegister));

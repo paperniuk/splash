@@ -332,7 +332,7 @@ void encodeAttentionPieces(id<MTLComputeCommandEncoder> encoder,
     const uint32_t rows = std::min(pieceRows, data.params.chunk_tokens - begin);
     const auto plan = splash::ops::PagedAttention::prefillPlan(
         rows, data.params.committed_tokens + begin, kQueryHeads, {1, kKvHeads, kHeadDimension},
-        kPagesPerSplit);
+        splash::ops::kApple10Attention, splash::ops::Int8Activations::Off);
     const PrefillAttentionParams params{
         data.params.committed_tokens + begin, rows, data.params.chunk_stride,
         data.params.page_table_entries, data.params.kv, plan.splits, 0, 0};
