@@ -2375,7 +2375,8 @@ void pipelinesCreatedWhileServingAreCounted(const std::string &metallibPath) {
         (void)capturedStderr([&] { (void)BackendInstrumentation::awakeHostStepsSpin(backend); });
     }
     (void)capturedStderr([&] { (void)spinCheck(backend, "a check after one that decided nothing"); });
-    require(backend.pipelinesCreatedWhileServing() == 3,
+    // Apple7/8 check no spin (spinsOnThisGpu), so they create no spin pipeline.
+    require(backend.pipelinesCreatedWhileServing() == (spinsOnThisGpu(backend) ? 3U : 2U),
             "a spin check after one that decided nothing created the spin's pipeline again");
     std::cout << "PASS pipelines created while serving are counted\n";
 }
@@ -2801,6 +2802,11 @@ void awakeHostStepsBesideLongWorkResumePromptly(const std::string &metallibPath)
     constexpr uint32_t kSteps = 128, kCommands = 8, kCopyWords = 8u << 20;
     MetalBackend backend(metallibPath);
     const std::optional<bool> spins = spinCheck(backend, "awake host steps beside long work");
+    // Apple7/8 run awake host steps as plain ones (spinsOnThisGpu): no spin to resume from.
+    if (!spinsOnThisGpu(backend)) {
+      require(spins == false, "a GPU spin through an awake host step ran on Apple7/8");
+      return;
+    }
     require(spins.value_or(true), "a GPU spin through an awake host step did not see the CPU end it");
     if (!spins) return;
     const uint32_t copyWords = kCopyWords, one = 1;
