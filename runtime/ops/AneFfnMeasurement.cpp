@@ -126,7 +126,7 @@ Timings Measurement::time() {
   timings.gpuAlone = layer(sampled, kCount, kRows);
   const auto measure = [&](double share) {
     const uint32_t aneUnits = nearestUnits(share, units);
-    AneFfn split(backend_, linear_, sampled, aneUnits, interrupted_, std::array{kRows});
+    AneFfn split(backend_, linear_, sampled, aneUnits, interrupted_, std::array{kRows}, AneFfn::Mode::Single);
     return Timing{static_cast<double>(aneUnits) / units, gpuPart(sampled, split),
                   layer(sampled, kCount, kRows, &split, timings.gpuAlone)};
   };
@@ -137,7 +137,7 @@ Timings Measurement::time() {
 
 double Measurement::split(uint32_t aneUnits, double gpuAlone) {
   const std::vector<SwiGluProjections> sampled = this->sampled();
-  AneFfn split(backend_, linear_, sampled, aneUnits, interrupted_, std::array{kRows});
+  AneFfn split(backend_, linear_, sampled, aneUnits, interrupted_, std::array{kRows}, AneFfn::Mode::Single);
   return layer(sampled, kCount, kRows, &split, gpuAlone);
 }
 

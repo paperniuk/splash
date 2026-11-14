@@ -1510,7 +1510,9 @@ AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &
   }
   model.unavailable = [] { return ane::unavailable(); };
   model.units = ops::AneFfn::units(*layers);
-  model.plannedBytes = [layers](uint32_t aneUnits) { return ops::AneFfn::plannedBytes(*layers, aneUnits); };
+  model.plannedBytes = [layers](uint32_t aneUnits, bool pairs) {
+    return ops::AneFfn::plannedBytes(*layers, aneUnits, pairs);
+  };
   const auto onArena = [&backend, &loaded, &operators, format](const auto &use) {
     model::withPrefillArena(backend, loaded, operators, format, use);
   };
@@ -1529,10 +1531,10 @@ AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &
     });
     return milliseconds;
   };
-  model.prepare = [&backend, &linear, layers, cancelled, onArena](uint32_t aneUnits, bool timeChunks) {
+  model.prepare = [&backend, &linear, layers, cancelled, onArena](uint32_t aneUnits, bool timeChunks, ops::AneFfn::Mode mode) {
     AneFfnPrepared prepared;
     onArena([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
-      prepared.split = std::make_unique<ops::AneFfn>(backend, linear, *layers, aneUnits, cancelled);
+      prepared.split = std::make_unique<ops::AneFfn>(backend, linear, *layers, aneUnits, cancelled, mode);
       prepared.error = prepared.split->verify(*layers, ffn, hidden);
       if (timeChunks)
         prepared.chunks =

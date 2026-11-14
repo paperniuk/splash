@@ -2,6 +2,7 @@
 
 #include <dispatch/dispatch.h>
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -12,6 +13,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace splash::ane {
 namespace {
@@ -37,16 +39,17 @@ std::string seconds(AwakeClock::duration duration) {
 } // namespace
 
 struct Handoff::State final {
-  State(metal::SharedEvent event, AwakeClock::duration bound) : event(std::move(event)), bound(bound) {}
+  State(std::vector<metal::SharedEvent> events, AwakeClock::duration bound)
+      : events(std::move(events)), bound(bound), values(this->events.size()) {}
 
-  // Retires with `why` unless already retired, and raises the event to the
-  // highest value allocated. Under `mutex`.
+  // Retires with `why` unless already retired, and raises each event to the
+  // highest value allocated of it. Under `mutex`.
   void retire(std::string why) {
     if (!retired) {
       retired = true;
       reason = std::move(why);
     }
-    event.signal(value);
+    for (size_t lane = 0; lane < events.size(); ++lane) events[lane].signal(values[lane]);
     changed.notify_all();
   }
   // Fails the job of `phase` with `why`. Under `mutex`.
@@ -104,10 +107,10 @@ struct Handoff::State final {
 
   std::mutex mutex;
   std::condition_variable changed;
-  const metal::SharedEvent event;
+  const std::vector<metal::SharedEvent> events;
   const AwakeClock::duration bound;
-  // The highest value of the event allocated.
-  uint64_t value = 0;
+  // The highest value allocated of each event.
+  std::vector<uint64_t> values;
   // The jobs of the command queued last, by id, until finish() or cancel().
   std::unordered_map<uint64_t, Job> jobs;
   // The jobs of any command the agent started and has not reported.
@@ -117,8 +120,11 @@ struct Handoff::State final {
   std::string reason;
 };
 
-Handoff::Handoff(metal::MetalBackend &backend, AwakeClock::duration bound)
-    : state_(std::make_shared<State>(backend.newSharedEvent(), bound)) {}
+Handoff::Handoff(metal::MetalBackend &backend, AwakeClock::duration bound, uint32_t lanes) {
+  std::vector<metal::SharedEvent> events;
+  for (uint32_t lane = 0; lane < std::max<uint32_t>(lanes, 1); ++lane) events.push_back(backend.newSharedEvent());
+  state_ = std::make_shared<State>(std::move(events), bound);
+}
 
 Handoff::~Handoff() {
   try {
@@ -127,16 +133,18 @@ Handoff::~Handoff() {
   }
 }
 
-const metal::SharedEvent &Handoff::event() const noexcept { return state_->event; }
+const metal::SharedEvent &Handoff::event(uint32_t lane) const { return state_->events.at(lane); }
 
-uint64_t Handoff::next() {
+uint64_t Handoff::next(uint32_t lane) {
   std::lock_guard lock(state_->mutex);
-  ++state_->value;
-  if (state_->retired) state_->event.signal(state_->value);
-  return state_->value;
+  uint64_t &value = state_->values.at(lane);
+  ++value;
+  if (state_->retired) state_->events[lane].signal(value);
+  return value;
 }
 
-void Handoff::queue(uint64_t ready, uint64_t done, const Start &start) {
+void Handoff::queue(uint64_t ready, uint64_t done, const Start &start, uint32_t lane) {
+  const metal::SharedEvent &event = state_->events.at(lane);
   uint64_t id = 0;
   {
     std::lock_guard lock(state_->mutex);
@@ -150,9 +158,8 @@ void Handoff::queue(uint64_t ready, uint64_t done, const Start &start) {
   }
   std::string failure;
   try {
-    start(state_->event, ready, done,
-          [state = state_, id](bool success) { State::reported(state, id, success); });
-    state_->event.notify(ready, [state = state_, id] { State::reached(state, id); });
+    start(event, ready, done, [state = state_, id](bool success) { State::reported(state, id, success); });
+    event.notify(ready, [state = state_, id] { State::reached(state, id); });
     return;
   } catch (const std::exception &error) {
     failure = std::string("an evaluation could not start: ") + error.what();
@@ -179,13 +186,22 @@ std::optional<AwakeClock::duration> Handoff::finish() {
     for (auto &[id, job] : state.jobs)
       if (job.phase != Phase::Succeeded)
         state.fail(job.phase, "an evaluation did not report within " + seconds(state.bound) + " s of its command");
+  // The time some job ran: lanes' jobs overlap.
+  std::vector<std::pair<AwakeClock::time_point, AwakeClock::time_point>> spans;
   std::optional<AwakeClock::duration> ran = AwakeClock::duration{};
   for (const auto &[id, job] : state.jobs) {
     if (job.phase != Phase::Succeeded) {
       ran.reset();
       break;
     }
-    *ran += job.ran;
+    if (job.ran > AwakeClock::duration{}) spans.emplace_back(job.started, job.started + job.ran);
+  }
+  std::ranges::sort(spans);
+  AwakeClock::time_point covered{};
+  for (const auto &[begin, end] : spans) {
+    if (!ran) break;
+    if (end > covered) *ran += end - std::max(begin, covered);
+    covered = std::max(covered, end);
   }
   state.jobs.clear();
   return ran;

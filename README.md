@@ -151,7 +151,7 @@ window. To set your own limits or cache options, add these to `splash serve`:
 | `--prefill-bound-ms 1000` | Longest prefill GPU command buffer. Prefill ends a buffer at every layer, so 2048-token chunks still fit at most context lengths. Default: 2000 (`SPLASH_PREFILL_BOUND_MS`), so macOS does not abort long-context prefill for stalling the display (`ImpactingInteractivity`); after such an abort the restarted engine halves it, down to 500. `--prefill-mode full` always sends whole 2048-token chunks. `/status` reports it as `scheduler.prefill_bound_ms`. |
 | `--activations bf16` | Use BF16 activations. Default: auto. |
 | `--disable-ane` | Prefill on the GPU alone. Default: the 27B also uses the Neural Engine. |
-| `--ane-ffn-share 0.35 --ane-ffn-minimum-rows 520` | Fix the Neural Engine's share of the prefill FFN, and the least chunk rows it splits, instead of calibrating them at start. Default: calibrated; `0` keeps the FFN on the GPU. |
+| `--ane-ffn-share 0.35 --ane-ffn-minimum-rows 520` | Fix the Neural Engine's share of the prefill FFN, and the least chunk rows it splits, instead of calibrating them at start; a fixed share also runs a command of 256 rows or more as two chunks, one's FFN on the Neural Engine beside the other's mixer, which gains only at a share above the calibrated one. Default: calibrated; `0` keeps the FFN on the GPU. |
 | `--max-cache-disk 16G` | Cap the SSD cache (default: auto, up to 32 GiB; `0` turns it off). |
 | `--persistent-cache` | Keep the SSD cache across restarts. Off by default. |
 
