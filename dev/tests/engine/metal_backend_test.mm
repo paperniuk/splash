@@ -1893,6 +1893,34 @@ void commandBreaksSplitBuffers(const std::string &metallibPath) {
     std::cout << "PASS command buffer breaks split a command\n";
 }
 
+// A break after a host step commits its buffer only once the step returned, as
+// the buffers after a step are (HostSteps::commitAfter): the work it ends may
+// read what the step wrote, an expert load in a streamed prefill on Apple7/8,
+// which ends a buffer at every layer. Committed before the step returned, the
+// add between the step and the break ran ahead of the step's write.
+void breakAfterAHostStepWaitsForIt(const std::string &metallibPath) {
+    using enum EventStep::Kind;
+    MetalBackend backend(metallibPath);
+    MetalBuffer buffer = sharedBuffer(backend, sizeof(uint32_t));
+    auto *value = static_cast<volatile uint32_t *>(buffer.contents());
+    *value = 0;
+    const uint32_t count = 1, one = 1;
+    const std::vector<ComputeDispatch> dispatches(3, addition(buffer, count, one));
+    uint32_t seen = 0;
+    const std::vector<EventStep> steps{{1, {}, 0, Host,
+                                        [&] {
+                                            seen = *value;
+                                            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                                            *value = 100;
+                                        }},
+                                       {2, {}, 0, Break}};
+    (void)backend.submitCommandAsync(Command{dispatches, steps}).wait();
+    require(seen == 1 && *value == 102 && backend.healthy(),
+            "the work between a host step and a break ran before the step returned (value " +
+                std::to_string(*value) + ", step saw " + std::to_string(seen) + ")");
+    std::cout << "PASS a break after a host step waits for it\n";
+}
+
 // A command of 100 signal and wait pairs, more command buffers than a queue
 // holds by default, runs in order against an agent that answers each signal:
 // a signal follows the work before it, and the work after its wait waits for
@@ -3446,6 +3474,7 @@ std::span<const splash::test::TestCase> behaviourTests() {
         {"shutdownSparesACommandThatCompletes", [] { shutdownSparesACommandThatCompletes(metallib); }},
         {"dispatchProfilingCoversEveryCommand", [] { dispatchProfilingCoversEveryCommand(metallib); }},
         {"commandBreaksSplitBuffers", [] { commandBreaksSplitBuffers(metallib); }},
+        {"breakAfterAHostStepWaitsForIt", [] { breakAfterAHostStepWaitsForIt(metallib); }},
         {"preparedPipelinesCompileAhead", [] { preparedPipelinesCompileAhead(metallib); }},
         {"functionConstantsSpecializePipelines", [] { functionConstantsSpecializePipelines(metallib); }},
         {"pipelinesCreatedTogether", [] { pipelinesCreatedTogether(metallib); }},

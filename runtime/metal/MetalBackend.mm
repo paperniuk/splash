@@ -1918,8 +1918,11 @@ struct MetalBackend::Impl {
                             continue;
                         }
                         if (step->kind == EventStep::Kind::Break) {
+                            // Committed after the host steps before it returned, as every
+                            // buffer of a command with host steps is (HostSteps::commitAfter):
+                            // its work may read what a step's load wrote.
                             leading.push_back(command);
-                            [command commit];
+                            commitEncoded(command);
                             command = [queue commandBuffer];
                             if (!command) {
                                 failEncoding("unable to create Metal command buffer");
