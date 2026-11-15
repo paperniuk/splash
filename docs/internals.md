@@ -1127,17 +1127,43 @@ view leaves unread, or, on the int8-activation tile, through that tile's
 stride over the planes' rows. The Neural Engine runs the rest as one W8A8
 program, Hadamard-rotated int8 activations and per-row int8 weights
 (`runtime/ane/Program.mm`): a chunk takes the smallest of
-its functions that holds it, one every 128 rows from 512 to 2048, all reading
-and writing one set of surfaces sized for 2048 rows. The ANE service holds
+its functions that holds it, one every 128 rows from 128 to 1792 and one of
+2048 (the compiler refuses more than 15), all reading and writing surfaces
+sized for 2048 rows. The ANE service holds
 memory for a loaded program's intermediate values, which its functions share:
 13 programs of one function each held it 13 times (3.25 GB at the M6's share,
 against 0.67 GB for the one program). The GPU requantizes the
 ANE's weights from the block planes one layer ahead into double-buffered
-IOSurfaces and adds the ANE's partial down projection to its own. Shared
-events order each evaluation between the GPU's packing and that join inside
-the one prefill command (`metal::EventStep`); each signal ends a Metal command
-buffer, so the queue holds 512. MoE targets, the mixers and decode stay on the
-GPU.
+IOSurfaces, and adds the ANE's partial down projection to its own. Shared events order each evaluation between the
+GPU's packing and that join inside the one prefill command
+(`metal::EventStep`); each signal ends a Metal command buffer, so the queue
+holds 512. MoE targets, the mixers and decode stay on the GPU.
+
+A single chunk leaves the ANE idle through each layer's mixer. A split given
+a share (`--ane-ffn-share`) therefore runs a command it takes of 256 rows or
+more as a pair of chunks, layer by layer (`RuntimeGeometry::prefillPairs`,
+`AneFfn::pairRows`): each chunk has a slot of its own input and output
+surfaces and its own event, a chunk's join is left until its output is read
+(`AneFfn::settle`), and the ANE runs one chunk's FFN while the GPU runs the
+other's mixer. A chunk of a pair runs on the same functions as any chunk. The
+first chunk fills a function, the second takes the rest, and of such pairs the
+one whose functions hold the fewest rows runs. A pair has one set of weight
+surfaces, which the GPU stages at each layer's first chunk once every
+evaluation of the layer before is done: the other chunk's may still run beside
+this chunk's mixer, so no layer's weights can be staged ahead. The pair shares
+one chunk's rows of the prefill arena, and its second chunk advances the
+recurrent states in place in the lane's next cell. The service failed an evaluation when a 64-layer
+command queued all 128 at once, so each slot keeps 32 queued. The breaker
+(below) judges single chunks only. A split that cannot give a pair its slots
+is built again with one slot over the pair's one weight set, and serves single
+chunks at the given share. The calibrated split never pairs and is the split
+as before, with double-buffered weights and one slot: its share is timed on
+single chunks, whose best is near 0.5, where a pair's is higher and a pair at
+that share gains nothing. A given share pairs and pays only above that
+calibrated one: on a 16-core M1 Pro (ANE about 2.7 times the GPU on the FFN)
+pairs at the calibrated 0.68 gain about nothing and at 0.82-0.88 gain 11-29%
+from 476 rows up; on a 32-core M1 Max (about 1.5 times), cold prefill of 6.7K
+tokens runs 212 tok/s at the calibrated 0.50 and 254 tok/s given 0.735.
 
 Startup decides the split on the loaded model before it allocates the KV cache
 (`runtime/engine/AneFfnStartup.cpp`), once it has built the memory governor,
@@ -1220,7 +1246,7 @@ program of its own (half a minute on an M6).
 
 The start then builds the split that serves and checks every function of its
 program against the GPU alone (`AneFfn::verify`): at the function's own rows
-over two layers, which stage the ANE's weights through both sets, with the
+in each slot over two layers, which stage the ANE's weights twice, with the
 ANE's output filled with NaN first so that rows it leaves unwritten show,
 against the leading rows of a full chunk on the GPU alone, which computes every
 row alike whatever the chunk's rows. The outputs must be finite and differ from

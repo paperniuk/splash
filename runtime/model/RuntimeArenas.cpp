@@ -137,12 +137,15 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
           workspace.*ops::kMoeScratchFields[field].bytes);
   }
   // A prefill group's tensors hold every chunk's rows, each chunk's aligned,
-  // and its chain's scratch cell.
+  // and its chain's scratch cell. A pair's chunks share one chunk's rows, and
+  // its scratch cell holds no recurrent state (PrefillArena).
   if (geometry.prefillChunks > 1) {
-    for (uint32_t index = 0; index < result.size(); ++index)
+    for (uint32_t index = 0; index < result.size() && !geometry.prefillPairs; ++index)
       if (result[index] && prefillGroupTensor(static_cast<PrefillTensor>(index)))
         result[index] = alignUp(result[index]) * geometry.prefillChunks;
-    put(PrefillTensor::GroupCell, geometry.target.stateLayout.cellBytes());
+    const GdnStateLayout &state = geometry.target.stateLayout;
+    put(PrefillTensor::GroupCell,
+        geometry.prefillPairs ? state.convolutionBytes() + alignUp(state.auxiliaryBytes) : state.cellBytes());
   }
   return result;
 }

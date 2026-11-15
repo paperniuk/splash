@@ -110,7 +110,9 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
   // Feasibility. The split's memory comes out of the KV cache, more of it
   // with each unit the ANE takes: the plan must still hold the context asked
   // for, or with none asked some context, which becomes the automatic one.
-  const auto planWith = [&](uint32_t aneUnits) { return planMemory(model.plannedBytes(aneUnits)); };
+  // A given split may run pairs of chunks, which take their own memory.
+  const bool pairs = setting.given.has_value();
+  const auto planWith = [&](uint32_t aneUnits) { return planMemory(model.plannedBytes(aneUnits, pairs)); };
   const auto contextWith = [&](uint32_t aneUnits) { return contextOf(planWith(aneUnits)); };
   // The most units from `low`, whose plan holds `context`, to `high` whose
   // plan holds it.
@@ -186,7 +188,18 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
   };
   try {
     if (given) {
-      AneFfnPrepared prepared = model.prepare(*given, false);
+      // A split that cannot give a pair its slots still serves single chunks.
+      AneFfnPrepared prepared;
+      try {
+        prepared = model.prepare(*given, false, ops::AneFfn::Mode::Pair);
+      } catch (const ane::Interrupted &) {
+        throw;
+      } catch (const std::exception &error) {
+        if ((cancelled && cancelled()) || !model.healthy()) throw;
+        logWarning("Neural Engine FFN split cannot run a command as a pair of chunks (", error.what(),
+                   "); its chunks run one at a time.");
+        prepared = model.prepare(*given, false, ops::AneFfn::Mode::Fallback);
+      }
       if (prepared.split) prepared.split->setMinimumRows(setting.given->minimumRows);
       return serve(std::move(prepared), *given, setting.given->minimumRows, "", "set up");
     }
@@ -216,7 +229,7 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
       assumed = calibration->aneUnits;
       if (!calibration->aneUnits)
         return gpuAloneServing(Kind::NoGain, "no Neural Engine split beat it by enough when this Mac calibrated it");
-      AneFfnPrepared prepared = model.prepare(calibration->aneUnits, false);
+      AneFfnPrepared prepared = model.prepare(calibration->aneUnits, false, ops::AneFfn::Mode::Single);
       take(prepared, *calibration);
       return serve(std::move(prepared), calibration->aneUnits, calibration->minimumRows, "",
                    "set up as calibrated before");
@@ -231,7 +244,7 @@ AneFfnStart decide(const AneFfnModel &model, const AneFfnSetting &setting, Reque
     // The fit's units, or a neighbour's that their timings show faster.
     const uint32_t chosen = ane_ffn::refine(
         *fitted, maxAneUnits, [&](uint32_t aneUnits) { return model.timeSplit(aneUnits, timings.gpuAlone); });
-    AneFfnPrepared prepared = model.prepare(chosen, true);
+    AneFfnPrepared prepared = model.prepare(chosen, true, ops::AneFfn::Mode::Single);
     const ane_ffn::ChunkTimings &chunks = prepared.chunks;
     if (chunks.functions.empty()) throw std::logic_error("the split's chunks were not timed");
     const std::string timed =
@@ -295,7 +308,7 @@ AneFfnStart startAneFfn(const AneFfnModel &model, const AneFfnSetting &setting, 
 bool aneFfnRefused(const AneFfnModel &model, const AneFfnSetting &setting, uint32_t requestedContextTokens,
                    const std::function<EngineMemoryPlanResult(uint64_t aneFfnBytes)> &planMemory) {
   return !notRunning(model, setting) &&
-         contextOf(planMemory(model.plannedBytes(leastUnits(model, setting)))) <
+         contextOf(planMemory(model.plannedBytes(leastUnits(model, setting), setting.given.has_value()))) <
              std::max<uint32_t>(requestedContextTokens, 1);
 }
 

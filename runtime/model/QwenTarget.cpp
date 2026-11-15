@@ -128,11 +128,12 @@ void QwenTarget::requireLayerPartition(uint32_t gdnLayers, uint32_t attentionLay
 
 void QwenTarget::requirePrefill(std::span<const QwenTargetPrefillChunk> chunks, const kv::PageStorage &kv,
                                 QwenPrefillLayers layers, const ops::AneFfn *aneFfn) const {
-  // The Neural Engine splits a dense target's commands, which are one chunk
-  // and run whole.
+  // The Neural Engine splits a dense target's commands, which run whole: one
+  // chunk, or two whose FFNs it runs beside each other's mixers
+  // (AneFfn::add).
   const bool whole = !layers.first && layers.end == geometry_.layers;
   if (chunks.empty() || kv.layers().size() != geometry_.kvLayout.attentionLayers ||
-      (aneFfn && (chunks.size() > 1 || !whole)) || layers.first >= layers.end || layers.end > geometry_.layers)
+      (aneFfn && (chunks.size() > 2 || !whole)) || layers.first >= layers.end || layers.end > geometry_.layers)
     throw std::invalid_argument("invalid Qwen prefill");
 }
 
@@ -145,7 +146,7 @@ ops::PrefillAttentionPlan prefillAttentionPlan(const ops::ExecutionPlans &plans,
 
 QwenTarget::PrefillStep QwenTarget::prefillStep(metal::CommandGraph &graph, const QwenTargetPrefillChunk &chunk,
                                                 const kv::PageStorage &kv, SpilledKvReads &spilled,
-                                                ops::AneFfn *aneFfn) const {
+                                                ops::AneFfn *aneFfn, bool paired) const {
   if (chunk.sequences.empty() || chunk.sequences.size() > ExecutionLimits::maximumBatchWidth || !chunk.rows ||
       chunk.rows > ExecutionLimits::prefillTokenBudget)
     throw std::invalid_argument("invalid Qwen prefill chunk");
@@ -159,7 +160,7 @@ QwenTarget::PrefillStep QwenTarget::prefillStep(metal::CommandGraph &graph, cons
   }
   if (geometry_.ffnKind == QwenFfnKind::SparseMoe)
     step.moe = operators_.moePrefill(geometry_.moeBlockShape(), geometry_.moeRouterFormat, chunk.rows);
-  if (aneFfn && aneFfn->splits(chunk.rows)) step.aneFfn = aneFfn;
+  if (aneFfn && (paired ? aneFfn->pairs(chunk.rows) : aneFfn->splits(chunk.rows))) step.aneFfn = aneFfn;
   return step;
 }
 
@@ -448,7 +449,7 @@ void QwenTarget::addPrefillDenseFfn(PrefillStep &step, uint32_t index, const ops
   const ops::PrefillFfnBuffers buffers = step.buffers.ffn();
   // The split takes whole chunks; read rows alone run on the GPU.
   if (step.aneFfn && step.readRows.empty())
-    step.aneFfn->add(step.graph, index, buffers, std::move(residual), std::move(output), rows);
+    step.aneFfn->add(step.graph, index, buffers, std::move(residual), std::move(output), rows, &step.buffers);
   else
     operators_.linear().addPrefillSwiGlu(step.graph, ffn, buffers, std::move(residual), std::move(output), rows,
                                          step.rows);
@@ -590,6 +591,8 @@ private:
   void addPrefillLayer(PrefillStep &step, uint32_t index) const {
     const Layer &layer = weights_.layers[index];
     const QwenTargetPrefillBuffers &b = step.buffers;
+    // The layer before's rows, once the Neural Engine's part joined them.
+    if (step.aneFfn) step.aneFfn->settle(step.graph, &b);
     const metal::MetalBuffer input = b.hidden[index & 1];
     planOutputRows(step, index);
     ops::Normalization::addRms(step.graph, input, layer.inputNorm, b.normalized, geometry_.hiddenSize, step.rows);
@@ -607,11 +610,13 @@ private:
     const QwenTargetPrefillBuffers &b = step.buffers;
     if (const ops::BlockMoeWeights *ffn = moe(index)) ops::MoE::addRouted(step.graph, step.ffn, *ffn, *step.moe);
     addReadRows(step, b.hidden[index & 1], b.hidden[(index & 1) ^ 1]);
+    if (step.aneFfn && geometry_.captureSlot(index)) step.aneFfn->settle(step.graph, &b);
     forEachPrefillCapture(step, index, [&](uint32_t slot, uint32_t source, uint32_t destination, uint32_t rows) {
       addCapture(step.graph, slot, b.hidden[(index & 1) ^ 1], source, b.captured, destination, rows);
     });
   }
   [[nodiscard]] metal::MetalBuffer addPrefillEnd(PrefillStep &step) const {
+    if (step.aneFfn) step.aneFfn->settle(step.graph, &step.buffers);
     return step.buffers.hidden[geometry_.layers & 1];
   }
 

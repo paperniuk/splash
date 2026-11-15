@@ -22,7 +22,12 @@ struct AneFfnSetting final {
   // A given share without its least chunk keeps 256 rows, where the program
   // started before its 128-row functions: Macs whose split loses below that
   // (M1 Max, M2 Max) keep their given split, and smaller chunks take it only
-  // as calibration or --ane-ffn-minimum-rows chooses.
+  // as calibration or --ane-ffn-minimum-rows chooses. A given split also runs
+  // a command it takes of 256 rows or more as two chunks, each one's FFN on
+  // the Neural Engine beside the other's mixer on the GPU
+  // (ops::AneFfn::pairRows), where calibration's share, timed on single
+  // chunks, would leave the Neural Engine no more work than the GPU's mixer
+  // gives it.
   static constexpr uint32_t kGivenMinimumRows = 256;
   static_assert(kGivenMinimumRows >= ops::AneFfn::kMinimumRows && kGivenMinimumRows <= ops::AneFfn::kMaximumRows);
   struct Given final {
@@ -60,17 +65,19 @@ struct AneFfnModel final {
   std::function<std::optional<std::string>()> unavailable;
   // The channel units of the split (ops::AneFfn::units).
   uint32_t units = 0;
-  // The split's Metal memory with the ANE taking `aneUnits` of them.
-  std::function<uint64_t(uint32_t aneUnits)> plannedBytes;
+  // The split's Metal memory with the ANE taking `aneUnits` of them, of one
+  // that may run pairs of chunks or of one that does not
+  // (ops::AneFfn::plannedBytes).
+  std::function<uint64_t(uint32_t aneUnits, bool pairs)> plannedBytes;
   // Calibration's timings (ops::ane_ffn::Measurement::time).
   std::function<ops::ane_ffn::Timings()> time;
   // The split layer of full chunks with the ANE taking `aneUnits` units, less
   // the GPU alone's `gpuAlone` of time() (ops::ane_ffn::Measurement::split).
   std::function<double(uint32_t aneUnits, double gpuAlone)> timeSplit;
   // The split that serves with the ANE taking `aneUnits`, verified, with its
-  // chunks timed (ops::ane_ffn::Measurement::chunks) when `timeChunks`. A
-  // model a test plays prepares no split.
-  std::function<AneFfnPrepared(uint32_t aneUnits, bool timeChunks)> prepare;
+  // chunks timed (ops::ane_ffn::Measurement::chunks) when `timeChunks`, run
+  // as `mode` says. A model a test plays prepares no split.
+  std::function<AneFfnPrepared(uint32_t aneUnits, bool timeChunks, ops::AneFfn::Mode mode)> prepare;
   // This Mac's calibration of the split within `maxAneUnits` units, if one
   // is remembered; remembering one; and forgetting it.
   std::function<std::optional<ops::ane_ffn::Calibration>(uint32_t maxAneUnits)> recall;

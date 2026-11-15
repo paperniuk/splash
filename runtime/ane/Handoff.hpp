@@ -12,9 +12,11 @@
 namespace splash::ane {
 
 // The handoff of a Metal command's work to another agent, the Neural Engine,
-// over one shared event, which only the GPU, the agent and this handoff
-// raise. Each job of a command waits for the GPU to raise the event to its
-// `ready`, and raises it to its `done`, which the GPU waits for in turn.
+// over a shared event per lane, which only the GPU, the agent and this
+// handoff raise. Each job of a command waits for the GPU to raise its lane's
+// event to its `ready`, and raises it to its `done`, which the GPU waits for
+// in turn. A lane's jobs follow one another; those of two lanes may overlap,
+// which one event, whose value only rises, could not order.
 //
 // A job has `bound` from the moment the event reaches its `ready` to report
 // success. Any failure, the agent reporting one, failing to start the job or
@@ -41,7 +43,7 @@ public:
   using Start = std::function<void(const metal::SharedEvent &event, uint64_t wait, uint64_t signal,
                                    Report report)>;
 
-  Handoff(metal::MetalBackend &backend, AwakeClock::duration bound);
+  Handoff(metal::MetalBackend &backend, AwakeClock::duration bound, uint32_t lanes = 1);
   // Retires the handoff and waits at most one bound for the agent to report
   // the jobs it started. A job it never reports keeps what it references
   // itself: the Neural Engine's requests hold the surfaces they read and
@@ -50,22 +52,23 @@ public:
   Handoff(const Handoff &) = delete;
   Handoff &operator=(const Handoff &) = delete;
 
-  [[nodiscard]] const metal::SharedEvent &event() const noexcept;
+  [[nodiscard]] const metal::SharedEvent &event(uint32_t lane = 0) const;
 
-  // A value of the event no step has taken, for a step of the command being
-  // encoded; once retired, one the event has reached.
-  [[nodiscard]] uint64_t next();
+  // A value of the lane's event no step has taken, for a step of the command
+  // being encoded; once retired, one the event has reached.
+  [[nodiscard]] uint64_t next(uint32_t lane = 0);
 
-  // Starts a job of the command being encoded, before the command is
-  // committed, through `start`, which this call does not keep. A job that
+  // Starts a job of the command being encoded on `lane`, before the command
+  // is committed, through `start`, which this call does not keep. A job that
   // cannot start, or one queued once retired, has failed: this never throws
   // for the agent's faults.
-  void queue(uint64_t ready, uint64_t done, const Start &start);
+  void queue(uint64_t ready, uint64_t done, const Start &start, uint32_t lane = 0);
   // After the command has completed: if every job it queued succeeded, the
-  // agent's time over them, each job's from the notice that the event reached
-  // its `ready` to its report (none for a report that came first); none
-  // otherwise. Waits at most one bound for their reports: a job that has not
-  // reported by then has failed. Forgets the command's jobs either way.
+  // time the agent spent on them, from the notice that the event reached a
+  // job's `ready` to its report (none for a report that came first), counting
+  // once the time jobs of two lanes share; none otherwise. Waits at most one
+  // bound for their reports: a job that has not reported by then has failed.
+  // Forgets the command's jobs either way.
   [[nodiscard]] std::optional<AwakeClock::duration> finish();
   // The command will not be committed: retires with `reason`, forgets its
   // jobs, and waits at most one bound for the agent to report those it

@@ -1698,7 +1698,16 @@ struct Runtime::Impl {
   // DFlash2 draft captures.
   std::vector<PrefillChunk> preparePrefill(std::span<const ModelBatchItem> items,
                                            std::array<Request *, kLaneCount> &entries) {
+    // A command the Neural Engine's split takes in two chunks runs as a pair
+    // (AneFfn::pairRows): the split runs each chunk's FFN beside the other's
+    // mixer.
+    uint32_t rows = 0;
+    for (const ModelBatchItem &item : items) rows += item.tokenCount;
+    uint32_t firstRows = kPrefillRows;
+    if (geometry.prefillPairs && aneFfn && aneFfn->splits(rows))
+      firstRows = aneFfn->pairRows(rows).value_or(kPrefillRows);
     std::vector<PrefillChunk> chunks(1);
+    const auto chunkRows = [&] { return chunks.size() == 1 ? firstRows : kPrefillRows; };
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
       const ModelBatchItem &item = items[lane];
       Request &entry = prefillLane(item);
@@ -1708,13 +1717,13 @@ struct Runtime::Impl {
       QwenLogicalLengths lengths = states.metadata(entry.stateLane).lengths;
       size_t nextCapture = 0;
       for (uint32_t offset = 0; offset < item.tokenCount;) {
-        if (chunks.back().rows == kPrefillRows) chunks.emplace_back();
+        if (chunks.back().rows == chunkRows()) chunks.emplace_back();
         PrefillChunk &chunk = chunks.back();
         PrefillSequence &sequence = chunk.sequences.emplace_back();
         ModelBatchItem &part = sequence.part;
         part = item;
         part.logicalPosition = item.logicalPosition + offset;
-        part.tokenCount = std::min(kPrefillRows - chunk.rows, item.tokenCount - offset);
+        part.tokenCount = std::min(chunkRows() - chunk.rows, item.tokenCount - offset);
         part.inputTokens = item.inputTokens.subspan(offset, part.tokenCount);
         part.stateCaptures.clear();
         const uint64_t partEnd = part.logicalPosition + part.tokenCount;
@@ -1924,6 +1933,10 @@ struct Runtime::Impl {
       for (uint32_t s = 0; s < chunks[c].sequences.size(); ++s) parts[chunks[c].sequences[s].lane].push_back({c, s});
     std::vector<std::vector<const GdnParityBuffers *>> written(chunks.size());
     for (uint32_t c = 0; c < chunks.size(); ++c) written[c].resize(chunks[c].sequences.size());
+    // A pair's scratch cell with the lane's next cell's recurrent states: the
+    // scan loads a state's rows before it stores them, so the second chunk
+    // advances in place what the first left there.
+    std::optional<GdnParityBuffers> pairCell;
     for (uint32_t lane = 0; lane < lanes; ++lane) {
       const GdnParityBuffers *const next = &states.next(entries[lane]->stateLane);
       // The cell the part after this one writes; none after the last part,
@@ -1938,8 +1951,14 @@ struct Runtime::Impl {
         const GdnParityBuffers *cell = next;
         if (boundary)
           cell = &boundary->reservation->buffers().gdn->buffers();
-        else if (after == next)
+        else if (after == next) {
           cell = prefillArena->groupCell();
+          if (cell && geometry.prefillPairs) {
+            pairCell = *cell;
+            pairCell->recurrentLayers = next->recurrentLayers;
+            cell = &*pairCell;
+          }
+        }
         if (!cell) throw std::logic_error("a prefill group has no scratch cell");
         written[c][s] = after = cell;
       }
