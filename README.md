@@ -142,6 +142,13 @@ measures it against the GPU and remembers the split; MoE models run their
 prefill on the GPU only, as upstream. `--disable-ane` keeps everything on
 the GPU.
 
+Since 1.6.1-m1.1, a share given by hand runs prefill as a pair of chunks, the
+Neural Engine on one while the GPU runs the other: on an M1 Max
+`--ane-ffn-share 0.735 --ane-ffn-minimum-rows 512` reads prompts of 2K
+tokens and more about 18% faster, and prompts under about 700 tokens a
+little slower. A good share is about 0.2 above the calibrated one, which the
+log prints at start.
+
 ### `--kv-format bf16`
 
 Keep the default INT8 cache unless you are comparing quality. BF16 takes
@@ -175,7 +182,7 @@ follows upstream and does not run on M1/M2.
 
 ## Status
 
-- Stable: [1.6.1-m1](https://github.com/paperniuk/splash/releases/latest),
+- Stable: [1.6.1-m1.1](https://github.com/paperniuk/splash/releases/latest),
   upstream 1.6.1 plus the M1/M2 work.
 - Known gaps: the 35B MoE's expert kernels are not tuned for M1/M2 yet;
   Macs below 64 GB are covered by the kernel tests, not run end to end on
