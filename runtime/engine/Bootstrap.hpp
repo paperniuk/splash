@@ -151,13 +151,18 @@ public:
     // one of each of `prefillRowClasses` (ops::ExecutionPlans), each decode
     // width that fits and a state restore. `progress` takes the steps done of
     // all (protocol::WarmingEvent) as it begins and as each step ends.
+    // `timePairs`, if any, times the Neural Engine split's pairs of chunks on
+    // the seconds of the prefill of the most rows
+    // (RuntimeResources::timeAneFfnPairs).
+    using PairTimer = std::function<void(const std::function<double()> &prefill)>;
     [[nodiscard]] static RuntimeBootstrapReport requireWarmup(
         const EngineMemoryPlan &memoryPlan,
         std::span<const uint32_t> prefillRowClasses,
         model::RuntimeModel &modelRuntime,
         KvPool &kvPool,
         WarmupProgress progress,
-        ActualMemoryReporter memoryReporter);
+        ActualMemoryReporter memoryReporter,
+        const PairTimer &timePairs = {});
 
     ServingRuntime(const ServingRuntime &) = delete;
     ServingRuntime &operator=(const ServingRuntime &) = delete;

@@ -896,7 +896,9 @@ SERVE_OPTIONS = (
             "instead of the one calibration finds, which also runs a prefill "
             "command of 256 rows or more as two chunks, one's FFN on the "
             "Neural Engine beside the other's mixer; that pays only at a "
-            "share above the calibrated one (default: calibrated; 0 "
+            "share above the calibrated one (default: calibrated, with a "
+            "higher share of its own for commands of 769 rows or more as two "
+            "chunks, which the first start times and later starts serve; 0 "
             "prefills on the GPU alone, as --disable-ane does whatever this says)",
         ),
         needs="dense_ffn",

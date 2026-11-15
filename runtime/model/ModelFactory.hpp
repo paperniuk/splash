@@ -127,8 +127,12 @@ struct RuntimeContext final {
   kv::PageStorage &kvPages;
   QwenStateStorage &stateStorage;
   const ops::ExecutionPlans &operators;
-  // The prefill FFN's Neural Engine split (engine::startAneFfn), if any.
+  // The prefill FFN's Neural Engine split (engine::startAneFfn), if any, and
+  // where the engine keeps the split that takes the commands that one runs
+  // as pairs of chunks: the start's (engine::AneFfnStart::pair), or between
+  // commands the one a start times; null for none.
   ops::AneFfn *aneFfn = nullptr;
+  ops::AneFfn *const *aneFfnPair = nullptr;
   // The readers of a spill-capable target's spilled K/V, both or neither:
   // the hot block cache its verifies resolve through, and the stream of its
   // prefills' history (StreamedParts::kv).
