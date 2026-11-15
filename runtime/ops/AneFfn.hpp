@@ -158,6 +158,9 @@ public:
   // against 4.9 s as 640 and 418. The caller decides whether the command
   // splits at all (splits()).
   [[nodiscard]] std::optional<uint32_t> pairRows(uint32_t rows) const;
+  // The least rows of a command pairRows() takes: two chunks of kMinimumRows
+  // until set, and from there to kMaximumRows.
+  void setPairMinimumRows(uint32_t rows);
   // Whether the split stopped, and why.
   [[nodiscard]] bool retired() const { return handoff_.retired(); }
   [[nodiscard]] std::string reason() const { return handoff_.reason(); }
@@ -324,7 +327,7 @@ private:
   metal::MetalBackend &backend_;
   const Linear linear_;
   Shape shape_;
-  uint32_t minimumRows_ = kMinimumRows;
+  uint32_t minimumRows_ = kMinimumRows, pairMinimumRows_ = kSlots * kMinimumRows;
   // The slots and weight sets the split was built with (Mode).
   uint32_t slots_ = 1, sets_ = 2;
   std::vector<Layer> layers_;

@@ -134,6 +134,13 @@ Timing Measurement::time(uint32_t aneUnits, double gpuAlone) {
                 layer(layers, kSampledLayers - 1, kRows, &split, gpuAlone)};
 }
 
+std::unique_ptr<AneFfn> Measurement::pair(metal::MetalBackend &backend, const Linear &linear,
+                                          std::span<const SwiGluProjections> layers, uint32_t aneUnits,
+                                          std::function<bool()> interrupted) {
+  return std::unique_ptr<AneFfn>(new AneFfn(backend, linear, layers, aneUnits, std::move(interrupted),
+                                            std::array{AneFfn::kMaximumRows / AneFfn::kSlots}, AneFfn::Mode::Pair));
+}
+
 // On the layers time() timed, as many to a command, so that the splits
 // calibration compares (slowerNowhere) are timed where it fitted them. Six
 // calibrations of Qwen3.8-27B MLX 4-bit on an M5 Max timed each function's

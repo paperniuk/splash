@@ -332,6 +332,11 @@ public:
   [[nodiscard]] const AneFfnOutcome &aneFfnOutcome() const noexcept { return aneFfnOutcome_; }
   // The split as it stands now, for /status.
   [[nodiscard]] AneFfnSnapshot aneFfnSnapshot() const;
+  // Times the units of the split's pairs of chunks where the start has yet
+  // to (AneFfnStart::timePairs): `prefill` returns the seconds of a cold
+  // prefill of a full command on the model's runtime, which takes the split
+  // being timed from modelContext(). Nothing otherwise.
+  void timeAneFfnPairs(const std::function<double()> &prefill);
   // The streamed PLE table's store (--ple-memory), if the model has one.
   [[nodiscard]] std::optional<model::SparseRowStats> streamedTableStats() const;
   // The streamed routed experts' store (--expert-memory), if the model has one.
@@ -369,7 +374,8 @@ private:
                    std::unique_ptr<DiskSpace> diskSpace,
                    std::unique_ptr<KvPool> kvPool,
                    std::unique_ptr<engine::Cache> cache,
-                   std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome,
+                   std::unique_ptr<ops::AneFfn> aneFfn, std::unique_ptr<ops::AneFfn> aneFfnPair,
+                   AneFfnOutcome aneFfnOutcome,
                    std::unique_ptr<model::KvBlockCache> blockCache,
                    std::unique_ptr<model::KvHistoryStream> historyStream, bool spillAlways,
                    model::VerifyRows verifyRows);
@@ -400,10 +406,18 @@ private:
   std::unique_ptr<KvPool> kvPool_;
   std::unique_ptr<engine::Cache> cache_;
   std::unique_ptr<ops::AneFfn> aneFfn_;
+  // The split that takes the commands aneFfn_ runs as pairs of chunks
+  // (AneFfnStart::pair); what times its units until a start has; and the one
+  // the model's commands run on, which modelContext() hands over by address:
+  // aneFfnPair_, or the one being timed.
+  std::unique_ptr<ops::AneFfn> aneFfnPair_;
+  std::function<void(const AneFfnPairPrefill &)> timeAneFfnPairs_;
+  ops::AneFfn *servingPair_ = nullptr;
   // A spill-capable target's readers of its spilled KV; none for another.
   std::unique_ptr<model::KvBlockCache> blockCache_;
   std::unique_ptr<model::KvHistoryStream> historyStream_;
-  // Over model_'s images, its expert store if it has one, and aneFfn_.
+  // Over model_'s images, its expert store if it has one, aneFfn_ and
+  // aneFfnPair_.
   ReleasableMemory releasableMemory_;
   AneFfnOutcome aneFfnOutcome_;
   // --kv-spill always.

@@ -152,7 +152,7 @@ window. To set your own limits or cache options, add these to `splash serve`:
 | `--cached-states exact` | Cache recurrent states unquantized. Default: 8-bit (INT8). |
 | `--activations bf16` | Use BF16 activations. Default: auto. |
 | `--disable-ane` | Prefill on the GPU alone. Default: the 27B also uses the Neural Engine. |
-| `--ane-ffn-share 0.35 --ane-ffn-minimum-rows 520` | Fix the Neural Engine's share of the prefill FFN, and the least chunk rows it splits, instead of calibrating them at start; a fixed share also runs a command of 256 rows or more as two chunks, one's FFN on the Neural Engine beside the other's mixer, which gains only at a share above the calibrated one. Default: calibrated; `0` keeps the FFN on the GPU. |
+| `--ane-ffn-share 0.35 --ane-ffn-minimum-rows 520` | Fix the Neural Engine's share of the prefill FFN, and the least chunk rows it splits, instead of calibrating them at start; a fixed share also runs a command of 256 rows or more as two chunks, one's FFN on the Neural Engine beside the other's mixer, which gains only at a share above the calibrated one. Default: calibrated, with a higher share of its own for commands of 769 rows or more as two chunks, which the first start times and later starts serve; `0` keeps the FFN on the GPU. |
 | `--max-cache-disk 16G` | Cap the SSD cache (default: auto, up to 32 GiB; `0` turns it off). |
 | `--persistent-cache` | Keep the SSD cache across restarts. Off by default. |
 

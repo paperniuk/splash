@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -92,9 +93,27 @@ struct ChunkTimings final {
 // (AneFfnCalibration.cpp).
 [[nodiscard]] bool slowerNowhere(const ChunkTimings &candidate, const ChunkTimings &incumbent);
 
+// A split's units and a full command's time as a pair of chunks on it
+// (ops::AneFfn::pairRows).
+struct PairTiming final {
+  uint32_t units = 0;
+  double time = 0.0;
+};
+// The units, within `mostUnits`, whose command runs fastest as a pair of
+// chunks beside single chunks at `singleUnits`, as `timed` measures a
+// command at the units it is given, none where no split of them runs
+// (AneFfnCalibration.cpp); none where no units run one. Throws for no
+// feasible units or a time that is not usable().
+[[nodiscard]] std::optional<PairTiming>
+choosePair(uint32_t singleUnits, uint32_t mostUnits,
+           const std::function<std::optional<double>(uint32_t pairUnits)> &timed);
+// Whether a full command that takes `pair` as a pair of chunks gains enough on
+// one that takes `single` as one chunk for the pair's split to serve.
+[[nodiscard]] bool pairGains(double single, double pair);
+
 // What one calibration of the split on this Mac decided, which later starts
 // take again (engine::startAneFfn): the ANE's units and the least rows of a
-// chunk the split takes, none of either when no split gained enough; and the
+// chunk the split takes, none of either when no split gained enough; the
 // GPU alone's layer at the least and the most rows of the split's functions,
 // which the breaker judges the split against. Beside it, how often the
 // Neural Engine refused a split of the model (ane::Refused) since the start
@@ -102,11 +121,14 @@ struct ChunkTimings final {
 // again, and the next refusal leaves no split and kRefusals, the GPU alone,
 // so that a split the Neural Engine refuses each time costs two calibrations
 // at most, not one every other start.
+// And the units of the split that runs commands as pairs of chunks, 0 where
+// none gained enough, none until a start has timed them.
 struct Calibration final {
   static constexpr uint32_t kRefusals = 2;
   uint32_t aneUnits = 0, minimumRows = 0;
   std::array<ChunkTimings::Gpu, 2> gpu{};
   uint32_t refusals = 0;
+  std::optional<uint32_t> pairUnits{};
 
   // What the next start does with `record`, as remembered, in a log's words:
   // sets its split up, calibrates again or leaves the GPU alone.

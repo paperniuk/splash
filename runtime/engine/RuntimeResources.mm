@@ -179,12 +179,19 @@ void reportDiskTier(const DiskSpace &space, const model::DiskBudget &budget, uin
   logLine(line.str());
 }
 
-// The split's part of what the engine gives back while idle, if it runs one.
-std::optional<ReleasableMemory::Split> idleSplit(ops::AneFfn *split) {
+// The splits' part of what the engine gives back while idle, if it runs one:
+// `split`'s, and `pair`'s if it has that too.
+std::optional<ReleasableMemory::Split> idleSplit(ops::AneFfn *split, ops::AneFfn *pair) {
   if (!split)
     return std::nullopt;
-  return ReleasableMemory::Split{[split] { return split->release(); },
-                                 [split] { split->restore(); }};
+  return ReleasableMemory::Split{[split, pair] {
+                                   const bool released = split->release();
+                                   return (pair && pair->release()) || released;
+                                 },
+                                 [split, pair] {
+                                   split->restore();
+                                   if (pair) pair->restore();
+                                 }};
 }
 
 // The SSD cache tier as a start opens its files (openDiskTier): its budget,
@@ -615,7 +622,7 @@ RuntimeResources::RuntimeResources(
     std::unique_ptr<model::QwenStateStorage> stateStorage,
     std::unique_ptr<KvPageTier> kvTier, std::unique_ptr<DiskSpace> diskSpace,
     std::unique_ptr<KvPool> kvPool, std::unique_ptr<engine::Cache> cache,
-    std::unique_ptr<ops::AneFfn> aneFfn, AneFfnOutcome aneFfnOutcome,
+    std::unique_ptr<ops::AneFfn> aneFfn, std::unique_ptr<ops::AneFfn> aneFfnPair, AneFfnOutcome aneFfnOutcome,
     std::unique_ptr<model::KvBlockCache> blockCache,
     std::unique_ptr<model::KvHistoryStream> historyStream, bool spillAlways,
     model::VerifyRows verifyRows)
@@ -628,9 +635,10 @@ RuntimeResources::RuntimeResources(
       kvPages_(std::move(kvPages)),
       stateStorage_(std::move(stateStorage)), kvTier_(std::move(kvTier)),
       diskSpace_(std::move(diskSpace)), kvPool_(std::move(kvPool)),
-      cache_(std::move(cache)), aneFfn_(std::move(aneFfn)),
+      cache_(std::move(cache)), aneFfn_(std::move(aneFfn)), aneFfnPair_(std::move(aneFfnPair)),
+      servingPair_(aneFfnPair_.get()),
       blockCache_(std::move(blockCache)), historyStream_(std::move(historyStream)),
-      releasableMemory_({model_.images.get(), model_.expertStore()}, idleSplit(aneFfn_.get())),
+      releasableMemory_({model_.images.get(), model_.expertStore()}, idleSplit(aneFfn_.get(), aneFfnPair_.get())),
       aneFfnOutcome_(std::move(aneFfnOutcome)), spillAlways_(spillAlways), verifyRows_(verifyRows) {}
 
 std::unique_ptr<RuntimeResources>
@@ -1280,8 +1288,15 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         std::move(operators), std::move(memoryPlan), std::move(cacheIdentity),
         std::move(memoryGovernor), startClaim, std::move(startScope), std::move(kvPages), std::move(stateStorage),
         std::move(kvTier), std::move(disk.space), std::move(kvPool), std::move(cache),
-        std::move(aneFfn.split), std::move(aneFfn.outcome), std::move(blockCache),
+        std::move(aneFfn.split), std::move(aneFfn.pair), std::move(aneFfn.outcome), std::move(blockCache),
         std::move(historyStream), config.kvSpillAlways, config.verifyRows));
+    // The model's side of the split over what the resources hold: this
+    // function's own go with it.
+    if (aneFfn.timePairs)
+      result->timeAneFfnPairs_ = [time = std::move(aneFfn.timePairs),
+                                  model = aneFfnModel(*result->backend_, result->model_, result->operators_,
+                                                      config.kvFormat, config.buildId, config.cancelled)](
+                                     const AneFfnPairPrefill &prefill) { time(model, prefill); };
     result->adoptPersistentCache();
     return result;
   } catch (const RuntimeResourcesError &) {
@@ -1409,7 +1424,7 @@ model::RuntimeContext RuntimeResources::modelContext() {
   // A start's measured step costs stay beside the split's calibrations.
   const std::string key =
       model::stepCostsKey(model_, *kvPages_, *stateStorage_, operators_, *backend_, cacheIdentity_.buildId);
-  return {*backend_, model_, *kvPages_, *stateStorage_, operators_, aneFfn_.get(), blockCache_.get(),
+  return {*backend_, model_, *kvPages_, *stateStorage_, operators_, aneFfn_.get(), &servingPair_, blockCache_.get(),
           historyStream_.get(), verifyRows_, [key](uint32_t lanes) { return ane::recall(key + std::to_string(lanes)); },
           [key](uint32_t lanes, std::string_view line) { ane::remember(key + std::to_string(lanes), line); }};
 }
@@ -1452,7 +1467,13 @@ AneFfnSnapshot RuntimeResources::aneFfnSnapshot() const {
   if (!aneFfn_)
     return {.reason = aneFfnOutcome_.reason};
   const bool stopped = aneFfn_->retired();
-  const ops::AneFfn::Served &served = aneFfn_->served();
+  ops::AneFfn::Served served = aneFfn_->served();
+  if (aneFfnPair_) {
+    const ops::AneFfn::Served &pair = aneFfnPair_->served();
+    served.commands += pair.commands;
+    served.evaluations += pair.evaluations;
+    served.milliseconds += pair.milliseconds;
+  }
   return {stopped ? AneFfnSnapshot::State::Stopped : AneFfnSnapshot::State::Split,
           stopped ? aneFfn_->reason() : aneFfnOutcome_.reason,
           aneFfn_->share(),
@@ -1460,6 +1481,20 @@ AneFfnSnapshot RuntimeResources::aneFfnSnapshot() const {
           served.commands,
           served.evaluations,
           served.milliseconds};
+}
+
+void RuntimeResources::timeAneFfnPairs(const std::function<double()> &prefill) {
+  if (!timeAneFfnPairs_) return;
+  // The runtime's commands take the split being timed, and none once its
+  // command ends, whatever ends it: a start that times pairs serves none.
+  struct Serving final {
+    ops::AneFfn *&slot;
+    ~Serving() { slot = nullptr; }
+  };
+  std::exchange(timeAneFfnPairs_, {})([&](uint32_t, ops::AneFfn *pair) {
+    const Serving serving{servingPair_ = pair};
+    return prefill();
+  });
 }
 
 ActualMemoryReport RuntimeResources::actualMemoryReport(
@@ -1486,7 +1521,8 @@ ActualMemoryReport RuntimeResources::actualMemoryReport(
     report.spilledKvTableBytes += staging.tableBytes;
   }
   report.stateStagingBytes = modelMemory.stateStagingBytes;
-  report.aneFfnBytes = aneFfn_ ? aneFfn_->allocatedBytes() : 0;
+  report.aneFfnBytes =
+      (aneFfn_ ? aneFfn_->allocatedBytes() : 0) + (aneFfnPair_ ? aneFfnPair_->allocatedBytes() : 0);
   if (const auto table = streamedTableStats()) report.streamedTableBytes = table->cacheBytes;
   // Optional warmup may end with a rolled-back allocation and no subsequent
   // command. Refresh the current counts after that rollback; peaks stay intact.
@@ -1546,6 +1582,9 @@ AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &
       prepared.error = prepared.split->verify(*layers, ffn, hidden);
     });
     return prepared;
+  };
+  model.timingPair = [&backend, &linear, layers, cancelled](uint32_t aneUnits) {
+    return ops::ane_ffn::Measurement::pair(backend, linear, *layers, aneUnits, cancelled);
   };
   const std::string key = ops::AneFfn::calibrationKey(*layers, linear) + " device " +
                           backend.capabilities().deviceName + " macos " +

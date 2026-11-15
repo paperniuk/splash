@@ -40,6 +40,13 @@ public:
   // the rows of each of its functions, on the layers time() times: a
   // program of every function, as the split that serves compiles.
   [[nodiscard]] ChunkTimings chunks(uint32_t aneUnits);
+  // The split of pairs of `layers` with the ANE taking `aneUnits` and the one
+  // function a full command's chunks run: what a start times a pair's
+  // command on, since each units it tries build in 4 s on an M1 Max, where
+  // the program of every function takes 53.
+  [[nodiscard]] static std::unique_ptr<AneFfn> pair(metal::MetalBackend &backend, const Linear &linear,
+                                                    std::span<const SwiGluProjections> layers, uint32_t aneUnits,
+                                                    std::function<bool()> interrupted);
 
 private:
   // The per-layer milliseconds of `count` `rows`-row FFN layers of `layers`

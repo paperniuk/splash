@@ -224,31 +224,43 @@ void testSlowerNowhere() {
           "a split that took chunks longer was taken");
 }
 
-// A calibration as a line of text comes back as it was, its refusals too, and one of no split as none with its
-// refusals; a line of another tag or version, with more or fewer fields, units without least rows, the GPU alone out
-// of order or unusable, more refusals than kRefusals or a split beside kRefusals is not one.
+// A calibration as a line of text comes back as it was, its refusals too, with its pair's units: none until a start
+// timed them, 0 where no pair gained. One of no split comes back as none with its refusals. A line of another tag or
+// version, with more or fewer fields, units without least rows, a pair's units that are no number or come without a
+// split, the GPU alone out of order or unusable, more refusals than kRefusals or a split beside kRefusals is not one.
 void testCalibrationText() {
   const Calibration made{8, 655, {{{512, 5.25}, {2048, 19.375}}}, 1};
   const std::optional<Calibration> back = Calibration::parse(made.text());
   require(back && back->aneUnits == 8 && back->minimumRows == 655 && back->gpu[0].rows == 512 &&
               back->gpu[0].milliseconds == 5.25 && back->gpu[1].rows == 2048 &&
-              back->gpu[1].milliseconds == 19.375 && back->refusals == 1,
+              back->gpu[1].milliseconds == 19.375 && back->refusals == 1 && !back->pairUnits,
           "a calibration did not come back as it was: " + made.text());
+  for (const uint32_t pairUnits : {0u, 25u}) {
+    Calibration paired = made;
+    paired.pairUnits = pairUnits;
+    const std::optional<Calibration> again = Calibration::parse(paired.text());
+    require(again && again->aneUnits == 8 && again->minimumRows == 655 && again->refusals == 1 &&
+                again->pairUnits == pairUnits,
+            "a calibration did not come back with its pair's units: " + paired.text());
+  }
   const std::optional<Calibration> none = Calibration::parse(Calibration{}.text()),
                                    refused = Calibration::parse(Calibration{.refusals = 2}.text());
-  require(none && !none->aneUnits && !none->minimumRows && !none->refusals && refused && !refused->aneUnits &&
-              refused->refusals == 2,
+  require(none && !none->aneUnits && !none->minimumRows && !none->refusals && !none->pairUnits && refused &&
+              !refused->aneUnits && refused->refusals == 2,
           "a calibration of no split did not come back");
-  for (const std::string_view line : {"", "ane-ffn-calibration-1 8 655 512 5.25 2048 19.375",
-                                      "ane-ffn-calibration-2 8 655 512 5.25 2048 19.375",
-                                      "ane-ffn-calibration-2 8 655 512 5.25 2048 19.375 0 1",
-                                      "ane-ffn-calibration-2 8 0 512 5.25 2048 19.375 0",
-                                      "ane-ffn-calibration-2 0 655 0 0 0 0 0",
-                                      "ane-ffn-calibration-2 8 655 2048 19.375 512 5.25 0",
-                                      "ane-ffn-calibration-2 8 655 512 0 2048 19.375 0",
-                                      "ane-ffn-calibration-2 8 655 512 nan 2048 19.375 0",
-                                      "ane-ffn-calibration-2 0 0 0 0 0 0 3",
-                                      "ane-ffn-calibration-2 8 655 512 5.25 2048 19.375 2"})
+  for (const std::string_view line : {"", "ane-ffn-calibration-2 8 655 512 5.25 2048 19.375 0",
+                                      "ane-ffn-calibration-3 8 655 512 5.25 2048 19.375 0",
+                                      "ane-ffn-calibration-3 8 655 512 5.25 2048 19.375 0 - 1",
+                                      "ane-ffn-calibration-3 8 0 512 5.25 2048 19.375 0 -",
+                                      "ane-ffn-calibration-3 0 655 0 0 0 0 0 -",
+                                      "ane-ffn-calibration-3 0 0 0 0 0 0 0 25",
+                                      "ane-ffn-calibration-3 8 655 512 5.25 2048 19.375 0 25x",
+                                      "ane-ffn-calibration-3 8 655 512 5.25 2048 19.375 0 -1",
+                                      "ane-ffn-calibration-3 8 655 2048 19.375 512 5.25 0 -",
+                                      "ane-ffn-calibration-3 8 655 512 0 2048 19.375 0 -",
+                                      "ane-ffn-calibration-3 8 655 512 nan 2048 19.375 0 -",
+                                      "ane-ffn-calibration-3 0 0 0 0 0 0 3 -",
+                                      "ane-ffn-calibration-3 8 655 512 5.25 2048 19.375 2 -"})
     require(!Calibration::parse(line), "\"" + std::string(line) + "\" was taken for a calibration");
 }
 
@@ -300,6 +312,49 @@ void testBreaker() {
 
 } // namespace
 
+// The pair's units climb from the single chunks' 17 three at a time while each command takes 2% less, then move to a
+// neighbour's as a refinement does: a command of 8 s at 25 units and 0.2 s more a unit either way climbs to 26 and
+// moves down to 25. Units no split runs at end the climb, as where the compiler refuses more than 30: from 23 the
+// units climb to 29 and move up to 30. A pair that only loses comes back to the single chunks' units, for the caller
+// to weigh; none comes back where no units run.
+void testChoosePair() {
+  std::vector<uint32_t> timedUnits;
+  // A command's seconds at its units, 8 at `least` and 0.2 more a unit either way, none above `most`.
+  const auto vee = [&](uint32_t least, uint32_t most) {
+    return [&timedUnits, least, most](uint32_t pairUnits) -> std::optional<double> {
+      timedUnits.push_back(pairUnits);
+      if (pairUnits > most) return std::nullopt;
+      return 8.0 + 0.2 * std::abs(static_cast<double>(pairUnits) - least);
+    };
+  };
+  std::optional<PairTiming> pair = choosePair(17, 33, vee(25, 33));
+  require(pair && pair->units == 25 && near(pair->time, 8.0) &&
+              timedUnits == std::vector<uint32_t>{20, 23, 26, 29, 25, 24},
+          "the pair's units did not climb to the fastest command's");
+  timedUnits.clear();
+  pair = choosePair(23, 33, vee(33, 30));
+  require(pair && pair->units == 30 && timedUnits == std::vector<uint32_t>{26, 29, 32, 28, 30, 31},
+          "units no split runs at did not end the climb below them");
+  timedUnits.clear();
+  pair = choosePair(17, 33, vee(17, 33));
+  require(pair && pair->units == 17 && near(pair->time, 8.0),
+          "a pair that loses above the single chunks' units did not come back to them");
+  timedUnits.clear();
+  require(!choosePair(17, 33, vee(25, 0)) && timedUnits == std::vector<uint32_t>{20, 17, 16, 18},
+          "units were chosen where no split runs");
+  pair = choosePair(30, 33, vee(40, 33));
+  require(pair && pair->units == 33, "the climb did not end at the most units");
+  for (const auto &[single, most] : {std::pair{0u, 33u}, std::pair{9u, 8u}})
+    rejects([&] { static_cast<void>(choosePair(single, most, vee(25, 33))); }, "no feasible units",
+            "a pair beside " + std::to_string(single) + " units of at most " + std::to_string(most));
+  rejects([] { static_cast<void>(choosePair(17, 33, [](uint32_t) { return std::optional(0.0); })); }, "not usable",
+          "a command of 0 s chose units");
+  // The pair's split serves where its command takes 5% less than the single chunk's.
+  require(pairGains(10.0, 9.5) && !pairGains(10.0, 9.6), "the pair's gain is not 5%");
+  rejects([] { static_cast<void>(pairGains(10.0, std::numeric_limits<double>::infinity())); }, "not usable",
+          "a command of no usable time gained");
+}
+
 int main() {
   try {
     testFit();
@@ -308,6 +363,7 @@ int main() {
     testChoice();
     testUnusable();
     testMostUnits();
+    testChoosePair();
     testNoGain();
     testUsable();
     testNearestUnits();

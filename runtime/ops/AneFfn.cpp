@@ -506,6 +506,12 @@ void AneFfn::setMinimumRows(uint32_t rows) {
   minimumRows_ = rows;
 }
 
+void AneFfn::setPairMinimumRows(uint32_t rows) {
+  if (rows < kSlots * kMinimumRows || rows > kMaximumRows)
+    throw std::invalid_argument("ANE FFN split has no pair of " + std::to_string(rows) + " rows");
+  pairMinimumRows_ = rows;
+}
+
 bool AneFfn::splits(uint32_t rows) const {
   return rows >= minimumRows_ && rows <= kMaximumRows && !handoff_.retired();
 }
@@ -515,6 +521,7 @@ bool AneFfn::pairs(uint32_t rows) const {
 }
 
 std::optional<uint32_t> AneFfn::pairRows(uint32_t rows) const {
+  if (rows < pairMinimumRows_) return std::nullopt;
   // By the larger of the pair's functions, then by both, then with the first
   // chunk the smaller: ascending, the first found of a rank stays.
   std::optional<uint32_t> best;
