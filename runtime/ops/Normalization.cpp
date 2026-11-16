@@ -8,6 +8,10 @@
 
 namespace splash::ops {
 
+// A table norm's row runs as this many threadgroups, each reducing the whole row and writing every
+// kTableNormParts-th span: eight rows of 5120 otherwise leave a 32-core M1 Max eight threadgroups.
+constexpr uint64_t kTableNormParts = 4;
+
 std::string normKernel(std::string_view name, const NormWeights &weights, uint32_t width) {
   requireBytes(weights.buffer, weights.bytes(width), "norm weight");
   return std::string(name) + (weights.float32 ? "_f32" : "");
@@ -25,7 +29,7 @@ PreparedInput Normalization::addRms(metal::CommandGraph &graph,
   if (layout != LinearInput::Plain) {
     requireTableScratch(scratch, layout, width, rows);
     graph.add(normKernel(std::string("norm_rms") + tableSuffix(layout) + "_decode", weight, width),
-              {input, weight.buffer, output, scratch.input, scratch.sums}, width, {rows, 1, 1});
+              {input, weight.buffer, output, scratch.input, scratch.sums}, width, {rows, kTableNormParts, 1});
     return {std::move(output), layout};
   }
   if (rows <= SPLASH_STAGED_NORM_ROWS && width <= SPLASH_STAGED_NORM_WIDTH && width % 4 == 0)
