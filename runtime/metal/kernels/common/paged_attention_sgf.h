@@ -222,21 +222,27 @@ __attribute__((always_inline)) inline void tile(
     }
 
     // S^T tile s: tokens page_token(fm, s) x rows (row, row + 1), each tile
-    // summing its (b, t) steps in order.
+    // summing its (b, t) steps in order. The four tiles' chains interleave, and
+    // each query pair is read once per step for all four.
     float2 scores[4];
 #pragma unroll
     for (uint s = 0; s < 4; ++s)
       scores[s] = float2(0.0f);
 #pragma unroll
-    for (uint b = 0; b < D / 64; ++b)
+    for (uint b = 0; b < D / 64; ++b) {
+      KeyRun<CacheElement> runs[4];
 #pragma unroll
-      for (uint s = 0; s < 4; ++s) {
-        KeyRun<CacheElement> run;
-        run.load(keys + page_token(fm, s) * D + 64 * b + 8 * fn);
+      for (uint s = 0; s < 4; ++s)
+        runs[s].load(keys + page_token(fm, s) * D + 64 * b + 8 * fn);
 #pragma unroll
-        for (uint t = 0; t < 8; ++t)
-          mma(scores[s], run.step(t), bfloat_pair(queries[(b * 8 + t) * 32 + lane]));
+      for (uint t = 0; t < 8; ++t) {
+        const float2 query = bfloat_pair(queries[(b * 8 + t) * 32 + lane]);
+        mma(scores[0], runs[0].step(t), query);
+        mma(scores[1], runs[1].step(t), query);
+        mma(scores[2], runs[2].step(t), query);
+        mma(scores[3], runs[3].step(t), query);
       }
+    }
 
     // Online softmax, as splash_attention_page_softmax: key scale, then
     // 1/sqrt(D); masked tokens never contribute, whatever their cache holds.
@@ -300,18 +306,33 @@ __attribute__((always_inline)) inline void tile(
     }
 
     // O^T tile d += V^T (dimensions 8 d + fm, tokens) x P^T, each output tile
-    // summing its four token steps in order. The steps are spelled out: as a
-    // nested loop inside the unrolled dimension loop, the compiler leaves the
-    // step index dynamic, which costs up to 10% in verify and 20% in BF16.
+    // summing its four token steps in order, four tiles' chains interleaved. The
+    // steps are spelled out: as a nested loop inside the unrolled dimension
+    // loop, the compiler leaves the step index dynamic, which costs up to 10% in
+    // verify and 20% in BF16.
     device const CacheElement *value_row = values + fm * N + 4 * fn;
 #pragma unroll
-    for (uint d = 0; d < D / 8; ++d) {
-      ValueRun<CacheElement> run;
-      run.load(value_row + d * 8 * N);
-      mma(output[d], run.step(0), weights[0]);
-      mma(output[d], run.step(1), weights[1]);
-      mma(output[d], run.step(2), weights[2]);
-      mma(output[d], run.step(3), weights[3]);
+    for (uint d = 0; d < D / 8; d += 4) {
+      ValueRun<CacheElement> runs[4];
+#pragma unroll
+      for (uint i = 0; i < 4; ++i)
+        runs[i].load(value_row + (d + i) * 8 * N);
+      mma(output[d], runs[0].step(0), weights[0]);
+      mma(output[d + 1], runs[1].step(0), weights[0]);
+      mma(output[d + 2], runs[2].step(0), weights[0]);
+      mma(output[d + 3], runs[3].step(0), weights[0]);
+      mma(output[d], runs[0].step(1), weights[1]);
+      mma(output[d + 1], runs[1].step(1), weights[1]);
+      mma(output[d + 2], runs[2].step(1), weights[1]);
+      mma(output[d + 3], runs[3].step(1), weights[1]);
+      mma(output[d], runs[0].step(2), weights[2]);
+      mma(output[d + 1], runs[1].step(2), weights[2]);
+      mma(output[d + 2], runs[2].step(2), weights[2]);
+      mma(output[d + 3], runs[3].step(2), weights[2]);
+      mma(output[d], runs[0].step(3), weights[3]);
+      mma(output[d + 1], runs[1].step(3), weights[3]);
+      mma(output[d + 2], runs[2].step(3), weights[3]);
+      mma(output[d + 3], runs[3].step(3), weights[3]);
     }
   }
 
