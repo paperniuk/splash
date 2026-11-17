@@ -26,9 +26,9 @@ struct UnitFormats final {
   // A gate/up pair of single tensors of one format, which the one-pass
   // kernels take.
   bool oneFormat = false;
-  // That one format is an MLX affine one (af4g64), which Apple7/8's register
-  // tile keeps in two passes: 17408 x 5120 takes 2-4% longer in one at three
-  // and four lanes on an M1 Max.
+  // Every quantized segment is an MLX affine one (af4g64): Apple7/8's register tile splits such units by
+  // kApple7AffineRegisterLaw, and keeps a pair of one in two passes past two table tiles (17408 x 5120 takes 2-4%
+  // longer in one at three and four on an M1 Max).
   bool affine = false;
   // The int8 decode tiles take every quantized segment: a rotated
   // projection's in a format they take (quant_decode_int8_format), over whose

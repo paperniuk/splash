@@ -288,6 +288,12 @@ inline constexpr ProjectionCalibration kApple11Projection = [] {
 // S4 0.164; at four lanes within 5% of either.
 inline constexpr SplitTier kMmaTiers[] = {{24, 512}};
 
+// Apple7/8's register tile over MLX affine units: a wave law, its constants a grid search's fit to the 27B MLX
+// 4-bit projections' fastest splits at one to four lanes on a 32-core M1 Max, weighted by their calls a decode step.
+// Summed over one to four lanes it leaves 1.2 ms a step from the fastest splits, where kRegisterTiers leave 7.6.
+inline constexpr WaveLaw kApple7AffineRegisterLaw{
+    .tile = {12, 10, 6}, .gateUpPair = {1, 0, 1}, .sixteenRowResident = 0, .partitionInputs = 1024, .maximumSplits = 16};
+
 // Apple7/8 decode on the register tile's F32 instances wherever every format
 // takes it: the MMA tile's per-element dequantization through threadgroup
 // memory bounds MLX 4-bit decode there. Other plans of up to 32 rows run
