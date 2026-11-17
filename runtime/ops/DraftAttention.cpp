@@ -20,7 +20,8 @@ constexpr uint32_t kThreads = metal::CommandGraph::kDefaultThreads;
 constexpr uint32_t kWindowThreads = SPLASH_DRAFT_CONTEXT_SIMDGROUPS * 32;
 // Each split leaves a partial of its attention rows x (head dimensions + max
 // + sum) fp32 values behind the grouped queries.
-constexpr uint32_t kSplits = SPLASH_DRAFT_ATTENTION_SPLITS;
+constexpr uint32_t kSplits = SPLASH_DRAFT_ATTENTION_SPLITS,
+                   kRegisterSplits = SPLASH_DRAFT_ATTENTION_REGISTER_SPLITS;
 constexpr uint64_t kPartialBytes = uint64_t{SPLASH_DRAFT_ATTENTION_ROWS} *
                                    (SPLASH_DRAFT_HEAD_DIMENSION + 2) * sizeof(float);
 
@@ -94,16 +95,16 @@ DraftAttentionWorkspace DraftAttentionPlan::workspace() const noexcept {
   const uint64_t rows = uint64_t{lanes_} * kRows;
   const uint64_t kvBytes = rows * shape_.kvHeads * shape_.headDimension * 2;
   const uint64_t partialBytes =
-      uint64_t{lanes_} * shape_.kvHeads * kSplits * kPartialBytes;
+      uint64_t{lanes_} * shape_.kvHeads * (registerTile_ ? kRegisterSplits : kSplits) * kPartialBytes;
   return {rows * shape_.hiddenSize * 2, rows * shape_.qkvSize * 2,
           rows * shape_.attentionSize * 2 + partialBytes, kvBytes, kvBytes};
 }
 
 DraftAttentionPlan DraftAttention::plan(DraftAttentionShape shape,
-                                        uint32_t lanes) {
+                                        uint32_t lanes, bool registerTile) {
   requireLanes(lanes);
   requireCompiledShape(shape);
-  return {shape, lanes};
+  return {shape, lanes, registerTile};
 }
 
 void DraftAttention::addConvolution(metal::CommandGraph &graph,
@@ -194,10 +195,15 @@ void DraftAttention::addDecode(
                      buffers.persistentValues);
   bindings.push_back(buffers.queryKeys);
   bindings.push_back(buffers.queryValues);
-  graph.add("draft_attention_bf16_split", std::move(bindings), params,
-            {shape.kvHeads, lanes, kSplits});
-  graph.add("draft_attention_bf16_reduce", {buffers.groupedQueries}, params,
-            {shape.kvHeads, lanes, 1});
+  // The register tile runs a simdgroup per eight of the 32 attention rows.
+  if (plan.registerTile()) {
+    graph.add("draft_attention_bf16_split_sgf", std::move(bindings), params,
+              {shape.kvHeads, lanes, kRegisterSplits}, {128, 1, 1});
+    graph.add("draft_attention_bf16_reduce_sgf", {buffers.groupedQueries}, params, {shape.kvHeads, lanes, 1});
+  } else {
+    graph.add("draft_attention_bf16_split", std::move(bindings), params, {shape.kvHeads, lanes, kSplits});
+    graph.add("draft_attention_bf16_reduce", {buffers.groupedQueries}, params, {shape.kvHeads, lanes, 1});
+  }
 }
 
 void DraftAttention::addReorder(metal::CommandGraph &graph,

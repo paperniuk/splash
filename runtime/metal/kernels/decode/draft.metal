@@ -1,6 +1,7 @@
 #include "metal/abi/KernelABI.h"
 #include "metal/kernels/common/draft_context_kv.h"
 #include "metal/kernels/common/lane_bindings.h"
+#include "metal/kernels/common/paged_attention_sgf.h"
 #include "metal/kernels/common/rms_inverse.h"
 
 inline void draft_conv_phase(device const bfloat *input,
@@ -398,12 +399,12 @@ inline void draft_attention_split_phase(
 // Fixed-order combine of one (lane, head) pair's split partials into the
 // normalized bf16 rows, so the result does not depend on which split
 // finished first or on how many lanes ran.
+template <uint Splits>
 inline void draft_attention_reduce_phase(device const float *partials,
                                          device bfloat *output,
                                          uint thread_index) {
   constexpr uint M = SPLASH_DRAFT_ATTENTION_ROWS, D = SPLASH_DRAFT_HEAD_DIMENSION,
-                 Stride = M * D + 2 * M,
-                 Splits = SPLASH_DRAFT_ATTENTION_SPLITS;
+                 Stride = M * D + 2 * M;
   constexpr uint Chunk = D / 8;
   uint row = thread_index / 8;
   uint dim = (thread_index % 8) * Chunk;
@@ -543,11 +544,179 @@ kernel void draft_attention_bf16_split(
       lane, simd_group);
 }
 
-kernel void draft_attention_bf16_reduce(
+// Apple7/8's register-matrix form of draft_attention_bf16_split (the matmul2d
+// tile runs at about 1 TFLOPS there): four simdgroups of eight fused rows,
+// each running its rows' online softmax in registers over 32-slot pages of
+// the ring with q8sgf's fragment maps (kernels/common/paged_attention_sgf.h),
+// the keys token-major as a KV page's and the values a ring's dimension rows.
+// It writes draft_attention_bf16_split's partials, which the same reduce combines at this tile's split count.
+inline void draft_attention_split_sgf_phase(
+    device const bfloat *queries, device const bfloat *keys, device const bfloat *values,
+    device const bfloat *query_keys, device const bfloat *query_values,
+    device float *partial, uint value_stride, uint cache_length, uint split,
+    threadgroup uint *query_stage, uint lane, uint sg) {
+  constexpr uint M = SPLASH_DRAFT_ATTENTION_ROWS, D = SPLASH_DRAFT_HEAD_DIMENSION, N = 32;
+  constexpr uint Rows = SPLASH_DRAFT_QUERY_ROWS, Window = SPLASH_DRAFT_SLIDING_WINDOW,
+                 Splits = SPLASH_DRAFT_ATTENTION_REGISTER_SPLITS;
+  constexpr float kScoreScale = 0.08838834765f;
+  static_assert(M == 32 && D == 128 && Rows == 8, "four simdgroups of eight fused rows, 128 dimensions");
+  const uint common_start = cache_length >= Window - 1 ? cache_length - (Window - 1) : 0;
+  const uint old_count = cache_length - common_start;
+  const uint physical_start = common_start % Window;
+  const uint physical_end = physical_start + old_count;
+  const uint wrapped = physical_end > Window ? (physical_end - Window + N - 1) / N : 0;
+  const uint tail_end = (min(physical_end, Window) + N - 1) / N;
+  const uint resume = max(physical_start / N, wrapped);
+  const uint live_pages = wrapped + tail_end - resume;
+  const bool last = split + 1 == Splits;
+  if (split >= live_pages && !last) {
+    if (lane < 8) partial[M * D + sg * 8 + lane] = -INFINITY;
+    return;
+  }
+  const q8sgf::Lane l = q8sgf::lane_map(lane);
+  const uint fm = l.fm, fn = l.fn;
+  const uint row = sg * 8 + fn;
+  // A row sees ring keys whose logical position is at least its window's start.
+  const uint2 hidden_prefix(
+      (cache_length + row % Rows >= Window - 1 ? cache_length + row % Rows - (Window - 1) : 0) - common_start,
+      (cache_length + (row + 1) % Rows >= Window - 1 ? cache_length + (row + 1) % Rows - (Window - 1) : 0) -
+          common_start);
+  constexpr uint kQueryWords = 32 * (D / 8);
+  threadgroup uint *qs = query_stage + sg * kQueryWords;
+  {
+    device const ushort *q0 = reinterpret_cast<device const ushort *>(queries) + row * D;
+    device const ushort *q1 = q0 + D;
+    for (uint b = 0; b < D / 64; ++b)
+      for (uint t = 0; t < 8; ++t) {
+        const uint d = 64 * b + q8sgf::block_dimension(fm, t);
+        qs[(b * 8 + t) * 32 + lane] = uint(q0[d]) | (uint(q1[d]) << 16);
+      }
+  }
+  float2 output[D / 8];
+  for (uint d = 0; d < D / 8; ++d) output[d] = float2(0.0f);
+  float2 row_max(-INFINITY), row_sum(0.0f);
+  // One page of up to 32 keys: ring slots (current = false) or the eight current rows (current = true), whose
+  // keys are [token][D] and values [dimension][stride].
+  const auto page = [&](device const bfloat *page_keys, device const bfloat *page_values, uint stride, uint slot,
+                        bool current) __attribute__((always_inline)) {
+    bool valid[4][2];
+    for (uint s = 0; s < 4; ++s) {
+      const uint token = q8sgf::page_token(fm, s);
+      if (current) {
+        valid[s][0] = valid[s][1] = token < Rows;
+      } else {
+        const uint key = slot + token;
+        const uint logical = key >= physical_start ? key - physical_start : key + Window - physical_start;
+        valid[s][0] = logical < old_count && logical >= hidden_prefix.x;
+        valid[s][1] = logical < old_count && logical >= hidden_prefix.y;
+      }
+    }
+    float2 scores[4];
+    for (uint s = 0; s < 4; ++s) scores[s] = float2(0.0f);
+    for (uint b = 0; b < D / 64; ++b) {
+      q8sgf::KeyRun<bfloat> runs[4];
+      for (uint s = 0; s < 4; ++s) {
+        if (current && !(q8sgf::page_token(fm, s) < Rows)) {
+          runs[s].low = runs[s].high = uint4(0);
+        } else {
+          runs[s].load(page_keys + q8sgf::page_token(fm, s) * D + 64 * b + 8 * fn);
+        }
+      }
+      for (uint t = 0; t < 8; ++t) {
+        const float2 query = q8sgf::bfloat_pair(qs[(b * 8 + t) * 32 + lane]);
+        q8sgf::mma(scores[0], runs[0].step(t), query);
+        q8sgf::mma(scores[1], runs[1].step(t), query);
+        q8sgf::mma(scores[2], runs[2].step(t), query);
+        q8sgf::mma(scores[3], runs[3].step(t), query);
+      }
+    }
+    float2 local_max(-INFINITY);
+    for (uint s = 0; s < 4; ++s) {
+      const float2 score = scores[s] * kScoreScale;
+      scores[s] = float2(valid[s][0] ? score.x : -INFINITY, valid[s][1] ? score.y : -INFINITY);
+      local_max = max(local_max, scores[s]);
+    }
+    local_max = max(local_max, simd_shuffle_xor(local_max, 2));
+    local_max = max(local_max, simd_shuffle_xor(local_max, 4));
+    local_max = max(local_max, simd_shuffle_xor(local_max, 16));
+    const float2 next_max = max(row_max, local_max);
+    float2 weights[4];
+    float2 local_sum(0.0f);
+    for (uint s = 0; s < 4; ++s) {
+      weights[s] = float2(valid[s][0] ? fast::exp(scores[s].x - next_max.x) : 0.0f,
+                          valid[s][1] ? fast::exp(scores[s].y - next_max.y) : 0.0f);
+      local_sum += weights[s];
+    }
+    local_sum += simd_shuffle_xor(local_sum, 2);
+    local_sum += simd_shuffle_xor(local_sum, 4);
+    local_sum += simd_shuffle_xor(local_sum, 16);
+    const float2 scale(next_max.x == -INFINITY || next_max.x == row_max.x ? 1.0f : fast::exp(row_max.x - next_max.x),
+                       next_max.y == -INFINITY || next_max.y == row_max.y ? 1.0f : fast::exp(row_max.y - next_max.y));
+    row_sum = row_sum * scale + local_sum;
+    row_max = next_max;
+    if (simd_any(scale.x != 1.0f || scale.y != 1.0f))
+      for (uint d = 0; d < D / 8; ++d) output[d] *= scale;
+    // A lane's values are tokens 4 fn .. 4 fn + 7 of dimension 8 d + fm; past the current rows they are zero.
+    const bool values_live = !current || 4 * fn < Rows;
+    device const bfloat *value_row = page_values + fm * stride + 4 * fn;
+    for (uint d = 0; d < D / 8; d += 4) {
+      q8sgf::ValueRun<bfloat> runs[4];
+      for (uint i = 0; i < 4; ++i) {
+        if (values_live) runs[i].load(value_row + (d + i) * 8 * stride);
+        else runs[i].words = uint4(0);
+      }
+      for (uint s = 0; s < 4; ++s)
+        for (uint i = 0; i < 4; ++i) q8sgf::mma(output[d + i], runs[i].step(s), weights[s]);
+    }
+  };
+  for (uint p = split; p < live_pages; p += Splits) {
+    const uint slot = (p < wrapped ? p : resume + p - wrapped) * N;
+    page(keys + ulong(slot) * D, values + slot, value_stride, slot, false);
+  }
+  if (last) page(query_keys, query_values, Rows, 0, true);
+  for (uint d = 0; d < D / 8; ++d) {
+    partial[row * D + 8 * d + fm] = output[d].x;
+    partial[(row + 1) * D + 8 * d + fm] = output[d].y;
+  }
+  if (fm == 0) {
+    partial[M * D + row] = row_max.x;
+    partial[M * D + row + 1] = row_max.y;
+    partial[M * D + M + row] = row_sum.x;
+    partial[M * D + M + row + 1] = row_sum.y;
+  }
+}
+
+kernel void draft_attention_bf16_split_sgf(
     device bfloat *queries [[buffer(0)]],
-    constant DraftAttentionBatchParams &params [[buffer(1)]],
-    uint2 group [[threadgroup_position_in_grid]],
-    uint thread_index [[thread_index_in_threadgroup]]) {
+    device bfloat *keys0 [[buffer(1)]], device bfloat *keys1 [[buffer(2)]],
+    device bfloat *keys2 [[buffer(3)]], device bfloat *keys3 [[buffer(4)]],
+    device bfloat *values0 [[buffer(5)]], device bfloat *values1 [[buffer(6)]],
+    device bfloat *values2 [[buffer(7)]], device bfloat *values3 [[buffer(8)]],
+    device bfloat *query_keys [[buffer(9)]], device bfloat *query_values [[buffer(10)]],
+    constant DraftAttentionBatchParams &params [[buffer(11)]],
+    uint3 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint AttentionM = SPLASH_DRAFT_ATTENTION_ROWS, KVHeads = SPLASH_DRAFT_KV_HEADS;
+  constexpr ulong Rows = SPLASH_DRAFT_QUERY_ROWS, Attention = SPLASH_DRAFT_ATTENTION_WIDTH,
+                  HeadDim = SPLASH_DRAFT_HEAD_DIMENSION, Window = SPLASH_DRAFT_SLIDING_WINDOW;
+  constexpr ulong PartialFloats = AttentionM * HeadDim + 2 * AttentionM;
+  const uint batch = group.y;
+  device bfloat *keys = SPLASH_LANE_BINDING(batch, keys0, keys1, keys2, keys3);
+  device bfloat *values = SPLASH_LANE_BINDING(batch, values0, values1, values2, values3);
+  device float *partials =
+      reinterpret_cast<device float *>(queries + params.lanes * Rows * Attention) +
+      ((batch * KVHeads + group.x) * SPLASH_DRAFT_ATTENTION_REGISTER_SPLITS + group.z) * PartialFloats;
+  threadgroup uint query_stage[AttentionM / 8 * 32 * (HeadDim / 8)];
+  draft_attention_split_sgf_phase(
+      queries + batch * Rows * Attention + group.x * AttentionM * HeadDim, keys + group.x * Window * HeadDim,
+      values + group.x * Window * HeadDim, query_keys + batch * KVHeads * Rows * HeadDim + group.x * Rows * HeadDim,
+      query_values + batch * KVHeads * HeadDim * Rows + group.x * Rows * HeadDim, partials, params.value_stride,
+      params.cache_length[batch], group.z, query_stage, lane, simd_group);
+}
+
+template <uint Splits>
+inline void draft_attention_reduce_kernel(device bfloat *queries, constant DraftAttentionBatchParams &params,
+                                          uint2 group, uint thread_index) {
   constexpr uint AttentionM = SPLASH_DRAFT_ATTENTION_ROWS, KVHeads = SPLASH_DRAFT_KV_HEADS;
   constexpr ulong Rows = SPLASH_DRAFT_QUERY_ROWS;
   constexpr ulong Attention = SPLASH_DRAFT_ATTENTION_WIDTH;
@@ -557,12 +726,25 @@ kernel void draft_attention_bf16_reduce(
   device const float *partials =
       reinterpret_cast<device const float *>(queries +
                                              params.lanes * Rows * Attention) +
-      (batch * KVHeads + group.x) * SPLASH_DRAFT_ATTENTION_SPLITS *
-          PartialFloats;
-  draft_attention_reduce_phase(
+      (batch * KVHeads + group.x) * Splits * PartialFloats;
+  draft_attention_reduce_phase<Splits>(
       partials,
       queries + batch * Rows * Attention + group.x * AttentionM * HeadDim,
       thread_index);
+}
+kernel void draft_attention_bf16_reduce(
+    device bfloat *queries [[buffer(0)]],
+    constant DraftAttentionBatchParams &params [[buffer(1)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+  draft_attention_reduce_kernel<SPLASH_DRAFT_ATTENTION_SPLITS>(queries, params, group, thread_index);
+}
+kernel void draft_attention_bf16_reduce_sgf(
+    device bfloat *queries [[buffer(0)]],
+    constant DraftAttentionBatchParams &params [[buffer(1)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+  draft_attention_reduce_kernel<SPLASH_DRAFT_ATTENTION_REGISTER_SPLITS>(queries, params, group, thread_index);
 }
 
 kernel void draft_attention_reorder(

@@ -36,14 +36,18 @@ class DraftAttentionPlan final {
 public:
   [[nodiscard]] DraftAttentionShape shape() const noexcept { return shape_; }
   [[nodiscard]] uint32_t lanes() const noexcept { return lanes_; }
+  // Apple7/8 run the attention core on the register-matrix tile
+  // (draft_attention_bf16_split_sgf), others on the matmul2d tile.
+  [[nodiscard]] bool registerTile() const noexcept { return registerTile_; }
   [[nodiscard]] DraftAttentionWorkspace workspace() const noexcept;
 
 private:
-  DraftAttentionPlan(DraftAttentionShape shape, uint32_t lanes)
-      : shape_(shape), lanes_(lanes) {}
+  DraftAttentionPlan(DraftAttentionShape shape, uint32_t lanes, bool registerTile)
+      : shape_(shape), lanes_(lanes), registerTile_(registerTile) {}
 
   DraftAttentionShape shape_;
   uint32_t lanes_;
+  bool registerTile_;
 
   friend class DraftAttention;
 };
@@ -80,7 +84,7 @@ struct DraftDecodeAttentionBuffers final {
 class DraftAttention final {
 public:
   [[nodiscard]] static DraftAttentionPlan plan(DraftAttentionShape shape,
-                                               uint32_t lanes);
+                                               uint32_t lanes, bool registerTile);
 
   static void addConvolution(metal::CommandGraph &graph,
                              DraftConvolutionBuffers buffers,

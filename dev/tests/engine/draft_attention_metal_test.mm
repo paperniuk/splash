@@ -148,13 +148,13 @@ void referenceRows(const uint16_t *queries, const uint16_t *keys,
 }
 
 void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
-             const std::array<uint32_t, kLanes> &cacheLengths) {
+             const std::array<uint32_t, kLanes> &cacheLengths, bool registerTile) {
   Random random(0x5eed0000ULL + cacheLengths[0]);
   const uint64_t ringElements = uint64_t{kKvHeads} * kWindow * kHeadDim;
   // The grouped-queries tensor is sized by the plan so the split partials
   // behind the query rows end exactly at the allocation under validation.
   MetalBuffer queries = randomBfloat(
-      backend, DraftAttention::plan(shape, lanes).workspace().groupedQueriesBytes / 2,
+      backend, DraftAttention::plan(shape, lanes, registerTile).workspace().groupedQueriesBytes / 2,
       random, "draft queries");
   std::vector<MetalBuffer> keys;
   std::vector<MetalBuffer> values;
@@ -186,12 +186,13 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
   CommandGraph graph;
   DraftAttention::addDecode(graph,
       {queries, keys, values, queryKeys, queryValues},
-      std::span(cacheLengths).first(lanes), DraftAttention::plan(shape, lanes));
+      std::span(cacheLengths).first(lanes), DraftAttention::plan(shape, lanes, registerTile));
   const auto dispatches = graph.dispatches();
   require(dispatches.size() == 2 &&
               dispatches[0].threadgroups.x == kKvHeads &&
               dispatches[0].threadgroups.y == lanes &&
-              dispatches[0].threadgroups.z == kSplits &&
+              dispatches[0].threadgroups.z ==
+                  (registerTile ? SPLASH_DRAFT_ATTENTION_REGISTER_SPLITS : kSplits) &&
               dispatches[1].threadgroups.x == kKvHeads &&
               dispatches[1].threadgroups.y == lanes &&
               dispatches[1].threadgroups.z == 1,
@@ -204,7 +205,7 @@ void runCase(MetalBackend &backend, uint32_t lanes, DraftAttentionShape shape,
         DraftAttention::addDecode(mismatched,
             {queries, keys, values, queryKeys, queryValues},
             std::span(cacheLengths).first(lanes - 1),
-            DraftAttention::plan(shape, lanes));
+            DraftAttention::plan(shape, lanes, registerTile));
       },
       "invalid draft attention geometry", "fewer cache lengths than lanes were accepted");
   require(mismatched.empty(), "mismatched cache lengths encoded a graph");
@@ -250,7 +251,7 @@ void planGeometry() {
   for (const auto shape : kShapes) {
     for (uint32_t lanes = 1; lanes <= kLanes; ++lanes) {
       const uint64_t rows = uint64_t{lanes} * kRows;
-      const auto plan = DraftAttention::plan(shape, lanes);
+      const auto plan = DraftAttention::plan(shape, lanes, false);
       const auto workspace = plan.workspace();
       require(plan.lanes() == lanes && plan.shape() == shape &&
                   workspace.convolutionBytes == rows * shape.hiddenSize * 2 &&
@@ -262,22 +263,22 @@ void planGeometry() {
                   workspace.queryValuesBytes == rows * 8 * 128 * 2,
               "draft plan padded lanes or changed tensor storage");
     }
-    rejects([&] { (void)DraftAttention::plan(shape, 0); }, "invalid draft batch width",
+    rejects([&] { (void)DraftAttention::plan(shape, 0, false); }, "invalid draft batch width",
             "a draft plan of no lanes was accepted");
-    rejects([&] { (void)DraftAttention::plan(shape, 5); }, "invalid draft batch width",
+    rejects([&] { (void)DraftAttention::plan(shape, 5, false); }, "invalid draft batch width",
             "a draft plan wider than a batch was accepted");
   }
   auto unsupported = kShapes[0];
   unsupported.queryHeads = 16;
-  rejects([&] { (void)DraftAttention::plan(unsupported, 1); },
+  rejects([&] { (void)DraftAttention::plan(unsupported, 1, false); },
           "unsupported compiled draft attention shape",
           "a draft shape without a compiled kernel was accepted");
   // A hidden width of a partial convolution group.
   const DraftAttentionShape partialGroup{2056, 512, 6144, 4096, 32, 8, 128};
-  rejects([&] { (void)DraftAttention::plan(partialGroup, 1); },
+  rejects([&] { (void)DraftAttention::plan(partialGroup, 1, false); },
           "unsupported compiled draft attention shape",
           "a draft of a partial convolution group was accepted");
-  rejects([&] { (void)DraftAttention::plan({}, 1); }, "unsupported compiled draft attention shape",
+  rejects([&] { (void)DraftAttention::plan({}, 1, false); }, "unsupported compiled draft attention shape",
           "an empty draft shape was accepted");
 }
 
@@ -289,7 +290,7 @@ void fillDyadic(const MetalBuffer &buffer, uint32_t multiplier, uint32_t modulus
 
 void surroundingPhases(MetalBackend &backend, DraftAttentionShape shape,
                        uint32_t lanes) {
-  const auto plan = DraftAttention::plan(shape, lanes);
+  const auto plan = DraftAttention::plan(shape, lanes, false);
   const auto workspace = plan.workspace();
   const uint64_t rows = uint64_t{lanes} * kRows;
   auto allocate = [&](uint64_t bytes) {
@@ -761,7 +762,7 @@ void contextWindowCapturedInside(MetalBackend &backend, uint32_t width) {
 // RoPE rows, rings and the commit's retained counts.
 void bufferExtents(MetalBackend &backend, DraftAttentionShape shape) {
   constexpr uint32_t lanes = 3, contextTokens = 37;
-  const auto plan = DraftAttention::plan(shape, lanes);
+  const auto plan = DraftAttention::plan(shape, lanes, false);
   const uint64_t rows = uint64_t{lanes} * kRows, hidden = rows * shape.hiddenSize * 2;
   const uint64_t queryRows = rows * kAttention * 2, current = rows * kKvHeads * kHeadDim * 2;
   const uint64_t ring = uint64_t{kKvHeads} * kWindow * kHeadDim * 2, norm = kHeadDim * 2;
@@ -873,13 +874,16 @@ int main(int argc, char **argv) {
       contextWriters(backend, shape);
       contextWindow(backend, shape.hiddenSize);
       contextWindowCapturedInside(backend, shape.hiddenSize);
-      runCase(backend, 1, shape, {0, 0, 0, 0});
-      runCase(backend, 2, shape, {2048, 2047, 0, 0});
-      runCase(backend, 3, shape, {2100, 4094, 6143, 0});
-      runCase(backend, 4, shape, {262137, 4094, 500, 6143});
-      runCase(backend, 4, shape, {512, 513, 1024, 1536});
-      runCase(backend, 4, shape, {2046, 2049, 4095, 4096});
-      runCase(backend, 2, shape, {8191, 262144, 0, 0});
+      // Both attention cores: the matmul2d tile and Apple7/8's register-matrix tile.
+      for (const bool registerTile : {false, true}) {
+        runCase(backend, 1, shape, {0, 0, 0, 0}, registerTile);
+        runCase(backend, 2, shape, {2048, 2047, 0, 0}, registerTile);
+        runCase(backend, 3, shape, {2100, 4094, 6143, 0}, registerTile);
+        runCase(backend, 4, shape, {262137, 4094, 500, 6143}, registerTile);
+        runCase(backend, 4, shape, {512, 513, 1024, 1536}, registerTile);
+        runCase(backend, 4, shape, {2046, 2049, 4095, 4096}, registerTile);
+        runCase(backend, 2, shape, {8191, 262144, 0, 0}, registerTile);
+      }
     }
     std::cout << "draft_attention_metal_test: PASS\n";
     return 0;

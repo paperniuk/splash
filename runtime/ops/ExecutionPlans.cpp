@@ -78,7 +78,7 @@ VerifyAttentionPlan ExecutionPlans::verifyAttention(
 
 DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,
                                                  uint32_t lanes) const {
-  return DraftAttention::plan(shape, lanes);
+  return DraftAttention::plan(shape, lanes, attentionTile_ == AttentionTile::Register);
 }
 
 MoePlan ExecutionPlans::moePrefill(MoeShape shape, uint32_t routerFormat, uint32_t rows) const {
@@ -108,7 +108,7 @@ AttentionWorkspace ExecutionPlans::verifyAttentionWorkspacePerLane(
 // share.
 DraftAttentionWorkspace ExecutionPlans::draftAttentionWorkspacePerLane(
     DraftAttentionShape shape) const {
-  return DraftAttention::plan(shape, 1).workspace();
+  return DraftAttention::plan(shape, 1, attentionTile_ == AttentionTile::Register).workspace();
 }
 
 MoeWorkspace ExecutionPlans::moePrefillWorkspace(MoeShape shape, uint32_t routerFormat,

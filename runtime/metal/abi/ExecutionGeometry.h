@@ -28,6 +28,11 @@
 // current rows. Fixed rather than derived from the GPU so the combine order,
 // and with it the rounding, is the same on every machine and lane count.
 #define SPLASH_DRAFT_ATTENTION_SPLITS 4u
+// Apple7/8's register-matrix draft attention (draft_attention_bf16_split_sgf)
+// deals its 32-slot pages to this many groups: four leave a 32-core M1 Max a
+// group per core, and with eight its full window takes 0.71 ms over five
+// layers instead of 0.95 (sixteen: 0.78).
+#define SPLASH_DRAFT_ATTENTION_REGISTER_SPLITS 8u
 #define SPLASH_VERIFY_ATTENTION_MAXIMUM_SPLITS 128u
 #define SPLASH_TARGET_SAMPLING_SHARDS 16u
 // Threads of each group that selects a sampled row over the whole
