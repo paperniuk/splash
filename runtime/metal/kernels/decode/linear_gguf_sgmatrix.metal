@@ -152,7 +152,7 @@ template <bool F32> using TableElem = InputType<F32>;
 // The exact half operand of pair f of a chunk, as operand<F> but for Apple7/8: linear codes or-ed into half 1024
 // (whose ulp is 1) less 1024 minus the bf16 tile's offset, so the chains are that tile's.
 template <class F>
-inline vec<OperandType<F, true>, 2> operand_f32(typename F::Chunk ch, uint f, threadgroup const half2 *lut) {
+inline vec<OperandType<F, true>, 2> operand_f32_value(typename F::Chunk ch, uint f, threadgroup const half2 *lut) {
   typedef Shape<F> S;
   if constexpr (F::Kind == QuantLinear) {
     constexpr uint offset = S::Wide ? 0 : S::Seeded ? kZeroPointOffset - F::Zero : 128;
@@ -181,8 +181,17 @@ inline vec<OperandType<F, true>, 2> operand_f32(typename F::Chunk ch, uint f, th
     return select(v, -v, bool2(s & 1u, s & 2u));
   }
 }
+// Apple7/8's table holds the inputs of odd pairs at 1/16 of their value (gguf_sgmatrix.h write_input), so every F32
+// operand of an odd pair is 16 times its value: nibble_subnormal then takes an odd pair at bits 4-7 with one mask and
+// no shift, 2-3% off MLX 4-bit's 27B down and gate/up projections at one lane on an M1 Max. The or-ed operands below
+// take the exponent of 16 for it, and operand_f32 one multiply.
+template <class F>
+inline vec<OperandType<F, true>, 2> operand_f32(typename F::Chunk ch, uint f, threadgroup const half2 *lut) {
+  const vec<OperandType<F, true>, 2> v = operand_f32_value<F>(ch, f, lut);
+  return f & 1 ? v * OperandType<F, true>(16) : v;
+}
 
-// MLX affine 4-bit over whole spans, whose F32 chains take nibble_operand.
+// MLX affine 4-bit over whole spans, whose F32 chains take nibble_subnormal.
 template <class F> struct NibbleSpan { static constexpr constant bool value = false; };
 template <uint Groups> struct NibbleSpan<FmtAffine<4, Groups>> { static constexpr constant bool value = Groups >= 2; };
 // The exact half operand 1 + code / 64 of pair f of a 4-bit chunk word: the codes at bits 4-7 of each halfword
@@ -190,7 +199,14 @@ template <uint Groups> struct NibbleSpan<FmtAffine<4, Groups>> { static constexp
 // adds a subtraction), and a span chain whose min part (64 s against codes to 15) is half operand_f32's.
 inline half2 nibble_operand(uint word, uint f) {
   const uint at = f == 0 ? word << 4 : f == 1 ? word : word >> (4 * (f - 1));
-  return as_type<half2>((at & 0x00F000F0u) | 0x3C003C00u);
+  return as_type<half2>((at & 0x00F000F0u) | (f & 1 ? 0x4C004C00u : 0x3C003C00u));
+}
+// The exact half operand code * 2^-24 of pair f of a 4-bit chunk word (16 times that of an odd pair), an fp16
+// subnormal: a mask, and for pairs 2 and 3 a shift, without nibble_operand's or, and a span chain closed by 2^24 s
+// and m.
+inline half2 nibble_subnormal(uint word, uint f) {
+  const uint at = f < 2 ? word : word >> 8;
+  return as_type<half2>(at & (f & 1 ? 0x00F000F0u : 0x000F000Fu));
 }
 // The same of a 5-bit chunk in Q5_K's planes, its fifth bits (pair p's at bits 2p and 16 + 2p) at bit 8 of each
 // halfword: 1 + code / 64, exact for codes to 31, where operand_f32 shifts them below the nibble and subtracts. On
@@ -198,7 +214,8 @@ inline half2 nibble_operand(uint word, uint f) {
 // UD-Q4_K_XL and UD-Q5_K_M, 45% Q5_K, decodes 1.8-2.2% faster at one lane.
 inline half2 nibble_operand(uint2 chunk, uint f) {
   const uint at = f == 0 ? chunk.x << 4 : f == 1 ? chunk.x : chunk.x >> (4 * (f - 1));
-  return as_type<half2>((at & 0x00F000F0u) | ((chunk.y << (8 - 2 * f)) & 0x01000100u) | 0x3C003C00u);
+  return as_type<half2>((at & 0x00F000F0u) | ((chunk.y << (8 - 2 * f)) & 0x01000100u) |
+                        (f & 1 ? 0x4C004C00u : 0x3C003C00u));
 }
 
 // The exact half operand (code - 32) / 64 of pair f of a Q6_K chunk (uint2: the 4-bit word, then the high bits as
@@ -209,7 +226,8 @@ inline half2 nibble_operand(uint2 chunk, uint f) {
 inline half2 nibble6_operand(uint2 chunk, uint f) {
   const uint at = f == 0 ? chunk.x << 4 : f == 1 ? chunk.x : chunk.x >> (4 * (f - 1));
   const uint high = f == 3 ? chunk.y >> 4 : chunk.y << (8 - 4 * f);
-  return as_type<half2>((at & 0x00F000F0u) | (high & 0x03000300u) | 0x3C003C00u) - half2(1.5h);
+  return as_type<half2>((at & 0x00F000F0u) | (high & 0x03000300u) | (f & 1 ? 0x4C004C00u : 0x3C003C00u)) -
+         half2(f & 1 ? 24.0h : 1.5h);
 }
 // The exact half operand (code - 4) / 8 of pair f of a Q3_K chunk (uint2: the low bits as quant_spread2 places them,
 // pair p's at bits 4p and 16 + 4p, then the hmask bits as quant_spread1 does, at 2p and 16 + 2p): the low bits at bits
@@ -217,7 +235,8 @@ inline half2 nibble6_operand(uint2 chunk, uint f) {
 // seed. On an M2 Max this takes 2% off the 27B's Q3_K projections at one and two lanes and 6-10% at three and four.
 inline half2 q3_operand(uint2 chunk, uint f) {
   const uint low = f == 0 ? chunk.x << 7 : f == 1 ? chunk.x << 3 : chunk.x >> (4 * f - 7);
-  return as_type<half2>((low & 0x01800180u) | ((chunk.y << (9 - 2 * f)) & 0x02000200u) | 0x3C003C00u) - half2(1.5h);
+  return as_type<half2>((low & 0x01800180u) | ((chunk.y << (9 - 2 * f)) & 0x02000200u) |
+                        (f & 1 ? 0x4C004C00u : 0x3C003C00u)) - half2(f & 1 ? 24.0h : 1.5h);
 }
 
 // Apple7/8's (F32) view of Q4_0, Q5_0, PQ2_0 and Q2_0: the zero point taken as a min, m = -zero d, so their chains close once per
@@ -476,7 +495,7 @@ inline void decode(device const TableElem<F32> *table, device const float *sums,
           for (uint nf = 0; nf < 2; ++nf)
 #pragma unroll
             for (uint f = 0; f < 4; ++f) {
-              if constexpr (NibbleSpan<F>::value) a[nf][f] = nibble_operand(cur[nf][q], f);
+              if constexpr (NibbleSpan<F>::value) a[nf][f] = nibble_subnormal(cur[nf][q], f);
               else a[nf][f] = operand_f32<F>(cur[nf][q], f, lut);
             }
 #pragma unroll
@@ -500,9 +519,9 @@ inline void decode(device const TableElem<F32> *table, device const float *sums,
 #pragma unroll
           for (uint nf = 0; nf < 2; ++nf) {
             if constexpr (NibbleSpan<F>::value) {
-              // code = 64 (operand - 1): s code + m = 64 s operand + m - 64 s.
-              acc[r][nf] = fma(dot[r][nf], 64 * cs[nf].x, acc[r][nf]);
-              acc[r][nf] = fma(sum, fma(64.0f, cs[nf].x, cs[nf].y), acc[r][nf]);
+              // code = 2^24 operand, and cs is (s, m - 128 s): s code + m = 2^24 s operand + m.
+              acc[r][nf] = fma(dot[r][nf], 16777216.0f * cs[nf].x, acc[r][nf]);
+              acc[r][nf] = fma(sum, fma(128.0f, cs[nf].x, cs[nf].y), acc[r][nf]);
             } else {
               acc[r][nf] = fma(dot[r][nf], cs[nf].x, acc[r][nf]);
               acc[r][nf] = fma(sum, cs[nf].y, acc[r][nf]);
@@ -722,7 +741,7 @@ inline void decode_fragment_paired(device const TableElem<F32> *table, device co
           for (uint nf = 0; nf < 2; ++nf)
 #pragma unroll
             for (uint f = 0; f < 4; ++f) {
-              if constexpr (NibbleSpan<F>::value) a[nf][f] = nibble_operand(cur[nf][q], f);
+              if constexpr (NibbleSpan<F>::value) a[nf][f] = nibble_subnormal(cur[nf][q], f);
               else a[nf][f] = operand_f32<F>(cur[nf][q], f, lut);
             }
 #pragma unroll
@@ -746,8 +765,8 @@ inline void decode_fragment_paired(device const TableElem<F32> *table, device co
 #pragma unroll
           for (uint nf = 0; nf < 2; ++nf) {
             if constexpr (NibbleSpan<F>::value) {
-              acc[r][nf] = fma(dot[r][nf], 64 * cs[nf].x, acc[r][nf]);
-              acc[r][nf] = fma(sum, fma(64.0f, cs[nf].x, cs[nf].y), acc[r][nf]);
+              acc[r][nf] = fma(dot[r][nf], 16777216.0f * cs[nf].x, acc[r][nf]);
+              acc[r][nf] = fma(sum, fma(128.0f, cs[nf].x, cs[nf].y), acc[r][nf]);
             } else {
               acc[r][nf] = fma(dot[r][nf], cs[nf].x, acc[r][nf]);
               acc[r][nf] = fma(sum, cs[nf].y, acc[r][nf]);
