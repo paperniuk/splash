@@ -12,6 +12,9 @@ newer; this fork runs the same engine, version 1.6.1, on M1 and M2.
 **On an M3 or newer, use official Splash:** `brew install incoai/tap/splash`.
 Nothing here is faster there.
 
+Project page with the download, benchmarks and FAQ:
+**[paperniuk.com/splash-m1](https://paperniuk.com/splash-m1/)**.
+
 The engine, the models and the draft models are Inco's work. What this fork
 adds:
 
