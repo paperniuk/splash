@@ -48,8 +48,11 @@ template <class T>
 inline void write_input(device T *table, device float *sums, uint width, uint span,
                         uint row, uint lane, bfloat a, bfloat b) {
   const uint2 l = klogical(2 * lane);
-  table[span * GGUF_TABLE16_SPAN_VALUES + xt_offset(l.x, l.y, row)] = T(a);
-  table[span * GGUF_TABLE16_SPAN_VALUES + xt_offset(l.x, l.y + 1, row)] = T(b);
+  // Apple7/8's fp32 table holds odd pairs' inputs at 1/16, which their operands take back
+  // (linear_gguf_sgmatrix.metal operand_f32); the sums stay the inputs'.
+  const float scale = is_same<T, float>::value && (l.x & 1) ? 0.0625f : 1.0f;
+  table[span * GGUF_TABLE16_SPAN_VALUES + xt_offset(l.x, l.y, row)] = T(float(a) * scale);
+  table[span * GGUF_TABLE16_SPAN_VALUES + xt_offset(l.x, l.y + 1, row)] = T(float(b) * scale);
   float s = float(a) + float(b);
   s += simd_shuffle_xor(s, 1u);
   s += simd_shuffle_xor(s, 2u);
