@@ -173,8 +173,13 @@ void LinearPlan::requireConfiguration() const {
       throw std::invalid_argument("the register block tile takes up to four table tiles' rows and a K unit per split");
     return;
   }
-  if (c.tile == LinearTile::GgufPrefill || c.tile == LinearTile::GgufPrefillInt8) {
+  if (c.tile == LinearTile::GgufPrefillInt8) {
     if (c.splits != 1) throw std::invalid_argument("invalid block prefill configuration");
+    return;
+  }
+  if (c.tile == LinearTile::GgufPrefill) {
+    if (!c.validSplits() || (k / 32) % c.splits)
+      throw std::invalid_argument("block prefill splits take whole 32-input groups");
     return;
   }
   if (!c.validSplits() || (k / 32) % c.splits)
@@ -208,10 +213,17 @@ LinearScratchSize LinearPlan::scratchSize() const noexcept {
   // Int8 prefill: the codes and scales of the stored rows.
   if (config_.tile == LinearTile::GgufPrefillInt8)
     return {gguf_prefill_int8_table_bytes(k, storageRows()), gguf_prefill_int8_scale_bytes(k, storageRows()), 0, 0};
+  // MMA split-K prefill: [split][64][64] fp32 partials and one counter per
+  // 64x64 tile.
+  if (config_.tile == LinearTile::GgufPrefill) {
+    if (config_.splits == 1) return {};
+    const uint64_t rowTiles = (workload_.rows + kMmaPrefillRows - 1) / kMmaPrefillRows;
+    return {0, 0, uint64_t{config_.splits} * rowTiles * kMmaPrefillRows * n * sizeof(float),
+            rowTiles * (n / GGUF_TILE_COLUMNS) * sizeof(uint32_t)};
+  }
   // Staged split-K: [split][row][column] fp32 partials over the tile's rows,
   // a one-pass gate/up's of both tensors, and one counter per column tile (a
-  // tile covers every row of the dispatch): 64 columns, 32 in one pass. The
-  // prefill tile never splits.
+  // tile covers every row of the dispatch): 64 columns, 32 in one pass.
   const uint64_t columns = config_.oneGateUpPass ? 2 * uint64_t{n} : n;
   const uint32_t tile = config_.oneGateUpPass ? GGUF_STAGED_COLUMNS : GGUF_TILE_COLUMNS;
   return config_.splits > 1
@@ -403,6 +415,9 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
   const bool useMma = mma();
   if (plan.configuration().mmaPrefill && !useMma)
     throw std::invalid_argument("Apple7/8's 64-row MMA prefill tiles run on Apple7/8 alone");
+  const uint32_t splits = plan.configuration().splits;
+  if (splits > 1 && (!useMma || p.planeInputs()))
+    throw std::invalid_argument("split block prefill requires the MMA tile");
   // The MMA tiles stop at the chunk's last row: a 64-row tile past it would
   // stream the weights for no row, which on an M1 Max made a 136-row chunk's
   // projection cost 1.5 times a 128-row one's.
@@ -438,11 +453,19 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
     }
     return;
   }
+  const auto [partials, counters] = splitScratch(b, splits);
   for (const QuantizedSegment &s : p.blocks().segments) {
     std::vector<metal::MetalBuffer> bindings{b.input, s.plane0, s.plane1Slot(), s.meta, b.output};
-    if (w.epilogue != LinearEpilogue::None) bindings.push_back(epilogueInput(b, w.epilogue));
     const GgufPrefillParams params{k, w.rows, n, s.columnOffset};
-    const metal::DispatchSize groups{rowTiles, s.outputSize / GGUF_TILE_COLUMNS, 1};
+    const uint32_t colTiles = s.outputSize / GGUF_TILE_COLUMNS;
+    if (splits > 1) {
+      bindings.insert(bindings.end(), {partials, counters, epilogueInput(b, w.epilogue)});
+      graph.add("gguf_prefill_mma_split_" + std::string(s.name()) + "_" + epilogue, std::move(bindings),
+                GgufPrefillSplitParams{params, splits}, {rowTiles, colTiles, splits}, {kMmaPrefillThreads, 1, 1});
+      continue;
+    }
+    if (w.epilogue != LinearEpilogue::None) bindings.push_back(epilogueInput(b, w.epilogue));
+    const metal::DispatchSize groups{rowTiles, colTiles, 1};
     const std::string kernel = prefillKernel(s.name(), epilogue, useMma);
     const uint32_t threads = useMma ? kMmaPrefillThreads : GGUF_PREFILL_THREADS;
     if (p.planeInputs()) {

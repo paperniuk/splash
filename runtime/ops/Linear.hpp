@@ -141,8 +141,8 @@ struct LinearWorkload final {
 
 struct LinearConfig final {
   LinearTile tile = LinearTile::GgufStaged;
-  // Cross-threadgroup K partitions for GgufStaged and GgufRegister, a power
-  // of two up to kMaximumSplits; GgufPrefill uses one.
+  // Cross-threadgroup K partitions for GgufStaged, GgufRegister, and
+  // Apple7/8's GgufPrefill, a power of two up to kMaximumSplits.
   uint32_t splits = 1;
   static constexpr uint32_t kMaximumSplits = 16;
   // GgufStaged: each column tile starts its walk over its K partition at its
@@ -337,6 +337,11 @@ public:
   // runs the int8 prefill tile on the shape's formats, its codes and scales of
   // `rows` rows.
   [[nodiscard]] LinearScratchSize scratchSize(ProjectionShape shape, uint32_t rows) const;
+  // The split partials and counters of the plans of up to `rows` rows of a
+  // projection of `shape` on the 64-row MMA prefill tile, where the device
+  // splits it (Apple7/8, ProjectionCalibration::prefillSplits); none
+  // elsewhere.
+  [[nodiscard]] LinearScratchSize prefillSplitScratchSize(ProjectionShape shape, uint32_t rows) const;
   // The tile of a float projection of `rows` rows into `outputSize` columns
   // of rows in `formatId` (QuantizedSegment::rows) on this device
   // (selectFloatTile).

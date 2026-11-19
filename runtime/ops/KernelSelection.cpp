@@ -48,9 +48,8 @@ constexpr uint32_t kMostWeightBits16 = [] {
   return most;
 }();
 
-// The split count doubles while some tier asks (TierLaw).
-uint32_t tierSplits(uint32_t n, uint32_t k, uint32_t cores, std::span<const SplitTier> tiers) {
-  const uint64_t grid = n / GGUF_TILE_COLUMNS;
+// The split count doubles while some tier asks (TierLaw) over `grid` tiles.
+uint32_t gridTierSplits(uint64_t grid, uint32_t k, uint32_t cores, std::span<const SplitTier> tiers) {
   uint32_t splits = 1;
   const auto asks = [&](const SplitTier &t) {
     return splits < t.splits && grid * splits < uint64_t{t.threadgroupsPerCore} * cores &&
@@ -58,6 +57,9 @@ uint32_t tierSplits(uint32_t n, uint32_t k, uint32_t cores, std::span<const Spli
   };
   while ((k / 32) % (2 * splits) == 0 && std::any_of(tiers.begin(), tiers.end(), asks)) splits *= 2;
   return splits;
+}
+uint32_t tierSplits(uint32_t n, uint32_t k, uint32_t cores, std::span<const SplitTier> tiers) {
+  return gridTierSplits(n / GGUF_TILE_COLUMNS, k, cores, tiers);
 }
 
 // The waves of a dispatch of `groups` threadgroups of a staged tile on
@@ -164,8 +166,15 @@ LinearConfig bf16Projection(const KernelCalibration &calibration, LinearWorkload
   const ProjectionCalibration &p = calibration.projection;
   const uint32_t cores = calibration.cores;
   if (w.rows > kMaximumDecodeTileRows ||
-      (calibration.simdgroupMma && w.rows > std::max(kMaximumMmaStagedRows, kMaximumRegisterRows)))
-    return {.tile = LinearTile::GgufPrefill, .mmaPrefill = calibration.simdgroupMma};
+      (calibration.simdgroupMma && w.rows > std::max(kMaximumMmaStagedRows, kMaximumRegisterRows))) {
+    if (!calibration.simdgroupMma) return {.tile = LinearTile::GgufPrefill};
+    // Apple7/8's 64-row MMA tile splits K where the grid of the plan's 64-row
+    // by 64-column tiles is too small for the cores (prefillSplits).
+    const uint64_t grid = uint64_t{(w.rows + 63) / 64} * (n / GGUF_TILE_COLUMNS);
+    return {.tile = LinearTile::GgufPrefill,
+            .splits = gridTierSplits(grid, k, cores, p.prefillSplits),
+            .mmaPrefill = true};
+  }
   const uint32_t tiles = tableTiles(w.rows);
   const bool gateUp = w.epilogue == LinearEpilogue::GateUp,
              onePass = gateUp && unit.oneFormat && cores >= p.onePassFromCores && w.rows <= kMaximumPairRows;
@@ -281,6 +290,7 @@ LinearConfig selectProjection(const KernelCalibration &calibration, Int8Activati
   const ProjectionCalibration &p = calibration.projection;
   if (config.tile == LinearTile::GgufPrefill && p.prefillInt8 && unit.prefillInt8Takes) {
     config.tile = LinearTile::GgufPrefillInt8;
+    config.splits = 1;
     config.mmaPrefill = false;
   }
   const uint32_t storage = stagedStorageRows(w.rows, config.sixteenRows);

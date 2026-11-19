@@ -15,6 +15,10 @@
 namespace splash::ops {
 namespace {
 
+// The rows of Apple7/8's MMA prefill tile (LinearGguf.cpp), whose chunks split
+// K by the grid of these tiles (ProjectionCalibration::prefillSplits).
+constexpr uint32_t kMmaPrefillTileRows = 64;
+
 // Matrices of whole 64-row tiles (GGUF_TILE_COLUMNS) of whole 64-input spans,
 // whose K is a multiple of a 64-input span (or of its format's superblock), and
 // up to a prefill chunk's rows. A gate/up pair runs as one plan on the decode
@@ -40,7 +44,8 @@ void requireLeadingInputs(const LinearPlan &plan, const Projection &p) {
   if (!p.planeInputs()) return;
   const LinearWorkload w = plan.workload();
   const LinearTile tile = plan.configuration().tile;
-  if (w.epilogue != LinearEpilogue::Residual || (tile != LinearTile::GgufPrefill && tile != LinearTile::GgufPrefillInt8) ||
+  if (w.epilogue != LinearEpilogue::Residual ||
+      ((tile != LinearTile::GgufPrefill || plan.configuration().splits != 1) && tile != LinearTile::GgufPrefillInt8) ||
       p.rotation)
     throw std::invalid_argument("a view of leading inputs runs only the quantized prefill residual tiles");
 }
@@ -190,6 +195,9 @@ LinearPlan Linear::plan(LinearWorkload w, const Projection &p, const Projection 
                   selectProjection(calibration_, int8Activations_, w, unitFormats(projections),
                                    pair ? std::span<const UnitFormats>(tensors) : std::span<const UnitFormats>{}),
                   p.destination);
+  // A view of leading inputs (the ANE FFN split's down) has no split prefill
+  // kernel (requireLeadingInputs): it runs the prefill tile unsplit.
+  if (p.planeInputs() && plan.config_.tile == LinearTile::GgufPrefill) plan.config_.splits = 1;
   plan.rotated_ = static_cast<bool>(p.rotation);
   return plan;
 }
@@ -213,8 +221,8 @@ LinearScratchSize Linear::scratchSize(ProjectionShape shape, uint32_t rows) cons
   if (!rows || rows > SPLASH_PREFILL_TOKEN_BUDGET) throw std::invalid_argument("invalid linear scratch rows");
   LinearScratchSize bound;
   // Split scratch and tables grow with the rows of the decode tiles, each
-  // count of rows any tile the device may run it on; the prefill tiles never
-  // split (LinearGguf.cpp).
+  // count of rows any tile the device may run it on; the prefill tiles split
+  // only on Apple7/8, below.
   const LinearMatrix matrix{shape.outputSize, shape.inputSize};
   for (uint32_t count = 1; count <= std::min(rows, kMaximumDecodeTileRows); ++count)
     for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp})
@@ -232,6 +240,22 @@ LinearScratchSize Linear::scratchSize(ProjectionShape shape, uint32_t rows) cons
     const LinearWorkload most{matrix, rows, LinearEpilogue::None};
     bound.include(
         LinearPlan(most, selectProjection(calibration_, int8Activations_, most, unitFormats(shape))).scratchSize());
+  }
+  bound.include(prefillSplitScratchSize(shape, rows));
+  return bound;
+}
+
+LinearScratchSize Linear::prefillSplitScratchSize(ProjectionShape shape, uint32_t rows) const {
+  if (!rows || rows > SPLASH_PREFILL_TOKEN_BUDGET) throw std::invalid_argument("invalid linear scratch rows");
+  LinearScratchSize bound;
+  if (calibration_.projection.prefillSplits.empty()) return bound;
+  // The split is the grid's of the plan's 64-row tiles: every count of them
+  // up to `rows` rows may take its own.
+  const LinearMatrix matrix{shape.outputSize, shape.inputSize};
+  for (uint32_t tiled = kMmaPrefillTileRows; tiled < rows + kMmaPrefillTileRows; tiled += kMmaPrefillTileRows) {
+    const LinearWorkload chunk{matrix, std::min(tiled, rows), LinearEpilogue::None};
+    bound.include(
+        LinearPlan(chunk, selectProjection(calibration_, int8Activations_, chunk, unitFormats(shape))).scratchSize());
   }
   return bound;
 }
