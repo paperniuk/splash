@@ -290,6 +290,14 @@ int main(int argc, char **argv) {
         const LinearConfig config{.tile = LinearTile::GgufPrefill};
         cases.push_back({"R" + std::to_string(rows), "prefill128", Linear::plan(w, config, FloatOutput::BFloat16),
                          config == policy, {}});
+        if (backend.capabilities().appleGpuFamily < 9) {
+          for (uint32_t splits = 2; splits <= LinearConfig::kMaximumSplits; splits *= 2) {
+            if ((K / 32) % splits) continue;
+            const LinearConfig splitCfg{.tile = LinearTile::GgufPrefill, .splits = splits};
+            cases.push_back({"R" + std::to_string(rows), "prefill64 S" + std::to_string(splits),
+                             Linear::plan(w, splitCfg, FloatOutput::BFloat16), splitCfg == policy, {}});
+          }
+        }
         if (std::all_of(images.begin(), images.end(),
                         [](const Image &i) { return quant_prefill_int8_format(i.format); })) {
           const LinearConfig int8{.tile = LinearTile::GgufPrefillInt8};
