@@ -97,6 +97,9 @@ struct ProjectionCalibration final {
   // (UnitFormats::prefillInt8Takes) run that tile, where the family's int8
   // matmul is faster than its bf16 one.
   bool prefillInt8;
+  // K-split tiers for long prefill chunks (GgufPrefill) over the chunk's
+  // 2D grid of 64-row by 64-column tiles; empty leaves prefill unsplit.
+  std::span<const SplitTier> prefillSplits{};
 };
 
 struct FloatTileCalibration final {
@@ -297,6 +300,13 @@ inline constexpr ProjectionCalibration kApple11Projection = [] {
 // 12288 x 5120 S4 0.264 against S1 0.302, Q4_K 5120 x 6144 S8 0.151 against
 // S4 0.164; at four lanes within 5% of either.
 inline constexpr SplitTier kMmaTiers[] = {{24, 512}};
+// Narrow prefill grids on Apple7/8's 64x64 MMA tile starve cores at S1:
+// Q8_0 320x10240 (Flash-Next hyper-connection down) gains 3.5-4.1x at
+// 128 rows (0.670-0.791 -> 0.193 ms at S8) and -38% at 384 rows (0.677 ->
+// 0.422 ms at S8) on a 38-core M2 Max, cutting 128/384-row appends on 64K
+// history by 13.7%/3.7% in decode-profile while leaving wide projections
+// (e.g. 2560x6144 at >= 1024 rows, 5120x17408 from 384 rows) unsplit.
+inline constexpr SplitTier kMmaPrefillTiers[] = {{8, 512, 8}};
 
 // Apple7/8 decode on the register tile's F32 instances wherever every format
 // takes it: the MMA tile's per-element dequantization through threadgroup
@@ -319,6 +329,7 @@ inline constexpr ProjectionCalibration kApple7Projection{
     // fp32-only matrix operations: bf16 activations in decode and prefill.
     .decodeInt8FromRows = kNever,
     .prefillInt8 = false,
+    .prefillSplits = kMmaPrefillTiers,
 };
 
 // ---- Float projections ----------------------------------------------------

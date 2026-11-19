@@ -50,9 +50,8 @@ constexpr uint32_t kMostWeightBits16 = [] {
   return most;
 }();
 
-// The split count doubles while some tier asks (TierLaw).
-uint32_t tierSplits(uint32_t n, uint32_t k, uint32_t cores, std::span<const SplitTier> tiers) {
-  const uint64_t grid = n / GGUF_TILE_COLUMNS;
+// The split count doubles while some tier asks (TierLaw) over `grid` tiles.
+uint32_t gridTierSplits(uint64_t grid, uint32_t k, uint32_t cores, std::span<const SplitTier> tiers) {
   uint32_t splits = 1;
   const auto asks = [&](const SplitTier &t) {
     return splits < t.splits && grid * splits < uint64_t{t.threadgroupsPerCore} * cores &&
@@ -60,6 +59,9 @@ uint32_t tierSplits(uint32_t n, uint32_t k, uint32_t cores, std::span<const Spli
   };
   while ((k / 32) % (2 * splits) == 0 && std::any_of(tiers.begin(), tiers.end(), asks)) splits *= 2;
   return splits;
+}
+uint32_t tierSplits(uint32_t n, uint32_t k, uint32_t cores, std::span<const SplitTier> tiers) {
+  return gridTierSplits(n / GGUF_TILE_COLUMNS, k, cores, tiers);
 }
 
 // The waves of a dispatch of `groups` threadgroups of a staged tile on
@@ -163,7 +165,11 @@ LinearConfig bf16Projection(const KernelCalibration &calibration, LinearWorkload
   const ProjectionCalibration &p = calibration.projection;
   const uint32_t cores = calibration.cores;
   if (w.phase == LinearPhase::Prefill) {
-    if (w.rows > p.stagedPrefillRows) return LinearConfig{.tile = LinearTile::GgufPrefill};
+    if (w.rows > p.stagedPrefillRows) {
+      const uint64_t grid = uint64_t{(w.rows + 63) / 64} * (n / GGUF_TILE_COLUMNS);
+      return LinearConfig{.tile = LinearTile::GgufPrefill,
+                          .splits = gridTierSplits(grid, k, cores, p.prefillSplits)};
+    }
     LinearConfig config = staged(p, n, k, w.rows, unit.weightBits16, cores, Passes::Two);
     // Apple7/8's MMA tile also holds 24 rows: a chunk of 17 to 24 took the
     // 32-row tile's time, 330 ms against 260 on a 32-core M1 Max (27B).
