@@ -865,6 +865,110 @@ void prefill(MetalBackend &backend, const Linear &linear, uint32_t K, const std:
           "chunk's last rows alone bitwise the chunk's");
 }
 
+// Apple7/8 split-K 64-row prefill tiles (gguf_prefill_mma_split_*): Flash-Next's Q8_0 320x10240 shape and
+// 1024x1024 across Q8_0, Q4_K, AF4G64 and all three epilogues at S in {2, 4, 8, 16}, partial 64-row tail tiles
+// (136 and 168 rows), 3-segment multi-format None chunks, bit-exact lastRows (1 and 4), finite and NaN partial
+// poisoning, unwritten rows beyond the active simdgroups, and zeroed counters.
+void prefillSplit(MetalBackend &backend, const Linear &linear) {
+  const auto checkShape = [&](const Projection &p, const std::vector<const Tensor *> &parts, uint32_t K,
+                              LinearEpilogue epilogue, std::span<const uint32_t> chunkRows,
+                              std::span<const uint32_t> splitsList, uint32_t poison, bool checkFused) {
+    const uint32_t covered = segmentColumns(parts), columns = p.outputSize;
+    const auto workload = [&](uint32_t rows) {
+      return LinearWorkload{{columns, K}, rows, LinearPhase::Prefill, epilogue};
+    };
+    const uint32_t maxRows = *std::max_element(chunkRows.begin(), chunkRows.end());
+    const uint32_t maxStorage =
+        Linear::plan(workload(maxRows), {.tile = LinearTile::GgufPrefill, .splits = 2}, FloatOutput::BFloat16)
+            .storageRows();
+    const std::vector<float> x = activations(Inputs::Dense, maxStorage, K);
+    const std::vector<float> auxiliary = epilogue == LinearEpilogue::Residual
+        ? residuals(maxStorage, columns) : activations(Inputs::Dense, maxStorage, columns);
+    const std::vector<uint16_t> aux = storageRows(auxiliary, columns, maxStorage, maxStorage);
+    const std::vector<Dot> dots = products(parts, columns, x, maxRows);
+    const std::string baseLabel = std::to_string(columns) + "x" + std::to_string(K) + " " + epilogueName(epilogue);
+    for (const uint32_t chunk : chunkRows) {
+      for (const uint32_t splits : splitsList) {
+        const LinearConfig cfg{.tile = LinearTile::GgufPrefill, .splits = splits};
+        const LinearWorkload w = workload(chunk);
+        const LinearPlan plan = Linear::plan(w, cfg, FloatOutput::BFloat16);
+        const uint32_t storage = plan.storageRows();
+        const std::string name = baseLabel + " R=" + std::to_string(chunk) + " S=" + std::to_string(splits);
+        const std::vector<uint16_t> chunkAux(aux.begin(), aux.begin() + uint64_t{storage} * columns);
+        const Outcome out =
+            run(backend, linear, plan, p, nullptr, storageRows(x, K, chunk, storage), chunkAux, poison, covered, name);
+        checkValues(out, within(dots, true), {}, chunkAux, w, chunk, covered, name);
+        const uint32_t written = (chunk + 31) / 32 * 32;
+        if (!std::all_of(out.output.begin() + uint64_t{written} * columns, out.output.end(),
+                         [](uint16_t v) { return v == kUnwritten; }))
+          fail(name + ": simdgroups past the chunk wrote trailing rows");
+        for (const uint32_t lastN : {1U, 4U}) {
+          const LinearPlan part = Linear::plan(workload(lastN), cfg, FloatOutput::BFloat16);
+          const auto last = [&](const std::vector<float> &values, uint32_t width) {
+            const auto end = values.begin() + uint64_t{chunk} * width;
+            return storageRows(std::vector<float>(end - uint64_t{lastN} * width, end), width, lastN,
+                               part.storageRows());
+          };
+          const std::string own = name + ", its last " + std::to_string(lastN);
+          const Outcome alone =
+              run(backend, linear, part, p, nullptr, last(x, K), last(auxiliary, columns), kPoisonFinite, covered, own);
+          if (!sameRows(alone.output, 0, out.output, chunk - lastN, lastN, columns))
+            fail(own + ": differs from the chunk's");
+        }
+        if (checkFused) {
+          if (out.pipelines.size() != parts.size())
+            fail(name + ": expected " + std::to_string(parts.size()) + " segment dispatches, got " +
+                 std::to_string(out.pipelines.size()));
+          uint32_t offset = 0;
+          for (const Tensor *t : parts) {
+            const LinearPlan ownPlan =
+                Linear::plan({{t->N, K}, chunk, LinearPhase::Prefill, epilogue}, cfg, FloatOutput::BFloat16);
+            const Outcome segOut = run(backend, linear, ownPlan, projection({t}, t->N), nullptr,
+                                       storageRows(x, K, chunk, ownPlan.storageRows()), chunkAux, poison, t->N,
+                                       name + " seg");
+            for (uint32_t r = 0; r < chunk; ++r)
+              if (!std::equal(segOut.output.begin() + uint64_t{r} * t->N,
+                              segOut.output.begin() + uint64_t{r + 1} * t->N,
+                              out.output.begin() + uint64_t{r} * columns + offset))
+                fail(name + ": segment columns differ from single-segment dispatch");
+            offset += t->N;
+          }
+        }
+      }
+    }
+  };
+  constexpr uint32_t kAllSplits[] = {2, 4, 8, 16};
+  constexpr uint32_t kHcRows[] = {128, 136, 168, 384};
+  {
+    const Tensor w = tensor(backend, Q80, 320, 10240);
+    const Projection p = projection({&w}, w.N);
+    checkShape(p, {&w}, 10240, LinearEpilogue::None, kHcRows, kAllSplits, kPoisonNaN, false);
+    constexpr uint32_t kFiniteCheckRows[] = {136};
+    constexpr uint32_t kFiniteCheckSplits[] = {4, 16};
+    checkShape(p, {&w}, 10240, LinearEpilogue::None, kFiniteCheckRows, kFiniteCheckSplits, kPoisonFinite, false);
+  }
+  constexpr uint32_t kTileRows[] = {136, 168};
+  for (const Fmt f : {Q80, Q4K, Fmt(GGUF_FMT_AF4G64)}) {
+    const Tensor w = tensor(backend, f, 1024, 1024);
+    const Projection p = projection({&w}, w.N);
+    for (const LinearEpilogue e : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate})
+      checkShape(p, {&w}, 1024, e, kTileRows, kAllSplits,
+                 e == LinearEpilogue::UpWithGate ? kPoisonFinite : kPoisonNaN, false);
+  }
+  {
+    const Tensor s0 = tensor(backend, Q80, 256, 1024), s1 = tensor(backend, Q4K, 256, 1024),
+                 s2 = tensor(backend, Fmt(GGUF_FMT_AF4G64), 256, 1024);
+    const std::vector<const Tensor *> parts{&s0, &s1, &s2};
+    constexpr uint32_t kFusedRows[] = {136};
+    constexpr uint32_t kFusedSplits[] = {4};
+    checkShape(projection(parts, segmentColumns(parts) + kPadding), parts, 1024, LinearEpilogue::None, kFusedRows,
+               kFusedSplits, kPoisonNaN, true);
+  }
+  section("prefill split-K (Apple7/8): Q8_0 320x10240 at 128/136/168/384 rows and Q8_0/Q4_K/AF4G64 1024x1024 at "
+          "plain/residual/up-with-gate + 3-segment chunk, S 2-16, last 1/4 rows bitwise, NaN and finite poison, "
+          "unwritten tail rows, counters reset to 0");
+}
+
 // ---------------------------------------------------------------- int8 decode
 // Rotated PQ2_0 projections in int8 activations (LinearConfig::decodeInt8, which selection takes on plans of
 // ProjectionCalibration::decodeInt8FromRows rows or more): gguf_rotate_int8 codes each rotation block of the rotated
@@ -1744,6 +1848,7 @@ int main(int argc, char **argv) {
       else
         registerOneGateUpPass(backend, linear);
       prefill(backend, linear, 1024, tileFormats(LinearTile::GgufStaged));
+      if (backend.capabilities().appleGpuFamily < 9) prefillSplit(backend, linear);
       decodeInt8(backend, linear);
       prefillInt8(backend, linear);
       leadingInputs(backend, linear);

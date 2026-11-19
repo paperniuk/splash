@@ -774,11 +774,16 @@ void ggufPlans() {
       "the register block decode tile takes a K unit per split", "the register tile split three K units four ways");
   rejects([&] { (void)Linear::plan(chunk, {.tile = LinearTile::GgufRegister}, FloatOutput::BFloat16); },
           "the register block decode tile takes a K unit per split", "a prefill plan took the register tile");
-  // The prefill tile runs prefill chunks on their matrix grid, unsplit.
+  // The prefill tile splits K on Apple7/8 (power of two whole 32-input groups); the int8 prefill tile never splits.
   rejects([&] { (void)Linear::plan(down, {.tile = LinearTile::GgufPrefill}, FloatOutput::BFloat16); },
           "invalid block prefill configuration", "a decode plan took the prefill tile");
-  rejects([&] { (void)Linear::plan(chunk, {.tile = LinearTile::GgufPrefill, .splits = 2}, FloatOutput::BFloat16); },
-          "invalid block prefill configuration", "the prefill tile split K");
+  rejects([&] { (void)Linear::plan(chunk, {.tile = LinearTile::GgufPrefillInt8, .splits = 2}, FloatOutput::BFloat16); },
+          "invalid block prefill configuration", "the int8 prefill tile split K");
+  rejects([&] { (void)Linear::plan(chunk, {.tile = LinearTile::GgufPrefill, .splits = 3}, FloatOutput::BFloat16); },
+          "block prefill splits take whole 32-input groups", "the prefill tile split K three ways");
+  rejects([&] { (void)Linear::plan({{5120, 64}, 128, LinearPhase::Prefill, kNone},
+                                   {.tile = LinearTile::GgufPrefill, .splits = 4}, FloatOutput::BFloat16); },
+          "block prefill splits take whole 32-input groups", "the prefill tile split 64 inputs four ways");
   // The staged decode tiles spread their walks on Apple10 and later from 16
   // cores; Apple9's, those of fewer cores and every prefill plan, the staged
   // chunks of up to 32 rows among them, walk in lockstep. No other tile
@@ -1625,6 +1630,118 @@ void registerSplitUnits(metal::MetalBackend &backend) {
   }
 }
 
+// Apple7/8's 64-row MMA prefill tile (GgufPrefill) splits K by ProjectionCalibration::prefillSplits on narrow
+// grids (Flash-Next's Q8_0 320 x 10240 hyper-connection down projection), never on wide projections or on Apple9+.
+// prefillScratchSize covers every row count up to SPLASH_PREFILL_TOKEN_BUDGET.
+void apple7PrefillSplits() {
+  const Projection hcDown = blockProjection(320, 10240, 1, GGUF_FMT_Q80);
+  const Projection wide = blockProjection(5120, 17408, 1);
+  for (const uint32_t family : {7U, 8U}) {
+    for (const uint32_t cores : {32U, 38U}) {
+      const Linear linear = gpu(family, cores);
+      for (const auto [rows, wantSplits] :
+           {std::pair{33U, 8U}, {64U, 8U}, {128U, 8U}, {384U, 8U}, {1024U, 4U}}) {
+        const LinearPlan plan = linear.prefillPlan(hcDown, rows, LinearEpilogue::None);
+        const LinearConfig cfg = plan.configuration();
+        const uint64_t rowTiles = (rows + 63) / 64;
+        require(cfg.tile == LinearTile::GgufPrefill && cfg.splits == wantSplits &&
+                    plan.scratchSize().partials == uint64_t{wantSplits} * rowTiles * 64 * 320 * 4 &&
+                    plan.scratchSize().counters == rowTiles * (320 / 64) * 4,
+                "Apple7/8 HC down prefill split plan at " + std::to_string(rows) + " rows");
+      }
+      const LinearScratchSize bound = linear.prefillScratchSize({320, 10240});
+      for (uint32_t rows = 1; rows <= SPLASH_PREFILL_TOKEN_BUDGET; ++rows) {
+        for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate}) {
+          const LinearScratchSize need = linear.prefillPlan(hcDown, rows, epilogue).scratchSize();
+          require(bound.partials >= need.partials && bound.counters >= need.counters,
+                  "Apple7/8 HC down prefillScratchSize bound at " + std::to_string(rows) + " rows");
+        }
+      }
+      for (const uint32_t chunk : {128U, 384U, 1024U}) {
+        const LinearPlan whole = linear.prefillPlan(hcDown, chunk, LinearEpilogue::None);
+        const LinearPlan part = linear.prefillPlan(hcDown, 1, LinearEpilogue::None, chunk);
+        const LinearScratchSize own = part.scratchSize();
+        require(part.configuration() == whole.configuration() && own.partials <= bound.partials &&
+                    own.counters <= bound.counters,
+                "Apple7/8 HC down chunkRow plan inheritance at chunk " + std::to_string(chunk));
+      }
+      for (const uint32_t rows : {384U, 2048U}) {
+        const LinearPlan plan = linear.prefillPlan(wide, rows, LinearEpilogue::Residual);
+        require(plan.configuration().tile == LinearTile::GgufPrefill && plan.configuration().splits == 1 &&
+                    plan.scratchSize().partials == 0 && plan.scratchSize().counters == 0,
+                "Apple7/8 wide projection stayed unsplit at " + std::to_string(rows) + " rows");
+      }
+      // The ANE FFN split's down, a view of leading inputs, has no split
+      // kernel: it stays unsplit where a projection of its shape splits.
+      const Projection downView = wide.leadingInputs(8192);
+      for (const uint32_t rows : {128U, 192U}) {
+        const LinearPlan plan = linear.prefillPlan(downView, rows, LinearEpilogue::Residual);
+        require(plan.configuration().tile == LinearTile::GgufPrefill && plan.configuration().splits == 1 &&
+                    plan.scratchSize().partials == 0 &&
+                    linear.prefillPlan(blockProjection(5120, 8192, 1), rows, LinearEpilogue::Residual)
+                            .configuration()
+                            .splits > 1,
+                "Apple7/8 leading-input view stayed unsplit at " + std::to_string(rows) + " rows");
+      }
+    }
+  }
+  for (const uint32_t family : {9U, 10U, 11U}) {
+    for (const uint32_t cores : {10U, 12U, 16U, 32U, 40U}) {
+      const Linear linear = gpu(family, cores);
+      for (const uint32_t rows : {65U, 128U, 384U, 1024U, 2048U}) {
+        const LinearPlan plan = linear.prefillPlan(hcDown, rows, LinearEpilogue::None);
+        require(plan.configuration().splits == 1 && plan.scratchSize().partials == 0 &&
+                    plan.scratchSize().counters == 0,
+                "Apple9+ HC down prefill stayed unsplit at " + std::to_string(rows) + " rows");
+      }
+    }
+  }
+}
+
+// Leading-input views and non-Apple7/8 devices refuse split GgufPrefill dispatches; Apple7/8 encodes
+// gguf_prefill_mma_split_* with its 3D grid.
+void apple7PrefillSplitDispatch(metal::MetalBackend &backend) {
+  constexpr uint32_t n = 320, k = 10240, rows = 384, splits = 8;
+  const QuantizedSegment seg = segmentPlanes(backend, GGUF_FMT_Q80, n, k);
+  const Projection hcDown(n, k, BlockWeights{{seg}});
+  const QuantizedSegment wideSeg = segmentPlanes(backend, GGUF_FMT_Q80, n, k + 256);
+  const Projection wide(n, k + 256, BlockWeights{{wideSeg}});
+  const Projection view = wide.leadingInputs(k);
+  const Linear m1 = gpu(7, 38), m3 = gpu(9, 40);
+  const LinearPlan splitRes = Linear::plan({{n, k}, rows, LinearPhase::Prefill, LinearEpilogue::Residual},
+                                           {.tile = LinearTile::GgufPrefill, .splits = splits}, FloatOutput::BFloat16);
+  const LinearPlan splitNone = Linear::plan({{n, k}, rows, LinearPhase::Prefill, LinearEpilogue::None},
+                                            {.tile = LinearTile::GgufPrefill, .splits = splits}, FloatOutput::BFloat16);
+  const LinearScratchSize need = splitNone.scratchSize();
+  const LinearBuffers buffers{.input = allocate(backend, uint64_t{splitNone.storageRows()} * k * 2),
+                              .output = allocate(backend, uint64_t{splitNone.storageRows()} * n * 2),
+                              .residual = allocate(backend, uint64_t{splitNone.storageRows()} * n * 2),
+                              .scratch = {{}, {}, allocate(backend, need.partials), allocate(backend, need.counters)}};
+  {
+    metal::CommandGraph graph;
+    rejects([&] { (void)m1.add(graph, buffers, view, splitRes); },
+            "a view of leading inputs runs only the quantized prefill residual tiles",
+            "a leading-input view ran split GgufPrefill");
+    require(graph.empty(), "refused leading-input split prefill encoded a dispatch");
+  }
+  {
+    metal::CommandGraph graph;
+    rejects([&] { (void)m3.add(graph, buffers, hcDown, splitNone); }, "split block prefill requires the MMA tile",
+            "Apple9 accepted a split GgufPrefill plan");
+    require(graph.empty(), "refused Apple9 split prefill encoded a dispatch");
+  }
+  {
+    metal::CommandGraph graph;
+    (void)m1.add(graph, buffers, hcDown, splitNone);
+    require(graph.dispatches().size() == 1 &&
+                graph.dispatches()[0].pipelineName == "gguf_prefill_mma_split_q80_a" &&
+                graph.dispatches()[0].threadgroups.x == (rows + 63) / 64 &&
+                graph.dispatches()[0].threadgroups.y == n / GGUF_TILE_COLUMNS &&
+                graph.dispatches()[0].threadgroups.z == splits,
+            "Apple7/8 split prefill dispatch pipeline and grid");
+  }
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -1637,6 +1754,7 @@ int main(int argc, char **argv) {
     smallApple9StagesShortPrefillChunks();
     chunkRowPlans();
     prefillInt8Rule();
+    apple7PrefillSplits();
     if (std::string_view(argv[1]) == "--cpu") {
       std::cout << "Linear CPU plans: PASS\n";
       return 0;
@@ -1649,6 +1767,7 @@ int main(int argc, char **argv) {
     decodeInt8TakesRotation(backend);
     blockExtents(backend);
     leadingInputViews(backend);
+    apple7PrefillSplitDispatch(backend);
     registerTileExtents(backend);
     registerSplitUnits(backend);
     std::cout << "Linear plans: PASS\n";
