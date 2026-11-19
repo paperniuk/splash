@@ -810,12 +810,13 @@ void checkGrouping(const MoeScratch &scratch, const MoePlan &plan, const std::st
 
 // Whether tile t of a grouping ran the column tile on `tile`'s expert passes: on the staged passes every tile
 // moe_column_tile names, and on the MMA passes (Apple7/8, kernels/shared/moe_gguf_mma.metal) those of them whose
-// expert, routed or shared, has a Q2_0 projection, the one format they run there apart from their MMA tiles.
-bool columnTile(const MoeTileDescriptor *tiles, uint32_t t, MoeGgufTile tile, const Model &m) {
+// expert, routed or shared, has a projection in a format they run there apart from their MMA tiles
+// (moe_mma_column_format).
+bool columnTile(const MoeTileDescriptor *tiles, uint32_t t, uint32_t tileRows, MoeGgufTile tile, const Model &m) {
   if (!moe_column_tile(tiles, t)) return false;
   if (tile == MoeGgufTile::Staged) return true;
   const auto first = m.formats.begin() + (tiles[t].expert == kExperts ? 3 : 0);
-  return std::any_of(first, first + 3, [](gguf_reference::Fmt f) { return f == gguf_reference::Q20; });
+  return std::any_of(first, first + 3, [&](gguf_reference::Fmt f) { return moe_mma_column_format(f, tileRows); });
 }
 
 // A run's output rows and, per route, whether its expert tile ran the column tile (columnTile).
@@ -825,13 +826,13 @@ struct MoeRun {
 };
 std::vector<bool> columnRoutes(const MoeScratch &scratch, const MoePlan &plan, const std::string &label,
                                const Model &m) {
-  const uint32_t routes = plan.rows() * kRoutes;
+  const uint32_t routes = plan.rows() * kRoutes, tileRows = plan.tileRows();
   const auto *routeRows = static_cast<const uint32_t *>(scratch.routeRows.contents());
   const auto *tiles = static_cast<const MoeTileDescriptor *>(scratch.tileDescriptors.contents());
   const std::vector<uint32_t> tileOf = rowTiles(scratch, plan, label);
   std::vector<bool> column(routes);
   for (uint32_t route = 0; route < routes; ++route)
-    column[route] = columnTile(tiles, tileOf[routeRows[route]], plan.configuration().ggufTile, m);
+    column[route] = columnTile(tiles, tileOf[routeRows[route]], tileRows, plan.configuration().ggufTile, m);
   return column;
 }
 // The first `rows` rows of two runs: rows whose routes ran the same tile kinds are bitwise equal, as a row's output
@@ -1627,7 +1628,7 @@ int laneRowsRoute(MetalBackend &backend, const std::string &name, uint32_t rows,
     std::vector<uint32_t> kinds(uint64_t{rows} * kRoutes);
     for (uint32_t route = 0; route < kinds.size(); ++route)
       kinds[route] = routeRows[route] == UINT32_MAX ? UINT32_MAX
-                                                    : uint32_t(columnTile(tiles, tileOf[routeRows[route]],
+                                                    : uint32_t(columnTile(tiles, tileOf[routeRows[route]], tileRows,
                                                                           plan.configuration().ggufTile, m));
     return std::pair{std::vector<uint16_t>(output, output + uint64_t{rows} * kHidden), kinds};
   };
@@ -1688,10 +1689,13 @@ int laneRowsRoute(MetalBackend &backend, const std::string &name, uint32_t rows,
     if (!std::equal(at(output), at(output) + kHidden, at(allOutput)))
       fail("lane row " + std::to_string(row) + " differs from the all-rows run");
   }
-  // Each lane's first row has an expert of its own, whose tile is a column
-  // tile; Apple7/8's MMA passes run one only for a Q2_0 expert (columnTile).
+  // Each lane's first row has an expert of its own, whose tile is a
+  // column tile; Apple7/8's MMA passes run one only for an expert of a
+  // moe_mma_column_format projection (columnTile), which this model has none
+  // of.
   const bool columnKinds = moeTile(backend) == MoeGgufTile::Staged ||
-                           std::find(m.formats.begin(), m.formats.end(), gguf_reference::Q20) != m.formats.end();
+                           std::any_of(m.formats.begin(), m.formats.end(),
+                                       [&](gguf_reference::Fmt f) { return moe_mma_column_format(f, tileRows); });
   const size_t columnRows = columnKinds ? lanes.size() : 0;
   if (compared != expected || column != columnRows)
     fail(std::to_string(compared) + " of " + std::to_string(expected) + " lane rows kept their tile kinds, " +

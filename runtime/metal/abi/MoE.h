@@ -9,6 +9,7 @@
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
 #include "metal/abi/VerifyTree.h"
+#include "metal/abi/QuantFormat.h"
 
 // The expert slots of the routing kernels (ops::MoE): a row's router scores
 // take this many floats, the block's experts first, and the select and
@@ -61,6 +62,13 @@ static_assert(sizeof(MoeTileDescriptor) == 12,
 template <typename Tiles>
 inline bool moe_column_tile(Tiles tiles, uint32_t t) {
   return tiles[t].rows <= GGUF_COLUMN_ROWS && (t == 0 || tiles[t - 1].expert != tiles[t].expert);
+}
+
+// Whether Apple7/8's MMA expert passes (kernels/shared/moe_gguf_mma.metal) of `tile_rows`-row tiles run a projection
+// in `format` on the column tile of a moe_column_tile tile, rather than the 8-row MMA: Q2_0 in every pass, IQ2_XXS and
+// IQ2_S in the 8-row (decode) passes only. The kernels and the MoE test's expected tile kinds ask this.
+constexpr inline bool moe_mma_column_format(uint32_t format, uint32_t tile_rows) {
+  return format == GGUF_FMT_Q20 || (tile_rows == 8 && (format == GGUF_FMT_IQ2XXS || format == GGUF_FMT_IQ2S));
 }
 
 // The column tiles of the gate/up and down passes, whose grids the grouping
