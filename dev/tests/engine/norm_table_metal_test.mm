@@ -73,7 +73,7 @@ void tableMatchesPreparation(MetalBackend &backend, LinearInput layout, uint32_t
   const PreparedInput prepared =
       Normalization::addRms(graph, input, norm, output, width, rows, {table, sums, {}, {}}, layout);
   (void)Normalization::addRms(graph, input, norm, plain, width, rows);
-  addReferencePreparation(graph, layout, output, referenceTable, referenceSums, width, lanes);
+  addReferencePreparation(graph, layout, output, referenceTable, referenceSums, width, rows / GGUF_TABLE16_ROWS);
   (void)backend.submitCommandAsync(graph.dispatches()).wait();
   require(prepared.layout == layout && prepared.source.sameView(output), what + " did not report its table");
   require(!std::memcmp(output.contents(), plain.contents(), rowBytes), what + ": rows differ from the plain norm's");
