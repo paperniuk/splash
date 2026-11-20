@@ -227,8 +227,8 @@ NOTE_ALLOWANCE: dict[str, int] = {
 }
 # runtime/engine's production lines: the budget only goes down, unless the
 # owner raises it. The M1/M2 port's prefill bound and Neural Engine options
-# hold 241 lines over upstream's 30_594.
-ENGINE_LINE_BUDGET = 30_835
+# hold 241 lines over upstream's 30_594, and its calibrated pair (#66) 232.
+ENGINE_LINE_BUDGET = 31_067
 C_LIKE_SUFFIXES = SOURCE_SUFFIXES | {".swift"}
 HASH_COMMENT_SUFFIXES = {"", ".sh", ".bash", ".fish", ".mk", ".yml", ".yaml", ".toml"}
 C_LIKE_COMMENT = re.compile(
