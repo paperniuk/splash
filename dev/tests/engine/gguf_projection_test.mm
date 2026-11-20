@@ -83,6 +83,8 @@ constexpr uint32_t kLaneRows = 8, kMaximumLanes = 4, kMaximumRows = kLaneRows * 
 // The staged tile's lanes of 8 rows, to the decode tiles' 64 rows; the register tile, the one-pass pair and the int8
 // tiles hold kMaximumLanes (kMaximumRegisterRows, kMaximumPairRows, kMaximumInt8Rows).
 constexpr uint32_t kMaximumStagedLanes = kMaximumDecodeTileRows / kLaneRows;
+// The staged tile's lanes this GPU runs: Apple7/8's MMA staged tiles stop at kMaximumMmaStagedRows; main sets it.
+uint32_t stagedLanes = kMaximumStagedLanes;
 static_assert(kMaximumRows == kMaximumRegisterRows && kMaximumRows == kMaximumPairRows &&
               kMaximumRows == kMaximumInt8Rows);
 // Every K split a plan takes: the powers of two up to the largest.
@@ -502,7 +504,7 @@ void decodeTile(MetalBackend &backend, const Linear &linear, LinearTile tile, bo
                 const std::vector<Fmt> &formats) {
   constexpr uint32_t N = 512, columns = N + kPadding;
   const bool staged = tile == LinearTile::GgufStaged;
-  const uint32_t mostLanes = staged ? kMaximumStagedLanes : kMaximumLanes, mostRows = mostLanes * kLaneRows;
+  const uint32_t mostLanes = staged ? stagedLanes : kMaximumLanes, mostRows = mostLanes * kLaneRows;
   uint32_t mostSplits = 1;
   for (size_t i = 0; i < formats.size(); ++i) {
     const Tensor w = tensor(backend, formats[i], N, K), g = tensor(backend, formats[(i + 3) % formats.size()], N, K);
@@ -1580,7 +1582,7 @@ void rowViews(MetalBackend &backend, const Linear &linear) {
     for (const Fmt f : tileFormats(tile)) {
       const Tensor t = tensor(backend, f, N, K);
       const uint32_t splits = takesSplits(tile, f, K, 2) ? 2 : 1;
-      compare(projection({&t}, N), {.tile = tile, .splits = splits}, std::string(tileName(tile)) + " " + fmtName(f));
+      compare(projection({&t}, N), config(tile, splits), std::string(tileName(tile)) + " " + fmtName(f));
     }
   MetalBuffer signs = test::sharedBuffer(backend, K);
   for (uint32_t i = 0; i < K; ++i) static_cast<int8_t *>(signs.contents())[i] = rng() & 1 ? 1 : -1;
@@ -1588,7 +1590,7 @@ void rowViews(MetalBackend &backend, const Linear &linear) {
   Projection rotated = projection({&pq20}, N);
   rotated.rotation.signs = signs;
   for (const LinearTile tile : {LinearTile::GgufRegister, LinearTile::GgufStaged})
-    compare(rotated, {.tile = tile, .splits = 2}, std::string("rotated ") + tileName(tile) + " pq2_0");
+    compare(rotated, config(tile, 2), std::string("rotated ") + tileName(tile) + " pq2_0");
   if (linear.calibration().projection.decodeInt8FromRows != kNever)
     compare(rotated, {.tile = LinearTile::GgufStaged, .splits = 2, .decodeInt8 = true}, "rotated int8 pq2_0");
   section("row views: " + std::to_string(cases) + " fp32 decodes over the leading and last rows of a tensor (every "
@@ -1889,6 +1891,7 @@ int main(int argc, char **argv) {
       MetalBackend backend(argv[1]);
       const Linear linear(backend.capabilities(), Int8Activations::On);
       fp32RegisterTable = backend.capabilities().appleGpuFamily < 9;
+      if (fp32RegisterTable) stagedLanes = splash::ops::kMaximumMmaStagedRows / kLaneRows;
       // Apple7/8 run the staged tiles' dispatches on their MMA kernels and the register tile's on its F32 instances.
       for (const LinearTile tile : {LinearTile::GgufRegister, LinearTile::GgufStaged}) {
         decodeTile(backend, linear, tile, false, decodeInputs(false), tileFormats(tile));
