@@ -146,6 +146,8 @@ void LinearPlan::requireConfiguration() const {
        workload_.epilogue != LinearEpilogue::GateUp))
     throw std::invalid_argument("only a staged or column block gate/up of up to 32 rows, or an F32 register one, runs "
                                 "gate and up in one pass");
+  if (c.mmaPrefill && c.tile != LinearTile::GgufPrefill)
+    throw std::invalid_argument("only the prefill block tile runs Apple7/8's 64-row MMA tiles");
   if (c.fp32Table && c.tile != LinearTile::GgufRegister)
     throw std::invalid_argument("only the register block tile reads an fp32 table");
   if (c.sixteenRows && (c.tile != LinearTile::GgufStaged || workload_.rows > 8))
@@ -183,6 +185,7 @@ void LinearPlan::requireConfiguration() const {
 uint32_t LinearPlan::storageRows() const noexcept {
   if (config_.tile == LinearTile::GgufColumn) return workload_.rows;
   if (config_.tile == LinearTile::GgufRegister) return tableTiles(workload_.rows) * GGUF_TABLE16_ROWS;
+  if (config_.mmaPrefill) return workload_.rows;
   if (config_.tile == LinearTile::GgufPrefill || config_.tile == LinearTile::GgufPrefillInt8)
     return (workload_.rows + GGUF_PREFILL_ROWS - 1) / GGUF_PREFILL_ROWS * GGUF_PREFILL_ROWS;
   return config_.twentyFourRows ? 24 : stagedStorageRows(workload_.rows, config_.sixteenRows, config_.decodeInt8);
@@ -398,6 +401,8 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
   const auto [n, k] = w.matrix;
   const char epilogue = epilogueSuffix(w.epilogue);
   const bool useMma = mma();
+  if (plan.configuration().mmaPrefill && !useMma)
+    throw std::invalid_argument("Apple7/8's 64-row MMA prefill tiles run on Apple7/8 alone");
   // The MMA tiles stop at the chunk's last row: a 64-row tile past it would
   // stream the weights for no row, which on an M1 Max made a 136-row chunk's
   // projection cost 1.5 times a 128-row one's.

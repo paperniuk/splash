@@ -63,6 +63,20 @@ inline void load_inputs(device const bfloat *x, uint input_size, uint k0, sgmatr
       v[r][e] = *reinterpret_cast<device const uint2 *>(x + ulong(8 * r + l.fn + e) * input_size + k);
 }
 
+// load_inputs over `live` rows: the rows past them read as zeros, so that a tile reads no row past a chunk's.
+template <uint FM>
+inline void load_live_inputs(device const bfloat *x, uint input_size, uint k0, sgmatrix::Lane l, uint live,
+                             thread uint2 (&v)[FM][2]) {
+  const uint k = k0 + 4 * (l.fm >> 1) + 16 * (l.fm & 1);
+#pragma unroll
+  for (uint r = 0; r < FM; ++r)
+#pragma unroll
+    for (uint e = 0; e < 2; ++e) {
+      const uint row = 8 * r + l.fn + e;
+      v[r][e] = row < live ? *reinterpret_cast<device const uint2 *>(x + ulong(row) * input_size + k) : uint2(0);
+    }
+}
+
 // acc += one group of FN column fragments, a(i, j) giving the lane's A elements of fragment i at step j, times the
 // lane's activations v.
 template <uint FM, class A>
@@ -179,7 +193,9 @@ inline void store_sums(thread float2 (&acc)[FN][FM], sgmatrix::Lane l, uint spli
 
 // The prefill tile of chunk rows [first, first + 64) and columns [origin, origin + 64) of one segment: threads 0-63
 // stage one column's group per step into a double-buffered stage, and each simdgroup that holds chunk rows runs its
-// 32 columns by 32 rows. `rows` counts the chunk's rows from the tile's first: a simdgroup past them only stages.
+// 32 columns by 32 rows. `rows` counts the chunk's rows from the tile's first: a simdgroup past them only stages,
+// and one that holds fewer than 32 reads and stores its live rows alone, so the input and output hold the chunk's
+// rows and no padding (a decode step of three lanes' 16-row trees runs 48 rows here on Apple7/8).
 template <class F, class Store>
 inline void prefill_tile(device const bfloat *x, device uchar *w0, device uchar *w1, device uchar *meta,
                          uint input_size, uint origin, uint rows, threadgroup half *stage, threadgroup half2 *tl,
@@ -190,6 +206,8 @@ inline void prefill_tile(device const bfloat *x, device uchar *w0, device uchar 
   const uint half_n = simd_group & 1, half_m = simd_group >> 1;
   const bool stages = thread_index < GGUF_TILE_COLUMNS;
   const bool owns = half_m * kPrefillSimdgroupRows < rows;  // uniform per simdgroup
+  const uint live = owns ? min(rows - half_m * kPrefillSimdgroupRows, uint(kPrefillSimdgroupRows)) : 0;
+  const bool full = live == kPrefillSimdgroupRows;
   const uint groups = input_size / 32, units = groups / F::MetaGroups;
   const uint plane_tile = origin / QUANT_TILE_ROWS, plane_row = origin % QUANT_TILE_ROWS + column;
   device uchar *c0 = w0 + (ulong(plane_tile) * groups * QUANT_TILE_ROWS + plane_row) * F::P0;
@@ -221,7 +239,10 @@ inline void prefill_tile(device const bfloat *x, device uchar *w0, device uchar 
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (owns) {
       uint2 v[FM][2];
-      load_inputs<FM>(x, input_size, step * kStep, l, v);
+      if (full)
+        load_inputs<FM>(x, input_size, step * kStep, l, v);
+      else
+        load_live_inputs<FM>(x, input_size, step * kStep, l, live, v);
       threadgroup const half *mine = buffer + half_n * kSimdgroupStage;
       mma_group<FM>(v, [&](uint i, uint j) {
         return *reinterpret_cast<threadgroup const half2 *>(mine + (8 * i + l.fm) * kStride + 8 * j + l.fn);
@@ -229,8 +250,14 @@ inline void prefill_tile(device const bfloat *x, device uchar *w0, device uchar 
     }
   }
   if (!owns) return;
+  if (full) {
+    elements(acc, l, [&](uint row, uint col, float v) {
+      store(half_m * kPrefillSimdgroupRows + row, half_n * kColumns + col, v);
+    });
+    return;
+  }
   elements(acc, l, [&](uint row, uint col, float v) {
-    store(half_m * kPrefillSimdgroupRows + row, half_n * kColumns + col, v);
+    if (row < live) store(half_m * kPrefillSimdgroupRows + row, half_n * kColumns + col, v);
   });
 }
 

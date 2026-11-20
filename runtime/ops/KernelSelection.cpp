@@ -165,7 +165,7 @@ LinearConfig bf16Projection(const KernelCalibration &calibration, LinearWorkload
   const uint32_t cores = calibration.cores;
   if (w.rows > kMaximumDecodeTileRows ||
       (calibration.simdgroupMma && w.rows > std::max(kMaximumMmaStagedRows, kMaximumRegisterRows)))
-    return {.tile = LinearTile::GgufPrefill};
+    return {.tile = LinearTile::GgufPrefill, .mmaPrefill = calibration.simdgroupMma};
   const uint32_t tiles = tableTiles(w.rows);
   const bool gateUp = w.epilogue == LinearEpilogue::GateUp,
              onePass = gateUp && unit.oneFormat && cores >= p.onePassFromCores && w.rows <= kMaximumPairRows;
@@ -279,8 +279,10 @@ LinearConfig selectProjection(const KernelCalibration &calibration, Int8Activati
   LinearConfig config = bf16Projection(calibration, w, unit, pairTensors);
   if (int8Activations == Int8Activations::Off) return config;
   const ProjectionCalibration &p = calibration.projection;
-  if (config.tile == LinearTile::GgufPrefill && p.prefillInt8 && unit.prefillInt8Takes)
+  if (config.tile == LinearTile::GgufPrefill && p.prefillInt8 && unit.prefillInt8Takes) {
     config.tile = LinearTile::GgufPrefillInt8;
+    config.mmaPrefill = false;
+  }
   const uint32_t storage = stagedStorageRows(w.rows, config.sixteenRows);
   config.decodeInt8 = config.tile == LinearTile::GgufStaged && unit.decodeInt8Takes &&
                       decodeInt8TakesSplits(w.matrix.inputSize, config.splits) &&

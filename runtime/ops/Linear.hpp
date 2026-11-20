@@ -172,6 +172,12 @@ struct LinearConfig final {
   // (gguf_decode_int8_pq20_m<rows>_*) at the plan's storage rows, splits,
   // spread and passes.
   bool decodeInt8 = false;
+  // GgufPrefill on Apple7/8, whose MMA tiles read and write the chunk's rows
+  // alone (gguf_mma::prefill_tile): the plan's storage rows are its rows, not
+  // a multiple of GGUF_PREFILL_ROWS, so that a decode step of 33 to 64 rows
+  // (three or four lanes' trees) runs the prefill tile within the decode
+  // arena's rows.
+  bool mmaPrefill = false;
   [[nodiscard]] constexpr bool validSplits() const noexcept {
     return splits && splits <= kMaximumSplits && !(splits & (splits - 1));
   }
