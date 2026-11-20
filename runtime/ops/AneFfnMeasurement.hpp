@@ -31,14 +31,15 @@ public:
   // differ with depth: a program of one function of a full chunk's rows
   // each, which the ANE's service keeps once compiled.
   [[nodiscard]] Timings time();
-  // The split layer of full chunks with the ANE taking `aneUnits`, on the
-  // layers time() takes, less `gpuAlone`, time()'s GPU alone of them: what
-  // refine() weighs the units choose() took against their neighbours by.
-  [[nodiscard]] double split(uint32_t aneUnits, double gpuAlone);
-  // The GPU alone over the least and the most rows of `split`'s functions,
-  // and `split` over a chunk of the rows of each of its functions, on the
-  // first layers.
-  [[nodiscard]] ChunkTimings chunks(AneFfn &split);
+  // The same at `aneUnits`, the split layer less `gpuAlone`, the GPU's FFN
+  // alone that time() timed: what calibration fits again at the units it
+  // first chooses (ane_ffn::refit), on the layers it fitted.
+  [[nodiscard]] Timing time(uint32_t aneUnits, double gpuAlone);
+  // The GPU alone over the least and the most rows of the split's
+  // functions, and the split with the ANE taking `aneUnits` over a chunk of
+  // the rows of each of its functions, on the layers time() times: a
+  // program of every function, as the split that serves compiles.
+  [[nodiscard]] ChunkTimings chunks(uint32_t aneUnits);
 
 private:
   // The per-layer milliseconds of `count` `rows`-row FFN layers of `layers`
@@ -48,7 +49,8 @@ private:
   [[nodiscard]] double layer(std::span<const SwiGluProjections> layers, uint32_t count, uint32_t rows,
                              AneFfn *split = nullptr, double standIn = 0.0);
   [[nodiscard]] double gpuPart(std::span<const SwiGluProjections> layers, AneFfn &split);
-  // The layers time() spreads over the model.
+  // The kSampledLayers layers time() spreads over the model, first and last
+  // among them (AneFfnMeasurement.cpp).
   [[nodiscard]] std::vector<SwiGluProjections> sampled() const;
 
   metal::MetalBackend &backend_;

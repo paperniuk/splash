@@ -59,7 +59,7 @@ kernel void moe_expert_gguf_mma_down(device bfloat *input [[buffer(0)]], device 
   device bfloat *x = input + ulong(t) * Rows * p.input_size;
   const ulong out = ulong(t) * Rows * p.output_size;
   const uint origin = group.x * GGUF_TILE_COLUMNS + simd_group * kColumns, thread_index = simd_group * 32 + simd_lane;
-  // A tile of at most MOE_GGUF_COLUMN_ROWS live rows runs the column tile (kernels/common/gguf_column_tile.h), as
+  // A tile of at most GGUF_COLUMN_ROWS live rows runs the column tile (kernels/common/gguf_column_tile.h), as
   // moe_expert_gguf's does: a GEMV in registers without a stage or barrier, where the staged MMA tile's padded 8-row
   // steps and their per-step stage barrier bound a one- or two-row tile, not DRAM. A decode tile of a sparse route
   // (Qwen3.8-Flash-Next: ten of 512 experts a layer) is almost always such a tile. Q2_0 only, which has no pair
@@ -67,8 +67,8 @@ kernel void moe_expert_gguf_mma_down(device bfloat *input [[buffer(0)]], device 
   // MMA on IQ3_XXS, whose heavier weights and dequant outweigh the stage it skips; formats not measured stay on the
   // staged MMA.
   if (moe_column_tile(tiles, t) && s.format == FmtQ20::Id) {
-    float sums[MOE_GGUF_COLUMN_ROWS];
-    column_dot<FmtQ20, MOE_GGUF_COLUMN_ROWS>(x, tile.rows, p.input_size, s.w0, s.w1, s.meta, origin + simd_lane, 0,
+    float sums[GGUF_COLUMN_ROWS];
+    column_dot<FmtQ20, GGUF_COLUMN_ROWS>(x, tile.rows, p.input_size, s.w0, s.w1, s.meta, origin + simd_lane, 0,
                                              p.input_size / 32, tl, sums);
     for (uint row = 0; row < tile.rows; ++row)
       output[out + ulong(row) * p.output_size + origin + simd_lane] = bfloat(sums[row]);
@@ -104,7 +104,7 @@ template [[host_name("moe_expert_gguf_mma_m32_down_s2")]] kernel MoeExpertGgufMm
 // simdgroup parks bf16(gate) in its stage, which it no longer reads, and the up simdgroup writes bf16(up) * silu(gate)
 // as gguf_epilogue<EpUpWithGate> does, so the intermediate is bitwise that of the gate and up passes apart.
 //
-// A column tile (moe_column_tile: an expert's only tile, of at most MOE_GGUF_COLUMN_ROWS live rows) runs each
+// A column tile (moe_column_tile: an expert's only tile, of at most GGUF_COLUMN_ROWS live rows) runs each
 // projection on the tile its own pass would take: the column tile for Q2_0, the 8-row MMA otherwise. Where gate and up
 // both take the column tile, a lane runs its column's two chains interleaved (column_dot_pair), whose FMAs overlap and
 // whose activation loads serve both; the even threadgroup's two simdgroups take its columns and the odd one's, which
@@ -151,8 +151,8 @@ kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
     if (group.x % 2) return;
     // Q2_0 has no pair table, so tl is left unfilled here on purpose.
     const uint pair_column = origin + simd_group * kColumns + simd_lane;
-    float g[MOE_GGUF_COLUMN_ROWS], u[MOE_GGUF_COLUMN_ROWS];
-    column_dot_pair<FmtQ20, MOE_GGUF_COLUMN_ROWS>(x, tile.rows, K, gs.w0, gs.w1, gs.meta, us.w0, us.w1, us.meta,
+    float g[GGUF_COLUMN_ROWS], u[GGUF_COLUMN_ROWS];
+    column_dot_pair<FmtQ20, GGUF_COLUMN_ROWS>(x, tile.rows, K, gs.w0, gs.w1, gs.meta, us.w0, us.w1, us.meta,
                                                   pair_column, tl, g, u);
     for (uint row = 0; row < tile.rows; ++row)
       output[out + ulong(row) * N + pair_column] = product(u[row], bfloat(g[row]));
@@ -174,15 +174,15 @@ kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
   const sgmatrix::Lane l = sgmatrix::lane_map(simd_lane);
   static_assert(Rows * kColumns * sizeof(bfloat) <= kSimdgroupStage * sizeof(half), "the gate fits a stage");
   if (column) {
-    // At most MOE_GGUF_COLUMN_ROWS live rows, one fragment. Each simdgroup sums its projection on its own tile, the
+    // At most GGUF_COLUMN_ROWS live rows, one fragment. Each simdgroup sums its projection on its own tile, the
     // gate parks bf16(gate) in its stage, and both meet at the one barrier before the up writes the products: the
     // simdgroups may take different tiles (a shared expert of Q2_0 gate and another up format), so neither tile's
     // branch holds a barrier of its own.
     const bool on_column = up ? up_column : gate_column;
-    float sums[MOE_GGUF_COLUMN_ROWS];
+    float sums[GGUF_COLUMN_ROWS];
     float2 acc[FN][1];
     if (on_column) {
-      column_dot<FmtQ20, MOE_GGUF_COLUMN_ROWS>(x, tile.rows, K, s.w0, s.w1, s.meta, origin + simd_lane, 0, K / 32,
+      column_dot<FmtQ20, GGUF_COLUMN_ROWS>(x, tile.rows, K, s.w0, s.w1, s.meta, origin + simd_lane, 0, K / 32,
                                                table, sums);
     } else {
       zero(acc);

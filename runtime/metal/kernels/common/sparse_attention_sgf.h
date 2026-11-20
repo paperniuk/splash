@@ -12,7 +12,8 @@
 // to [dimension][token] (the dense page's value layout, which PV reads as
 // q8sgf::tile does), go through threadgroup memory; each lane reads its keys
 // and scales from the cache itself. Tokens of a slot past the list's end, of
-// a block a row does not attend or past a row's causal end never contribute.
+// a block a row does not attend, past a row's causal end or, in a tree, off
+// the row's path never contribute.
 namespace q8sgf {
 
 constant constexpr uint kSparseSgfBlocks = 32 / SPLASH_ATTENTION_BLOCK_TOKENS;
@@ -54,14 +55,17 @@ inline void sparse_gather_values(threadgroup SparseScratch<CacheElement> &scratc
 
 // One tile of eight query rows x G heads over its split's run of its block
 // list (`list`, `count` entries), or with a null list over its history's
-// blocks, as splash_sparse_attention_tile. Takes 32 x G threads; every thread
-// reaches each barrier.
+// blocks, as splash_sparse_attention_tile, a tree's rows (`tree`) each
+// masked to its path's rows of its block and, through a list, to those its
+// row mask holds (`attended`). Takes 32 x G threads; every thread reaches
+// each barrier.
 template <uint KVHeads, uint QueryHeadsPerKVHead, typename CacheElement, bool Located = false>
 __attribute__((always_inline)) inline void sparse_tile(
     device const bfloat *tile_queries, device const SplashKvPage *page_table, SplashKvLayer kv, uint kv_head,
     uint first_position, uint active_rows, device const uint *list, uint count, device const uint *locations,
     device const SplashKvPage *location_pages, uint splits, uint split, device float *partials,
-    device float *statistics, ulong slot, threadgroup SparseScratch<CacheElement> &scratch, uint sg, uint lane) {
+    device float *statistics, ulong slot, threadgroup SparseScratch<CacheElement> &scratch,
+    SplashAttentionTree tree, device const uint *attended, uint sg, uint lane) {
   constexpr bool Quantized = is_same<CacheElement, int8_t>::value;
   constexpr uint G = QueryHeadsPerKVHead;
   constexpr uint M = 8 * G;
@@ -71,8 +75,7 @@ __attribute__((always_inline)) inline void sparse_tile(
   constexpr uint PageBlocks = SplashKvPageTokens / BlockTokens;
   constexpr uint AllRows = (1u << 8) - 1u;
   static_assert(D == 256, "fragment maps assume D = 256");
-  static_assert(SPLASH_TARGET_VERIFY_ROWS == 8 && SPLASH_PREFILL_ATTENTION_TILE_ROWS == 8 &&
-                    SPLASH_ATTENTION_BLOCK_ROW_BITS == 8,
+  static_assert(SPLASH_ATTENTION_TILE_ROWS == 8 && SPLASH_ATTENTION_BLOCK_ROW_BITS == 8,
                 "one simdgroup per G fused rows of an eight-row tile");
   const uint per_split = splash_sparse_split_entries(count, splits);
   const uint begin = split * per_split;
@@ -88,6 +91,13 @@ __attribute__((always_inline)) inline void sparse_tile(
   const uint row = sg * 8 + fn;
   const uint2 tile_row(min(row / G, active_rows - 1), min((row + 1) / G, active_rows - 1));
   const uint2 causal_end = first_position + tile_row + 1;
+  // Of a tree's block, the row's path, through a list only its rows in
+  // blocks the row attends: every other token sees all of it.
+  const uint2 anchor = tree.rows ? uint2(tree.anchor) : causal_end;
+  uint2 ancestors(0);
+  if (tree.rows)
+    ancestors = uint2(tree.rows[tile_row.x].ancestors & (attended ? attended[tile_row.x] : ~0u),
+                      tree.rows[tile_row.y].ancestors & (attended ? attended[tile_row.y] : ~0u));
 
   uint queries[4][8];
   {
@@ -145,8 +155,10 @@ __attribute__((always_inline)) inline void sparse_tile(
       const uint entry = scratch.entries[slot_index];
       const bool valid = entry != SplashSparseNoEntry;
       const uint position = (entry >> SPLASH_ATTENTION_BLOCK_ROW_BITS) * BlockTokens + token % BlockTokens;
-      allowed[s] = bool2(valid && ((entry >> tile_row.x) & 1u) && position < causal_end.x,
-                         valid && ((entry >> tile_row.y) & 1u) && position < causal_end.y);
+      allowed[s] = bool2(valid && ((entry >> tile_row.x) & 1u) && position < causal_end.x &&
+                             (position < anchor.x || ((ancestors.x >> min(position - anchor.x, 31u)) & 1u)),
+                         valid && ((entry >> tile_row.y) & 1u) && position < causal_end.y &&
+                             (position < anchor.y || ((ancestors.y >> min(position - anchor.y, 31u)) & 1u)));
       key_rows[s] = nullptr;
       if (valid) {
         const SplashKvPageTensors<CacheElement> tensors = addressing.page(scratch.pages[slot_index]);
