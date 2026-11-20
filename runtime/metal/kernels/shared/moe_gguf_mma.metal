@@ -29,6 +29,20 @@ template <uint Count> struct moe_mma_formats {
   }
 };
 
+// Writes the elements of `acc` through write(row, column, v), the tile's `live` rows alone: a tile's grouped rows
+// start at its first_row and the next tile's follow its live rows (moe_expert_slab.h), so a partial tile's padding
+// rows are the next tile's. A full tile writes every row without the guard.
+template <uint FM, class Write>
+inline void moe_mma_store(thread float2 (&acc)[FN][FM], sgmatrix::Lane l, uint live, Write write) {
+  if (live == FM * 8) {
+    elements(acc, l, write);
+    return;
+  }
+  elements(acc, l, [&](uint row, uint column, float v) {
+    if (row < live) write(row, column, v);
+  });
+}
+
 // Runs body(integral_constant<uint, FM>) with the fewest 8-row fragments that hold a tile's live rows.
 template <ushort Rows, class Body> inline void moe_mma_live_rows(uint rows, Body body) {
   if constexpr (Rows == 8) body(integral_constant<uint, 1>{});
@@ -56,8 +70,8 @@ kernel void moe_expert_gguf_mma_down(device bfloat *input [[buffer(0)]], device 
   const MoeGgufSegment s =
       moe_gguf_segment<Shared>(tile.expert, p.experts, p.input_size, p.output_size, p.routed_format, p.shared_format,
                                slots, chunks, p.floor_slots, p.chunk_slots, 2, sw0, sw1, smeta);
-  device bfloat *x = input + ulong(t) * Rows * p.input_size;
-  const ulong out = ulong(t) * Rows * p.output_size;
+  device bfloat *x = input + ulong(tile.first_row) * p.input_size;
+  const ulong out = ulong(tile.first_row) * p.output_size;
   const uint origin = group.x * GGUF_TILE_COLUMNS + simd_group * kColumns, thread_index = simd_group * 32 + simd_lane;
   // A tile of at most GGUF_COLUMN_ROWS live rows runs the column tile (kernels/common/gguf_column_tile.h), as
   // moe_expert_gguf's does: a GEMV in registers without a stage or barrier, where the staged MMA tile's padded 8-row
@@ -84,7 +98,7 @@ kernel void moe_expert_gguf_mma_down(device bfloat *input [[buffer(0)]], device 
       accumulate<F, FM>(x, s.w0, s.w1, s.meta, p.input_size, origin, stage + simd_group * kSimdgroupStage, tl,
                         simd_lane, 0, p.input_size / kStep, acc);
     });
-    elements(acc, sgmatrix::lane_map(simd_lane), [&](uint row, uint column, float v) {
+    moe_mma_store(acc, sgmatrix::lane_map(simd_lane), tile.rows, [&](uint row, uint column, float v) {
       output[out + ulong(row) * p.output_size + origin + column] = bfloat(v);
     });
   });
@@ -137,8 +151,8 @@ kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
                                                      p.up_routed_format, p.up_shared_format, slots, chunks,
                                                      p.floor_slots, p.chunk_slots, 1, usw0, usw1, usmeta);
   const uint K = p.input_size, N = p.output_size;
-  device bfloat *x = input + ulong(t) * Rows * K;
-  const ulong out = ulong(t) * Rows * N;
+  device bfloat *x = input + ulong(tile.first_row) * K;
+  const ulong out = ulong(tile.first_row) * N;
   const uint origin = group.x * kColumns, thread_index = simd_group * 32 + simd_lane;
   const bool up = simd_group == 1;
   threadgroup bfloat *gate = reinterpret_cast<threadgroup bfloat *>(stage);
@@ -202,7 +216,7 @@ kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
       for (uint row = 0; row < tile.rows; ++row)
         output[out + ulong(row) * N + origin + simd_lane] = product(sums[row], gate[row * kColumns + simd_lane]);
     else
-      elements(acc, l, [&](uint row, uint column, float v) {
+      moe_mma_store(acc, l, tile.rows, [&](uint row, uint column, float v) {
         output[out + ulong(row) * N + origin + column] = product(v, gate[row * kColumns + column]);
       });
     return;
@@ -218,7 +232,7 @@ kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
     if (!up) elements(acc, l, [&](uint row, uint column, float v) { gate[row * kColumns + column] = bfloat(v); });
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (up)
-      elements(acc, l, [&](uint row, uint column, float v) {
+      moe_mma_store(acc, l, tile.rows, [&](uint row, uint column, float v) {
         output[out + ulong(row) * N + origin + column] = product(v, gate[row * kColumns + column]);
       });
   });
