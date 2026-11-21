@@ -7,7 +7,7 @@ An unofficial port of [Inco's Splash](https://github.com/incoai/splash) to
 Macs with an M1 or M2 chip. Splash is a local inference engine that serves
 Qwen3.8-27B, Qwen3.6-35B-A3B, Qwen3.8-Flash-Next and Flint to coding agents and to
 any OpenAI or Anthropic compatible client. Official Splash needs an M3 or
-newer; this fork runs the same engine, version 1.6.1, on M1 and M2.
+newer; this fork runs the same engine, version 1.7.0, on M1 and M2.
 
 **On an M3 or newer, use official Splash:** `brew install incoai/tap/splash`.
 Nothing here is faster there.
@@ -94,20 +94,21 @@ splash-m1 serve --model prism-ml/Ternary-Bonsai-2-27B-gguf:PQ2_0 --language-only
 
 ## Speed on an M1 Max
 
-M1 Max, 32-core GPU, 64 GB, release 1.6.1-m1, temperature 0, 400 tokens
+M1 Max, 32-core GPU, 64 GB, release 1.7.0-m1, temperature 0, 400 tokens
 on a short prompt. Decode in tok/s, one request / two at once:
 
 | Model | 1 request | 2 requests |
 |---|---:|---:|
-| `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0` | 81 | 100 |
+| `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0` | 81 | 102 |
 | `unsloth/flint-GGUF:UD-Q4_K_XL` | 77 | 94 |
-| `mlx-community/Qwen3.8-27B-4bit` | 57 | 63 |
-| `unsloth/Qwen3.8-27B-GGUF:UD-Q5_K_M` | 50 | 58 |
+| `mlx-community/Qwen3.8-27B-4bit` | 61 | 72 |
+| `unsloth/Qwen3.8-27B-GGUF:UD-Q5_K_M` | 49 | 60 |
 
 Prose is slower than code because the draft model guesses fewer tokens.
-Flint was measured on 1.5.0-m1 with its fork pull request.
+Flint was measured on 1.5.0-m1 with its fork pull request. With four
+requests at once the 27B MLX decodes 80 tok/s in total.
 
-The 27B reads a cold 16K prompt at about 205 tok/s with the Neural Engine.
+The 27B reads a cold 16K prompt at about 225 tok/s with the Neural Engine.
 In a replayed agent session that grows to 128K of context, prompt reading
 averaged 175 tok/s up to 32K, 119 at 64K, 91 at 96K and 73 at 128K, and
 decode 25, 26, 21 and 17 tok/s. Splash keeps the prompt in a prefix cache,
@@ -145,12 +146,11 @@ measures it against the GPU and remembers the split; MoE models run their
 prefill on the GPU only, as upstream. `--disable-ane` keeps everything on
 the GPU.
 
-Since 1.6.1-m1.1, a share given by hand runs prefill as a pair of chunks, the
-Neural Engine on one while the GPU runs the other: on an M1 Max
-`--ane-ffn-share 0.735 --ane-ffn-minimum-rows 512` reads prompts of 2K
-tokens and more about 18% faster, and prompts under about 700 tokens a
-little slower. A good share is about 0.2 above the calibrated one, which the
-log prints at start.
+Since 1.7.0-m1 the first start also times prefill as a pair of chunks, the
+Neural Engine on one while the GPU runs the other, and uses it for prompts
+of 769 tokens and more: about 15% faster on a 16K prompt on an M1 Max. This
+first start takes about 5 minutes on the 27B; later starts reuse the result.
+`--ane-ffn-share` still sets a share by hand.
 
 ### `--kv-format bf16`
 
@@ -163,7 +163,7 @@ twice the memory, and in a 128K agent session on an M1 Max it read prompts
 The API is upstream's: OpenAI Chat Completions, OpenAI Responses and
 Anthropic Messages on `127.0.0.1:8000`, with streaming, tool calls, images
 and PDFs. `splash-m1 serve --help` lists the options. For the rest, read
-[the README of the 1.6.1 branch](https://github.com/paperniuk/splash/blob/apple7-m1-1.6.1/README.md)
+[the README of the 1.7 branch](https://github.com/paperniuk/splash/blob/apple7-m1-1.7/README.md)
 with `splash-m1` in place of `splash`. Since 1.4, `--max-context` can go past
 a model's native window with YaRN (`--yarn-factor`).
 
@@ -174,19 +174,19 @@ Reasoning is turned off per request with `"reasoning_effort": "none"`.
 Needs Xcode with the Metal Toolchain.
 
 ```bash
-git clone -b apple7-m1-1.6.1 https://github.com/paperniuk/splash.git
+git clone -b apple7-m1-1.7 https://github.com/paperniuk/splash.git
 cd splash
 make -j4
 ./splash serve --model mlx-community/Qwen3.8-27B-4bit
 ```
 
-Branch `apple7-m1-1.6.1` is upstream 1.6.1 plus the M1/M2 commits. `main`
+Branch `apple7-m1-1.7` is upstream 1.7.0 plus the M1/M2 commits. `main`
 follows upstream and does not run on M1/M2.
 
 ## Status
 
-- Stable: [1.6.1-m1.1](https://github.com/paperniuk/splash/releases/latest),
-  upstream 1.6.1 plus the M1/M2 work.
+- Stable: [1.7.0-m1](https://github.com/paperniuk/splash/releases/latest),
+  upstream 1.7.0 plus the M1/M2 work.
 - Known gaps: the 35B MoE's expert kernels are not tuned for M1/M2 yet;
   Macs below 64 GB are covered by the kernel tests, not run end to end on
   this release.
@@ -204,7 +204,8 @@ the port on an M2 Max and contributed most of its decode speedups: GGUF Q4_0,
 the K-quant and MLX decode kernels and fewer decode passes.
 [@sady4850](https://github.com/sady4850) contributed the faster long-context
 attention and Neural Engine prefill from 128 rows,
-[@abssoul](https://github.com/abssoul) Flint and the small MoE tiles, and
+[@wtfsayo](https://github.com/wtfsayo) the Neural Engine pair of chunks and
+faster MLX 4-bit decode, [@abssoul](https://github.com/abssoul) Flint and the small MoE tiles, and
 [@airiclenz](https://github.com/airiclenz) and
 [@UtmostMaker](https://github.com/UtmostMaker) scheduler and upstream port work.
 
