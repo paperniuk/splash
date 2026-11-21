@@ -180,11 +180,17 @@ LinearConfig bf16Projection(const KernelCalibration &calibration, LinearWorkload
   // MLX affine formats (af4g64) take it at one and two lanes only: at three
   // and four 17408x5120 takes 2-4% more, and at one a 32-core M1 Max decodes
   // 1.2% more cycles a second.
-  if (calibration.simdgroupMma && unit.registerTakes)
-    return {.tile = LinearTile::GgufRegister,
-            .splits = splitsFor(p.registerSplits, n, k, w.rows, unit.weightBits16, cores).splits,
-            .oneGateUpPass = gateUp && unit.oneFormat && (!unit.affine || lanes <= 2),
-            .fp32Table = true};
+  if (calibration.simdgroupMma && unit.registerTakes) {
+    const bool onePassPair = gateUp && unit.oneFormat && (!unit.affine || lanes <= 2);
+    // MLX affine units split by kApple7AffineRegisterLaw at the eight rows of one lane, so that every width takes
+    // the same split.
+    const uint32_t splits =
+        unit.affine ? splitsFor(kApple7AffineRegisterLaw, n, k, SPLASH_TARGET_VERIFY_ROWS, unit.weightBits16, cores,
+                                onePassPair ? Passes::One : Passes::Two)
+                          .splits
+                    : splitsFor(p.registerSplits, n, k, w.rows, unit.weightBits16, cores).splits;
+    return {.tile = LinearTile::GgufRegister, .splits = splits, .oneGateUpPass = onePassPair, .fp32Table = true};
+  }
   if (unit.registerTakes &&
       registers(p.decodeRegister, unit.formatClass, lanes, (onePass ? 2 : 1) * uint64_t{n / GGUF_TILE_COLUMNS},
                 cores))
@@ -213,7 +219,7 @@ UnitFormats unitFormats(std::span<const Projection *const> projections) noexcept
   UnitFormats unit;
   FormatClassifier classes;
   uint32_t bits = 0, count = 0;
-  bool decodeInt8 = true, prefillInt8 = true, quantized = false;
+  bool decodeInt8 = true, prefillInt8 = true, quantized = false, affine = true;
   for (const Projection *p : projections) {
     if (!p) continue;
     bits += p->shape().weightBits16, ++count;
@@ -223,6 +229,7 @@ UnitFormats unitFormats(std::span<const Projection *const> projections) noexcept
       classes.add(s.formatId);
       decodeInt8 &= static_cast<bool>(p->rotation) && quant_decode_int8_format(s.formatId);
       prefillInt8 &= quant_prefill_int8_format(s.formatId);
+      affine &= quant_affine_format(s.formatId);
       quantized = true;
     }
   }
@@ -230,12 +237,12 @@ UnitFormats unitFormats(std::span<const Projection *const> projections) noexcept
   unit.prefillInt8Takes = quantized && prefillInt8;
   unit.formatClass = classes.formatClass();
   unit.weightBits16 = count ? bits / count : 0;
+  unit.affine = quantized && affine;
   if (projections.size() == 2 && projections[0] && projections[1]) {
     const std::vector<QuantizedSegment> &up = projections[0]->blocks().segments,
                                         &gate = projections[1]->blocks().segments;
     unit.oneFormat = up.size() == 1 && gate.size() == 1 && !up.front().isFloat() &&
                      up.front().formatId == gate.front().formatId;
-    unit.affine = unit.oneFormat && quant_affine_format(up.front().formatId);
   }
   return unit;
 }
@@ -290,9 +297,16 @@ std::vector<LinearConfig> decodeConfigurations(const KernelCalibration &calibrat
     configurations.push_back(staged(p, n, k, w.rows, 0, cores, Passes::Two));
   if (w.epilogue == LinearEpilogue::GateUp && cores >= p.onePassFromCores)
     configurations.push_back(staged(p, n, k, w.rows, 0, cores, Passes::One));
-  // Apple7/8's register tile also runs a gate/up pair of one format in one pass.
-  if (w.epilogue == LinearEpilogue::GateUp && calibration.simdgroupMma && registerTakes)
-    configurations.push_back(bf16Projection(calibration, w, {.registerTakes = true, .oneFormat = true}, {}));
+  // Apple7/8's register tile also runs a gate/up pair of one format in one pass, and MLX affine units split by
+  // kApple7AffineRegisterLaw.
+  if (calibration.simdgroupMma && registerTakes) {
+    configurations.push_back(bf16Projection(calibration, w, {.registerTakes = true, .affine = true}, {}));
+    if (w.epilogue == LinearEpilogue::GateUp) {
+      configurations.push_back(bf16Projection(calibration, w, {.registerTakes = true, .oneFormat = true}, {}));
+      configurations.push_back(
+          bf16Projection(calibration, w, {.registerTakes = true, .oneFormat = true, .affine = true}, {}));
+    }
+  }
   return configurations;
 }
 
