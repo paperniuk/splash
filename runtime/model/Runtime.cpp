@@ -468,6 +468,9 @@ struct Runtime::Impl {
   // the cycles verify every row.
   std::optional<VerifyBudget> verifyBudget;
   ops::AneFfn *aneFfn;
+  // The split that takes the commands aneFfn runs as pairs of chunks, null
+  // where the engine has none (RuntimeContext::aneFfnPair).
+  ops::AneFfn *const *aneFfnPair;
   // The readers of spilled K/V, when the target's K/V spills.
   KvBlockCache *blockCache;
   KvHistoryStream *historyStream;
@@ -605,7 +608,8 @@ struct Runtime::Impl {
                         },
                         value.model.target)),
         draftModel(value.model.draft, value.backend, operators),
-        aneFfn(value.aneFfn), blockCache(value.blockCache), historyStream(value.historyStream),
+        aneFfn(value.aneFfn), aneFfnPair(value.aneFfnPair), blockCache(value.blockCache),
+        historyStream(value.historyStream),
         limits(splash::model::commandLimits(geometry, aneFfn ? aneFfn->minimumRows() : 0)) {
     if (states.layout() != model.stateLayout(states.layout().target.format) ||
         kvPages.layout() != model.targetKvLayout(kvPages.layout().format) || !blockCache != !historyStream) {
@@ -1687,6 +1691,20 @@ struct Runtime::Impl {
     return inside;
   }
 
+  [[nodiscard]] static uint32_t commandRows(std::span<const ModelBatchItem> items) {
+    uint32_t rows = 0;
+    for (const ModelBatchItem &item : items) rows += item.tokenCount;
+    return rows;
+  }
+  // The split a command of `items` runs on, none without one: the pair's,
+  // where it takes the command as two chunks, else the start's.
+  [[nodiscard]] ops::AneFfn *splitOf(std::span<const ModelBatchItem> items) const {
+    ops::AneFfn *const pair = aneFfnPair ? *aneFfnPair : nullptr;
+    if (!pair || !geometry.prefillPairs) return aneFfn;
+    const uint32_t rows = commandRows(items);
+    return pair->splits(rows) && pair->pairRows(rows) ? pair : aneFfn;
+  }
+
   // The chunks of a prefill command, in order: its items' rows fill them
   // from the first with room on, so that a lane's rows past a chunk's
   // continue in the next, up to the arena's chunks (a prefill group's). A
@@ -1697,15 +1715,14 @@ struct Runtime::Impl {
   // their tokens and RoPE positions, and the draft positions of the rows the
   // DFlash2 draft captures.
   std::vector<PrefillChunk> preparePrefill(std::span<const ModelBatchItem> items,
-                                           std::array<Request *, kLaneCount> &entries) {
+                                           std::array<Request *, kLaneCount> &entries, const ops::AneFfn *split) {
     // A command the Neural Engine's split takes in two chunks runs as a pair
     // (AneFfn::pairRows): the split runs each chunk's FFN beside the other's
     // mixer.
-    uint32_t rows = 0;
-    for (const ModelBatchItem &item : items) rows += item.tokenCount;
+    const uint32_t rows = commandRows(items);
     uint32_t firstRows = kPrefillRows;
-    if (geometry.prefillPairs && aneFfn && aneFfn->splits(rows))
-      firstRows = aneFfn->pairRows(rows).value_or(kPrefillRows);
+    if (geometry.prefillPairs && split && split->splits(rows))
+      firstRows = split->pairRows(rows).value_or(kPrefillRows);
     std::vector<PrefillChunk> chunks(1);
     const auto chunkRows = [&] { return chunks.size() == 1 ? firstRows : kPrefillRows; };
     for (uint32_t lane = 0; lane < items.size(); ++lane) {
@@ -1919,13 +1936,14 @@ struct Runtime::Impl {
   // the arena's scratch cell, whichever the part after it does not write. So
   // no part writes the cell it reads, and none the lane's current cell; with
   // one scratch cell, at most one lane's rows run past a chunk
-  // (CommandLimits::lanesPastChunk).
+  // (CommandLimits::lanesPastChunk). `split` runs the FFN of the chunks it
+  // takes, the GPU alone for none.
   PrefillOutputs encodePrefillGraph(CommandGraph &graph, CommandGraph &encodes,
                                     std::span<const ModelBatchItem> items,
                                     std::array<Request *, kLaneCount> &entries, SpilledKvReads &reads,
-                                    QwenPrefillLayers layers) {
+                                    QwenPrefillLayers layers, ops::AneFfn *split) {
     const bool begins = !layers.first, ends = layers.end == geometry.target.layers;
-    const std::vector<PrefillChunk> chunks = preparePrefill(items, entries);
+    const std::vector<PrefillChunk> chunks = preparePrefill(items, entries, split);
     const uint32_t lanes = static_cast<uint32_t>(items.size());
     // Each lane's parts, (chunk, sequence) in order.
     std::array<std::vector<std::pair<uint32_t, uint32_t>>, kLaneCount> parts;
@@ -2030,7 +2048,7 @@ struct Runtime::Impl {
       model.sequences = sequences[c];
     }
     const std::vector<MetalBuffer> finalHidden =
-        targetModel->addPrefill(graph, modelChunks, kvPages, reads, layers, aneFfn);
+        targetModel->addPrefill(graph, modelChunks, kvPages, reads, layers, split);
     for (uint32_t c = 0; ends && c < chunks.size(); ++c) addDraftContext(graph, chunks, c);
 
     PrefillOutputs outputs;
@@ -2972,14 +2990,15 @@ Runtime::prefillAsync(const BatchPlan &plan,
   for (uint32_t lane = 0; begins && lane < items.size(); ++lane)
     impl_->request(items[lane].requestId).unreadableBlocks.clear();
   CommandGraph graph;
-  if (impl_->aneFfn) {
+  ops::AneFfn *const split = impl_->splitOf(items);
+  if (split) {
     for (uint32_t lane = 0; lane < items.size(); ++lane)
       draws[lane] = impl_->request(items[lane].requestId).rngCounter;
-    impl_->aneFfn->begin();
+    split->begin();
   }
   const std::shared_ptr<SpilledKvReads> reads = impl_->prefillReads(items, layers);
   CommandGraph encodes;
-  const auto outputs = impl_->encodePrefillGraph(graph, encodes, items, entries, *reads, layers);
+  const auto outputs = impl_->encodePrefillGraph(graph, encodes, items, entries, *reads, layers, split);
   // A state captured inside the command starts from the lane's context
   // window as the command finds it, whose older rows the command's own rows
   // overwrite. It is copied once, before the command's first pass runs: a
@@ -2992,7 +3011,7 @@ Runtime::prefillAsync(const BatchPlan &plan,
   // has waited for every run of the command.
   std::vector<ModelBatchItem> copiedItems(items.begin(), items.end());
   Impl *impl = impl_.get();
-  auto finish = [impl, entries, outputs, draws, reads, layers, ends,
+  auto finish = [impl, split, entries, outputs, draws, reads, layers, ends,
                  items = std::move(copiedItems)](CommandTiming &timing) mutable {
     // A chunk whose Neural Engine work failed holds no usable outputs, and
     // the split has stopped: the GPU runs the chunk again alone, which
@@ -3013,13 +3032,13 @@ Runtime::prefillAsync(const BatchPlan &plan,
     // the first run could not read. The first ticket was released before
     // this completion runs (DeferredMetalTicket::wait), so the backend takes
     // the rerun's command, whose time counts in the chunk's.
-    if (impl->aneFfn && !impl->aneFfn->finish()) {
+    if (split && !split->finish()) {
       for (uint32_t lane = 0; lane < items.size(); ++lane)
         entries[lane]->rngCounter = draws[lane];
       reads->end();
       CommandGraph again, encodes;
       static_cast<void>(
-          impl->encodePrefillGraph(again, encodes, items, entries, *reads, layers));
+          impl->encodePrefillGraph(again, encodes, items, entries, *reads, layers, nullptr));
       const CommandTiming rerun = impl->backend.submitCommandAsync(again.command()).wait();
       timing.gpuSeconds += rerun.gpuSeconds;
       timing.wallSeconds += rerun.wallSeconds;
@@ -3199,10 +3218,10 @@ Runtime::prefillAsync(const BatchPlan &plan,
     impl->counters.totalPrefillGpuSeconds += timing.gpuSeconds;
     return results;
   };
-  const auto submit = [impl, graph = std::make_shared<CommandGraph>(std::move(graph)),
+  const auto submit = [impl, split, graph = std::make_shared<CommandGraph>(std::move(graph)),
                        completion](const CommandTiming &) {
-    return impl->aneFfn ? impl->aneFfn->commit(*graph, completion)
-                        : impl->backend.submitCommandAsync(graph->command(), completion);
+    return split ? split->commit(*graph, completion)
+                 : impl->backend.submitCommandAsync(graph->command(), completion);
   };
   std::array<PrefillLane, kLaneCount> lanes{};
   for (uint32_t lane = 0; lane < items.size(); ++lane)

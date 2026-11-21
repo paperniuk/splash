@@ -42,6 +42,7 @@
 #include "metal/abi/AneFfn.h"
 #include "metal/abi/QuantFormat.h"
 #include "ops/AneFfn.hpp"
+#include "ops/AneFfnMeasurement.hpp"
 #include "ops/Linear.hpp"
 
 #include <algorithm>
@@ -676,6 +677,31 @@ void pair(MetalBackend &backend, const Linear &linear, const Model &model) {
       split->pairRows(1100) != 512u || split->pairRows(577) != 256u || split->pairRows(477) != 256u)
     fail("pair: 2048, 256, 1100, 577 or 477 rows do not split as 1024, 128, 512, 256 and 256 first");
   section("pair: the rows of a command's two chunks");
+
+  // The split a start times a pair's command on holds the one function a full command's two chunks run, and runs
+  // them.
+  const std::unique_ptr<AneFfn> timing = ane_ffn::Measurement::pair(backend, linear, model.layers, kAneUnits, nullptr);
+  if (timing->pairRows(kMost) != kMost / 2) fail("pair: the split that times a pair does not halve a full command");
+  CommandGraph full;
+  if (!timing->begin()) fail("pair: the split that times a pair does not begin a command");
+  for (uint32_t layer = 0; layer < kLayers; ++layer)
+    for (const Chunk &part : chunks) {
+      timing->settle(full, &part);
+      timing->add(full, layer, part.ffn, part.hidden[layer & 1], part.hidden[(layer & 1) ^ 1], kRows[0], &part);
+    }
+  timing->settle(full);
+  static_cast<void>(timing->commit(full, {}).wait());
+  if (!timing->finish()) fail("pair: the split that times a pair: " + timing->reason());
+  section("pair: the split a start times a pair's command on runs a full command's two chunks");
+
+  // From the least rows a split is given, it takes no smaller command as two chunks, and the others as before.
+  split->setPairMinimumRows(768);
+  if (split->pairRows(767) || split->pairRows(768) != 384u || split->pairRows(kMost) != kMost / 2)
+    fail("pair: a split of pairs from 768 rows does not take 767 rows as none, 768 as 384 first and 2048 as 1024");
+  for (const uint32_t rows : {2 * kLeast - 1, kMost + 1})
+    test::rejects([&] { split->setPairMinimumRows(rows); }, "no pair of " + std::to_string(rows) + " rows",
+                  "a split took " + std::to_string(rows) + " rows for its least pair");
+  section("pair: the least rows of a command it takes as two chunks");
 
   // A split built without pairs takes no command as two chunks and refuses a second chunk of a layer.
   AneFfn single(backend, Linear(backend.capabilities(), Int8Activations::On), model.layers, kAneUnits, nullptr,

@@ -1,9 +1,11 @@
 #include "ops/AneFfnCalibration.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <cmath>
 #include <iomanip>
 #include <limits>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -24,9 +26,18 @@ constexpr double kChunkNoise = 0.02;
 // the most units it moves.
 constexpr double kRefineGain = 0.02;
 constexpr uint32_t kRefineSteps = 3;
+// The units choosePair() climbs at a time, which refine() covers either way,
+// and the gain on a full command at which a pair's split serves beside the
+// single chunks': its memory comes out of the KV cache.
+constexpr uint32_t kPairStride = kRefineSteps;
+constexpr double kPairGain = 0.05;
+// The time of a command no split runs.
+constexpr double kUnrun = std::numeric_limits<double>::max();
 // The first word of a Calibration's text, which a change to its fields
 // renumbers.
-constexpr std::string_view kCalibrationTag = "ane-ffn-calibration-1";
+constexpr std::string_view kCalibrationTag = "ane-ffn-calibration-2";
+// The pair's units in a Calibration's text until a start has timed them.
+constexpr std::string_view kUntimed = "-";
 
 // The GPU alone's milliseconds of a chunk's FFN layer by its rows: the line
 // through its timings, which the GPU follows within 1% between them.
@@ -154,26 +165,69 @@ std::optional<uint32_t> minimumRows(const ChunkTimings &timings) {
   return minimum;
 }
 
+// A pair's Neural Engine works beside the other chunk's mixer, so its
+// fastest units lie above the single chunks', by what the mixer takes of a
+// layer, which no FFN layer timed alone shows: 25 of Qwen3.8-27B's 34 on an
+// M1 Max against 17. The units climb from the single chunks' kPairStride at a
+// time while each command takes kRefineGain less, then move to a neighbour's
+// as refine() does. Units no split runs at gain nothing, which ends a climb
+// where the ANE compiler refuses more channels.
+std::optional<PairTiming> choosePair(uint32_t singleUnits, uint32_t mostUnits,
+                                     const std::function<std::optional<double>(uint32_t pairUnits)> &timed) {
+  if (!singleUnits || singleUnits > mostUnits) throw std::invalid_argument("ANE FFN pair of no feasible units");
+  std::map<uint32_t, double> times;
+  const auto time = [&](uint32_t units) {
+    if (const auto found = times.find(units); found != times.end()) return found->second;
+    const std::optional<double> took = timed(units);
+    return times[units] = took ? usable(*took) : kUnrun;
+  };
+  uint32_t chosen = singleUnits;
+  for (double least = kUnrun; chosen < mostUnits;) {
+    const uint32_t next = std::min(chosen + kPairStride, mostUnits);
+    const double took = time(next);
+    if (took == kUnrun || !(took <= (1.0 - kRefineGain) * least)) break;
+    chosen = next;
+    least = took;
+  }
+  chosen = refine(chosen, mostUnits, time);
+  if (time(chosen) == kUnrun) return std::nullopt;
+  return PairTiming{chosen, time(chosen)};
+}
+
+bool pairGains(double single, double pair) { return usable(pair) <= (1.0 - kPairGain) * usable(single); }
+
 std::string Calibration::text() const {
   std::ostringstream text;
   text << std::setprecision(9) << kCalibrationTag << ' ' << aneUnits << ' ' << minimumRows;
   for (const ChunkTimings::Gpu &point : gpu) text << ' ' << point.rows << ' ' << point.milliseconds;
+  if (pairUnits)
+    text << ' ' << *pairUnits;
+  else
+    text << ' ' << kUntimed;
   return text.str();
 }
 
 // A record of units holds least rows and the GPU alone at ascending rows of
-// usable milliseconds; one of none holds neither.
+// usable milliseconds; one of none holds neither, and no pair's units.
 std::optional<Calibration> Calibration::parse(std::string_view text) {
   std::istringstream in{std::string(text)};
-  std::string tag;
+  std::string tag, pair;
   Calibration calibration;
   in >> tag >> calibration.aneUnits >> calibration.minimumRows;
   for (ChunkTimings::Gpu &point : calibration.gpu) in >> point.rows >> point.milliseconds;
+  in >> pair;
   std::string rest;
   if (!in || tag != kCalibrationTag || (in >> rest)) return std::nullopt;
+  if (pair != kUntimed) {
+    uint32_t units = 0;
+    const auto [end, error] = std::from_chars(pair.data(), pair.data() + pair.size(), units);
+    if (error != std::errc{} || end != pair.data() + pair.size()) return std::nullopt;
+    calibration.pairUnits = units;
+  }
   const auto &[low, high] = calibration.gpu;
   const auto usableMilliseconds = [](double value) { return value > 0.0 && std::isfinite(value); };
-  if (!calibration.aneUnits) return calibration.minimumRows ? std::nullopt : std::optional(Calibration{});
+  if (!calibration.aneUnits)
+    return calibration.minimumRows || calibration.pairUnits ? std::nullopt : std::optional(Calibration{});
   if (!calibration.minimumRows || !(low.rows < high.rows) || !usableMilliseconds(low.milliseconds) ||
       !usableMilliseconds(high.milliseconds))
     return std::nullopt;

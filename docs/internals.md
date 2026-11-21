@@ -1156,14 +1156,23 @@ recurrent states in place in the lane's next cell. The service failed an evaluat
 command queued all 128 at once, so each slot keeps 32 queued. The breaker
 (below) judges single chunks only. A split that cannot give a pair its slots
 is built again with one slot over the pair's one weight set, and serves single
-chunks at the given share. The calibrated split never pairs and is the split
-as before, with double-buffered weights and one slot: its share is timed on
-single chunks, whose best is near 0.5, where a pair's is higher and a pair at
-that share gains nothing. A given share pairs and pays only above that
+chunks at the given share. A given share pairs and pays only above the
 calibrated one: on a 16-core M1 Pro (ANE about 2.7 times the GPU on the FFN)
 pairs at the calibrated 0.68 gain about nothing and at 0.82-0.88 gain 11-29%
-from 476 rows up; on a 32-core M1 Max (about 1.5 times), cold prefill of 6.7K
-tokens runs 212 tok/s at the calibrated 0.50 and 254 tok/s given 0.735.
+from 476 rows up.
+
+A calibrated split serves single chunks, with double-buffered weights and one
+slot, at the share timed on them. A pair's fastest share is higher, since its
+ANE works through the other chunk's mixer: on a 32-core M1 Max with
+Qwen3.8-27B a 2048-row prefill takes 9.13 s as a single chunk at the
+calibrated 17 of 34 units, and 8.50, 7.80, 7.57, 7.45 and 7.81 s as a pair at
+20, 23, 24, 25 and 26. So commands of 769 rows or more run as pairs on a
+second split of more units, a Pair beside the Single (`AneFfnStart::pair`),
+and smaller commands stay single chunks. A single chunk of 768 rows fills its
+function and one of more pads to the next: on that Mac the pair runs 206
+tok/s against 211 at 768 rows, 209 against 196 at 816, and 252 against 218 at
+1024. The second split takes its own memory out of the KV cache, 278 MB there:
+163,833 tokens of automatic context against 172,025.
 
 Startup decides the split on the loaded model before it allocates the KV cache
 (`runtime/engine/AneFfnStartup.cpp`), once it has built the memory governor,
@@ -1260,6 +1269,25 @@ costs the ANE its function's rows, which a chunk pads up to, and the functions
 do not cost it in proportion to their rows (on an M5 Max 640 rows take 93% of
 768's). On an M5 Max with Qwen3.8-27B at 0.24 that is 540-850 rows over
 calibrations.
+
+Once the engine prefills, a start whose calibration holds no units for pairs
+times them (`AneFfnStart::timePairs`, `ops::ane_ffn::choosePair`) on the
+warm-up's 2048-row prefill, since only a whole prefill has the mixer a pair's
+ANE works beside. It runs twice as a single chunk, the lesser taken, then as
+a pair on splits of the one 1024-row function its two chunks run
+(`Measurement::pair`), which build in 4 s on the M1 Max where the program of
+every function takes 53. The units climb from the single chunks' three at a
+time while each command takes 2% less, then move to a neighbour's as the
+refinement above does; units no split runs at end the climb. A pair that
+takes 5% less than the single chunk is kept. The start then builds the split
+that serves at its units, or at the most below them that build: the ANE
+compiler refuses more channels of the program of every function (0.94 of the
+27B's on an M1 Pro, where 0.88 compiles). It remembers the units beside the
+calibration, 0 where no pair gains, and serves single chunks itself, as its
+memory plan was made without a pair's split. The next start sets that split's
+memory aside beside the first's, where the plan still holds the context asked
+for, and serves pairs. On the M1 Max the timing took 71 s with its programs
+compiled before, and chose 24 units (0.71).
 
 The GPU runs the FFN alone if no share or chunk gains enough, or the ANE or one
 of its functions is unavailable or fails the check, as under Metal's validation

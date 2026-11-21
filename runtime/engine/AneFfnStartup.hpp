@@ -30,6 +30,14 @@ struct AneFfnSetting final {
   // gives it.
   static constexpr uint32_t kGivenMinimumRows = 256;
   static_assert(kGivenMinimumRows >= ops::AneFfn::kMinimumRows && kGivenMinimumRows <= ops::AneFfn::kMaximumRows);
+  // A calibrated split runs single chunks, at the share timed on them. A
+  // command of this many rows or more runs as a pair of chunks on a second
+  // split of more units (AneFfnStart::pair): past the 768 rows that fill a
+  // function, where a single chunk pads to the next one's rows. On an M1 Max
+  // the 27B's 768-row prefill ran 206 tok/s as a pair at 0.71 against 211 as
+  // one chunk at the calibrated 0.50, and one of 816 rows 209 against 196.
+  static constexpr uint32_t kPairMinimumRows = 6 * ops::AneFfn::kProgramStep + 1;
+  static_assert(kPairMinimumRows >= 2 * ops::AneFfn::kMinimumRows && kPairMinimumRows <= ops::AneFfn::kMaximumRows);
   struct Given final {
     double share = 0.0;
     uint32_t minimumRows = kGivenMinimumRows;
@@ -78,6 +86,9 @@ struct AneFfnModel final {
   // chunks timed (ops::ane_ffn::Measurement::chunks) when `timeChunks`, run
   // as `mode` says. A model a test plays prepares no split.
   std::function<AneFfnPrepared(uint32_t aneUnits, bool timeChunks, ops::AneFfn::Mode mode)> prepare;
+  // The split a start times a pair's command at `aneUnits` on
+  // (ops::ane_ffn::Measurement::pair).
+  std::function<std::unique_ptr<ops::AneFfn>(uint32_t aneUnits)> timingPair;
   // This Mac's calibration of the split within `maxAneUnits` units, if one
   // is remembered; remembering one; and forgetting it.
   std::function<std::optional<ops::ane_ffn::Calibration>(uint32_t maxAneUnits)> recall;
@@ -132,12 +143,25 @@ struct AneFfnSnapshot {
   double aneMilliseconds = 0.0;
 };
 
+// The seconds of a cold prefill of a full command on the engine once it
+// prefills: with `pair` taking it as a pair of chunks at `pairUnits`, or as a
+// single chunk on the start's split for none (AneFfnStart::timePairs).
+using AneFfnPairPrefill = std::function<double(uint32_t pairUnits, ops::AneFfn *pair)>;
+
 // The split a start runs and the memory plan that sets its memory aside,
-// both none without one, and the outcome.
+// both none without one, and the outcome. Beside a calibrated split, `pair`
+// takes the commands that run as pairs of chunks
+// (AneFfnSetting::kPairMinimumRows), at the units this Mac's calibration
+// holds for it, with its memory set aside too. Where the calibration holds
+// none yet, `timePairs` times them on `model`, the start's as the engine
+// holds it, and remembers the units, or that no pair gains enough: the next
+// start serves them, as its plan sets their memory aside.
 struct AneFfnStart final {
   std::unique_ptr<ops::AneFfn> split;
   std::optional<EngineMemoryPlan> plan;
   AneFfnOutcome outcome;
+  std::unique_ptr<ops::AneFfn> pair{};
+  std::function<void(const AneFfnModel &model, const AneFfnPairPrefill &prefill)> timePairs{};
 };
 
 // The prefill FFN's Neural Engine split of `model` as `setting` allows,
@@ -152,7 +176,12 @@ struct AneFfnStart final {
 // remembered, a split or none. The split then judges itself against the GPU
 // alone as calibrated (ops::ane_ffn::Breaker), which forgets the calibration
 // when it trips, so that the next start calibrates again; a given split
-// takes the given least chunk, no breaker, and nothing remembered. Logs the
+// takes the given least chunk, no breaker, and nothing remembered. A
+// calibrated split serves single chunks; the commands that run as pairs of
+// chunks take a second split (AneFfnStart::pair), whose units a start times
+// on whole prefills once the engine runs them (AneFfnStart::timePairs): a
+// pair's Neural Engine works beside the other chunk's mixer, which no FFN
+// layer timed here shows. Logs the
 // outcome, a split a relaunch's context refuses in a plain line: the server,
 // not the user, asked for that context. A failure leaves the GPU alone,
 // unless `cancelled` returns true, the wait for the ANE was interrupted or

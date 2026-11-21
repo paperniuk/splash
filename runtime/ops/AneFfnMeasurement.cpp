@@ -141,6 +141,13 @@ double Measurement::split(uint32_t aneUnits, double gpuAlone) {
   return layer(sampled, kCount, kRows, &split, gpuAlone);
 }
 
+std::unique_ptr<AneFfn> Measurement::pair(metal::MetalBackend &backend, const Linear &linear,
+                                          std::span<const SwiGluProjections> layers, uint32_t aneUnits,
+                                          std::function<bool()> interrupted) {
+  return std::unique_ptr<AneFfn>(new AneFfn(backend, linear, layers, aneUnits, std::move(interrupted),
+                                            std::array{AneFfn::kMaximumRows / AneFfn::kSlots}, AneFfn::Mode::Pair));
+}
+
 ChunkTimings Measurement::chunks(AneFfn &split) {
   std::vector<uint32_t> rows;
   for (const AneFfn::Evaluation &evaluation : split.evaluations_) rows.push_back(evaluation.rows);
