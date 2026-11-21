@@ -70,6 +70,14 @@ struct GgufPrefillLeadingParams {
 };
 static_assert(sizeof(GgufPrefillLeadingParams) == 20,
               "GGUF leading-input prefill parameters are 20 bytes on both sides");
+// Apple7/8's split-K prefill kernels (gguf_prefill_mma_split_*): grid
+// (64-row tiles, column tiles, K partitions).
+struct GgufPrefillSplitParams {
+  GgufPrefillParams prefill;
+  uint32_t splits;
+};
+static_assert(sizeof(GgufPrefillSplitParams) == 20,
+              "GGUF split-K prefill parameters are 20 bytes on both sides");
 // The plain prefill kernels (gguf_prefill_<format>_a): up to three column segments of the kernel's format in one
 // dispatch, tiles in segment order, as a fused decode dispatch takes them; a single tensor is one segment.
 struct GgufPrefillSegmentsParams {

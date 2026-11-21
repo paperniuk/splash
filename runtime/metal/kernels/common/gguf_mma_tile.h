@@ -177,19 +177,22 @@ inline void store_sums(thread float2 (&acc)[FN][FM], sgmatrix::Lane l, uint spli
   split_release(counter, thread_index);
 }
 
-// The prefill tile of chunk rows [first, first + 64) and columns [origin, origin + 64) of one segment: threads 0-63
-// stage one column's group per step into a double-buffered stage, and each simdgroup that holds chunk rows runs its
-// 32 columns by 32 rows. `rows` counts the chunk's rows from the tile's first: a simdgroup past them only stages.
-template <class F, class Store>
-inline void prefill_tile(device const bfloat *x, device uchar *w0, device uchar *w1, device uchar *meta,
-                         uint input_size, uint origin, uint rows, threadgroup half *stage, threadgroup half2 *tl,
-                         uint lane, uint simd_group, Store store) {
+// Accumulates K steps [step_begin, step_end) of a prefill tile (rows [first, first + 64) and columns
+// [origin, origin + 64)) into `acc`. Returns whether this simdgroup holds chunk rows (`half_m * 32 < rows`);
+// simdgroups past them only stage weights.
+template <class F>
+inline bool prefill_accumulate(device const bfloat *x, device uchar *w0, device uchar *w1, device uchar *meta,
+                               uint input_size, uint origin, uint rows, uint step_begin, uint step_end,
+                               threadgroup half *stage, threadgroup half2 *tl, uint lane, uint simd_group,
+                               thread float2 (&acc)[FN][kPrefillSimdgroupRows / 8]) {
   constexpr uint FM = kPrefillSimdgroupRows / 8;
   const sgmatrix::Lane l = sgmatrix::lane_map(lane);
   const uint thread_index = simd_group * 32 + lane, column = thread_index % GGUF_TILE_COLUMNS;
   const uint half_n = simd_group & 1, half_m = simd_group >> 1;
   const bool stages = thread_index < GGUF_TILE_COLUMNS;
   const bool owns = half_m * kPrefillSimdgroupRows < rows;  // uniform per simdgroup
+  zero(acc);
+  if (step_begin >= step_end) return owns;
   const uint groups = input_size / 32, units = groups / F::MetaGroups;
   const uint plane_tile = origin / QUANT_TILE_ROWS, plane_row = origin % QUANT_TILE_ROWS + column;
   device uchar *c0 = w0 + (ulong(plane_tile) * groups * QUANT_TILE_ROWS + plane_row) * F::P0;
@@ -198,15 +201,14 @@ inline void prefill_tile(device const bfloat *x, device uchar *w0, device uchar 
   x += ulong(half_m) * kPrefillSimdgroupRows * input_size;
   typename F::Payload packed;
   typename F::Meta hdr;
-  uint unit = 0;
+  uint unit = step_begin / F::MetaGroups;
   if (stages) {
-    packed = F::load(c0, c1);
-    hdr = F::loadMeta(cm);
+    packed = F::load(c0 + ulong(step_begin) * QUANT_TILE_ROWS * F::P0,
+                     c1 + ulong(step_begin) * QUANT_TILE_ROWS * F::P1);
+    hdr = F::loadMeta(cm + ulong(unit) * QUANT_TILE_ROWS * F::MetaBytes);
   }
-  float2 acc[FN][FM];
-  zero(acc);
-  for (uint step = 0; step < groups; ++step) {
-    threadgroup half *buffer = stage + (step & 1) * kPrefillStage;
+  for (uint step = step_begin; step < step_end; ++step) {
+    threadgroup half *buffer = stage + ((step - step_begin) & 1) * kPrefillStage;
     if (stages) {
       const uint u = step / F::MetaGroups;
       if (u != unit) {
@@ -214,7 +216,7 @@ inline void prefill_tile(device const bfloat *x, device uchar *w0, device uchar 
         unit = u;
       }
       stage_group<F>(packed, hdr, ushort(step % F::MetaGroups), tl, buffer + column * kStride);
-      if (step + 1 < groups)
+      if (step + 1 < step_end)
         packed = F::load(c0 + ulong(step + 1) * QUANT_TILE_ROWS * F::P0, c1 + ulong(step + 1) * QUANT_TILE_ROWS * F::P1);
     }
     // The other buffer's last readers passed this barrier's predecessor, so one barrier per step suffices.
@@ -228,10 +230,68 @@ inline void prefill_tile(device const bfloat *x, device uchar *w0, device uchar 
       }, acc);
     }
   }
-  if (!owns) return;
-  elements(acc, l, [&](uint row, uint col, float v) {
+  return owns;
+}
+
+// The prefill tile of chunk rows [first, first + 64) and columns [origin, origin + 64) of one segment: threads 0-63
+// stage one column's group per step into a double-buffered stage, and each simdgroup that holds chunk rows runs its
+// 32 columns by 32 rows. `rows` counts the chunk's rows from the tile's first: a simdgroup past them only stages.
+template <class F, class Store>
+inline void prefill_tile(device const bfloat *x, device uchar *w0, device uchar *w1, device uchar *meta,
+                         uint input_size, uint origin, uint rows, threadgroup half *stage, threadgroup half2 *tl,
+                         uint lane, uint simd_group, Store store) {
+  constexpr uint FM = kPrefillSimdgroupRows / 8;
+  float2 acc[FN][FM];
+  if (!prefill_accumulate<F>(x, w0, w1, meta, input_size, origin, rows, 0, input_size / kStep, stage, tl, lane,
+                             simd_group, acc))
+    return;
+  const uint half_n = simd_group & 1, half_m = simd_group >> 1;
+  elements(acc, sgmatrix::lane_map(lane), [&](uint row, uint col, float v) {
     store(half_m * kPrefillSimdgroupRows + row, half_n * kColumns + col, v);
   });
+}
+
+// One K partition `split` of `splits` of the 64x64 prefill tile: accumulates [split * per, (split + 1) * per),
+// publishes fp32 partials in [split][64][64], and all 128 threads synchronize through `counter` (`split_arrive_last`)
+// before the last arriving threadgroup sums the partials in split order, applies `store`, and resets `counter`.
+template <class F, class Store>
+inline void prefill_tile_split(device const bfloat *x, device uchar *w0, device uchar *w1, device uchar *meta,
+                               uint input_size, uint origin, uint rows, uint splits, uint split,
+                               device coherent(device) float *partials, device atomic_uint *counter,
+                               threadgroup half *stage, threadgroup half2 *tl, threadgroup uint *arrival,
+                               uint lane, uint simd_group, Store store) {
+  constexpr uint FM = kPrefillSimdgroupRows / 8;
+  const uint groups = input_size / kStep, per = groups / splits;
+  float2 acc[FN][FM];
+  const bool owns = prefill_accumulate<F>(x, w0, w1, meta, input_size, origin, rows, split * per, (split + 1) * per,
+                                          stage, tl, lane, simd_group, acc);
+  const sgmatrix::Lane l = sgmatrix::lane_map(lane);
+  const uint half_n = simd_group & 1, half_m = simd_group >> 1, thread_index = simd_group * 32 + lane;
+  if (splits == 1) {
+    if (owns) {
+      elements(acc, l, [&](uint row, uint col, float v) {
+        store(half_m * kPrefillSimdgroupRows + row, half_n * kColumns + col, v);
+      });
+    }
+    return;
+  }
+  const auto partial_at = [&](uint s, uint row, uint col) -> ulong {
+    return (ulong(s) * kPrefillRows + row) * GGUF_TILE_COLUMNS + col;
+  };
+  if (owns) {
+    elements(acc, l, [&](uint row, uint col, float v) {
+      partials[partial_at(split, half_m * kPrefillSimdgroupRows + row, half_n * kColumns + col)] = v;
+    });
+  }
+  // Every thread in the threadgroup enters the barrier even when half_m == 1 does not own rows.
+  if (!split_arrive_last(counter, splits, thread_index, arrival)) return;
+  if (owns) {
+    elements(acc, l, [&](uint row, uint col, float v) {
+      const uint trow = half_m * kPrefillSimdgroupRows + row, tcol = half_n * kColumns + col;
+      store(trow, tcol, split_sum(v, split, splits, [&](uint s) { return partials[partial_at(s, trow, tcol)]; }));
+    });
+  }
+  split_release(counter, thread_index);
 }
 
 } // namespace gguf_mma

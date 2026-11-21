@@ -1,5 +1,6 @@
 #include "model/RuntimeArenas.hpp"
 
+#include "ops/AneFfn.hpp"
 #include "ops/DraftSelector.hpp"
 #include "ops/Sampling.hpp"
 
@@ -120,6 +121,11 @@ prefillTensorBytes(const RuntimeGeometry &geometry,
   ops::LinearScratchSize linear;
   for (const auto &projection : geometry.target.prefillProjections)
     linear.include(operators.linear().prefillScratchSize(projection));
+  // The ANE FFN split's GPU part of gate and up, at any share: a split takes
+  // a target whose every layer has a dense FFN.
+  if (geometry.target.ffnKind == QwenFfnKind::Dense)
+    for (const auto &projection : geometry.target.gateUpProjections)
+      linear.include(ops::AneFfn::prefillScratchSize(operators.linear(), projection));
   const auto &draft = geometry.draft;
   for (const ops::ProjectionShape projection :
        {ops::ProjectionShape{draft.hiddenSize, draft.targetHiddenSize()}, {draft.contextKvSize(), draft.hiddenSize}})

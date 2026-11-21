@@ -157,6 +157,48 @@ QUANT_FORMATS(GGUF_PREFILL_MMA_FORMAT)
   }
 QUANT_FORMATS(GGUF_PREFILL_MMA_LEADING_INPUTS)
 #undef GGUF_PREFILL_MMA_LEADING_INPUTS
+
+// Split-K prefill kernels: grid (64-row tiles, column tiles of the segment, K partitions), uniform 8-buffer binding
+// with `aux` unused for plain projections.
+template <class F, GgufEpilogue Ep>
+inline void gguf_prefill_mma_split(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta,
+                                   device bfloat *output, device coherent(device) float *partials,
+                                   device atomic_uint *counters, device bfloat *aux,
+                                   constant GgufPrefillSplitParams &sp, uint3 group, uint simd_lane,
+                                   uint simd_group, threadgroup half *stage, threadgroup half2 *tl,
+                                   threadgroup uint *arrival) {
+  quant_pair_table<F>(tl, simd_group * 32 + simd_lane, kPrefillThreads);
+  constant GgufPrefillParams &p = sp.prefill;
+  const uint stride = p.out_stride, first = group.x * kPrefillRows, rows = p.rows > first ? p.rows - first : 0;
+  const uint origin = group.y * GGUF_TILE_COLUMNS;
+  const uint col_tiles = stride / GGUF_TILE_COLUMNS;
+  const ulong tile_index = ulong(group.x) * col_tiles + p.out_offset / GGUF_TILE_COLUMNS + group.y;
+  device coherent(device) float *tile_partials =
+      partials + tile_index * ulong(sp.splits) * (kPrefillRows * GGUF_TILE_COLUMNS);
+  prefill_tile_split<F>(input + ulong(first) * p.input_size, w0, w1, meta, p.input_size, origin, rows, sp.splits,
+                        group.z, tile_partials, counters + tile_index, stage, tl, arrival, simd_lane, simd_group,
+                        [&](uint row, uint column, float v) {
+                          const ulong o = ulong(first + row) * stride + p.out_offset + origin + column;
+                          output[o] = gguf_epilogue<Ep>(v, aux, o);
+                        });
+}
+#define GGUF_PREFILL_MMA_SPLIT(F, f, ep, Ep)                                                                       \
+  kernel void gguf_prefill_mma_split_##f##_##ep(                                                                   \
+      GGUF_PREFILL_MMA_BUFFERS, device coherent(device) float *partials [[buffer(5)]],                             \
+      device atomic_uint *counters [[buffer(6)]], device bfloat *aux [[buffer(7)]],                                \
+      constant GgufPrefillSplitParams &sp [[buffer(8)]], uint3 group [[threadgroup_position_in_grid]],             \
+      uint simd_lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]) {          \
+    GGUF_PREFILL_MMA_TABLES(F);                                                                                    \
+    threadgroup uint arrival;                                                                                      \
+    gguf_prefill_mma_split<F, Ep>(input, w0, w1, meta, output, partials, counters, aux, sp, group, simd_lane,      \
+                                  simd_group, stage, tl, &arrival);                                                \
+  }
+#define GGUF_PREFILL_MMA_SPLIT_FORMAT(F, f)                                                                        \
+  GGUF_PREFILL_MMA_SPLIT(F, f, a, EpNone) GGUF_PREFILL_MMA_SPLIT(F, f, r, EpResidual)                             \
+      GGUF_PREFILL_MMA_SPLIT(F, f, g, EpUpWithGate)
+QUANT_FORMATS(GGUF_PREFILL_MMA_SPLIT_FORMAT)
+#undef GGUF_PREFILL_MMA_SPLIT_FORMAT
+#undef GGUF_PREFILL_MMA_SPLIT
 #undef GGUF_PREFILL_MMA_EPILOGUE
 #undef GGUF_PREFILL_MMA
 #undef GGUF_PREFILL_MMA_TABLES

@@ -109,6 +109,14 @@ uint32_t AneFfn::units(std::span<const SwiGluProjections> layers) {
   return layers.front().gate->outputSize / kChannelUnit;
 }
 
+LinearScratchSize AneFfn::prefillScratchSize(const Linear &linear, ProjectionShape gate) {
+  LinearScratchSize bound;
+  if (gate.rotated || gate.outputSize % kChannelUnit) return bound;
+  for (uint32_t aneUnits = 1; aneUnits < gate.outputSize / kChannelUnit; ++aneUnits)
+    bound.include(linear.prefillSplitScratchSize({gpuChannels(gate.outputSize, aneUnits), gate.inputSize}));
+  return bound;
+}
+
 std::string AneFfn::calibrationKey(std::span<const SwiGluProjections> layers, const Linear &linear) {
   if (const char *reason = unsupported(layers)) throw std::invalid_argument(reason);
   std::string key = "ane-ffn calibration";

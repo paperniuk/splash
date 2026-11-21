@@ -52,7 +52,8 @@ void requireLeadingInputs(const LinearPlan &plan, const Projection &p) {
   const LinearWorkload w = plan.workload();
   const LinearTile tile = plan.configuration().tile;
   if (w.phase != LinearPhase::Prefill || w.epilogue != LinearEpilogue::Residual ||
-      (tile != LinearTile::GgufPrefill && tile != LinearTile::GgufPrefillInt8) || p.rotation)
+      ((tile != LinearTile::GgufPrefill || plan.configuration().splits != 1) && tile != LinearTile::GgufPrefillInt8) ||
+      p.rotation)
     throw std::invalid_argument("a view of leading inputs runs only the quantized prefill residual tiles");
 }
 
@@ -178,6 +179,9 @@ LinearPlan Linear::plan(LinearWorkload w, const Projection &p, const Projection 
                   selectProjection(calibration_, int8Activations_, w, unitFormats(projections),
                                    pair ? std::span<const UnitFormats>(tensors) : std::span<const UnitFormats>{}),
                   p.destination);
+  // A view of leading inputs (the ANE FFN split's down) has no split prefill
+  // kernel (requireLeadingInputs): it runs the prefill tile unsplit.
+  if (p.planeInputs() && plan.config_.tile == LinearTile::GgufPrefill) plan.config_.splits = 1;
   plan.rotated_ = static_cast<bool>(p.rotation);
   return plan;
 }
@@ -212,6 +216,18 @@ LinearScratchSize Linear::decodeScratchSize(ProjectionShape shape) const {
   return bound;
 }
 
+LinearScratchSize Linear::prefillSplitScratchSize(ProjectionShape shape) const {
+  LinearScratchSize bound;
+  // Where prefill splits K (Apple7/8's 64-row MMA tile), every row-tile count
+  // up to the token budget can pick a different split factor.
+  if (!calibration_.projection.prefillSplits.empty())
+    for (uint32_t rows = kMaximumStagedPrefillRows; rows <= SPLASH_PREFILL_TOKEN_BUDGET;
+         rows += kMaximumStagedPrefillRows)
+      bound.include(plan({{shape.outputSize, shape.inputSize}, rows, LinearPhase::Prefill, LinearEpilogue::None})
+                        .scratchSize());
+  return bound;
+}
+
 LinearScratchSize Linear::prefillScratchSize(ProjectionShape shape) const {
   LinearScratchSize bound;
   // Prefill plans take split scratch only in chunks that run the staged tile,
@@ -219,6 +235,7 @@ LinearScratchSize Linear::prefillScratchSize(ProjectionShape shape) const {
   for (uint32_t rows = 1; rows <= kMaximumStagedPrefillRows; ++rows)
     for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate})
       bound.include(plan({{shape.outputSize, shape.inputSize}, rows, LinearPhase::Prefill, epilogue}).scratchSize());
+  bound.include(prefillSplitScratchSize(shape));
   // Every prefill plan stores at most the token budget.
   static_assert(SPLASH_PREFILL_TOKEN_BUDGET % GGUF_PREFILL_ROWS == 0, "the prefill tiles cover the budget exactly");
   if (shape.rotated) bound.rotated = rotatedBytes(shape.inputSize, SPLASH_PREFILL_TOKEN_BUDGET);

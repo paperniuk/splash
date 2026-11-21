@@ -5,6 +5,7 @@
 #include "model/ModelFactory.hpp"
 #include "model/QwenTargetLoader.hpp"
 #include "model/RuntimeArenas.hpp"
+#include "ops/AneFfn.hpp"
 
 #include "metal/abi/Gguf.h"
 #include "metal/abi/QuantFormat.h"
@@ -13,6 +14,7 @@
 #include <array>
 #include <initializer_list>
 #include <iostream>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -98,6 +100,41 @@ model::LoadedModel loadedModel(const decltype(Weights::layout) &family = {},
   result.target = std::move(target);
   result.draft.layout = draft;
   return result;
+}
+
+// On Apple7/8 the prefill arena holds the split partials and counters of the
+// ANE FFN split's GPU part of gate and up at every share the ANE can take,
+// whose narrower grids split K where the whole projections' do not.
+void checkAneFfnSplitScratch() {
+  const model::LoadedModel dense = loadedModel<model::Qwen3_8Weights>();
+  const auto &layer = std::get<model::Qwen3_8Weights>(dense.target).layers.front();
+  const ops::SwiGluProjections ffn{&layer.gateProjection, &layer.upProjection, &layer.downProjection};
+  const uint32_t units = ops::AneFfn::units(std::span(&ffn, 1));
+  const uint32_t intermediate = layer.gateProjection.outputSize, hidden = layer.gateProjection.inputSize;
+  const auto geometry = model::RuntimeGeometry::from(dense, kv::Format::Int8, ops::GdnStateFormat::Float32);
+  for (uint32_t family : {7U, 8U})
+    for (uint32_t cores : {8U, 32U, 38U}) {
+      DeviceCapabilities device;
+      device.appleGpuFamily = family;
+      device.gpuCoreCount = cores;
+      const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
+      const auto sizes = model::prefillTensorBytes(geometry, plans);
+      bool split = false;
+      for (uint32_t aneUnits = 1; aneUnits < units; ++aneUnits) {
+        const uint32_t gpu = intermediate - aneUnits * (intermediate / units);
+        for (uint32_t rows = ops::AneFfn::kMinimumRows; rows <= ops::AneFfn::kMaximumRows; rows += 64)
+          for (const auto epilogue : {ops::LinearEpilogue::None, ops::LinearEpilogue::UpWithGate}) {
+            const auto plan = plans.linear().plan({{gpu, hidden}, rows, ops::LinearPhase::Prefill, epilogue});
+            const auto required = plan.scratchSize();
+            split |= plan.configuration().splits > 1;
+            require(sizes[uint32_t(model::PrefillTensor::LinearPartials)] >= required.partials &&
+                        sizes[uint32_t(model::PrefillTensor::LinearCounters)] >= required.counters,
+                    "the prefill arena is below the ANE FFN split's gate/up of " + std::to_string(gpu) +
+                        " channels at " + std::to_string(rows) + " rows");
+          }
+      }
+      require(split, "no share of the ANE FFN split's gate and up splits K on Apple7/8");
+    }
 }
 
 // A layer's gate and up projections run as one gate/up plan, so their shapes
@@ -467,6 +504,7 @@ int main() {
     checkSpilledKvGeometry();
     checkArenasWithoutGdnLayers();
     checkPrefillInt8Scratch();
+    checkAneFfnSplitScratch();
     checkLaneScratch(loadedModel<model::Qwen3_8Weights>());
     checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>());
     checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>(model::kQwen3_5_122BLayout, test::qwen3_5_122BDraft()));
