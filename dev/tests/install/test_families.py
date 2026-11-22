@@ -22,6 +22,7 @@ UNUSABLE = {
         "--disable-ane",
         "--ane-ffn-share",
         "--ane-ffn-minimum-rows",
+        "--recalibrate-ane",
     },
     "Qwen3.5-122B-A10B": {
         "--ple-memory",
@@ -29,11 +30,13 @@ UNUSABLE = {
         "--disable-ane",
         "--ane-ffn-share",
         "--ane-ffn-minimum-rows",
+        "--recalibrate-ane",
     },
     "Qwen3.8-Flash-Next": {
         "--disable-ane",
         "--ane-ffn-share",
         "--ane-ffn-minimum-rows",
+        "--recalibrate-ane",
     },
     "Flint": {
         "--language-only",
@@ -44,6 +47,7 @@ UNUSABLE = {
         "--disable-ane",
         "--ane-ffn-share",
         "--ane-ffn-minimum-rows",
+        "--recalibrate-ane",
         "--max-image-pixels",
         "--reasoning-effort",
         "--default-reasoning-effort",

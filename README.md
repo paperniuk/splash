@@ -99,8 +99,8 @@ automatically:
 | Qwen3.8-27B | `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M` | `mlx-community/Qwen3.8-27B-4bit` |
 | Qwen3.6-35B-A3B | `unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M` | `mlx-community/Qwen3.6-35B-A3B-4bit` |
 | Ornith-1.5-122B | `unsloth/Ornith-1.5-122B-GGUF:UD-Q4_K_XL` | `ornith-ai/Ornith-1.5-122B-MLX-4bit` |
-| Qwen3.8-Flash-Next | `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0` | — |
-| Flint | `unsloth/flint-GGUF:UD-Q4_K_XL` | — |
+| Qwen3.8-Flash-Next | `ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF:Q2_0` | `mlx-community/Qwen3.8-Flash-Next-4bit` |
+| Flint | `unsloth/flint-GGUF:UD-Q4_K_XL` | `mlx-community/flint-mixed-3-4bit` |
 
 Unsloth GGUF variants span **1–8 bits**, including mixed-precision UD formats
 up to `UD-Q8_K_XL`, whose BF16 tensors load too. Whole-BF16 and F16 models are
@@ -152,7 +152,7 @@ window. To set your own limits or cache options, add these to `splash serve`:
 | `--cached-states exact` | Cache recurrent states unquantized. Default: 8-bit (INT8). |
 | `--activations bf16` | Use BF16 activations. Default: auto. |
 | `--disable-ane` | Prefill on the GPU alone. Default: the 27B also uses the Neural Engine. |
-| `--ane-ffn-share 0.35 --ane-ffn-minimum-rows 520` | Fix the Neural Engine's share of the prefill FFN, and the least chunk rows it splits, instead of calibrating them at start; a fixed share also runs a command of 256 rows or more as two chunks, one's FFN on the Neural Engine beside the other's mixer, which gains only at a share above the calibrated one. Default: calibrated, with a higher share of its own for commands of 769 rows or more as two chunks, which the first start times and later starts serve; `0` keeps the FFN on the GPU. |
+| `--ane-ffn-share 0.35 --ane-ffn-minimum-rows 520` | Set the Neural Engine's share of the prefill FFN and the least rows it takes. By default Splash calibrates the shares for one and two steps. On M1/M2 a fixed share defaults to 256 rows. A share of `0` keeps the FFN on the GPU. |
 | `--max-cache-disk 16G` | Cap the SSD cache (default: auto, up to 32 GiB; `0` turns it off). |
 | `--persistent-cache` | Keep the SSD cache across restarts. Off by default. |
 

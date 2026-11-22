@@ -68,6 +68,7 @@ public:
   [[nodiscard]] uint32_t prefillTailAlignment() const noexcept override;
   void end(uint64_t requestId) override;
 
+  [[nodiscard]] std::vector<uint32_t> prefillRowClasses() const override;
   [[nodiscard]] WarmupStepResult warmupPrefill(uint32_t rows) override;
   [[nodiscard]] WarmupStepResult
   warmupDecodeBatch(uint32_t width) override;
@@ -78,6 +79,8 @@ public:
 
   [[nodiscard]] ModelTelemetry
   telemetry() const noexcept override;
+  void setAneFfn(ops::AneFfn *split) override;
+  void withPrefillFfn(const PrefillFfnUse &use) override;
 
 private:
   // The state lane of a resident request; the storage checks that its
@@ -86,8 +89,8 @@ private:
   void finishRestore(uint64_t requestId, uint32_t boundary, bool restoreDraft);
   void prepareWarmupDecode(uint64_t requestId, uint32_t anchor);
   // The step costs of `width` lanes on this machine (StepCosts::measure),
-  // from passes of a cycle of each of their points, and their spread.
-  double measureDecodeSteps(uint32_t width);
+  // from passes of a cycle of each of their points.
+  void measureDecodeSteps(uint32_t width);
   [[nodiscard]] StateAdmission beginAt(const ModelRequest &request,
                                        uint32_t stateLane);
   [[nodiscard]] std::unique_ptr<ModelBatchTicket>
