@@ -288,7 +288,7 @@ void checkLaneScratch(const model::LoadedModel &loaded) {
       {{target.draftVocabulary.columns(target.vocabularySize), target.hiddenSize}, model::kDraftRows}};
   for (const auto &p : target.decodeProjections)
     matrices.push_back({{p.outputSize, p.inputSize}, model::kDecodeRows});
-  for (uint32_t family : {9U, 10U, 11U})
+  for (uint32_t family : {7U, 8U, 9U, 10U, 11U})
     for (uint32_t cores : {12U, 20U, 40U, 80U}) {
       DeviceCapabilities device;
       device.appleGpuFamily = family;
@@ -316,7 +316,7 @@ void checkLaneScratch(const model::LoadedModel &loaded) {
 // bound of four lanes of 8 rows did not hold.
 void checkDecodeStepMoe(const model::LoadedModel &loaded) {
   for (const auto &[lanes, stepRows] : {std::pair{4U, 64U}, {8U, 128U}})
-  for (uint32_t family : {9U, 10U, 11U}) {
+  for (uint32_t family : {7U, 8U, 9U, 10U, 11U}) {
     const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32,
                                                        model::StreamedParts::loaded(loaded), lanes);
     DeviceCapabilities device;
@@ -344,7 +344,7 @@ void checkDecodeStepMoe(const model::LoadedModel &loaded) {
 // projections, on every device family.
 void checkDecodeStepRows(const model::LoadedModel &loaded) {
   const model::StreamedParts parts = model::StreamedParts::loaded(loaded);
-  for (uint32_t family : {9U, 10U, 11U}) {
+  for (uint32_t family : {7U, 8U, 9U, 10U, 11U}) {
     DeviceCapabilities device;
     device.appleGpuFamily = family;
     device.gpuCoreCount = 20;
@@ -479,7 +479,7 @@ void checkArenasHoldTheirLanes(const char *name, const model::LoadedModel &loade
   // One to eight lanes on every device family: arenas that grow with the
   // lanes, decode tensors of at least the lanes (the default's four at four),
   // and a step of a verify block a lane.
-  for (uint32_t family : {9U, 10U, 11U}) {
+  for (uint32_t family : {7U, 8U, 9U, 10U, 11U}) {
     device.appleGpuFamily = family;
     const ops::ExecutionPlans familyPlans(device, ops::Int8Activations::On);
     uint64_t fewer = 0;

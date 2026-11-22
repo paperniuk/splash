@@ -85,8 +85,8 @@ Projection blockProjection(uint32_t n, uint32_t k, uint32_t segments, uint32_t f
 
 // fp32 destinations (the logits): the plan of a projection with an fp32
 // destination keeps the configuration, input table and scratch of its bf16
-// plan on every family and core count, and only plain plans on the decode
-// tiles take one. ggufProjectionMatrix checks the fp32 kernel it encodes.
+// plan on every family and core count. The vocabulary head takes a plain
+// plan even past 32 rows, where Apple7/8 use the MMA prefill tile.
 void floatOutputPlans() {
   const auto fp32 = [](Projection p) {
     p.destination = FloatOutput::Float32;
@@ -94,12 +94,12 @@ void floatOutputPlans() {
   };
   for (const uint32_t family : {7U, 8U, 9U, 10U, 11U})
     for (uint32_t cores = 0; cores <= 128; ++cores) {
-      const Linear linear = gpu(family, cores);
+      const Linear linear = gpu(family, cores, StepKind::Decode);
       for (const uint32_t n : {256U, 5120U, 16640U, 248320U})
         for (const uint32_t k : {2048U, 5120U}) {
           const Projection p = blockProjection(n, k, 1);
-          for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-            const LinearWorkload w{{n, k}, lanes * 8, LinearEpilogue::None};
+          for (const uint32_t rows : {8U, 16U, 24U, 32U, 33U, 40U, 48U, 64U, 65U, 128U}) {
+            const LinearWorkload w{{n, k}, rows, LinearEpilogue::None};
             const LinearPlan bf16 = linear.plan(w, p), head = linear.plan(w, fp32(p));
             if (head.configuration() != bf16.configuration() || head.destination() != FloatOutput::Float32 ||
                 head.input() != bf16.input() || head.storageRows() != bf16.storageRows() ||
@@ -113,13 +113,15 @@ void floatOutputPlans() {
                                      {{5120, 2048}, 8, LinearEpilogue::UpWithGate}};
   for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::UpWithGate})
     others.push_back({{5120, 2048}, 2048, epilogue});
-  const Linear linear = gpu(10, 20);
   const Projection p = blockProjection(5120, 2048, 1);
-  for (const LinearWorkload &w : others) {
-    (void)linear.plan(w, p);
-    rejects([&] { (void)linear.plan(w, fp32(p)); }, "an fp32 destination takes a plain projection on the decode tiles",
-            "an fp32 plan of other than a plain projection on the decode tiles was accepted");
-  }
+  for (const uint32_t family : {7U, 8U, 9U, 10U, 11U})
+    for (const LinearWorkload &w : others) {
+      if (family < 9 && w.epilogue == LinearEpilogue::None) continue;
+      const Linear linear = gpu(family, 20);
+      (void)linear.plan(w, p);
+      rejects([&] { (void)linear.plan(w, fp32(p)); }, "an fp32 destination takes a plain projection",
+              "an unsupported fp32 plan was accepted");
+    }
 }
 
 // Every Apple9 GPU runs plans of up to 32 rows on the register tile (which

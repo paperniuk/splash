@@ -451,7 +451,8 @@ void floatOutput(MetalBackend &backend, const Linear &linear, const LinearPlan &
   const LinearWorkload w = plan.workload();
   const uint64_t active = uint64_t{w.rows} * columns;
   uint64_t wrong = 0;
-  for (uint64_t i = 0; i < uint64_t{w.rows} * columns; ++i) {
+  const uint64_t written = uint64_t{plan.configuration().mmaPrefill ? plan.storageRows() : w.rows} * columns;
+  for (uint64_t i = 0; i < written; ++i) {
     const float value = std::bit_cast<float>(values[i]);
     if (i % columns >= covered || i >= active) {
       wrong += values[i] != 0xFFFFFFFFu;
@@ -1085,6 +1086,31 @@ void prefillSplit(MetalBackend &backend, const Linear &linear) {
   section("prefill split-K (Apple7/8): Q8_0 320x10240 at 128/136/168/384 rows and Q8_0/Q4_K/AF4G64 1024x1024 at "
           "plain/residual/up-with-gate + 3-segment chunk, S 2-16, last 1/4 rows bitwise, NaN and finite poison, "
           "unwritten tail rows, counters reset to 0");
+}
+
+// The vocabulary head runs on the MMA prefill tiles past 32 rows. Check
+// both stores through the production planner with a segmented projection.
+void mmaFloatOutput(MetalBackend &backend) {
+  const Linear linear(backend.capabilities(), Int8Activations::Off, StepKind::Decode);
+  constexpr uint32_t kInputs = 4096, kRows = 48;
+  const Tensor a = tensor(backend, Q4K, 256, kInputs), b = tensor(backend, Fmt(GGUF_FMT_AF4G64), 256, kInputs);
+  const std::vector<const Tensor *> parts{&a, &b};
+  const uint32_t covered = segmentColumns(parts);
+  Projection p = projection(parts, covered + kPadding);
+  const auto x = activations(Inputs::Dense, kRows, kInputs);
+  const auto inputs = storageRows(x, kInputs, kRows, kRows);
+  const auto dots = products(parts, p.outputSize, x, kRows);
+  p.destination = FloatOutput::Float32;
+  const LinearPlan policy = linear.plan(p, kRows);
+  for (const uint32_t splits : {1U, 4U}) {
+    LinearConfig config = policy.configuration();
+    config.splits = splits;
+    const LinearPlan bf16 = Linear::plan(policy.workload(), config, FloatOutput::BFloat16);
+    const LinearPlan fp32 = Linear::plan(policy.workload(), config, p.destination);
+    const std::string label = "MMA vocabulary head, S " + std::to_string(splits);
+    const Outcome out = run(backend, linear, bf16, p, nullptr, inputs, {}, kPoisonNaN, covered, label);
+    floatOutput(backend, linear, fp32, p, inputs, out, within(dots, true), covered, label);
+  }
 }
 
 // ---------------------------------------------------------------- int8 decode
@@ -2057,7 +2083,10 @@ int main(int argc, char **argv) {
         registerOneGateUpPass(backend, linear);
       prefill(backend, linear, 1024, tileFormats(LinearTile::GgufStaged));
       policyGateUp(backend, linear);
-      if (backend.capabilities().appleGpuFamily < 9) prefillSplit(backend, linear);
+      if (backend.capabilities().appleGpuFamily < 9) {
+        prefillSplit(backend, linear);
+        mmaFloatOutput(backend);
+      }
       decodeInt8(backend, linear);
       prefillInt8(backend, linear);
       leadingInputs(backend, linear);
