@@ -919,6 +919,38 @@ void testTwoStepsFromFixedRows() {
           "a start did not set up two steps from 1024 rows beside one step from 897: " + text(fake.preparations));
 }
 
+// Apple7/8 time the one-step functions through 768 rows with two shares. The same split serves after recall.
+void testApple7Calibration() {
+  Fake fake;
+  fake.simdgroupMma = true;
+  fake.time = pipelined;
+  fake.mixer = 10.0;
+  const std::array<ChunkTimings::Gpu, 2> gpu{{{128, 2.0}, {2048, 20.0}}};
+  fake.prepare = [&](AneFfn::Shares, bool timed) {
+    AneFfnPrepared prepared;
+    if (timed)
+      prepared.chunks = {gpu, {{641, 768, 1.0}, {513, 640, 1.0}, {385, 512, 1.0},
+                               {257, 384, 1.0}, {129, 256, 1.0}, {128, 128, 1.0}}};
+    return prepared;
+  };
+  Ran ran = run(fake);
+  require(ran.outcome().kind == Kind::Split && fake.remembered && fake.remembered->minimumRows == 128 &&
+              fake.remembered->gpu[0].rows == 128 &&
+              fake.preparations == std::vector<Preparation>{{8, 13, 128, 769, true}},
+          "the Apple7/8 calibration timed other thresholds: " + text(fake.preparations) + ran.log);
+
+  fake.preparations.clear();
+  ran = run(fake);
+  require(ran.outcome().kind == Kind::Split && fake.timings == 1 &&
+              fake.preparations == std::vector<Preparation>{{8, 13, 128, 769, false}},
+          "the Apple7/8 calibration recalled other thresholds: " + text(fake.preparations) + ran.log);
+
+  fake.stored->minimumRows = 769;
+  const Started rejected = start(fake);
+  require(rejected.start.outcome.kind == Kind::Pending && !rejected.start.calibration,
+          "the Apple7/8 calibration took one step at the two-step crossover");
+}
+
 // Two steps run only where a command of them queues no more evaluations than the Neural Engine holds in flight
 // (AneFfn::fits): a model of 64 FFN layers takes them beside a mixer of 10 ms, one of 65 does not, and its split,
 // one share in the program of one share, timed to 2048 rows, records none. Without two steps one step may take
@@ -1477,21 +1509,20 @@ void testGivenShare() {
             "a given split of a model two steps do not fit ran from " + std::to_string(rows) + " rows");
   fake = {};
   fake.simdgroupMma = true;
-  for (const auto [minimum, expected] : {std::pair{std::optional<uint32_t>{}, Preparation{0, 7, 0, 256, false}},
-                                          std::pair{std::optional{128u}, Preparation{7, 7, 128, 256, false}},
-                                          std::pair{std::optional{1024u}, Preparation{0, 7, 0, 1024, false}}}) {
+  for (const auto &[minimum, expected] : {std::pair{std::optional<uint32_t>{}, Preparation{0, 7, 0, 256, false}},
+                                         std::pair{std::optional{128u}, Preparation{7, 7, 128, 256, false}},
+                                         std::pair{std::optional{1024u}, Preparation{0, 7, 0, 1024, false}}}) {
     fake.preparations.clear();
     started = start(fake, AneFfnSetting::fromGiven(0.2, minimum));
     require(started.start.outcome.kind == Kind::Split && fake.preparations == std::vector{expected},
             "the given Apple7/8 split used other thresholds: " + text(fake.preparations));
   }
   const auto functions = AneFfn::programRows({7, 8}, true);
-  require(functions[0].front() == 128 && functions[0].back() == 768 &&
-              functions[1].front() == 128 && functions[1].back() == 1024 &&
-              functions[0].size() + functions[1].size() == 14,
+  require(functions[0] == std::vector{128u, 256u, 384u, 512u, 640u, 768u} &&
+              functions[1] == std::vector{128u, 256u, 384u, 512u, 640u, 768u, 896u, 1024u},
           "the Apple7/8 pipeline's functions did not fit the compiler limit");
   // A dev tool's options: none calibrates, a share of 0 runs the GPU alone, least rows need a share, and a share
-  // without them takes one step's least function.
+  // without them lets the device choose its default.
   const AneFfnSetting calibrated = AneFfnSetting::fromGiven(std::nullopt, std::nullopt),
                       off = AneFfnSetting::fromGiven(0.0, 832), given = AneFfnSetting::fromGiven(0.3, 832);
   require(calibrated.enabled && !calibrated.given && !off.enabled && given.enabled && given.given &&
@@ -1597,6 +1628,7 @@ int main() {
     testNoGain();
     testTheMixerComesFromThePrefill();
     testTwoStepsFromFixedRows();
+    testApple7Calibration();
     testTwoStepsOnlyWhereTheyFit();
     testTwoStepsStandAlone();
     testRefitMovesTheChoice();

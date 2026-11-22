@@ -248,6 +248,19 @@ void testSlowerNowhere() {
           "a split that took chunks longer was taken");
 }
 
+void testApple7MinimumRows() {
+  ChunkTimings timings{{{{128, 4.0}, {2048, 19.0}}},
+                       {{641, 768, 3.0}, {513, 640, 3.0}, {385, 512, 3.0},
+                        {257, 384, 3.0}, {129, 256, 3.0}, {128, 128, 3.0}}};
+  require(minimumRows(timings) == 128, "calibration skipped the 128-row function");
+  timings.functions.back().split = 5.0;
+  const auto least = minimumRows(timings);
+  require(least == 129, "calibration skipped chunks that the 256-row function holds");
+  const auto record = Calibration::parse(Calibration{8, *least, timings.gpu, 0, 15, 2.0}.text());
+  require(record && record->minimumRows == 129 && record->gpu[0].rows == 128 && record->twoStepUnits == 15,
+          "calibration lost the Apple7/8 row counts or two-step share");
+}
+
 // A calibration as a line of text comes back as it was, its refusals too, and one of no split as none with its
 // refusals, one or kRefusals; one of one step alone too, and of two steps alone; a line of another tag or version,
 // with more or fewer fields, units without least rows or two steps, least rows or two steps without units of one
@@ -405,6 +418,7 @@ int main() {
     testNearestUnits();
     testMinimumRows();
     testSlowerNowhere();
+    testApple7MinimumRows();
     testCalibrationText();
     testBreaker();
     std::cout << "ane ffn calibration tests passed\n";
