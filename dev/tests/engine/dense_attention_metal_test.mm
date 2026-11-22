@@ -2,14 +2,13 @@
 // reference, row by row, in the vision tower's layout: per-head planes of
 // heads of 72 (queries and keys padded to 80), every patch attending the
 // whole image, the output in per-head planes or, as the tower writes it, in
-// rows of every head. Token counts fall below,
-// on and past the 32-row query tile and 128-key tile, up to 4,100 (33 key
-// tiles, the last of four keys), and each runs three kinds of input: random
-// queries, keys and values; keys whose scores rise tile by tile, so every
+// rows of every head. Token counts straddle the query and key tile sizes
+// and reach 4,100, ending in a tile of four keys. Each runs random queries,
+// keys and values; keys whose scores rise tile by tile, so every
 // row rescales its running output at every tile;
 // and scores and values over a wide dynamic range, whose probabilities
 // underflow. Each tensor is bound at the extent the operator requires and
-// followed by a key tile of bf16 NaN: shader validation does not see MPP
+// followed by bf16 NaNs: shader validation does not see MPP
 // loads and stores past a binding, but a NaN read reaches its row and a
 // write past the output changes its tail. Keys and values past the rows hold
 // large finite values, which the masks must hide.
@@ -20,6 +19,7 @@
 #include "TestChecks.hpp"
 #include "metal/CommandGraph.hpp"
 #include "metal/MetalBackend.hpp"
+#include "metal/abi/DenseAttention.h"
 #include "ops/DenseAttention.hpp"
 
 #import <Foundation/Foundation.h>
@@ -49,7 +49,7 @@ using splash::test::floatToBf16;
 using splash::test::require;
 
 constexpr uint32_t kHeads = 16;
-constexpr uint32_t kKeyTile = 128;
+constexpr uint32_t kMmaKeyTile = 32; // vision_mma.metal stages keys 32 at a time.
 constexpr uint16_t kNan = 0x7FC0;
 
 enum class Kind { Random, Rising, Wide };
@@ -123,7 +123,8 @@ struct HeadCheck final {
 // scores (up to 80 products, the scale and the maximum subtracted) change
 // each probability by up to 2 epsilon; and fp32 sums over the keys and the
 // rescales add a few units of 2^-24 per key.
-HeadCheck checkHead(const Case &c, Kind kind, uint32_t rows, float scale, uint32_t head, const Inputs &in) {
+HeadCheck checkHead(const Case &c, Kind kind, uint32_t rows, uint32_t keyTile, float scale, uint32_t head,
+                    const Inputs &in) {
   HeadCheck check;
   const uint32_t qk = paddedDimensions(c), d = c.dimensions;
   const DenseAttentionTensors &t = in.tensors;
@@ -155,9 +156,9 @@ HeadCheck checkHead(const Case &c, Kind kind, uint32_t rows, float scale, uint32
     }
     if (kind == Kind::Rising) {
       double previous = -INFINITY;
-      for (uint32_t start = 0; start < rows; start += kKeyTile) {
+      for (uint32_t start = 0; start < rows; start += keyTile) {
         const double tile =
-            *std::max_element(logits.begin() + start, logits.begin() + std::min(rows, start + kKeyTile));
+            *std::max_element(logits.begin() + start, logits.begin() + std::min(rows, start + keyTile));
         if (start && !(tile > previous + 0.05)) ++check.steadyTiles;
         previous = std::max(previous, tile);
       }
@@ -202,12 +203,14 @@ HeadCheck checkHead(const Case &c, Kind kind, uint32_t rows, float scale, uint32
 // dimension of one turns into scores that rise by 0.7 to 1.2 from tile to
 // tile, more than the spread of the small rest. Wide inputs scale each
 // query row, key and value by its own power of two.
-void fill(const Case &c, Kind kind, uint32_t rows, uint32_t padded, const Inputs &in) {
+void fill(const Case &c, Kind kind, uint32_t rows, uint32_t padded, uint32_t keyTile, const Inputs &in) {
   std::mt19937 random(0x7a11 + rows * 3 + static_cast<uint32_t>(kind) + c.dimensions);
   std::normal_distribution<float> normal(0.0F, 1.0F);
   std::uniform_int_distribution<int> step(6, 10), queryExponent(-3, 3), keyExponent(-4, 3), valueExponent(-8, 8);
-  std::vector<float> offset(padded / kKeyTile, 0.0F);
-  for (size_t tile = 1; tile < offset.size(); ++tile) offset[tile] = offset[tile - 1] + static_cast<float>(step(random));
+  std::vector<float> offset(padded / keyTile, 0.0F);
+  // The 4,100-row case has 129 MMA key tiles. A step of 8 stays distinct in bf16 through the last one.
+  for (size_t tile = 1; tile < offset.size(); ++tile)
+    offset[tile] = offset[tile - 1] + (keyTile == kMmaKeyTile ? 8.0F : static_cast<float>(step(random)));
   const uint32_t qk = paddedDimensions(c);
   for (uint32_t head = 0; head < kHeads; ++head) {
     for (uint32_t token = 0; token < padded; ++token) {
@@ -236,7 +239,7 @@ void fill(const Case &c, Kind kind, uint32_t rows, uint32_t padded, const Inputs
       }
       if (kind == Kind::Rising) {
         query[0] = floatToBf16(1.0F);
-        key[0] = floatToBf16(offset[token / kKeyTile]);
+        key[0] = floatToBf16(offset[token / keyTile]);
       }
     }
   }
@@ -248,8 +251,9 @@ void fill(const Case &c, Kind kind, uint32_t rows, uint32_t padded, const Inputs
 // of every head.
 void runCase(MetalBackend &backend, const Case &c, Kind kind, uint32_t rows) {
   const uint32_t padded = DenseAttention::paddedKeys(rows);
+  const uint32_t keyTile = backend.capabilities().appleGpuFamily < 9 ? kMmaKeyTile : SPLASH_DENSE_ATTENTION_KEYS;
   const uint32_t d = c.dimensions, qk = paddedDimensions(c);
-  const uint64_t tail = uint64_t{kKeyTile} * kHeads * qk;
+  const uint64_t tail = uint64_t{SPLASH_DENSE_ATTENTION_KEYS} * kHeads * qk;
   std::vector<Tensor> buffers;
   Inputs in;
   buffers.emplace_back(backend, uint64_t{kHeads} * padded * qk, tail);
@@ -267,7 +271,7 @@ void runCase(MetalBackend &backend, const Case &c, Kind kind, uint32_t rows) {
   in.keys = buffers[1].data();
   in.values = buffers[2].data();
   in.output = buffers[3].data();
-  fill(c, kind, rows, padded, in);
+  fill(c, kind, rows, padded, keyTile, in);
   const float scale = 1.0F / std::sqrt(static_cast<float>(d));
   CommandGraph graph;
   const DenseAttention attention(backend.capabilities());
@@ -279,7 +283,8 @@ void runCase(MetalBackend &backend, const Case &c, Kind kind, uint32_t rows) {
     require(tensor.tailIntact(), label + ": a write reached past a tensor's extent");
   std::vector<std::future<HeadCheck>> checks;
   for (uint32_t head = 0; head < kHeads; ++head)
-    checks.push_back(std::async(std::launch::async, checkHead, std::cref(c), kind, rows, scale, head, std::cref(in)));
+    checks.push_back(std::async(std::launch::async, checkHead, std::cref(c), kind, rows, keyTile, scale, head,
+                                std::cref(in)));
   double worst = 0.0;
   uint32_t worstHead = 0, worstRow = 0;
   uint64_t steadyTiles = 0;

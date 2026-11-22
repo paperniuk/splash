@@ -24,6 +24,7 @@
 #include <vector>
 
 using namespace splash::kv;
+using splash::ops::AttentionTile;
 using splash::test::HostKvExtents;
 
 namespace {
@@ -32,9 +33,8 @@ constexpr uint32_t kQueryHeads = 24;
 constexpr uint32_t kQueryHeadsPerKvHead = 6;
 // The test library's store of the K/V the test stages (attention_store_test.metal).
 constexpr std::string_view kChunkedPrefillStorePipeline = "test_staged_kv_store_q8";
-constexpr std::string_view kPrefillAttentionSplitPipeline = "attention_q8_split";
-constexpr std::string_view kPrefillAttentionReducePipeline = "attention_reduce";
 struct AttentionPipelines {
+  AttentionTile tile;
   id<MTLComputePipelineState> split;
   id<MTLComputePipelineState> reduce;
 };
@@ -340,24 +340,25 @@ void encodeStore(id<MTLComputeCommandEncoder> encoder,
 }
 
 // The case's plan in a prompt chunk's workspace.
-splash::ops::AttentionPlan planOf(const Case &data) {
-  const std::array sequence{data.params};
+splash::ops::AttentionPlan planOf(ChunkedPrefillParams params, AttentionTile tile) {
+  const std::array sequence{params};
   const splash::kv::Layout layout{1, kKvHeads, kHeadDimension};
   return splash::ops::PagedAttention::plan(
       sequence, kQueryHeads, layout, splash::ops::kApple10Attention, splash::ops::Int8Activations::Off,
-      splash::ops::PagedAttention::workspace(splash::ops::kAttentionSequenceSplits, kQueryHeads, layout));
+      splash::ops::PagedAttention::workspace(splash::ops::kAttentionSequenceSplits, kQueryHeads, layout), {}, tile);
 }
 
 void encodeAttention(id<MTLComputeCommandEncoder> encoder,
                      const AttentionPipelines &pipelines, const Case &data,
                      const SplashAttentionParams *overrideParams = nullptr) {
-  const auto plan = planOf(data);
+  const auto plan = planOf(data.params, pipelines.tile);
   require(plan.workspace().partialsBytes <= data.partials.length &&
               plan.workspace().statisticsBytes <= data.statistics.length,
           "attention splits exceed the shared arena");
   const SplashAttentionParams params =
       overrideParams ? *overrideParams : sequenceParams(data, plan.sequences()[0].splits);
   const auto split = plan.splitGroups(plan.dispatches()[0]), reduce = plan.reduceGroups(plan.dispatches()[0]);
+  const auto threads = plan.splitThreads();
   [encoder setComputePipelineState:pipelines.split];
   [encoder setBuffer:data.queries offset:0 atIndex:0];
   [encoder setBuffer:data.partials offset:0 atIndex:1];
@@ -369,7 +370,7 @@ void encodeAttention(id<MTLComputeCommandEncoder> encoder,
   [encoder setBytes:&params length:sizeof(params) atIndex:5 + SPLASH_MAXIMUM_BATCH_WIDTH];
   data.pool->use(encoder, MTLResourceUsageRead);
   [encoder dispatchThreadgroups:MTLSizeMake(split.x, split.y, split.z)
-             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+             threadsPerThreadgroup:MTLSizeMake(threads.x, threads.y, threads.z)];
   // The plain reduce writes no table: the output rows take the table's and
   // its sums' bindings.
   [encoder setComputePipelineState:pipelines.reduce];
@@ -755,7 +756,7 @@ void testChunkReference(id<MTLDevice> device, id<MTLCommandQueue> queue,
 void testInvalidAttentionParams(id<MTLDevice> device, id<MTLCommandQueue> queue,
                                 const AttentionPipelines &attention) {
   Case data = makeCase(device, 33, 17, 32);
-  const SplashAttentionParams valid = sequenceParams(data, planOf(data).sequences()[0].splits);
+  const SplashAttentionParams valid = sequenceParams(data, planOf(data.params, attention.tile).sequences()[0].splits);
   for (uint32_t invalidField = 0; invalidField < 3; ++invalidField) {
     auto params = valid;
     if (invalidField == 0) params.sequence[0].split_count = 0;
@@ -984,9 +985,10 @@ void run(const char *libraryPath) {
     throw std::runtime_error(error.localizedDescription.UTF8String);
   id<MTLComputePipelineState> store =
       makePipeline(device, library, kChunkedPrefillStorePipeline.data());
-  const AttentionPipelines attention{
-      makePipeline(device, library, kPrefillAttentionSplitPipeline.data()),
-      makePipeline(device, library, kPrefillAttentionReducePipeline.data())};
+  const AttentionTile tile = [device supportsFamily:MTLGPUFamilyApple9] ? AttentionTile::Mpp : AttentionTile::Register;
+  const auto plan = planOf({0, 8, 32, 1}, tile);
+  const AttentionPipelines attention{tile, makePipeline(device, library, plan.splitPipeline().c_str()),
+                                     makePipeline(device, library, plan.reducePipeline().c_str())};
   id<MTLCommandQueue> queue = [device newCommandQueue];
   testContract();
   testAttentionAndDirectStore(device, queue, store, attention);
