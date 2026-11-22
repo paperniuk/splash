@@ -73,7 +73,7 @@ struct NativeArguments final {
   std::optional<uint32_t> aneFfnMinimumRows;
   // --prefill-mode bounded|full and --prefill-bound-ms: the isolated prefill
   // command bound (Scheduler.hpp), infinite for full.
-  double prefillCommandMilliseconds = EngineConfig{}.prefillCommandMilliseconds;
+  double prefillCommandMilliseconds = kDefaultPrefillCommandMilliseconds;
   // --prefill-bound-scope buffer|command: whether that bound holds each
   // command buffer or the whole command (EngineConfig::prefillBoundPerBuffer).
   bool prefillBoundPerBuffer = EngineConfig{}.prefillBoundPerBuffer;

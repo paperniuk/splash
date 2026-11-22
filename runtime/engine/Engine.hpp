@@ -68,7 +68,7 @@ struct EngineConfig final {
   // Keep isolated prefill commands short enough that macOS does not abort
   // them for starving the display (SchedulerConfig::isolatedBoundMilliseconds);
   // kUnboundedPrefillCommand runs whole chunks.
-  double prefillCommandMilliseconds = kDefaultPrefillCommandMilliseconds;
+  double prefillCommandMilliseconds = kUnboundedPrefillCommand;
   // Whether that bound holds each command buffer of a prefill command
   // (model::Model::prefillCommandBuffers()) or the whole command. Some Macs
   // abort a long command for starving the display however it is split, and
