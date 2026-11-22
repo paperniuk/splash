@@ -185,7 +185,7 @@ follows upstream and does not run on M1/M2.
 
 ## Status
 
-- Stable: [1.7.0-m1](https://github.com/paperniuk/splash/releases/latest),
+- Stable: [1.7.0-m1.1](https://github.com/paperniuk/splash/releases/latest),
   upstream 1.7.0 plus the M1/M2 work.
 - Known gaps: the 35B MoE's expert kernels are not tuned for M1/M2 yet;
   Macs below 64 GB are covered by the kernel tests, not run end to end on
