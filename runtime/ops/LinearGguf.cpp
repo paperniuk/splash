@@ -298,8 +298,21 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
   switch (plan.configuration().tile) {
   case LinearTile::GgufRegister: addGgufRegister(graph, b, p, plan, gate); break;
   case LinearTile::GgufStaged: addGgufStaged(graph, b, p, plan, gate); break;
-  case LinearTile::GgufPrefill: addGgufPrefill(graph, b, p, plan); break;
-  case LinearTile::GgufPrefillInt8: addGgufPrefillInt8(graph, b, p, plan); break;
+  case LinearTile::GgufPrefill:
+    if (gate) {
+      // A gate/up pair of 33 to 64 rows on Apple7/8's MMA prefill tile, whose up kernel applies a gate it reads from
+      // the gate scratch: the gate's own pass writes it there first.
+      LinearBuffers gated = b;
+      gated.output = b.gateScratch;
+      addGgufPrefill(graph, gated, *gate,
+                     LinearPlan({w.matrix, w.rows, LinearEpilogue::None}, plan.configuration(), plan.destination()));
+    }
+    addGgufPrefill(graph, b, p, plan);
+    break;
+  case LinearTile::GgufPrefillInt8:
+    if (gate) throw std::invalid_argument("the int8 prefill tile runs no gate/up pair");
+    addGgufPrefillInt8(graph, b, p, plan);
+    break;
   case LinearTile::GgufColumn: addGgufColumn(graph, b, p, plan, gate); break;
   }
 }
