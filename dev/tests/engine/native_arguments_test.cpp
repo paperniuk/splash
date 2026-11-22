@@ -1,0 +1,485 @@
+// The serve-native command lines the server writes, as the engine reads them
+// (native_command_golden.txt), and the ones the engine refuses.
+
+#include "TestChecks.hpp"
+#include "TestFiles.hpp"
+#include "engine/NativeArguments.hpp"
+
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iostream>
+#include <limits>
+#include <map>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <vector>
+
+namespace {
+
+using namespace splash;
+using engine::NativeArguments;
+using engine::StreamedSetting;
+using splash::test::rejects;
+using splash::test::require;
+
+// The directory of the model configurations (dev/tests/fixtures/model-configs).
+std::filesystem::path modelConfigs;
+
+// A model directory the engine accepts: the target and draft directories and
+// the assembly's record and configurations of an MLX Qwen3.8-27B.
+class ModelDirectory final {
+public:
+  ModelDirectory() {
+    for (const char *directory : {"target", "draft"})
+      std::filesystem::create_directory(path() / directory);
+    test::writeFile(path() / "model.json",
+                    R"({"version":1,"model":"mlx-community/Qwen3.8-27B-4bit",)"
+                    R"("target_format":"mlx-affine","vision_format":"none"})");
+    const std::filesystem::path configs = modelConfigs / "qwen3.8-27b";
+    std::filesystem::copy_file(configs / "config.json", path() / "config.json");
+    std::filesystem::copy_file(configs / "draft" / "config.json", path() / "draft" / "config.json");
+  }
+
+  [[nodiscard]] const std::filesystem::path &path() const noexcept {
+    return directory_.path();
+  }
+
+private:
+  test::TemporaryDirectory directory_{"splash-native-arguments"};
+};
+
+// The whole command line, after the executable's name.
+NativeArguments parseCommand(const std::vector<std::string> &arguments) {
+  std::vector<const char *> argv{"splash"};
+  for (const std::string &argument : arguments)
+    argv.push_back(argument.c_str());
+  return engine::parseNativeArguments(static_cast<int>(argv.size()),
+                                      argv.data());
+}
+
+// serve-native with the model directory and the arguments after it.
+NativeArguments parse(const ModelDirectory &model,
+                      const std::vector<std::string> &arguments) {
+  std::vector<std::string> command{"serve-native", model.path().string()};
+  command.insert(command.end(), arguments.begin(), arguments.end());
+  return parseCommand(command);
+}
+
+// Each golden line's arguments after MODEL_DIRECTORY, by its name; the serve
+// options between are the server's to read.
+std::map<std::string, std::vector<std::string>> readGolden(const char *path) {
+  std::ifstream file(path);
+  if (!file)
+    throw std::runtime_error(std::string("cannot read ") + path);
+  std::map<std::string, std::vector<std::string>> golden;
+  for (std::string line; std::getline(file, line);) {
+    if (line.empty() || line.front() == '#')
+      continue;
+    const size_t options = line.find('|');
+    const size_t arguments = line.find('|', options + 1);
+    if (arguments == std::string::npos)
+      throw std::runtime_error("golden line without its arguments: " + line);
+    std::string name;
+    std::istringstream(line.substr(0, options)) >> name;
+    std::istringstream words(line.substr(arguments + 1));
+    std::vector<std::string> values;
+    for (std::string word; words >> word;)
+      values.push_back(word);
+    golden.emplace(std::move(name), std::move(values));
+  }
+  return golden;
+}
+
+// Every line the server writes reads as the server means it: what the
+// engine reads with no options, with what the line changes and nothing else.
+void testServerCommandLines(const char *path) {
+  const ModelDirectory model;
+  constexpr uint64_t kGiB = uint64_t{1} << 30;
+  NativeArguments defaults;
+  defaults.modelRoot = std::filesystem::canonical(model.path());
+  using Change = std::function<void(NativeArguments &)>;
+  const std::map<std::string, Change> changes{
+      {"defaults", [](NativeArguments &) {}},
+      {"limits",
+       [](NativeArguments &read) {
+         read.maxContext = 102400;
+         read.maxMemoryBytes = 32 * kGiB;
+       }},
+      // No quota is the automatic one.
+      {"disk_auto", [](NativeArguments &) {}},
+      {"disk_off", [](NativeArguments &read) { read.maxCacheDisk = {}; }},
+      {"disk", [](NativeArguments &read) { read.maxCacheDisk = {.bytes = 5 * kGiB}; }},
+      {"disk_writes", [](NativeArguments &read) { read.maxCacheDiskWritesBytes = 200 * kGiB; }},
+      {"persistent_auto", [](NativeArguments &read) { read.persistentCache = true; }},
+      {"persistent",
+       [](NativeArguments &read) {
+         read.maxCacheDisk = {.bytes = 5 * kGiB};
+         read.persistentCache = true;
+       }},
+      {"persistent_dir",
+       [](NativeArguments &read) {
+         read.maxCacheDisk = {.bytes = 5 * kGiB};
+         read.persistentCache = true;
+         read.cacheRoot = "/srv/cache";
+       }},
+      {"bf16", [](NativeArguments &read) { read.kvFormat = kv::Format::BFloat16; }},
+      {"disk_bf16",
+       [](NativeArguments &read) {
+         read.maxCacheDisk = {.bytes = 5 * kGiB};
+         read.kvFormat = kv::Format::BFloat16;
+       }},
+      {"state_bf16",
+       [](NativeArguments &read) { read.stateFormat = ops::GdnStateFormat::BFloat16; }},
+      {"idle_release", [](NativeArguments &read) { read.idleReleaseSeconds = 1800.0; }},
+      {"idle_release_off",
+       [](NativeArguments &read) {
+         read.idleReleaseSeconds = std::numeric_limits<double>::infinity();
+       }},
+      {"decode_share",
+       [](NativeArguments &read) {
+         read.maxCacheDisk = {.bytes = 5 * kGiB};
+         read.decodeShare = 0.0;
+       }},
+      {"image_patches", [](NativeArguments &read) { read.maxImagePatches = 4096; }},
+      {"image_patches_rounded",
+       [](NativeArguments &read) { read.maxImagePatches = 3904; }},
+      // The server's default pixel limit is the engine's default limit of
+      // 4194304 / (16 x 16) patches, so the server leaves it out.
+      {"image_patches_default",
+       [](NativeArguments &read) { read.maxImagePatches = 16384; }},
+      {"idle_sleep", [](NativeArguments &read) { read.preventIdleSleep = false; }},
+      {"disable_ane", [](NativeArguments &read) { read.neuralEngine = false; }},
+      {"ane_ffn_share", [](NativeArguments &read) { read.aneFfnShare = 0.35; }},
+      {"ane_ffn_rows",
+       [](NativeArguments &read) {
+         read.aneFfnShare = 0.35;
+         read.aneFfnMinimumRows = 520;
+       }},
+      {"ane_ffn_gpu", [](NativeArguments &read) { read.aneFfnShare = 0.0; }},
+      // --disable-ane outranks a share, which the server then leaves out.
+      {"ane_ffn_disabled", [](NativeArguments &read) { read.neuralEngine = false; }},
+      {"prefill_full",
+       [](NativeArguments &read) {
+         read.prefillCommandMilliseconds = engine::kUnboundedPrefillCommand;
+       }},
+      {"prefill_bound", [](NativeArguments &read) { read.prefillCommandMilliseconds = 3000.0; }},
+      {"prefill_bound_command", [](NativeArguments &read) { read.prefillBoundPerBuffer = false; }},
+      {"activations_bf16", [](NativeArguments &read) { read.int8Activations = ops::Int8Activations::Off; }},
+      {"verify_rows_all", [](NativeArguments &read) { read.verifyRows = model::VerifyRows::All; }},
+      // The defaults the server leaves out are the engine's: each meaning
+      // names the value, so a change of the engine's default fails it.
+      {"verify_rows_auto", [](NativeArguments &read) { read.verifyRows = model::VerifyRows::Auto; }},
+      {"activations_auto", [](NativeArguments &read) { read.int8Activations = ops::Int8Activations::On; }},
+      {"kv_format_default", [](NativeArguments &read) { read.kvFormat = kv::Format::Int8; }},
+      {"state_format_default",
+       [](NativeArguments &read) { read.stateFormat = ops::GdnStateFormat::Float32; }},
+      {"cached_states_exact", [](NativeArguments &read) { read.exactCachedStates = true; }},
+      {"cached_states_default", [](NativeArguments &read) { read.exactCachedStates = false; }},
+      // A relaunch asks for the first engine's context beside that engine's
+      // MAX_CONTEXT: it is planned as that engine was, and serves what its
+      // plan holds of the context.
+      {"relaunch", [](NativeArguments &read) { read.relaunchContext = 61433; }},
+      {"relaunch_limits",
+       [](NativeArguments &read) {
+         read.maxContext = 102400;
+         read.relaunchContext = 61433;
+         read.maxMemoryBytes = 32 * kGiB;
+       }},
+      // Past the native window, YaRN by the context over it.
+      {"yarn",
+       [](NativeArguments &read) {
+         read.maxContext = 1000000;
+         read.model.ropeScaling = {3.814697265625, 262144};
+       }},
+      {"yarn_double",
+       [](NativeArguments &read) {
+         read.maxContext = 524288;
+         read.model.ropeScaling = {2.0, 262144};
+       }},
+      {"ple_memory", [](NativeArguments &read) { read.pleMemory = {StreamedSetting::Mode::Size, 2 * kGiB}; }},
+      {"ple_memory_off", [](NativeArguments &read) { read.pleMemory = {StreamedSetting::Mode::Off, 0}; }},
+      {"expert_memory",
+       [](NativeArguments &read) { read.expertMemory = {StreamedSetting::Mode::Size, 16 * kGiB}; }},
+      {"expert_memory_off", [](NativeArguments &read) { read.expertMemory = {StreamedSetting::Mode::Off, 0}; }},
+      // Auto is the engine's default, which the server leaves out.
+      {"expert_memory_auto", [](NativeArguments &) {}},
+      {"sparse_kv_memory", [](NativeArguments &read) { read.sparseKvMemory = 1200 * (kGiB >> 10); }},
+  };
+  // Every field but the model inspected from the directory, whose RoPE
+  // scaling MAX_CONTEXT sets.
+  const auto same = [](const NativeArguments &read, const NativeArguments &meant) {
+    return read.modelRoot == meant.modelRoot && read.maxContext == meant.maxContext &&
+           read.model.ropeScaling == meant.model.ropeScaling &&
+           read.relaunchContext == meant.relaunchContext &&
+           read.maxMemoryBytes == meant.maxMemoryBytes &&
+           read.maxCacheDisk.automatic == meant.maxCacheDisk.automatic &&
+           read.maxCacheDisk.bytes == meant.maxCacheDisk.bytes &&
+           read.maxCacheDiskWritesBytes == meant.maxCacheDiskWritesBytes &&
+           read.persistentCache == meant.persistentCache && read.cacheRoot == meant.cacheRoot &&
+           read.kvFormat == meant.kvFormat && read.stateFormat == meant.stateFormat &&
+           read.exactCachedStates == meant.exactCachedStates &&
+           read.decodeShare == meant.decodeShare &&
+           read.maxImagePatches == meant.maxImagePatches &&
+           read.idleReleaseSeconds == meant.idleReleaseSeconds &&
+           read.preventIdleSleep == meant.preventIdleSleep &&
+           read.neuralEngine == meant.neuralEngine && read.aneFfnShare == meant.aneFfnShare &&
+           read.aneFfnMinimumRows == meant.aneFfnMinimumRows &&
+           read.prefillCommandMilliseconds == meant.prefillCommandMilliseconds &&
+           read.prefillBoundPerBuffer == meant.prefillBoundPerBuffer && read.pleMemory == meant.pleMemory &&
+           read.expertMemory == meant.expertMemory && read.sparseKvMemory == meant.sparseKvMemory &&
+           read.kvSpillAlways == meant.kvSpillAlways && read.kvWindowTrim == meant.kvWindowTrim &&
+           read.verifyRows == meant.verifyRows && read.int8Activations == meant.int8Activations;
+  };
+  const auto golden = readGolden(path);
+  require(golden.size() == changes.size(),
+          "a golden command line has no meaning to check, or a meaning no line");
+  for (const auto &[name, arguments] : golden) {
+    const auto change = changes.find(name);
+    require(change != changes.end(), "the golden command line " + name + " has no meaning");
+    NativeArguments meant = defaults;
+    change->second(meant);
+    require(same(parse(model, arguments), meant),
+            "the engine did not read the server's " + name + " command line as "
+            "the server means it");
+  }
+}
+
+// The Neural Engine split is on unless --ane off turns it off; --ane on, which
+// the server never writes, keeps it on.
+void testNeuralEngine() {
+  const ModelDirectory model;
+  require(parse(model, {"auto", "auto"}).neuralEngine &&
+              parse(model, {"auto", "auto", "--ane", "on"}).neuralEngine &&
+              !parse(model, {"auto", "auto", "--ane", "off"}).neuralEngine,
+          "--ane did not reach the arguments as given");
+}
+
+// Activations may round to int8 unless --activations bf16 keeps them bf16;
+// --activations auto, which the server never writes, keeps the rule.
+void testInt8Activations() {
+  const ModelDirectory model;
+  require(parse(model, {"auto", "auto"}).int8Activations == ops::Int8Activations::On &&
+              parse(model, {"auto", "auto", "--activations", "auto"}).int8Activations == ops::Int8Activations::On &&
+              parse(model, {"auto", "auto", "--activations", "bf16"}).int8Activations == ops::Int8Activations::Off,
+          "--activations did not reach the arguments as given");
+}
+
+// --verify-rows auto, which the server never writes, is the engine's rule.
+void testVerifyRows() {
+  const ModelDirectory model;
+  require(parse(model, {"auto", "auto"}).verifyRows == model::VerifyRows::Auto &&
+              parse(model, {"auto", "auto", "--verify-rows", "auto"}).verifyRows == model::VerifyRows::Auto,
+          "--verify-rows auto was not the engine's rule");
+}
+
+// --contended-prefill-rows reaches the engine's contended floor as given, the
+// minimum included; without it the floor is zero, which the bootstrap resolves
+// to the GPU family's default (Scheduler::resolveContendedPrefillRows).
+void testContendedPrefillRows() {
+  const ModelDirectory model;
+  require(parse(model, {"auto", "auto"}).contendedPrefillRows == 0,
+          "a missing --contended-prefill-rows did not leave the family default");
+  for (const uint32_t rows : {64u, 256u})
+    require(parse(model, {"auto", "auto", "--contended-prefill-rows", std::to_string(rows)})
+                    .contendedPrefillRows == rows,
+            "--contended-prefill-rows did not reach the arguments as given");
+  rejects([&] {
+    static_cast<void>(parse(model, {"auto", "auto", "--contended-prefill-rows", "32"}));
+  },
+          "--contended-prefill-rows requires a power of two in [64, 2048]",
+          "an out-of-range --contended-prefill-rows did not name the valid range");
+}
+
+// The stores' memory is the planner's unless set, which the server writes
+// only for off or a size; --kv-spill always, which only validation passes,
+// spills every request of a target that can.
+void testStreamedMemoryAndSpill() {
+  const ModelDirectory model;
+  const NativeArguments automatic =
+      parse(model, {"auto", "auto", "--expert-memory", "auto", "--ple-memory", "auto", "--sparse-kv-memory", "auto"});
+  require(automatic.expertMemory == StreamedSetting{} && automatic.pleMemory == StreamedSetting{} &&
+              !automatic.sparseKvMemory && !automatic.kvSpillAlways,
+          "auto did not leave the stores to the planner");
+  require(parse(model, {"auto", "auto", "--kv-spill", "always"}).kvSpillAlways, "--kv-spill always was not read");
+}
+
+// A windowed target trims the pages every window has passed unless
+// --kv-window-trim off, which only validation passes, keeps them Full.
+void testWindowTrim() {
+  const ModelDirectory model;
+  require(parse(model, {"auto", "auto"}).kvWindowTrim &&
+              parse(model, {"auto", "auto", "--kv-window-trim", "on"}).kvWindowTrim &&
+              !parse(model, {"auto", "auto", "--kv-window-trim", "off"}).kvWindowTrim,
+          "--kv-window-trim did not reach the arguments as given");
+}
+
+// A command line the server never writes is refused with what is wrong.
+void testRefusals() {
+  const ModelDirectory model;
+  const auto refuses = [&](const std::vector<std::string> &arguments,
+                           std::string_view expected) {
+    rejects([&] { static_cast<void>(parse(model, arguments)); }, expected,
+            "the engine read a command line it must refuse");
+  };
+  refuses({"auto", "auto", "--kv-format", "fp16"},
+          "--kv-format requires int8 or bf16");
+  // An option's missing value fails its check.
+  refuses({"auto", "auto", "--kv-format"}, "--kv-format requires int8 or bf16");
+  refuses({"auto", "auto", "--state-format", "fp16"},
+          "--state-format requires fp32 or bf16");
+  refuses({"auto", "auto", "--state-format"}, "--state-format requires fp32 or bf16");
+  refuses({"auto", "auto", "--cached-states", "fp32"}, "--cached-states requires int8 or exact");
+  for (const char *share : {"-1", "nan", "inf", "half"})
+    refuses({"auto", "auto", "--decode-share", share},
+            "--decode-share requires a nonnegative number");
+  for (const char *patches : {"0", "6", "16388"})
+    refuses({"auto", "auto", "--max-image-patches", patches},
+            "--max-image-patches requires a positive multiple of 4");
+  // The server passes seconds: a duration's unit is its to resolve.
+  for (const char *release : {"0", "-1", "30m", "inf"})
+    refuses({"auto", "auto", "--idle-release", release},
+            "--idle-release requires off or a positive number of seconds");
+  refuses({"auto", "auto", "--idle-sleep", "never"},
+          "--idle-sleep requires prevent or allow");
+  refuses({"auto", "auto", "--ane", "gpu"}, "--ane requires on or off");
+  for (const char *rows : {"0", "32", "96", "rows", ""})
+    refuses({"auto", "auto", "--contended-prefill-rows", rows},
+            "--contended-prefill-rows requires a power of two in [64, ");
+  for (const char *share : {"1", "-0.1", "nan", "inf", "half", ""})
+    refuses({"auto", "auto", "--ane-ffn-share", share}, "--ane-ffn-share requires a share in [0, 1)");
+  for (const char *rows : {"0", "-1", "1.5", "rows"})
+    refuses({"auto", "auto", "--ane-ffn-share", "0.35", "--ane-ffn-minimum-rows", rows},
+            "--ane-ffn-minimum-rows requires a positive row count");
+  refuses({"auto", "auto", "--ane-ffn-minimum-rows", "520"},
+          "--ane-ffn-minimum-rows requires --ane-ffn-share");
+  refuses({"auto", "auto", "--ane", "off", "--ane-ffn-share", "0.35"},
+          "--ane-ffn-share requires --ane on");
+  for (const char *value : {"on", "off", "BF16", ""})
+    refuses({"auto", "auto", "--activations", value}, "--activations requires auto or bf16");
+  for (const char *rows : {"budget", "every", "ALL", ""})
+    refuses({"auto", "auto", "--verify-rows", rows}, "--verify-rows requires auto or all");
+  // The server passes bytes, auto or off.
+  for (const char *size : {"0", "2G", "OFF", ""})
+    refuses({"auto", "auto", "--ple-memory", size}, "--ple-memory requires a positive byte count, auto or off");
+  for (const char *size : {"0", "16G", "Auto", ""})
+    refuses({"auto", "auto", "--expert-memory", size},
+            "--expert-memory requires a positive byte count, auto or off");
+  for (const char *size : {"0", "off", "1200M", ""})
+    refuses({"auto", "auto", "--sparse-kv-memory", size}, "--sparse-kv-memory requires a positive byte count or auto");
+  for (const char *spill : {"never", "auto", ""})
+    refuses({"auto", "auto", "--kv-spill", spill}, "--kv-spill requires always");
+  for (const char *trim : {"never", "auto", ""})
+    refuses({"auto", "auto", "--kv-window-trim", trim}, "--kv-window-trim requires on or off");
+  refuses({"auto", "auto", "--persistent-cache", "yes"}, "--persistent-cache requires on or off");
+  refuses({"auto", "auto", "0", "--persistent-cache", "on"},
+          "--persistent-cache requires an SSD cache, which MAX_CACHE_DISK_BYTES 0 turns off");
+  refuses({"auto", "auto", "5368709120", "--cache-dir", "/srv/cache"},
+          "--cache-dir requires --persistent-cache on");
+  refuses({"auto", "auto", "5368709120", "--persistent-cache", "on", "--cache-dir", ""},
+          "--cache-dir requires a directory");
+  refuses({"auto", "auto", "5G"},
+          "MAX_CACHE_DISK_BYTES must be a nonnegative integer");
+  for (const char *writes : {"200G", "-1", "1.5", ""})
+    refuses({"auto", "auto", "5368709120", "--max-cache-disk-writes", writes},
+            "--max-cache-disk-writes requires a nonnegative integer byte count");
+  refuses({"auto", "auto", "0", "--max-cache-disk-writes", "214748364800"},
+          "--max-cache-disk-writes requires an SSD cache, which MAX_CACHE_DISK_BYTES 0 turns off");
+  require(parse(model, {"auto", "auto", "5368709120", "--max-cache-disk-writes", "0"})
+                  .maxCacheDiskWritesBytes == 0,
+          "--max-cache-disk-writes 0 set a write budget");
+  refuses({"auto", "auto", "--max-memory", "32G"},
+          "unexpected argument --max-memory");
+  for (const char *memory : {"0", "32G", "-1"})
+    refuses({"auto", memory}, "MAX_MEMORY_BYTES must be auto or a positive integer");
+  // MAX_CONTEXT serves the model as it is up to its native window, and past
+  // it with YaRN by the context over the native window, up to the 1,010,000
+  // tokens Qwen validates.
+  const std::string maximum = std::to_string(
+      model::inspectModelRoot(model.path()).capabilities.maximumContextTokens);
+  for (const char *context : {"0", "-1", "100K", "1M", ""})
+    refuses({context, "auto"}, "MAX_CONTEXT must be auto or a positive integer");
+  refuses({"1010001", "auto"}, "MAX_CONTEXT: Qwen3.8-27B serves at most 1010000 tokens of context");
+  const NativeArguments native = parse(model, {maximum, "auto"});
+  require(native.maxContext == 262144 && !native.model.ropeScaling.yarn() &&
+              native.model.capabilities.maximumContextTokens == 262144,
+          "the native window was not served as it is");
+  for (const auto [context, factor] : {std::pair{262'145U, 1.000003814697265625}, {524'288U, 2.0},
+                                       {1'000'000U, 3.814697265625}, {1'010'000U, 3.85284423828125}}) {
+    const NativeArguments stretched = parse(model, {std::to_string(context), "auto"});
+    require(stretched.maxContext == context && stretched.model.capabilities.maximumContextTokens == context &&
+                stretched.model.ropeScaling == model::RopeScaling{factor, 262144},
+            "MAX_CONTEXT " + std::to_string(context) + " was not served with YaRN by its ratio to the native window");
+  }
+  // A relaunch's context is one its first engine served: at most MAX_CONTEXT,
+  // and without it at most the model holds; auto never serves it with YaRN.
+  for (const std::string &context : {std::string("0"), std::string("auto"), std::string("100K"),
+                                     std::to_string(std::stoull(maximum) + 1), std::string()})
+    refuses({"auto", "auto", "--relaunch-context", context},
+            "--relaunch-context requires an integer in [1, " + maximum + "]");
+  refuses({"auto", "auto", "--relaunch-context"},
+          "--relaunch-context requires an integer in [1, " + maximum + "]");
+  refuses({"102400", "auto", "--relaunch-context", "102401"},
+          "--relaunch-context requires an integer in [1, 102400]");
+  require(parse(model, {"auto", "auto", "--relaunch-context", maximum}).relaunchContext ==
+              std::stoul(maximum),
+          "the model's whole context was refused a relaunch");
+
+  const auto commandRefused = [](const std::vector<std::string> &command,
+                                 std::string_view expected) {
+    rejects([&] { static_cast<void>(parseCommand(command)); }, expected,
+            "the engine ran a command it must refuse");
+  };
+  commandRefused({"serve-native", model.path().string(), "auto"},
+                 "serve-native requires MODEL_DIRECTORY, MAX_CONTEXT and MAX_MEMORY_BYTES");
+  commandRefused({"serve-native", (model.path() / "missing").string(), "auto", "auto"},
+                 "MODEL_DIRECTORY must name an existing directory");
+  const test::TemporaryDirectory empty("splash-native-arguments-empty");
+  commandRefused({"serve-native", empty.path().string(), "auto", "auto"},
+                 "MODEL_DIRECTORY must hold the model's target/ and draft/ directories");
+}
+
+} // namespace
+
+// A relaunch of a server started with --max-context keeps it as MAX_CONTEXT
+// beside the first engine's context, so that it is planned as that engine
+// was (RuntimeResources::create) and serves the model as that engine did,
+// with YaRN past the native window.
+void testARelaunchKeepsItsFirstEnginesMaxContext() {
+  const ModelDirectory model;
+  const NativeArguments relaunch = parse(model, {"1000000", "auto", "--relaunch-context", "1000000"});
+  require(relaunch.maxContext == 1'000'000 && relaunch.relaunchContext == 1'000'000 &&
+              relaunch.model.ropeScaling == model::RopeScaling{3.814697265625, 262144} &&
+              relaunch.model.capabilities.maximumContextTokens == 1'000'000,
+          "a relaunch of a --max-context past the native window lost it or its YaRN");
+  const NativeArguments native = parse(model, {"102400", "auto", "--relaunch-context", "102400"});
+  require(native.maxContext == 102400 && native.relaunchContext == 102400 && !native.model.ropeScaling.yarn(),
+          "a relaunch of a --max-context within the native window lost it, or was served with YaRN");
+}
+
+int main(int argc, char **argv) {
+  if (argc != 3) {
+    std::cerr << "usage: " << argv[0] << " native_command_golden.txt MODEL_CONFIGS\n";
+    return 2;
+  }
+  modelConfigs = argv[2];
+  try {
+    testServerCommandLines(argv[1]);
+    testNeuralEngine();
+    testInt8Activations();
+    testVerifyRows();
+    testContendedPrefillRows();
+    testStreamedMemoryAndSpill();
+    testWindowTrim();
+    testRefusals();
+    testARelaunchKeepsItsFirstEnginesMaxContext();
+    std::cout << "native arguments tests passed\n";
+    return EXIT_SUCCESS;
+  } catch (const std::exception &error) {
+    std::cerr << "native arguments tests failed: " << error.what() << '\n';
+    return EXIT_FAILURE;
+  }
+}

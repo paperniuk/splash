@@ -1,28 +1,78 @@
 #pragma once
 
 #include "metal/MetalBackend.hpp"
+#include "metal/abi/QuantFormat.h"
 
 #include <compare>
+#include <cstddef>
 #include <cstdint>
+#include <initializer_list>
 #include <stdexcept>
 #include <utility>
-#include <variant>
 #include <vector>
-
-struct QuantFormat;
 
 namespace splash::ops {
 
-// Physical layout, independent of the checkpoint container and compute tile.
-enum class WeightLayout : uint8_t { Affine64, Block32 };
+// How selection classes a weight unit's quantized segments together (a
+// projection or a gate/up pair; FormatClassifier):
+// GridLookup when every segment's register-tile operands come from grid
+// lookups (IQ3_XXS, the IQ2 formats, IQ1); GridLookupOrQ2K when every one is
+// GridLookup or Q2_K, at least one Q2_K; otherwise FourBitsOrMore when every
+// one has at least four bits per weight (quant_four_bits) or none is
+// quantized; otherwise UnderFourBits.
+enum class FormatClass : uint8_t { GridLookup, GridLookupOrQ2K, UnderFourBits, FourBitsOrMore };
+inline constexpr size_t kFormatClasses = 4;
+
+// The FormatClass of the quantized segments' formats it is given.
+class FormatClassifier final {
+public:
+  constexpr void add(uint32_t format) noexcept {
+    grid_ &= gridLookup(format) || format == GGUF_FMT_Q2K;
+    q2k_ |= format == GGUF_FMT_Q2K;
+    fourBits_ &= quant_four_bits(format);
+    any_ = true;
+  }
+  [[nodiscard]] constexpr FormatClass formatClass() const noexcept {
+    if (any_ && grid_) return q2k_ ? FormatClass::GridLookupOrQ2K : FormatClass::GridLookup;
+    return fourBits_ ? FormatClass::FourBitsOrMore : FormatClass::UnderFourBits;
+  }
+
+private:
+  [[nodiscard]] static constexpr bool gridLookup(uint32_t format) noexcept {
+    switch (format) {
+    case GGUF_FMT_IQ3XXS: case GGUF_FMT_IQ2XXS: case GGUF_FMT_IQ2XS: case GGUF_FMT_IQ2S:
+    case GGUF_FMT_IQ1S: case GGUF_FMT_IQ1M: return true;
+    default: return false;
+    }
+  }
+  bool grid_ = true, q2k_ = false, fourBits_ = true, any_ = false;
+};
 
 struct ProjectionShape final {
   uint32_t outputSize = 0;
   uint32_t inputSize = 0;
-  WeightLayout layout = WeightLayout::Affine64;
   // Its quantized segments multiply the rotated input (InputRotation), which
   // takes LinearScratch::rotated.
   bool rotated = false;
+  // The Apple9 register tile takes all its quantized segments
+  // (quant_register_tensor); a projection with one it does not take stages
+  // whatever its rows (Linear::storageRows, scratchSize).
+  bool registerFormats = true;
+  // The FormatClass of its quantized segments, whose RegisterBoundary row
+  // bounds the register tile (Linear::storageRows).
+  FormatClass formatClass = FormatClass::FourBitsOrMore;
+  // The bits per weight its quantized segments store together, its float
+  // ones aside, in sixteenths, rounded down; 0 where it has none or they are
+  // unknown, which Apple10's staged split law takes for the most a format
+  // stores as it weighs a split's partials against the weights. The bits,
+  // with the wave law from 4.5, decide whether a plan of one table tile of
+  // rows runs the 16-row tile, never at 0 (KernelSelection.cpp).
+  uint32_t weightBits16 = 0;
+  // The int8 prefill tile takes all its quantized segments
+  // (quant_prefill_int8_format), of which it has one at least; a shape that
+  // names no formats bounds a projection the tile takes
+  // (Linear::scratchSize).
+  bool prefillInt8Formats = true;
   auto operator<=>(const ProjectionShape &) const = default;
 };
 
@@ -43,48 +93,37 @@ enum class FloatOutput : uint8_t { BFloat16, Float32 };
   return type == FloatOutput::Float32 ? sizeof(float) : sizeof(uint16_t);
 }
 
-struct AffineWeights final {
-  metal::MetalBuffer weights;
-  metal::MetalBuffer scales;
-  metal::MetalBuffer biases;
-};
-
-// A Q8 affine projection, quantized per 64 inputs in StorageN=256 order: the
-// MoE router and the shared expert's scalar gate.
-struct Q8Projection final {
-  AffineWeights planes;
-  uint32_t outputSize = 0;
-  uint32_t inputSize = 0;
-};
-
-// An expert-major Q4 slab holding one complete StorageN-packed projection per
-// expert, expertStrideBytes apart: the operator selects an expert by its
-// offset, so no per-expert buffer or copy exists at run time.
-struct ExpertProjection final {
-  metal::MetalBuffer packed;
-  uint32_t experts = 0;
-  uint32_t outputSize = 0;
-  uint32_t inputSize = 0;
-  uint64_t expertStrideBytes = 0;
-};
-
-// A prepared GGUF tensor occupying a projection's output columns
-// [columnOffset, columnOffset + outputSize): repacked planes in the GGUF_FMT_*
-// format formatId (metal/abi/QuantFormat.h), or a float tensor the GGUF keeps
-// unquantized (F32, as llama.cpp keeps the MoE router), whose plane0 holds
-// [outputSize][inputSize] floats multiplied unrounded in fp32
-// (kernels/shared/gguf_float.metal). The source container is not part of it.
+// A prepared tensor occupying a projection's output columns
+// [columnOffset, columnOffset + outputSize), in one of two layouts. Planes:
+// repacked planes in the GGUF_FMT_* format formatId (metal/abi/QuantFormat.h),
+// which the block tiles read. Rows: the tensor's rows as stored, a row of
+// inputSize values per output column in plane0, which the float projection
+// multiplies unrounded in fp32 (kernels/shared/gguf_float.metal): F32 values
+// (formatId kFloat32, which no GGUF_FMT_* format names) or BF16 values
+// (GGUF_FMT_BF16), as a GGUF keeps a tensor unquantized, or a quantized
+// format's native blocks, each value the fp32 its decode gives, as the token
+// gather decodes it. A segment of rows is a float segment (isFloat); the MoE
+// router is one, in the format its checkpoint holds it. The source container
+// is not part of it.
 struct QuantizedSegment final {
-  // The formatId of a float segment.
+  // The formatId of F32 rows.
   static constexpr uint32_t kFloat32 = 0xffffffff;
+  enum class Layout : uint8_t { Planes, Rows };
 
   [[nodiscard]] static QuantizedSegment planes(uint32_t formatId, uint32_t outputSize, uint32_t inputSize,
                                                metal::MetalBuffer plane0, metal::MetalBuffer plane1,
                                                metal::MetalBuffer meta);
-  [[nodiscard]] static QuantizedSegment floats(uint32_t outputSize, uint32_t inputSize,
-                                               metal::MetalBuffer values) {
-    return {std::move(values), {}, {}, outputSize, inputSize, 0, kFloat32};
+  // Rows of F32 or BF16 values or of a quantized format's native blocks,
+  // whole ones each (rowBytes); throws for F16 and any other formatId.
+  [[nodiscard]] static QuantizedSegment rows(uint32_t formatId, uint32_t outputSize, uint32_t inputSize,
+                                             metal::MetalBuffer rows);
+  // Rows of F32 values.
+  [[nodiscard]] static QuantizedSegment floats(uint32_t outputSize, uint32_t inputSize, metal::MetalBuffer values) {
+    return rows(kFloat32, outputSize, inputSize, std::move(values));
   }
+  // The bytes of a row of `inputSize` values in formatId's rows; 0 for a
+  // formatId that has none, or a row of a partial native block.
+  [[nodiscard]] static uint64_t rowBytes(uint32_t formatId, uint32_t inputSize) noexcept;
 
   metal::MetalBuffer plane0;
   metal::MetalBuffer plane1;
@@ -93,11 +132,17 @@ struct QuantizedSegment final {
   uint32_t inputSize = 0;
   uint32_t columnOffset = 0;
   uint32_t formatId = kFloat32;
+  Layout layout = Layout::Rows;
 
-  [[nodiscard]] bool isFloat() const noexcept { return formatId == kFloat32; }
-  // The plane geometry of a quantized segment.
+  [[nodiscard]] bool isFloat() const noexcept { return layout == Layout::Rows; }
+  // Rows of a quantized format, which the float projection decodes.
+  [[nodiscard]] bool quantizedRows() const noexcept {
+    return isFloat() && formatId != kFloat32 && formatId != GGUF_FMT_BF16;
+  }
+  // The plane geometry or native block of a GGUF_FMT_* format.
   [[nodiscard]] const QuantFormat &format() const noexcept;
-  // The kernel name suffix of its format ("f32" for a float segment).
+  // The kernel name suffix of its format: its kQuantFormats name, "f32" for
+  // F32 rows.
   [[nodiscard]] const char *name() const noexcept;
   // The buffer bound in plane1's slot: a format without a second plane binds
   // its meta plane there, which its kernels never read as plane1.
@@ -108,88 +153,110 @@ struct BlockWeights final {
   std::vector<QuantizedSegment> segments;
 };
 
-// Immutable weights in one of the two layouts: Affine holds the Affine64
-// form, Block the Block32 form, and layout() names the one held. Projections,
-// token tables and MoE blocks share this pattern; the accessor of the layout
-// not held throws std::bad_variant_access. A default value holds empty affine
-// weights, which a reader replaces.
-template <class Affine, class Block>
-class LayoutWeights {
-public:
-  LayoutWeights() = default;
-  LayoutWeights(Affine weights) : storage_(std::move(weights)) {}
-  LayoutWeights(Block weights) : storage_(std::move(weights)) {}
-
-  [[nodiscard]] WeightLayout layout() const noexcept {
-    return std::visit([](const auto &weights) { return layoutOf(weights); }, storage_);
-  }
-  [[nodiscard]] const Affine &affine() const { return std::get<Affine>(storage_); }
-  [[nodiscard]] const Block &blocks() const { return std::get<Block>(storage_); }
-
-private:
-  // One layout per alternative: an alternative without one does not compile.
-  static constexpr WeightLayout layoutOf(const Affine &) noexcept { return WeightLayout::Affine64; }
-  static constexpr WeightLayout layoutOf(const Block &) noexcept { return WeightLayout::Block32; }
-
-  std::variant<Affine, Block> storage_;
-};
-
-// A projection of outputSize x inputSize. A block projection's segments tile
-// its leading output columns in order: each takes every input and starts
-// where the previous one ends; the columns past the last are padding.
-class Projection final : public LayoutWeights<AffineWeights, BlockWeights> {
+// A projection of outputSize x inputSize. Its segments tile its leading
+// output columns in order: each takes every input and starts where the
+// previous one ends; the columns past the last are padding. A default value
+// holds no segments, which a reader replaces.
+class Projection final {
 public:
   Projection() = default;
-  Projection(uint32_t output, uint32_t input, AffineWeights weights)
-      : LayoutWeights(std::move(weights)), outputSize(output), inputSize(input) {}
   Projection(uint32_t output, uint32_t input, BlockWeights weights)
-      : LayoutWeights(std::move(weights)), outputSize(output), inputSize(input) {
-    if (blocks().segments.empty()) throw std::invalid_argument("block projection has no segments");
+      : outputSize(output), inputSize(input), weights_(std::move(weights)) {
+    if (weights_.segments.empty()) throw std::invalid_argument("block projection has no segments");
     uint32_t covered = 0;
-    for (const QuantizedSegment &s : blocks().segments) {
+    for (const QuantizedSegment &s : weights_.segments) {
       if (s.inputSize != input || s.columnOffset != covered || !s.outputSize || s.outputSize > output - covered)
         throw std::invalid_argument("block segments do not tile the projection");
       covered += s.outputSize;
     }
   }
 
+  [[nodiscard]] const BlockWeights &blocks() const noexcept { return weights_; }
   [[nodiscard]] ProjectionShape shape() const noexcept {
-    return {outputSize, inputSize, layout(), static_cast<bool>(rotation)};
+    bool registerFormats = true, prefillInt8Formats = true;
+    FormatClassifier classes;
+    // The quantized segments' weights and the bytes of their native blocks.
+    uint64_t weights = 0, bytes = 0;
+    for (const QuantizedSegment &s : weights_.segments) {
+      registerFormats &= s.isFloat() || quant_register_tensor(s.formatId, s.inputSize);
+      if (s.isFloat()) continue;
+      prefillInt8Formats &= quant_prefill_int8_format(s.formatId);
+      classes.add(s.formatId);
+      const uint64_t n = uint64_t{s.outputSize} * s.inputSize;
+      weights += n;
+      bytes += n * s.format().block_bytes / s.format().block_elements;
+    }
+    return {outputSize, inputSize, static_cast<bool>(rotation), registerFormats, classes.formatClass(),
+            weights ? uint32_t(128 * bytes / weights) : 0, weights && prefillInt8Formats};
   }
+
+  // Rows [first, first + count) of a projection's weights.
+  struct RowRange final {
+    uint32_t first = 0;
+    uint32_t count = 0;
+  };
+  // Views of a projection of one tensor (Linear.cpp): over the rows of
+  // `ranges`, whole QUANT_TILE_ROWS tiles of them (an empty range holds
+  // none), which become its output columns in order and multiply its input,
+  // rotation and destination as it does; or, of an unrotated quantized
+  // tensor, over the leading `inputs` inputs of each of its rows, whole quant
+  // groups and meta units, which reads its planes as they are (planeInputs()).
+  [[nodiscard]] Projection rows(const metal::MetalBackend &backend, std::initializer_list<RowRange> ranges) const;
+  [[nodiscard]] Projection leadingInputs(uint32_t inputs) const;
+  // Whether the view of leading inputs takes it: its own planes, not a view,
+  // of one unrotated quantized tensor.
+  [[nodiscard]] bool takesPlaneViews() const noexcept;
+  // The inputs each row of the weight planes holds when the projection reads
+  // only their first inputSize, a view of leadingInputs(); zero for
+  // inputSize. Only the prefill residual tiles of quantized weights take such
+  // a view, on kernel instances of their own (Linear::add).
+  [[nodiscard]] uint32_t planeInputs() const noexcept { return planeInputs_; }
 
   uint32_t outputSize = 0;
   uint32_t inputSize = 0;
   // fp32 only for plain decode plans (Linear::plan), which keep the tile of
   // the bf16 plan.
   FloatOutput destination = FloatOutput::BFloat16;
-  // Block projections only.
   InputRotation rotation;
+
+private:
+  BlockWeights weights_;
+  uint32_t planeInputs_ = 0;
 };
 
-// A token table's rows as the GGUF stores them, in a gguf_embedding_format
-// (metal/abi/Gguf.h), gathered, never multiplied (Embedding.cpp).
-struct NativeRows final {
-  NativeRows(metal::MetalBuffer rows, uint32_t formatId);
+// A token table's rows as stored, gathered, never multiplied (Embedding.cpp):
+// whole native blocks of a GGUF format (metal/abi/QuantFormat.h), or BF16 or
+// F16 values at any width (quant_stored_row_bytes), which a GGUF or a
+// safetensors checkpoint may keep unquantized. A default value holds no rows,
+// which a reader replaces.
+struct StoredRows final {
+  StoredRows() = default;
+  // Rows of a GGUF_FMT_*; throws for any other formatId.
+  StoredRows(metal::MetalBuffer rows, uint32_t formatId);
   metal::MetalBuffer rows;
-  uint32_t formatId;
-  [[nodiscard]] const char *name() const noexcept;
+  uint32_t formatId = 0;
+  // Its format's native block and kernel name suffix.
+  [[nodiscard]] const QuantFormat &format() const noexcept;
 };
 
 // A token table of outputSize rows of inputSize values, which Embedding
-// gathers: affine Q4 rows or native GGUF rows. It is intentionally a separate
-// type: no table may be bound as a projection.
-class EmbeddingWeights final : public LayoutWeights<AffineWeights, NativeRows> {
+// gathers. It is intentionally a separate type: no table may be bound as a
+// projection.
+class EmbeddingWeights final {
 public:
   EmbeddingWeights() = default;
-  EmbeddingWeights(uint32_t output, uint32_t input, AffineWeights weights)
-      : LayoutWeights(std::move(weights)), outputSize(output), inputSize(input) {}
-  EmbeddingWeights(uint32_t output, uint32_t input, NativeRows rows)
-      : LayoutWeights(std::move(rows)), outputSize(output), inputSize(input) {}
+  EmbeddingWeights(uint32_t output, uint32_t input, StoredRows rows)
+      : outputSize(output), inputSize(input), rows_(std::move(rows)) {}
+
+  [[nodiscard]] const StoredRows &rows() const noexcept { return rows_; }
 
   uint32_t outputSize = 0;
   uint32_t inputSize = 0;
-  // Native rows stored rotated, gathered as D (H r) (InputRotation).
+  // Rows stored rotated, gathered as D (H r) (InputRotation).
   InputRotation rotation;
+
+private:
+  StoredRows rows_;
 };
 
 } // namespace splash::ops

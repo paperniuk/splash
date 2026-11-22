@@ -3,8 +3,8 @@
 using namespace metal;
 
 // The 8x8 simdgroup_matrix MMA on operands held in plain registers, shared by
-// the register matrix kernels (decode/linear_q4_sgmatrix.metal,
-// decode/linear_gguf_sgmatrix.metal, shared/gguf_float.metal).
+// the register matrix kernels (decode/linear_gguf_sgmatrix.metal,
+// shared/gguf_float.metal).
 namespace sgmatrix {
 // simdgroup_matrix lane -> element mapping (verified by the driver's probe):
 // a lane's thread_elements() are M[fm][fn] and M[fm][fn + 1].
@@ -34,6 +34,20 @@ template <typename T>
 __attribute__((always_inline)) inline void
 mma_acc(thread float2 &c, vec<T, 2> a, vec<T, 2> b) {
   simdgroup_matrix<T, 8, 8> A, B;
+  simdgroup_matrix<float, 8, 8> C, D;
+  te(A) = a;
+  te(B) = b;
+  te(C) = c;
+  simdgroup_multiply_accumulate(D, A, B, C);
+  c = te(D);
+}
+// The same MMA with operands of two types: Apple7/8 (M1/M2), which have no bf16 arithmetic, take exact half or fp32
+// weights against fp32 activations.
+template <typename TA, typename TB>
+__attribute__((always_inline)) inline void
+mma_mixed(thread float2 &c, vec<TA, 2> a, vec<TB, 2> b) {
+  simdgroup_matrix<TA, 8, 8> A;
+  simdgroup_matrix<TB, 8, 8> B;
   simdgroup_matrix<float, 8, 8> C, D;
   te(A) = a;
   te(B) = b;

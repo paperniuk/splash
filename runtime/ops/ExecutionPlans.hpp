@@ -1,137 +1,93 @@
 #pragma once
 
 #include "ops/DraftAttention.hpp"
+#include "ops/KernelSelection.hpp"
 #include "ops/Linear.hpp"
 #include "ops/MoE.hpp"
 #include "ops/PagedAttention.hpp"
 
-#include <array>
-#include <compare>
+#include <cstdint>
+#include <optional>
 #include <span>
+#include <utility>
 #include <vector>
 
 namespace splash::ops {
 
-struct AttentionShape final {
-  uint32_t queryHeads = 0;
-  uint32_t kvHeads = 0;
-  uint32_t headDimension = 0;
-  kv::Format format = kv::Format::Int8;
-  auto operator<=>(const AttentionShape &) const = default;
-};
-
-// A startup-selected precompiled configuration applies only to this exact row
-// count. Histories are calibrated empirically, not encoded into serving keys.
-struct PrefillAttentionPolicy final {
-  AttentionShape shape;
-  uint32_t rows = SPLASH_PREFILL_TOKEN_BUDGET;
-  auto operator<=>(const PrefillAttentionPolicy &) const = default;
-};
-
-struct VerifyAttentionPolicy final {
-  AttentionShape shape;
-  uint32_t lanes = 0;
-  auto operator<=>(const VerifyAttentionPolicy &) const = default;
-};
-
-struct DraftAttentionWorkload final {
-  DraftAttentionShape shape;
-  uint32_t lanes = 0;
-  auto operator<=>(const DraftAttentionWorkload &) const = default;
-};
-
-struct MoeWorkload final {
-  MoeShape shape;
-  // Physical rows in both phases: decode uses 8, 16, 24 or 32.
-  uint32_t rows = 0;
-  MoePhase phase = MoePhase::Decode;
-  auto operator<=>(const MoeWorkload &) const = default;
-};
-
-struct PrefillAttentionChoice final {
-  PrefillAttentionPolicy workload;
-  PrefillAttentionConfig configuration;
-};
-struct VerifyAttentionChoice final {
-  VerifyAttentionPolicy workload;
-  VerifyAttentionConfig configuration;
-};
-struct DraftAttentionChoice final {
-  DraftAttentionWorkload workload;
-  DraftAttentionConfiguration configuration;
-};
-struct MoeChoice final {
-  MoeWorkload workload;
-  MoeConfig configuration;
-};
-
-struct OperatorChoices final {
-  std::vector<LinearChoice> linear;
-  std::vector<PrefillAttentionChoice> prefillAttention;
-  std::vector<VerifyAttentionChoice> verifyAttention;
-  std::vector<DraftAttentionChoice> draftAttention;
-  std::vector<MoeChoice> moe;
-
-  [[nodiscard]] bool empty() const noexcept {
-    return linear.empty() && prefillAttention.empty() && verifyAttention.empty() &&
-           draftAttention.empty() && moe.empty();
-  }
-};
-
-// One runtime owns this object; production models borrow it. Installation is
-// a startup-only operation, before concurrent encoding. Arena sizing precedes
-// confirmation; those trials may only toggle the preallocated baseline/selected
-// pair. After Ready the owner and all borrowed plans remain immutable.
+// The device's plans of every operator a model runs, at the runtime's
+// Int8Activations, which its Linear holds and its attention plans read too.
+// One runtime owns this object and production models borrow it; it never
+// changes after creation.
 class ExecutionPlans final {
 public:
-  explicit ExecutionPlans(const DeviceCapabilities &device);
+  explicit ExecutionPlans(const DeviceCapabilities &device, Int8Activations int8Activations);
   [[nodiscard]] const Linear &linear() const noexcept { return linear_; }
-  // Validate every table before replacing any installed choice. Missing keys
-  // always use the operator's shipped baseline; an empty install resets all.
-  void install(const OperatorChoices &choices);
+  // A DFlash2 draft's plans: linear()'s in bf16 activations
+  // (Int8Activations::Off), so no prefill chunk runs the int8 prefill tile.
+  // The draft's prefill gains nothing from it, while its context projection,
+  // the widest a prefill runs, would size the tile's scratch: 38 MB on
+  // Qwen3.6-35B-A3B GGUF, whose own projections never take the tile.
+  [[nodiscard]] const Linear &draftLinear() const noexcept { return draftLinear_; }
+  [[nodiscard]] const KernelCalibration &calibration() const noexcept { return linear_.calibration(); }
+  [[nodiscard]] AttentionTile attentionTile() const noexcept { return attentionTile_; }
+  // Whether an injecting hyper-connection norm of `rows` rows runs the staged
+  // kernel (ops::HyperConnection::addNorm).
+  [[nodiscard]] bool hyperNormStaged(uint32_t rows) const noexcept;
+  // The fewest rows of each class of prefill chunk whose projections run
+  // kernels of their own: each staged tile height a chunk takes, and the
+  // prefill tile (ExecutionPlans.cpp). Startup warmup runs a chunk of each and
+  // one of the most rows; kernel-selection checks that they select every
+  // projection, float and MoE tile a chunk of any rows selects, and its
+  // prefill attention after each history it plans.
+  [[nodiscard]] std::vector<uint32_t> prefillRowClasses() const;
+  // The fewest rows of each class of decode step of up to `mostRows` rows,
+  // at most a verify block a lane, whose kernels it picks by its rows: its
+  // projections' tile and staged height, as prefillRowClasses walks them, a
+  // float projection's tile (selectFloatTile), and a MoE target's expert
+  // tile (selectMoe) where `moe` names its blocks' shape and router format.
+  // A decode step's attention and GDN kernels follow its lane cap, not its
+  // rows; its norms and heads follow its projections' plans. The choice of a
+  // cycle's rows prices a class by a step of its last rows
+  // (model::StepCosts), and the start creates that step's kernels alone, so
+  // a class holds no kernel change; kernel-selection checks the tiles and
+  // heights that would.
+  [[nodiscard]] std::vector<uint32_t> decodeRowClasses(uint32_t mostRows,
+                                                       std::optional<std::pair<MoeShape, uint32_t>> moe) const;
 
-  [[nodiscard]] PrefillAttentionPlan prefillAttention(
-      uint32_t rows, uint32_t queryHeads, kv::Layout layout,
-      uint32_t historyTokens) const;
-  [[nodiscard]] VerifyAttentionPlan verifyAttention(
-      uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
-      std::span<const uint32_t> historyTokens) const;
+  // The attention of a command's sequences (PagedAttention::plan) whose
+  // dispatches fit `capacity`, the workspace bound to it.
+  [[nodiscard]] AttentionPlan attention(std::span<const kv::ChunkedPrefillParams> sequences, uint32_t queryHeads,
+                                        kv::Layout layout, AttentionWorkspace capacity,
+                                        AttentionVariant variant = {}) const;
   [[nodiscard]] DraftAttentionPlan draftAttention(
       DraftAttentionShape shape, uint32_t lanes) const;
-  [[nodiscard]] MoePlan moePrefill(MoeShape shape, uint32_t rows) const;
-  [[nodiscard]] MoePlan moeDecode(MoeShape shape, uint32_t lanes) const;
-  // Shipped baseline first, independent of installed choices. Every candidate
-  // uses the same device router and expert-tile policy as production lookups
-  // and encoding; a GGUF workload's two are its device plan.
-  [[nodiscard]] std::array<MoePlan, 2> moeCandidates(const MoeWorkload &workload) const;
+  // The plan of a step of `rows` rows of a MoE target's blocks, whose
+  // routers are in `routerFormat` (moeRouterFormat).
+  [[nodiscard]] MoePlan moe(MoeShape shape, uint32_t routerFormat, uint32_t rows) const;
 
-  // Bounds include baseline and every matching installed key, not just the
-  // currently requested row count. Packed decode arenas use a per-lane stride
-  // of max_B ceil(requiredBytes(B)/B), independently for each scratch field.
-  [[nodiscard]] AttentionWorkspace prefillAttentionWorkspace(
-      uint32_t maximumRows, uint32_t queryHeads, kv::Layout layout) const;
-  [[nodiscard]] AttentionWorkspace verifyAttentionWorkspacePerLane(
-      uint32_t queryHeads, kv::Layout layout) const;
+  // The attention workspace that holds any one sequence's partials, a
+  // prompt chunk's; and a decode lane's, the most split slots a lane of up to
+  // a verify block's rows takes: one tile at the most splits, which a lane of
+  // two tiles' 32 splits each stays within (PagedAttention.cpp,
+  // attentionSplits), so that a step's lanes, their workspaces added, attend
+  // in one dispatch.
+  [[nodiscard]] AttentionWorkspace sequenceAttentionWorkspace(uint32_t queryHeads, kv::Layout layout) const;
+  [[nodiscard]] AttentionWorkspace laneAttentionWorkspace(uint32_t queryHeads, kv::Layout layout) const;
   [[nodiscard]] DraftAttentionWorkspace draftAttentionWorkspacePerLane(
       DraftAttentionShape shape) const;
-  [[nodiscard]] MoeWorkspace moePrefillWorkspace(
-      MoeShape shape, uint32_t maximumRows) const;
-  [[nodiscard]] MoeWorkspace moeDecodeWorkspacePerLane(MoeShape shape) const;
-  // This scratch is one whole-command buffer, not a per-lane arena field.
-  [[nodiscard]] uint64_t gateUpWorkspace(ProjectionShape shape) const;
+  // The workspace of every MoE step of 1 to `maximumRows` rows, not just the
+  // most: a prompt chunk's, and a decode step's of its lanes' packed rows.
+  [[nodiscard]] MoeWorkspace moeWorkspace(MoeShape shape, uint32_t routerFormat, uint32_t maximumRows) const;
+  // The gate scratch of every gate/up plan of 1 to `maximumRows` rows of a
+  // pair of `shape`: one whole-command buffer, not a per-lane arena field.
+  [[nodiscard]] uint64_t gateUpWorkspace(ProjectionShape shape, uint32_t maximumRows) const;
 
 private:
-  // The plan of `config` with the device's fields.
-  [[nodiscard]] MoePlan moePlan(const MoeWorkload &workload, MoeConfig config) const;
-
   Linear linear_;
-  Linear baselineLinear_;
-  uint32_t moeRouteWideRows_ = kMoeRouteWideRows;
-  MoeExpertSimdgroups moeDecodeSimdgroups_ = MoeExpertSimdgroups::Eight;
-  uint32_t appleGpuFamily_ = 0;
+  Linear draftLinear_;
+  // Apple7/8 have no bfloat arithmetic: their prefill and verify attention
+  // run the register kernels.
   AttentionTile attentionTile_ = AttentionTile::Mpp;
-  MoeExpertKernel moeExpertKernel_ = MoeExpertKernel::Mpp;
-  OperatorChoices choices_;
 };
 
 } // namespace splash::ops

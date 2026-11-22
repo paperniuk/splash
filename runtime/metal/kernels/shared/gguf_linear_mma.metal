@@ -1,7 +1,7 @@
 // GGUF quantized GEMMs for Apple7/8 (M1/M2) on simdgroup MMAs (kernels/common/gguf_mma_tile.h): the bindings,
 // grids and outputs of the staged kernels of gguf_linear.metal, which run MPP matmul2d there. Decode tiles hold 8, 16
-// or 32 rows in two simdgroups of 32 columns, each over its own stage; prefill chunks of more than 32 rows run 64-row
-// tiles of four simdgroups over a shared stage.
+// or 32 rows (and 24, for prefill chunks of 17 to 24 rows) in two simdgroups of 32 columns, each over its own stage;
+// prefill chunks of more than 32 rows run 64-row tiles of four simdgroups over a shared stage.
 #pragma clang fp reassociate(off)
 #include "metal/kernels/common/gguf_mma_tile.h"
 
@@ -32,7 +32,7 @@ kernel void gguf_decode_mma(device bfloat *input [[buffer(0)]], device uchar *w0
                    [&](uint row, uint column, float v) {
                      const ulong o = ulong(row) * p.out_stride + column0 + column;
                      if constexpr (Ep == EpResidual) v += float(aux[o]);
-                     if constexpr (Ep == EpUpWithGate) v = float(bfloat(v)) * gguf_silu(float(aux[o]));
+                     if constexpr (Ep == EpUpWithGate) v = float(bfloat(v)) * splash_silu(float(aux[o]));
                      output[o] = Out(v);
                    });
 }
@@ -43,8 +43,9 @@ using GgufDecodeMmaKernel = void(device bfloat *, device uchar *, device uchar *
 #define GGUF_DECODE_MMA(F, f, R, ep, Ep, Out)                                                                    \
   template [[host_name("gguf_decode_mma_" #f "_m" #R "_" #ep)]] kernel GgufDecodeMmaKernel<Out>                 \
       gguf_decode_mma<F, R, Ep, Out>;
-#define GGUF_DECODE_MMA_ROWS(F, f, ep, Ep, Out) \
-  GGUF_DECODE_MMA(F, f, 8, ep, Ep, Out) GGUF_DECODE_MMA(F, f, 16, ep, Ep, Out) GGUF_DECODE_MMA(F, f, 32, ep, Ep, Out)
+#define GGUF_DECODE_MMA_ROWS(F, f, ep, Ep, Out)                                                                   \
+  GGUF_DECODE_MMA(F, f, 8, ep, Ep, Out) GGUF_DECODE_MMA(F, f, 16, ep, Ep, Out) GGUF_DECODE_MMA(F, f, 24, ep, Ep, Out) \
+  GGUF_DECODE_MMA(F, f, 32, ep, Ep, Out)
 #define GGUF_DECODE_MMA_FORMAT(F, f)                                                                           \
   GGUF_DECODE_MMA_ROWS(F, f, a, EpNone, bfloat) GGUF_DECODE_MMA_ROWS(F, f, a_f32, EpNone, float)               \
   GGUF_DECODE_MMA_ROWS(F, f, r, EpResidual, bfloat) GGUF_DECODE_MMA_ROWS(F, f, g, EpUpWithGate, bfloat)
@@ -53,7 +54,13 @@ QUANT_FORMATS(GGUF_DECODE_MMA_FORMAT)
 #undef GGUF_DECODE_MMA_ROWS
 #undef GGUF_DECODE_MMA
 
-// Fused projections: up to three column segments of any formats in one dispatch, as gguf_decode_fused_m*.
+// Fused projections: up to three column segments of any formats in one dispatch, as gguf_decode_fused_m*. The
+// segments' formats are function constants 0-2, each once in ascending order and the last repeated
+// (ops::Linear::addGgufStaged, CommandGraph::specialize), so a pipeline compiles only their paths; a segment picks
+// its own among them by p.fmt.
+constant uint kMmaFusedFormat0 [[function_constant(0)]];
+constant uint kMmaFusedFormat1 [[function_constant(1)]];
+constant uint kMmaFusedFormat2 [[function_constant(2)]];
 #define GGUF_SEGMENT(i, w0, w1, m) device uchar *w0 [[buffer(i)]], device uchar *w1 [[buffer(i + 1)]], device uchar *m [[buffer(i + 2)]]
 #define GGUF_DECODE_MMA_FUSED(R)                                                                                   \
   kernel void gguf_decode_mma_fused_m##R(device bfloat *input [[buffer(0)]], GGUF_SEGMENT(1, w0a, w1a, ma),      \
@@ -77,13 +84,15 @@ QUANT_FORMATS(GGUF_DECODE_MMA_FORMAT)
     const uint thread_index = simd_group * 32 + simd_lane;                                                        \
     float2 acc[FN][R / 8];                                                                                        \
     zero(acc);                                                                                                    \
-    accumulate_any<R / 8>(p.fmt[s], input, w0, w1, meta, p.input_size, origin, stage + simd_group * kSimdgroupStage, \
-                          tl, thread_index, GGUF_STAGED_THREADS, simd_lane, group.y * per, (group.y + 1) * per, acc); \
+    const uint3 formats(kMmaFusedFormat0, kMmaFusedFormat1, kMmaFusedFormat2);                                    \
+    accumulate_any<R / 8>(p.fmt[s], formats, input, w0, w1, meta, p.input_size, origin,                         \
+                          stage + simd_group * kSimdgroupStage, tl, thread_index, GGUF_STAGED_THREADS, simd_lane,  \
+                          group.y * per, (group.y + 1) * per, acc);                                               \
     store_sums<R>(acc, sgmatrix::lane_map(simd_lane), p.splits, group.y, partials,                                \
                   counters + p.offset[s] / GGUF_TILE_COLUMNS + local, p.out_stride, column0, thread_index, &arrival, \
                   [&](uint row, uint column, float v) { output[ulong(row) * p.out_stride + column0 + column] = bfloat(v); }); \
   }
-GGUF_DECODE_MMA_FUSED(8) GGUF_DECODE_MMA_FUSED(16) GGUF_DECODE_MMA_FUSED(32)
+GGUF_DECODE_MMA_FUSED(8) GGUF_DECODE_MMA_FUSED(16) GGUF_DECODE_MMA_FUSED(24) GGUF_DECODE_MMA_FUSED(32)
 #undef GGUF_DECODE_MMA_FUSED
 #undef GGUF_SEGMENT
 
@@ -94,7 +103,7 @@ inline void gguf_prefill_mma(device bfloat *input, device uchar *w0, device ucha
                              device bfloat *output, device bfloat *aux, constant GgufPrefillParams &p, uint2 group,
                              uint simd_lane, uint simd_group, threadgroup half *stage, threadgroup half2 *tl) {
   quant_pair_table<F>(tl, simd_group * 32 + simd_lane, kPrefillThreads);
-  const uint stride = p.out_stride ? p.out_stride : p.output_size;
+  const uint stride = p.out_stride;
   const uint first = group.x * kPrefillRows, rows = p.rows > first ? p.rows - first : 0;
   const uint origin = group.y * GGUF_TILE_COLUMNS;
   prefill_tile<F>(input + ulong(first) * p.input_size, w0, w1, meta, p.input_size, origin, rows, stage, tl, simd_lane,
@@ -128,6 +137,68 @@ inline void gguf_prefill_mma(device bfloat *input, device uchar *w0, device ucha
   GGUF_PREFILL_MMA(F, f) GGUF_PREFILL_MMA_EPILOGUE(F, f, r, EpResidual) GGUF_PREFILL_MMA_EPILOGUE(F, f, g, EpUpWithGate)
 QUANT_FORMATS(GGUF_PREFILL_MMA_FORMAT)
 #undef GGUF_PREFILL_MMA_FORMAT
+
+// The residual kernels over a view of the leading inputs of wider weight rows, for the Neural Engine FFN split's down
+// projection, one per format: the planes advance past the groups and meta units the view leaves unread in the rows of
+// the plane tiles before the column tile, as gguf_prefill_*_r_leading_inputs does for the MPP tile.
+#define GGUF_PREFILL_MMA_LEADING_INPUTS(F, f)                                                                      \
+  kernel void gguf_prefill_mma_##f##_r_leading_inputs(GGUF_PREFILL_MMA_BUFFERS, device bfloat *aux [[buffer(5)]],  \
+                                                      constant GgufPrefillLeadingParams &leading [[buffer(6)]],    \
+                                                      GGUF_PREFILL_MMA_THREAD) {                                   \
+    GGUF_PREFILL_MMA_TABLES(F);                                                                                    \
+    constant GgufPrefillParams &p = leading.prefill;                                                               \
+    const ulong before = ulong(group.y * GGUF_TILE_COLUMNS / QUANT_TILE_ROWS) * QUANT_TILE_ROWS;                   \
+    const uint groups = p.input_size / 32, plane_groups = leading.plane_input_size / 32;                           \
+    const ulong unread = before * (plane_groups - groups),                                                         \
+                unread_units = before * (plane_groups / F::MetaGroups - groups / F::MetaGroups);                   \
+    gguf_prefill_mma<F, EpResidual>(input, w0 + unread * F::P0, w1 + unread * F::P1,                               \
+                                    meta + unread_units * F::MetaBytes, output, aux, p, group, simd_lane,          \
+                                    simd_group, stage, tl);                                                        \
+  }
+QUANT_FORMATS(GGUF_PREFILL_MMA_LEADING_INPUTS)
+#undef GGUF_PREFILL_MMA_LEADING_INPUTS
+
+// Split-K prefill kernels: grid (64-row tiles, column tiles of the segment, K partitions), uniform 8-buffer binding
+// with `aux` unused for plain projections.
+template <class F, GgufEpilogue Ep>
+inline void gguf_prefill_mma_split(device bfloat *input, device uchar *w0, device uchar *w1, device uchar *meta,
+                                   device bfloat *output, device coherent(device) float *partials,
+                                   device atomic_uint *counters, device bfloat *aux,
+                                   constant GgufPrefillSplitParams &sp, uint3 group, uint simd_lane,
+                                   uint simd_group, threadgroup half *stage, threadgroup half2 *tl,
+                                   threadgroup uint *arrival) {
+  quant_pair_table<F>(tl, simd_group * 32 + simd_lane, kPrefillThreads);
+  constant GgufPrefillParams &p = sp.prefill;
+  const uint stride = p.out_stride, first = group.x * kPrefillRows, rows = p.rows > first ? p.rows - first : 0;
+  const uint origin = group.y * GGUF_TILE_COLUMNS;
+  const uint col_tiles = stride / GGUF_TILE_COLUMNS;
+  const ulong tile_index = ulong(group.x) * col_tiles + p.out_offset / GGUF_TILE_COLUMNS + group.y;
+  device coherent(device) float *tile_partials =
+      partials + tile_index * ulong(sp.splits) * (kPrefillRows * GGUF_TILE_COLUMNS);
+  prefill_tile_split<F>(input + ulong(first) * p.input_size, w0, w1, meta, p.input_size, origin, rows, sp.splits,
+                        group.z, tile_partials, counters + tile_index, stage, tl, arrival, simd_lane, simd_group,
+                        [&](uint row, uint column, float v) {
+                          const ulong o = ulong(first + row) * stride + p.out_offset + origin + column;
+                          output[o] = gguf_epilogue<Ep>(v, aux, o);
+                        });
+}
+#define GGUF_PREFILL_MMA_SPLIT(F, f, ep, Ep)                                                                       \
+  kernel void gguf_prefill_mma_split_##f##_##ep(                                                                   \
+      GGUF_PREFILL_MMA_BUFFERS, device coherent(device) float *partials [[buffer(5)]],                             \
+      device atomic_uint *counters [[buffer(6)]], device bfloat *aux [[buffer(7)]],                                \
+      constant GgufPrefillSplitParams &sp [[buffer(8)]], uint3 group [[threadgroup_position_in_grid]],             \
+      uint simd_lane [[thread_index_in_simdgroup]], uint simd_group [[simdgroup_index_in_threadgroup]]) {          \
+    GGUF_PREFILL_MMA_TABLES(F);                                                                                    \
+    threadgroup uint arrival;                                                                                      \
+    gguf_prefill_mma_split<F, Ep>(input, w0, w1, meta, output, partials, counters, aux, sp, group, simd_lane,      \
+                                  simd_group, stage, tl, &arrival);                                                \
+  }
+#define GGUF_PREFILL_MMA_SPLIT_FORMAT(F, f)                                                                        \
+  GGUF_PREFILL_MMA_SPLIT(F, f, a, EpNone) GGUF_PREFILL_MMA_SPLIT(F, f, r, EpResidual)                             \
+      GGUF_PREFILL_MMA_SPLIT(F, f, g, EpUpWithGate)
+QUANT_FORMATS(GGUF_PREFILL_MMA_SPLIT_FORMAT)
+#undef GGUF_PREFILL_MMA_SPLIT_FORMAT
+#undef GGUF_PREFILL_MMA_SPLIT
 #undef GGUF_PREFILL_MMA_EPILOGUE
 #undef GGUF_PREFILL_MMA
 #undef GGUF_PREFILL_MMA_TABLES

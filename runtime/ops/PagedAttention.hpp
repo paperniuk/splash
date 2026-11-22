@@ -3,6 +3,8 @@
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/PagedAttention.h"
+#include "metal/abi/VerifyTree.h"
+#include "ops/KernelCalibration.hpp"
 #include "ops/PagedKv.hpp"
 #include "ops/Linear.hpp"
 #include "ops/Normalization.hpp"
@@ -11,101 +13,57 @@
 #include <array>
 #include <cstdint>
 #include <span>
+#include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 
 namespace splash::kv {
 
-// Host aliases for the layouts shared with Metal; containers require these traits.
-using Q8ChunkedPrefillParams = ::SplashChunkedPrefillParams;
-using Q8VerifyAttentionParams = ::SplashQ8VerifyAttentionParams;
-using Q8PrefillAttentionParams = ::SplashQ8PrefillAttentionParams;
+// Host alias for the layout shared with Metal; containers require these traits.
+using AttentionParams = ::SplashAttentionParams;
+static_assert(std::is_standard_layout_v<AttentionParams>);
+static_assert(std::is_trivially_copyable_v<AttentionParams>);
 
-static_assert(std::is_standard_layout_v<Q8ChunkedPrefillParams>);
-static_assert(std::is_trivially_copyable_v<Q8ChunkedPrefillParams>);
-static_assert(std::is_standard_layout_v<Q8VerifyAttentionParams>);
-static_assert(std::is_trivially_copyable_v<Q8VerifyAttentionParams>);
-static_assert(std::is_standard_layout_v<Q8PrefillAttentionParams>);
-static_assert(std::is_trivially_copyable_v<Q8PrefillAttentionParams>);
+// A sequence's rows of a command: at most chunk_tokens rows (its bound: a
+// prompt sequence's rows, a decode lane's most) at positions from
+// committed_tokens, staged chunk_stride rows per KV head (whole KV blocks),
+// whose history and rows the first page_table_entries entries of its page
+// table hold. Its rows are its entry of the command's layout
+// (ops::AttentionRows).
+struct ChunkedPrefillParams final {
+  uint32_t committed_tokens = 0;
+  uint32_t chunk_tokens = 0;
+  uint32_t chunk_stride = 0;
+  uint32_t page_table_entries = 0;
+};
 
-inline constexpr uint32_t kQ8VerifyMaximumRows = SPLASH_TARGET_VERIFY_ROWS;
-inline constexpr uint32_t kQ8VerifySplits = SPLASH_VERIFY_ATTENTION_SPLITS;
-inline constexpr uint32_t kQ8VerifyMaximumSplits =
-    SPLASH_VERIFY_ATTENTION_MAXIMUM_SPLITS;
-inline constexpr uint32_t kQ8VerifyPagesPerSplit =
-    SPLASH_VERIFY_ATTENTION_PAGES_PER_SPLIT;
-static_assert(kQ8VerifySplits >= 1 && kQ8VerifySplits <= kQ8VerifyMaximumSplits);
-static_assert(kQ8VerifyPagesPerSplit >= 1);
+inline constexpr uint32_t kChunkedPrefillMaximumRows = SPLASH_PREFILL_TOKEN_BUDGET;
+// Attention runs each sequence's rows in tiles of kAttentionTileRows, its
+// last holding the rest (a decode lane's rows one tile or two), each over at
+// most kAttentionMaximumSplits history splits.
+inline constexpr uint32_t kAttentionTileRows = SPLASH_ATTENTION_TILE_ROWS;
+inline constexpr uint32_t kAttentionMaximumSplits = SPLASH_ATTENTION_MAXIMUM_SPLITS;
 
-// One lane's verify split count: one split per kQ8VerifyPagesPerSplit
-// visible pages, never fewer than the configured base and never more than
-// the maximum the partial workspace is sized for. It depends only on the
-// lane's own history, so batching never changes a lane's arithmetic.
-[[nodiscard]] constexpr uint32_t
-q8VerifyAttentionSplits(uint32_t baseSplits, uint32_t committedTokens,
-                        uint32_t activeRows) noexcept {
-  const uint64_t visible = uint64_t{committedTokens} + activeRows;
-  const uint64_t pages = (visible + kPageTokens - 1) / kPageTokens;
-  const uint64_t scaled =
-      (pages + kQ8VerifyPagesPerSplit - 1) / kQ8VerifyPagesPerSplit;
-  return static_cast<uint32_t>(std::min<uint64_t>(
-      std::max<uint64_t>(baseSplits, scaled), kQ8VerifyMaximumSplits));
+[[nodiscard]] constexpr uint32_t attentionTiles(uint32_t rows) noexcept {
+  return (rows + kAttentionTileRows - 1) / kAttentionTileRows;
 }
 
-// Default parameters; the verify plan sets both split counts for each lane
-// before dispatch.
-[[nodiscard]] constexpr Q8VerifyAttentionParams
-q8VerifyAttentionParams(uint32_t committedTokens, uint32_t activeRows,
-                        uint32_t chunkStride, uint32_t pageTableEntries,
-                        uint32_t physicalPageCount) noexcept {
-  return {committedTokens, activeRows, chunkStride, pageTableEntries,
-          physicalPageCount, kQ8VerifySplits, kQ8VerifySplits, 0};
-}
-
-[[nodiscard]] constexpr std::string_view q8VerifyAttentionValidationError(
-    const Q8VerifyAttentionParams &params) noexcept {
-  if (!params.active_rows || params.active_rows > kQ8VerifyMaximumRows)
-    return "active_rows_out_of_range";
-  if (params.chunk_stride < params.active_rows ||
-      params.chunk_stride % kPageTokens)
-    return "chunk_stride_invalid";
-  const uint64_t visible =
-      uint64_t{params.committed_tokens} + params.active_rows;
-  if (visible > kMaximumPhysicalTokens)
-    return "context_out_of_range";
-  const uint64_t requiredPages = (visible + kPageTokens - 1) / kPageTokens;
-  if (params.page_table_entries < requiredPages)
-    return "page_table_too_short";
-  if (!params.physical_page_count)
-    return "physical_page_pool_empty";
-  if (!params.split_count || params.split_count > kQ8VerifyMaximumSplits)
-    return "split_count_invalid";
-  if (params.slot_splits < params.split_count ||
-      params.slot_splits > kQ8VerifyMaximumSplits)
-    return "slot_splits_invalid";
-  if (params.reserved2)
-    return "reserved_fields_nonzero";
-  return {};
-}
-
-inline constexpr uint32_t kChunkedPrefillMaximumRows =
-    SPLASH_PREFILL_TOKEN_BUDGET;
-inline constexpr uint32_t kQ8PrefillAttentionTileRows =
-    SPLASH_PREFILL_ATTENTION_TILE_ROWS;
-
-[[nodiscard]] constexpr uint32_t
-prefillAttentionTiles(uint32_t rows) noexcept {
-  return (rows + kQ8PrefillAttentionTileRows - 1) / kQ8PrefillAttentionTileRows;
+// The most pages a tile reads with a window of windowTokens keys before each
+// row: its keys span windowTokens + kAttentionTileRows tokens, which may
+// straddle a page boundary at either end.
+[[nodiscard]] constexpr uint32_t windowAttentionPages(uint32_t windowTokens) noexcept {
+  return (windowTokens + kAttentionTileRows - 1 + kPageTokens - 1) / kPageTokens + 1;
 }
 
 [[nodiscard]] constexpr uint32_t
-chunkedPrefillRequiredPages(const Q8ChunkedPrefillParams &params) noexcept {
+chunkedPrefillRequiredPages(const ChunkedPrefillParams &params) noexcept {
   return (params.committed_tokens + params.chunk_tokens + kPageTokens - 1) /
          kPageTokens;
 }
 
 [[nodiscard]] constexpr std::string_view
-chunkedPrefillValidationError(const Q8ChunkedPrefillParams &params) noexcept {
+chunkedPrefillValidationError(const ChunkedPrefillParams &params) noexcept {
   if (!params.chunk_tokens || params.chunk_tokens > kChunkedPrefillMaximumRows)
     return "chunk_tokens_out_of_range";
   if (uint64_t{params.committed_tokens} + params.chunk_tokens >
@@ -117,32 +75,7 @@ chunkedPrefillValidationError(const Q8ChunkedPrefillParams &params) noexcept {
     return "chunk_stride_invalid";
   if (params.page_table_entries < chunkedPrefillRequiredPages(params))
     return "page_table_too_short";
-  if (!params.physical_page_count)
-    return "physical_page_pool_empty";
-  if (params.reserved0 || params.reserved1 || params.reserved2)
-    return "reserved_fields_nonzero";
   return {};
-}
-
-[[nodiscard]] constexpr bool
-chunkedPrefillValid(const Q8ChunkedPrefillParams &params) noexcept {
-  return chunkedPrefillValidationError(params).empty();
-}
-
-// Call this once when preparing a request lane, not once per attention layer.
-// Cache is the sole page-table owner and structurally guarantees
-// unique leases; this ABI boundary only has to reject out-of-range indices.
-[[nodiscard]] inline bool
-chunkedPrefillPageTableInRange(const Q8ChunkedPrefillParams &params,
-                               std::span<const uint32_t> pageTable) {
-  const uint32_t pages = chunkedPrefillRequiredPages(params);
-  if (!chunkedPrefillValid(params) || pageTable.size() < pages)
-    return false;
-  for (uint32_t logical = 0; logical < pages; ++logical) {
-    if (pageTable[logical] >= params.physical_page_count)
-      return false;
-  }
-  return true;
 }
 
 } // namespace splash::kv
@@ -154,215 +87,295 @@ struct AttentionWorkspace final {
   uint64_t statisticsBytes = 0;
 };
 
-// Both kernels use one full-K QK multiply. Only the key-scale placement differs.
-enum class AttentionScalePlacement : uint8_t { Softmax = 0, Cooperative = 1 };
+// The tile splits all of a sequence's tiles take at most (PagedAttention.cpp
+// attentionSplits): a workspace of this many, a prompt chunk's, holds any one
+// sequence's partials.
+inline constexpr uint32_t kAttentionSequenceSplits = 2 * kv::kAttentionMaximumSplits;
 
 // Mpp is the shipped tensor-operation tile. Register is the Apple7/8 tile
-// (exact half INT8 cache, fp32 queries and probabilities, one simdgroup per
-// eight fused rows) for prefill and verify; it applies to INT8 KV only and
-// ignores scale placement. The device policy sets it, the tuner does not.
+// (exact half INT8 or exact fp32 BF16 cache, fp32 queries and probabilities,
+// one simdgroup per eight fused rows). The device policy (ExecutionPlans)
+// selects it.
 enum class AttentionTile : uint8_t { Mpp = 0, Register = 1 };
 
-// One preserves the shipped row-dependent split count; Two offers additional
-// history parallelism with an explicitly larger scratch bound.
-enum class PrefillSplitMultiplier : uint32_t { One = 1, Two = 2 };
-struct PrefillAttentionConfig final {
-  PrefillSplitMultiplier splitMultiplier = PrefillSplitMultiplier::One;
-  AttentionScalePlacement scalePlacement = AttentionScalePlacement::Softmax;
-  AttentionTile tile = AttentionTile::Mpp;
-  bool operator==(const PrefillAttentionConfig &) const = default;
+// How one attention layer attends, of the variants its geometry is compiled
+// for (kCompiledAttention, PagedAttention.cpp): its queries and keys rotated
+// by the geometry's RoPE, or unrotated (NoPE); and each row over its whole
+// history, or over a window of the windowTokens keys before it (keys
+// p - windowTokens to p, a sliding-window layer's). The default is every
+// geometry's.
+struct AttentionVariant final {
+  bool rotated = true;
+  uint32_t windowTokens = 0;
+  bool operator==(const AttentionVariant &) const = default;
 };
 
-enum class VerifySplitCount : uint32_t {
-  One = 1,
-  Eight = 8,
-  Sixteen = 16,
-  ThirtyTwo = 32
-};
-struct VerifyAttentionConfig final {
-  VerifySplitCount splitCount = VerifySplitCount::ThirtyTwo;
-  AttentionScalePlacement scalePlacement = AttentionScalePlacement::Softmax;
-  AttentionTile tile = AttentionTile::Mpp;
-  bool operator==(const VerifyAttentionConfig &) const = default;
+// The block lists a sparse plan's tiles attend through (metal/abi/
+// PagedAttention.h, PagedAttention::addBlockLists): lists of `stride` entries,
+// each list's count in `counts`; a sequence's tile t reads list `list` + t.
+// Without a stride every tile attends to every block of its history. Only a
+// sparse plan takes lists. With `locations`, an array of the lists' shape,
+// each entry's block is read where its location names (SPLASH_ATTENTION_PAGED,
+// or a page of locationPages and the block's place in it), as the hot block
+// cache of a request whose K/V spilled gives them (model::KvBlockCache). A
+// decode step's tree rows (PagedAttention::addAttention's `tree`) attend,
+// of the rows of their block in the blocks their lists name, those their
+// row masks hold (`rowMasks`, a bit per row of the block, a word per row of
+// the command, ops::BlockIndexer::addTreeSelect's) and their ancestors.
+struct AttentionBlocks final {
+  metal::MetalBuffer lists;
+  metal::MetalBuffer counts;
+  uint32_t stride = 0;
+  uint32_t list = 0;
+  metal::MetalBuffer locations{};
+  metal::MetalBuffer locationPages{};
+  metal::MetalBuffer rowMasks{};
 };
 
-// Immutable factory-built plans are shared by allocation, measurement and
-// encoding. Each prefill uses one split dispatch followed by one reduction.
-// Callers cannot replace a dispatch or reduce its scratch bound.
-struct PrefillAttentionPlan final {
-  const kv::Format format;
-  const PrefillAttentionConfig configuration;
-  const uint32_t rows;
-  const uint32_t historyTokens;
-  const uint32_t splits;
-  const AttentionWorkspace workspace;
-  const std::string_view splitPipeline;
-  const std::string_view reducePipeline;
-  const metal::DispatchSize splitGroups;
-  const metal::DispatchSize splitThreads;
-  const metal::DispatchSize reduceGroups;
+// Where a sequence's attention reads its history: the layer's pages, placed
+// in the pool's extents by `kv`, through `pageTable`, and for a sparse plan
+// its block lists.
+struct AttentionHistory final {
+  SplashKvLayer kv{};
+  metal::MetalBuffer pageTable;
+  AttentionBlocks blocks{};
+};
 
-  // Policy provenance is irrelevant when its resolved execution is identical.
-  [[nodiscard]] bool sameExecutionAs(const PrefillAttentionPlan &other) const noexcept;
+// A command's rows as its sequences hold them: `rows` packed rows, sequence
+// s's first row and rows entry s of `layout` (SplashLaneRows,
+// metal/abi/VerifyTree.h: a prompt chunk's as its host writes them, a decode
+// step's as its selector writes them on the device), each at most its
+// chunk's chunk_tokens. The per-row kernel (q/k projection and store) takes
+// a grid of the sequences' rows up to the largest bound, and each
+// sequence's attention tiles are its bound's, whose splits its history and
+// bound plan (PagedAttention::plan); a row or tile past the sequence's rows
+// writes nothing. With `tree`, a decode step's rows' places in their lanes'
+// trees (a SplashTreeRow a packed row), each row attends its path
+// (SplashAttentionParams::trees); without, every row attends causally.
+struct AttentionRows final {
+  metal::MetalBuffer layout;
+  uint32_t rows = 0;
+  metal::MetalBuffer tree{};
+};
+
+// Which of its sequences' attention rows a layer outputs: every row, or each
+// sequence's last row alone, sequence s's as output row s.
+enum class AttentionOutput : uint8_t { Every, Last };
+
+// Where a layer's attention writes its rows (addAttention): as the
+// out-projection's input rows `hidden`, each multiplied by the sigmoid of its
+// query head's gate in its packed row of `packed` where the geometry is
+// gated, or for an ungated one gathered as they are, which reads no packed
+// row; the rows `output` names, every row as its packed row or each
+// sequence's last row as row s; and, when `input` is not Plain, the
+// out-projection's table of them in `scratch` too.
+struct AttentionOutputRows final {
+  metal::MetalBuffer packed;
+  metal::MetalBuffer hidden;
+  AttentionOutput output = AttentionOutput::Every;
+  LinearScratch scratch{};
+  LinearInput input = LinearInput::Plain;
+};
+
+// The attention of a command's sequences (at most a batch's) for one layer
+// variant, planned once a step: each sequence's history splits and the tiles
+// of it that run, the plan's kernels, and the dispatches of a split and a
+// reduce its sequences share. A dispatch holds sequences while their tiles'
+// splits fit the workspace, so no sequence's partition depends on another's.
+class AttentionPlan final {
+public:
+  struct Sequence final {
+    uint32_t rows = 0;
+    uint32_t historyTokens = 0;
+    // Its tiles from this one on run: its first, or the one that holds its
+    // last row (PagedAttention::lastTiles).
+    uint32_t firstTile = 0;
+    uint32_t splits = 0;
+    [[nodiscard]] uint32_t tiles() const noexcept { return kv::attentionTiles(rows); }
+  };
+  struct Dispatch final {
+    // The plan's sequences it runs, in row order.
+    std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> sequence{};
+    uint32_t sequences = 0;
+    uint32_t tiles = 0;
+    // The most splits of its sequences' tiles, and their splits all told.
+    uint32_t splits = 0;
+    uint32_t slots = 0;
+  };
+
+  const kv::Layout layout;
+  const uint32_t queryHeads;
+  // Whether the kernels attend through block lists (AttentionBlocks).
+  const bool sparse;
+  // Whether the reduce adds the layer's learned sinks, which addAttention
+  // then takes: its geometry's (kCompiledAttention).
+  const bool sinks;
+  // The tile splits the workspace holds, which each dispatch's fit.
+  const uint32_t workspaceSlots;
+
+  [[nodiscard]] std::span<const Sequence> sequences() const noexcept { return {sequences_.data(), sequenceCount_}; }
+  [[nodiscard]] std::span<const Dispatch> dispatches() const noexcept { return {dispatches_.data(), dispatchCount_}; }
+  // The workspace its largest dispatch writes.
+  [[nodiscard]] AttentionWorkspace workspace() const noexcept;
+  // The kernels and grids of its dispatches: a sparse plan's split for lists
+  // with locations, or without.
+  [[nodiscard]] const std::string &splitPipeline(bool located = false) const noexcept {
+    return located ? locatedSplitPipeline_ : splitPipeline_;
+  }
+  [[nodiscard]] const std::string &reducePipeline() const noexcept { return reducePipeline_; }
+  [[nodiscard]] metal::DispatchSize splitGroups(const Dispatch &dispatch) const noexcept;
+  // The split's threadgroup: the MPP tile's default, or the register tile's
+  // simdgroup per eight fused rows of a tile's part.
+  [[nodiscard]] metal::DispatchSize splitThreads() const noexcept;
+  [[nodiscard]] metal::DispatchSize reduceGroups(const Dispatch &dispatch) const noexcept;
 
 private:
   friend class PagedAttention;
-  PrefillAttentionPlan(PrefillAttentionConfig configuration, uint32_t rows,
-                       uint32_t historyTokens, uint32_t splits,
-                       AttentionWorkspace workspace,
-                       std::string_view splitPipeline, std::string_view reducePipeline,
-                       metal::DispatchSize splitGroups, metal::DispatchSize splitThreads,
-                       metal::DispatchSize reduceGroups, kv::Format format)
-      : format(format), configuration(configuration), rows(rows), historyTokens(historyTokens),
-        splits(splits), workspace(workspace),
-        splitPipeline(splitPipeline), reducePipeline(reducePipeline),
-        splitGroups(splitGroups), splitThreads(splitThreads), reduceGroups(reduceGroups) {}
+  AttentionPlan(kv::Layout layout, uint32_t queryHeads, bool sparse, bool sinks, uint32_t workspaceSlots)
+      : layout(layout), queryHeads(queryHeads), sparse(sparse), sinks(sinks), workspaceSlots(workspaceSlots) {}
+  std::array<Sequence, SPLASH_MAXIMUM_BATCH_WIDTH> sequences_{};
+  uint32_t sequenceCount_ = 0;
+  std::array<Dispatch, SPLASH_MAXIMUM_BATCH_WIDTH> dispatches_{};
+  uint32_t dispatchCount_ = 0;
+  std::string splitPipeline_;
+  std::string locatedSplitPipeline_;
+  std::string reducePipeline_;
+  AttentionTile tile_ = AttentionTile::Mpp;
 };
 
-struct VerifyAttentionPlan final {
-  const kv::Format format;
-  const VerifyAttentionConfig configuration;
-  const uint32_t lanes;
-  // Each lane's history-scaled split count; splits is their maximum, the
-  // split grid and the slot stride of every lane's partials. The workspace
-  // covers the maximum split count for every lane regardless of history.
-  const std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> laneSplits;
-  const uint32_t splits;
-  const AttentionWorkspace workspace;
-  const std::string_view splitPipeline;
-  const std::string_view reducePipeline;
-  const metal::DispatchSize splitGroups;
-  const metal::DispatchSize splitThreads;
-  const metal::DispatchSize reduceGroups;
-
-  // Compare resolved execution, including each lane's history partition.
-  [[nodiscard]] bool sameExecutionAs(const VerifyAttentionPlan &other) const noexcept;
-
-private:
-  friend class PagedAttention;
-  const std::string_view storePipeline_;
-  const metal::DispatchSize storeGroups_;
-  const metal::DispatchSize storeThreads_;
-  VerifyAttentionPlan(VerifyAttentionConfig configuration, uint32_t lanes,
-                      std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> laneSplits,
-                      uint32_t splits, AttentionWorkspace workspace,
-                      std::string_view splitPipeline, std::string_view reducePipeline,
-                      metal::DispatchSize splitGroups, metal::DispatchSize splitThreads,
-                      metal::DispatchSize reduceGroups,
-                      std::string_view storePipeline, metal::DispatchSize storeGroups,
-                      metal::DispatchSize storeThreads, kv::Format format)
-      : format(format), configuration(configuration), lanes(lanes), laneSplits(laneSplits),
-        splits(splits), workspace(workspace),
-        splitPipeline(splitPipeline), reducePipeline(reducePipeline),
-        splitGroups(splitGroups), splitThreads(splitThreads), reduceGroups(reduceGroups),
-        storePipeline_(storePipeline), storeGroups_(storeGroups), storeThreads_(storeThreads) {}
+// A sequence whose rows' block masks become block lists
+// (PagedAttention::addBlockLists): entry `sequence` of the command's layout
+// (AttentionRows), at most `rows` rows (its bound), the first at position
+// `firstPosition`, whose tiles of its bound take the lists from `list` on, a
+// tile past its rows an empty one.
+struct BlockListRows final {
+  uint32_t sequence = 0;
+  uint32_t rows = 0;
+  uint32_t firstPosition = 0;
+  uint32_t list = 0;
 };
 
-struct PagedVerifyBuffers final {
-  metal::MetalBuffer chunkKeys;
-  metal::MetalBuffer chunkValues;
-  metal::MetalBuffer queries;
-  metal::MetalBuffer partials;
-  metal::MetalBuffer statistics;
-  metal::MetalBuffer output;
-  std::span<const metal::MetalBuffer> pageTables;
-};
-
-// Q8 target attention over paged history. Prefill and verify both read the
-// history one Page32 at a time; neither changes cache ownership or commit
-// semantics.
+// Target attention over paged INT8 or BF16 history, one op for every
+// command: each layer stages its sequences' queries and stores their K/V in
+// their pages (addProjection), then attends them into the out-projection's
+// input rows (addAttention, whose reduce gates them), each once for all its
+// sequences, whether a decode step's lanes or a prompt
+// chunk's, each reading the sequences' rows from the command's layout
+// (AttentionRows). A tile reads its history one Page32 at a time, or,
+// sparse, the blocks of its list a few at a time; neither changes cache
+// ownership or commit semantics. A layer's AttentionVariant selects its
+// geometry's kernels: the projection's RoPE, and the window of the plans'
+// kernels and of their split counts.
 class PagedAttention final {
 public:
-  [[nodiscard]] static std::span<const PrefillAttentionConfig>
-  prefillCandidates() noexcept;
-  [[nodiscard]] static std::span<const VerifyAttentionConfig>
-  verifyCandidates() noexcept;
-  [[nodiscard]] static PrefillAttentionPlan
-  prefillPlan(uint32_t rows, uint32_t queryHeads, kv::Layout layout,
-              uint32_t historyTokens, PrefillAttentionConfig configuration = {});
-  // historyTokens holds each lane's committed tokens before its verify rows,
-  // sized to the batch width or to the maximum width with inactive lanes zero.
-  [[nodiscard]] static VerifyAttentionPlan
-  verifyPlan(uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
-             std::span<const uint32_t> historyTokens,
-             VerifyAttentionConfig configuration = {});
+  // The plan of a command's sequences (their chunks, in row order), whose
+  // dispatches each fit `capacity`, a workspace. Each sequence's tiles take
+  // the history splits its rows and the pages its tiles read of its history
+  // decide (attentionSplits, PagedAttention.cpp), with the device's
+  // `pagesPerSplit` (AttentionCalibration). With `int8Activations`
+  // on, the plan's queries score as INT8 against INT8 pages (the dense
+  // kernels' q8q entries) where some tile's splits read at least the
+  // device's `int8QueriesFromPages` pages each: a command's sequences share
+  // the choice, as a decode step's lanes do. Apple7/8 run the register
+  // `tile`, whose sequences of more than one tile split their history at
+  // least until their threadgroups fill the device's `gpuCores`.
+  [[nodiscard]] static AttentionPlan plan(std::span<const kv::ChunkedPrefillParams> sequences, uint32_t queryHeads,
+                                          kv::Layout layout, const AttentionCalibration &calibration,
+                                          Int8Activations int8Activations, AttentionWorkspace capacity,
+                                          AttentionVariant variant = {}, AttentionTile tile = AttentionTile::Mpp,
+                                          uint32_t gpuCores = 0);
+  // `plan`'s sequences from the tile that holds each one's last row: their
+  // kernels and splits, so each tile computes what it does in `plan`.
+  [[nodiscard]] static AttentionPlan lastTiles(const AttentionPlan &plan);
 
-  // The runtime owns allocation, not the selected kernel's workspace layout.
-  // Prefill storage covers every sequence length up to maximumRows; sequences
-  // in a packed command reuse it serially. Verify storage covers all lanes at
-  // the maximum split count.
-  [[nodiscard]] static AttentionWorkspace
-  prefillWorkspace(uint32_t maximumRows, uint32_t queryHeads,
-                   kv::Layout layout,
-                   PrefillAttentionConfig configuration = {});
-  [[nodiscard]] static AttentionWorkspace
-  verifyWorkspace(uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
-                  VerifyAttentionConfig configuration = {});
+  // The workspace of `slots` tile splits of a geometry's tiles. The runtime
+  // owns allocation: a prompt chunk's takes kAttentionSequenceSplits, a decode
+  // lane's kAttentionMaximumSplits (its one tile at the most splits, or each
+  // of its two, past 8 rows, at most 32).
+  [[nodiscard]] static AttentionWorkspace workspace(uint32_t slots, uint32_t queryHeads, kv::Layout layout);
+  // Whether the compiled geometry of `queryHeads` over a layout's KV heads
+  // (kCompiledAttention) computes attention as a target's layout states it:
+  // gated or not, rotating `rotaryPairs` pairs. Throws for a geometry with
+  // no kernels.
+  [[nodiscard]] static bool compiles(uint32_t queryHeads, kv::Layout layout, bool gated,
+                                     uint32_t rotaryPairs);
 
-  static void
-  addPrefillProjection(metal::CommandGraph &graph, metal::MetalBuffer packed,
-                       const NormWeights &queryNorm, const NormWeights &keyNorm,
-                       metal::MetalBuffer ropeCos, metal::MetalBuffer ropeSin,
-                       metal::MetalBuffer queries, metal::MetalBuffer chunkKeys,
-                       metal::MetalBuffer chunkValues, uint32_t tokens,
-                       uint32_t cacheStride, uint32_t rowStride,
-                       uint32_t queryHeads, kv::Layout layout);
-  static void addPrefillGate(metal::CommandGraph &graph,
-                             metal::MetalBuffer packed,
-                             metal::MetalBuffer attention,
-                             metal::MetalBuffer hidden, uint32_t tokens,
-                             uint32_t cacheStride, uint32_t rowStride,
-                             uint32_t queryHeads, kv::Layout layout);
-  static void
-  addVerifyProjection(metal::CommandGraph &graph, metal::MetalBuffer packed,
-                      const NormWeights &queryNorm, const NormWeights &keyNorm,
-                      metal::MetalBuffer ropeCos, metal::MetalBuffer ropeSin,
-                      metal::MetalBuffer queries, metal::MetalBuffer chunkKeys,
-                      metal::MetalBuffer chunkValues, uint32_t rowsPerLane,
-                      uint32_t cacheStride, uint32_t rowStride,
-                      uint32_t queryHeads, kv::Layout layout,
-                      uint32_t lanes);
-  // Also writes the out-projection's `input` table when it needs one.
-  static PreparedInput addVerifyGate(metal::CommandGraph &graph,
-                                     metal::MetalBuffer packed,
-                                     metal::MetalBuffer attention,
-                                     metal::MetalBuffer hidden, uint32_t rowsPerLane,
-                                     uint32_t cacheStride, uint32_t rowStride,
-                                     uint32_t queryHeads, kv::Layout layout,
-                                     uint32_t lanes, LinearScratch scratch = {},
-                                     LinearInput input = LinearInput::Plain);
+  // A sequence's chunk: `chunkTokens` rows after `logicalPosition`, staged
+  // `chunkStride` rows per KV head, its page table `pageTableEntries` long.
+  [[nodiscard]] static kv::ChunkedPrefillParams chunkParams(uint64_t logicalPosition, uint32_t chunkTokens,
+                                                            uint32_t chunkStride, uint32_t pageTableEntries);
 
-  [[nodiscard]] static kv::Q8ChunkedPrefillParams
-  prefillParams(uint64_t logicalPosition, uint32_t chunkTokens,
-                uint32_t chunkStride, std::span<const uint32_t> pageTable,
-                uint32_t physicalPageCount);
+  // The q/k norms and, for a rotated variant, the RoPE of the sequences'
+  // packed projection rows (every query head's queries, and a gated
+  // geometry's gates, then the K and V heads): their queries staged in
+  // `queries` for the attention, each sequence's after the one before it, a
+  // KV head's rows its chunk_stride apart ([KV head][row][query head in
+  // group][dimension]), and their keys and values written into the pages of
+  // `layer`,
+  // each sequence's through its page table, in one dispatch before the
+  // attention, which reads them there. A row rotates by its packed row's
+  // rows of the RoPE tables (ops::RoPE). An unrotated variant reads no RoPE
+  // tables; ropeCos and ropeSin may be empty.
+  static void addProjection(metal::CommandGraph &graph, metal::MetalBuffer packed, const NormWeights &queryNorm,
+                            const NormWeights &keyNorm, metal::MetalBuffer ropeCos, metal::MetalBuffer ropeSin,
+                            metal::MetalBuffer queries, SplashKvLayer layer,
+                            std::span<const metal::MetalBuffer> pageTables,
+                            std::span<const kv::ChunkedPrefillParams> sequences, const AttentionRows &rows,
+                            uint32_t queryHeads, kv::Layout layout, AttentionVariant variant = {});
+  // The plan's dispatches over the staged queries into the out-projection's
+  // input rows (`output`, AttentionOutputRows), which must not alias them,
+  // each sequence reading its history where `histories` say: each reduce
+  // gates its rows and writes them, and the out-projection's table where
+  // output.input is not Plain (it throws when output.scratch cannot hold
+  // it), which the returned input names. The plan owns the grids; partials
+  // and statistics hold its workspace. A dispatch whose sequences read their
+  // layer in two placements (`kv`) runs as a dispatch per run of them that
+  // reads one. `sinks` holds the layer's learned sinks, an F32 per query
+  // head, for a plan whose reduce adds them (its `sinks`). With rows' tree,
+  // each sequence is a decode lane's block of at most 32 rows whose rows
+  // attend their paths (SplashAttentionParams::trees). An output of each
+  // sequence's last row takes the plan of its last tiles (lastTiles).
+  static PreparedInput addAttention(metal::CommandGraph &graph, const AttentionPlan &plan,
+                                    metal::MetalBuffer queries, const metal::MetalBuffer &partials,
+                                    const metal::MetalBuffer &statistics,
+                                    std::span<const kv::ChunkedPrefillParams> sequences,
+                                    std::span<const AttentionHistory> histories, const AttentionRows &rows,
+                                    const AttentionOutputRows &output, metal::MetalBuffer sinks = {});
+  // One dispatch of the block lists of up to a batch of sequences of a
+  // command's rows (`rows`, whose tree it does not read), whose block masks
+  // are rows of `mask`, one a packed row, `maskWords` words each
+  // (metal/abi/PagedAttention.h) that cover each sequence's history: each
+  // sequence's tiles of kAttentionTileRows rows, its tile t's list into list
+  // blocks.list + its list + t. A list holds at most blocks.stride entries,
+  // which the masks' rows must keep to.
+  static void addBlockLists(metal::CommandGraph &graph, const metal::MetalBuffer &mask, uint32_t maskWords,
+                            std::span<const BlockListRows> sequences, const AttentionRows &rows,
+                            const AttentionBlocks &blocks);
+  // Stages one layer's history for a prefill that reads it apart from the
+  // pool (SplashKvStageParams, kernels/shared/kv_stage.metal): copies the K/V
+  // of pages [firstPage, firstPage + pages) of poolTable, in the pool's layer
+  // poolLayer, to the same pages of stagedTable, in the staging storage's one
+  // layer stagedLayer; a pool entry that is SPLASH_KV_PAGE_ABSENT is left to
+  // the reads that fill its staging page. Both storages have the layout's
+  // heads, dimension and format.
+  static void addStageLayer(metal::CommandGraph &graph, SplashKvLayer poolLayer, metal::MetalBuffer poolTable,
+                            SplashKvLayer stagedLayer, metal::MetalBuffer stagedTable, uint32_t firstPage,
+                            uint32_t pages, kv::Layout layout);
+  // The commit of each lane's accepted path after a decode step stored its
+  // block's rows at the slots of their rows (SplashKvPathCommitParams): in
+  // every attention layer of `layout`, in extents of extentPages pages, the
+  // path's row at depth k moves from committed[lane] plus its row to
+  // committed[lane] plus k, through the lane's page table, which holds the
+  // slots of laneRows rows from committed[lane], the most rows a lane's
+  // block held. `paths` holds each lane's path (a row mask, metal/abi/
+  // VerifyTree.h), as acceptance wrote it; a chain's moves nothing.
+  static void addPathCommit(metal::CommandGraph &graph, kv::Layout layout, uint32_t extentPages,
+                            std::span<const metal::MetalBuffer> pageTables, std::span<const uint32_t> committed,
+                            uint32_t laneRows, const metal::MetalBuffer &paths);
 
-  static void addPrefillStore(metal::CommandGraph &graph,
-                              const kv::LayerStorage &layer,
-                              metal::MetalBuffer chunkKeys,
-                              metal::MetalBuffer chunkValues,
-                              metal::MetalBuffer pageTable,
-                              const kv::Q8ChunkedPrefillParams &params,
-                              kv::Layout layout);
-  // Queries and output are [KV head][row][query head in group][dimension] and
-  // must not alias. Encode the store before attention; both stay in one
-  // compute encoder. The plan owns both dispatch grids and their exact scratch.
-  // prefillWorkspace() bounds every legal history for
-  // the command's largest sequence and configuration.
-  static void addPrefill(metal::CommandGraph &graph,
-                         const kv::LayerStorage &layer,
-                         metal::MetalBuffer queries, metal::MetalBuffer output,
-                         metal::MetalBuffer partials,
-                         metal::MetalBuffer statistics,
-                         metal::MetalBuffer pageTable,
-                         const kv::Q8ChunkedPrefillParams &chunk,
-                         const PrefillAttentionPlan &plan);
-  static void
-  addVerify(metal::CommandGraph &graph, const kv::LayerStorage &layer,
-            PagedVerifyBuffers buffers,
-            std::span<const kv::Q8ChunkedPrefillParams> storeParams,
-            std::span<const kv::Q8VerifyAttentionParams> attentionParams,
-            const VerifyAttentionPlan &plan);
+private:
+  // Gathers a plan's sequences into dispatches that fit its workspace.
+  static void group(AttentionPlan &plan);
 };
 
 } // namespace splash::ops

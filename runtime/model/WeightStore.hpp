@@ -6,7 +6,6 @@
 #include "ops/Normalization.hpp"
 
 #include <cstdint>
-#include <filesystem>
 #include <initializer_list>
 #include <memory>
 #include <span>
@@ -16,6 +15,10 @@
 #include <vector>
 
 namespace splash::model {
+
+namespace gguf {
+struct Fill;
+} // namespace gguf
 
 class WeightStoreError : public std::runtime_error {
 public:
@@ -28,19 +31,38 @@ struct WeightFileRecord final {
   uint32_t layer = 0;
   uint32_t type = 0;
   uint64_t declaredBytes = 0;
+  // What the image was written from (ModelDescriptor::sourceIdentity).
   std::string contentIdentity{};
 };
 
-// A read-only mmap with one no-copy Metal base buffer.  Sections are checked,
-// aligned views that retain the mapping; no model loader owns raw mmap state.
-// A file with a content identity, its cache key, is a prepared file: it is
-// mapped only as the cache verified it (requireVerifiedFile).
+// The lowercase hex SHA-256 of bytes or text.
+[[nodiscard]] std::string weightDigest(std::span<const uint8_t> bytes);
+[[nodiscard]] std::string weightDigest(std::string_view text);
+// A SHA-256 digest in lowercase hex.
+[[nodiscard]] inline std::string digestHex(std::span<const uint8_t, 32> digest) {
+  constexpr char digits[] = "0123456789abcdef";
+  std::string result;
+  result.reserve(2 * digest.size());
+  for (uint8_t byte : digest) {
+    result += digits[byte >> 4];
+    result += digits[byte & 15];
+  }
+  return result;
+}
+
+// The file of a loaded image (WeightImages): its header checked, its
+// sections read in order as aligned views of the image's buffer. An image
+// reserved without memory (one WeightImages loads while released) gives views
+// that are handles of no memory, and the bytes its readers parse on the
+// host, its header and descriptors, are those its plan writes there
+// (`planned`, gguf::Image::fills): its weights' layout is read at no memory.
 class WeightFile final {
 public:
-  WeightFile(metal::MetalBackend &backend, std::filesystem::path path,
+  WeightFile(metal::MetalBackend &backend, metal::MetalBuffer image,
              std::string relativePath, std::string_view expectedMagic,
              uint32_t expectedLayer, uint32_t expectedType,
-             std::string contentIdentity = {});
+             uint64_t declaredBytes, std::string contentIdentity,
+             std::shared_ptr<const std::vector<gguf::Fill>> planned = {});
   ~WeightFile();
 
   WeightFile(const WeightFile &) = delete;
@@ -49,10 +71,12 @@ public:
   WeightFile &operator=(WeightFile &&) noexcept;
 
   [[nodiscard]] metal::MetalBuffer section(uint64_t bytes,
-                                            std::string_view label = {});
-  // One section of the parts' total bytes, as a view of each part in order.
-  [[nodiscard]] std::vector<metal::MetalBuffer> split(std::initializer_list<uint64_t> parts,
-                                                      std::string_view label);
+                                            std::string_view label);
+  // The next section, of `bytes` bytes, as a reader parses it on the host:
+  // the image's bytes, or, while it holds no memory, those its plan writes
+  // there.
+  [[nodiscard]] std::span<const uint8_t> read(uint64_t bytes, std::string_view label);
+  // Requires the sections read to cover the whole file.
   void finish();
   [[nodiscard]] const WeightFileRecord &record() const noexcept;
 
@@ -61,48 +85,27 @@ private:
   std::unique_ptr<Impl> impl_;
 };
 
-[[nodiscard]] uint64_t checkedWeightMultiply(uint64_t left, uint64_t right,
-                                             std::string_view description);
-[[nodiscard]] uint64_t q4PackedBytes(uint32_t outputSize,
-                                     uint32_t inputSize);
-void validateQ4Layout(uint32_t outputSize, uint32_t inputSize);
-
-[[nodiscard]] ops::Projection
-readAffineProjection(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
-                     std::string_view label);
-
 // A norm of `width` multipliers: F32 when `float32` (a GGUF image keeps its
 // norms as the GGUF stores them), bf16 otherwise.
 [[nodiscard]] ops::NormWeights readNorm(WeightFile &file, uint32_t width,
                                         bool float32, std::string_view label);
 
-// GGUF image sections: a 64-byte descriptor, then plane0, optional plane1
+// GGUF image sections: a descriptor, then plane0, optional plane1
 // and metadata, each 16 KiB aligned (GgufTensorDescriptor and the layout in
-// model/GgufImageLayout.hpp).
+// model/GgufImageLayout.hpp); or, for F32 and BF16 values, the rows as stored.
 [[nodiscard]] ops::QuantizedSegment readQuantizedSegment(WeightFile &file,
                                                    std::string_view label);
+// A float segment, a descriptor and its rows as stored: F32 or BF16 values or
+// a quantized format's native rows (the MoE router, which the float
+// projection runs in fp32).
+[[nodiscard]] ops::QuantizedSegment readFloatSegment(WeightFile &file, std::string_view label);
 // A single-tensor projection; its descriptor must hold the layout's sizes.
 [[nodiscard]] ops::Projection readBlockProjection(WeightFile &file, uint32_t outputSize,
                                                   uint32_t inputSize, std::string_view label);
-// Native block_q4_K, block_q6_K or block_q8_0 rows for the token table
-// (gathered, never multiplied).
+// The token table's rows as stored in a GGUF format (ops::StoredRows),
+// gathered, never multiplied.
 [[nodiscard]] ops::EmbeddingWeights readBlockEmbedding(WeightFile &file, uint32_t outputSize,
                                                        uint32_t inputSize, std::string_view label);
-
-// Embedding weights, scales and biases are independently aligned sections
-// so token gather can bind each table directly.
-[[nodiscard]] ops::EmbeddingWeights
-readAffineEmbedding(WeightFile &file, uint32_t outputSize,
-                           uint32_t inputSize, std::string_view label);
-
-[[nodiscard]] ops::Q8Projection
-readAffineQ8Projection(WeightFile &file, uint32_t outputSize, uint32_t inputSize,
-                       std::string_view label);
-
-[[nodiscard]] ops::ExpertProjection
-readAffineExpertProjection(WeightFile &file, uint32_t experts,
-                           uint32_t outputSize, uint32_t inputSize,
-                           std::string_view label);
 
 [[nodiscard]] std::string
 weightManifestFingerprint(std::span<const WeightFileRecord> records);

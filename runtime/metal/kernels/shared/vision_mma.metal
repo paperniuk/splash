@@ -50,10 +50,10 @@ inline float erf_approx(float x) {
 // is input 4 fm + j, so lane (fm, fn) reads one 8-byte run of each of its two
 // rows; A column fn at step j is input 4 fn + j, one 16-byte run of its
 // weight row for both columns fn and fn + 1.
-template <ushort TileM, ushort TileN, Activation Act, bool AddResidual>
+template <ushort TileM, ushort TileN, Activation Act, bool AddResidual, typename Output>
 inline void gemm(device const bfloat *input, device const bfloat *weights,
-                 device const bfloat *bias, device bfloat *output,
-                 device const bfloat *residual, uint N, uint K, uint2 tg,
+                 device const bfloat *bias, device Output *output,
+                 device const Output *residual, uint N, uint K, uint2 tg,
                  uint sg, uint lane) {
   constexpr uint FM = 4, FN = 4, SGN = TileN / (FN * 8);
   static_assert((TileM / (FM * 8)) * SGN == 8, "eight simdgroups per tile");
@@ -111,7 +111,7 @@ inline void gemm(device const bfloat *input, device const bfloat *weights,
         else if (Act == GeluErf)
           value = 0.5f * value * (1.0f + erf_approx(value * 0.7071067811865476f));
         if (AddResidual) value += float(residual[o]);
-        output[o] = bfloat(value);
+        output[o] = Output(value);
       }
   }
 }
@@ -122,8 +122,10 @@ inline void gemm(device const bfloat *input, device const bfloat *weights,
 // in the fragment layout PV = V^T P^T takes as its B operand, so the online
 // softmax runs in registers; P is rounded to bf16 as the MPP kernel rounds
 // its probabilities, and the row sums keep the unrounded exponents.
-constexpr constant uint kRows = 64, kKeys = 32, kHeadDim = 72, kQkDim = 80;
+constexpr constant uint kRows = SPLASH_VISION_ATTENTION_MMA_ROWS, kKeys = 32, kHeadDim = 72, kQkDim = 80;
 constexpr constant uint kKeyStride = 84, kValueStride = 76;  // bank-spread rows
+constexpr constant uint kThreads = SPLASH_VISION_ATTENTION_MMA_THREADS;
+static_assert(kThreads / 32 * 8 == kRows, "eight rows per simdgroup");
 
 inline void attention(device const bfloat *queries, device const bfloat *keys,
                       device const bfloat *values, device bfloat *output,
@@ -152,7 +154,7 @@ inline void attention(device const bfloat *queries, device const bfloat *keys,
   for (uint base = 0; base < context; base += kKeys) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // 32 x 80 keys and 32 x 72 values: 320 and 288 runs of eight bf16.
-    for (uint u = thread_index; u < kKeys * (kQkDim + kHeadDim) / 8; u += 256) {
+    for (uint u = thread_index; u < kKeys * (kQkDim + kHeadDim) / 8; u += kThreads) {
       const bool key = u < kKeys * kQkDim / 8;
       const uint e = 8 * (key ? u : u - kKeys * kQkDim / 8);
       const uint dim = key ? kQkDim : kHeadDim;
@@ -227,24 +229,25 @@ inline void attention(device const bfloat *queries, device const bfloat *keys,
 
 } // namespace vision_mma
 
-#define VISION_GEMM_MMA_KERNEL(name, tile_m, tile_n, activation, add_residual)            \
+#define VISION_GEMM_MMA_KERNEL(name, tile_m, tile_n, activation, add_residual, output_type) \
   kernel void name(device bfloat *input [[buffer(0)]], device bfloat *weights [[buffer(1)]], \
-                   device bfloat *bias [[buffer(2)]], device bfloat *output [[buffer(3)]],    \
-                   device bfloat *residual [[buffer(4)]],                                   \
+                   device bfloat *bias [[buffer(2)]], device output_type *output [[buffer(3)]], \
+                   device output_type *residual [[buffer(4)]],                              \
                    constant VisionGemmParams &params [[buffer(5)]],                         \
                    uint2 tg [[threadgroup_position_in_grid]],                               \
                    uint sg [[simdgroup_index_in_threadgroup]],                              \
                    uint lane [[thread_index_in_simdgroup]]) {                               \
-    vision_mma::gemm<tile_m, tile_n, vision_mma::activation, add_residual>(                 \
+    vision_mma::gemm<tile_m, tile_n, vision_mma::activation, add_residual, output_type>(    \
         input, weights, bias, output, residual, params.output_size, params.input_size, tg,  \
         sg, lane);                                                                          \
   }
 
-VISION_GEMM_MMA_KERNEL(vision_gemm_mma_m64n128, 64, 128, None, false)
-VISION_GEMM_MMA_KERNEL(vision_gemm_mma_m64n128_residual, 64, 128, None, true)
-VISION_GEMM_MMA_KERNEL(vision_gemm_mma_m64n128_gelu_tanh, 64, 128, GeluTanh, false)
-VISION_GEMM_MMA_KERNEL(vision_gemm_mma_m32n256, 32, 256, None, false)
-VISION_GEMM_MMA_KERNEL(vision_gemm_mma_m32n256_gelu_erf, 32, 256, GeluErf, false)
+VISION_GEMM_MMA_KERNEL(vision_gemm_mma_m64n128, 64, 128, None, false, bfloat)
+// The fp32 residual stream of vision_gemm_m64n128_residual.
+VISION_GEMM_MMA_KERNEL(vision_gemm_mma_m64n128_residual, 64, 128, None, true, float)
+VISION_GEMM_MMA_KERNEL(vision_gemm_mma_m64n128_gelu_tanh, 64, 128, GeluTanh, false, bfloat)
+VISION_GEMM_MMA_KERNEL(vision_gemm_mma_m32n256, 32, 256, None, false, bfloat)
+VISION_GEMM_MMA_KERNEL(vision_gemm_mma_m32n256_gelu_erf, 32, 256, GeluErf, false, bfloat)
 #undef VISION_GEMM_MMA_KERNEL
 
 kernel void vision_attention_mma(device bfloat *queries [[buffer(0)]],

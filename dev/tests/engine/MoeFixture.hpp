@@ -1,0 +1,239 @@
+#pragma once
+
+// A GGUF sparse MoE block for the MoE tests (gguf_moe_test.mm, the kernels;
+// expert_store_test.mm, streamed experts): weights in GGUF formats with
+// their reference values (GgufFormatReference.hpp), bf16 rows, and the buffers
+// a plan runs in.
+
+#include "GgufFormatReference.hpp"
+#include "metal/MetalBackend.hpp"
+#include "model/ExpertStore.hpp"
+#include "ops/MoE.hpp"
+
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <random>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace moe_fixture {
+
+// The most rows a test's MoE step runs: a prefill chunk whose tiles end
+// ragged.
+inline constexpr uint32_t kMaximumRows = 263;
+
+// The tests' weights and rows, the same in every run.
+inline std::mt19937 rng(0x35);
+
+inline float bf16(double value) { return float(__bf16(float(value))); }
+
+inline splash::metal::MetalBuffer upload(splash::metal::MetalBackend &backend, const void *data, uint64_t bytes,
+                                         const char *label) {
+  splash::metal::MetalBuffer buffer = backend.allocateBuffer(bytes, splash::metal::BufferStorage::Shared, label);
+  std::memcpy(buffer.contents(), data, bytes);
+  return buffer;
+}
+
+inline splash::metal::MetalBuffer zeros(splash::metal::MetalBackend &backend, uint64_t bytes, const char *label) {
+  if (!bytes) return {};
+  splash::metal::MetalBuffer buffer = backend.allocateBuffer(bytes, splash::metal::BufferStorage::Shared, label);
+  std::memset(buffer.contents(), 0, bytes);
+  return buffer;
+}
+
+// The segments of a repacked [rows, K] tensor in format f and of [rows, K] floats.
+inline splash::ops::QuantizedSegment planeSegment(splash::metal::MetalBackend &backend, gguf_reference::Fmt f,
+                                                  const gguf_reference::Packed &planes, uint32_t rows, uint32_t K) {
+  return splash::ops::QuantizedSegment::planes(
+      f, rows, K, upload(backend, planes.w0.data(), planes.w0.size(), "gguf-plane0"),
+      kQuantFormats[f].plane1_bytes ? upload(backend, planes.w1.data(), planes.w1.size(), "gguf-plane1")
+                                    : splash::metal::MetalBuffer{},
+      upload(backend, planes.meta.data(), planes.meta.size(), "gguf-meta"));
+}
+inline splash::ops::QuantizedSegment floatSegment(splash::metal::MetalBackend &backend,
+                                                  const std::vector<float> &values, uint32_t rows, uint32_t K) {
+  return splash::ops::QuantizedSegment::floats(rows, K, upload(backend, values.data(), values.size() * sizeof(float),
+                                                               "gguf-floats"));
+}
+
+// A GGUF tensor [rows, K]: its segment, its reference fp32 values and, quantized, its native rows.
+struct Tensor {
+  splash::ops::QuantizedSegment segment;
+  std::vector<float> values;
+  std::vector<uint8_t> native;
+  uint32_t rows = 0, columns = 0;
+  [[nodiscard]] const float *row(uint64_t n) const { return values.data() + n * columns; }
+};
+
+inline Tensor quantized(splash::metal::MetalBackend &backend, gguf_reference::Fmt f, uint32_t rows, uint32_t K) {
+  Tensor t;
+  t.native = gguf_reference::makeNative(f, rows, K, rng);
+  t.rows = rows;
+  t.columns = K;
+  t.segment = planeSegment(backend, f, gguf_reference::repack(f, t.native, rows, K, &t.values), rows, K);
+  return t;
+}
+
+inline Tensor floating(splash::metal::MetalBackend &backend, uint32_t rows, uint32_t K, float scale) {
+  std::normal_distribution<float> normal(0.0f, scale);
+  Tensor t;
+  t.rows = rows;
+  t.columns = K;
+  t.values.resize(uint64_t{rows} * K);
+  for (float &v : t.values) v = normal(rng);
+  t.segment = floatSegment(backend, t.values, rows, K);
+  return t;
+}
+
+// bf16 rows in [-1, 1].
+inline std::vector<float> activations(uint64_t elements) {
+  std::uniform_real_distribution<float> unit(-1.0f, 1.0f);
+  std::vector<float> values(elements);
+  for (float &v : values) v = bf16(unit(rng));
+  return values;
+}
+
+inline splash::metal::MetalBuffer bfloatBuffer(splash::metal::MetalBackend &backend, const std::vector<float> &values,
+                                               const char *label) {
+  std::vector<__bf16> bits(values.begin(), values.end());
+  return upload(backend, bits.data(), bits.size() * 2, label);
+}
+
+// A block of `shape`: its router, shared expert scalar gate (none without
+// shape.sharedGate), routed experts' and shared expert's gate, up and down,
+// the shared expert's shape.sharedSlices slices in the order the kernels read
+// them (ops::BlockExpertProjection), their weights with expert e in slot e of
+// one chunk of the routed segments (ops::residentExpertChunks), and the
+// formats of the six projections.
+struct Model {
+  splash::ops::MoeShape shape;
+  Tensor router, sharedGate;
+  std::array<Tensor, 3> routed;   // gate, up, down: experts * N rows
+  std::array<Tensor, 3> shared;   // sharedSlices * N rows
+  splash::ops::BlockMoeWeights weights;
+  std::array<gguf_reference::Fmt, 6> formats{};
+};
+
+// The first format from id i on, cyclically, in rows of K values: one whose
+// column unit divides K (a GGUF stores no 256-value blocks in rows of 640,
+// Qwen3.8-Flash-Next's expert down projections, which take 32- or 64-value
+// blocks, and preparation takes PQ2_0's 128-value blocks and the MLX affine
+// formats' groups of 128 only in rows of whole superblocks).
+inline gguf_reference::Fmt fitting(size_t i, uint32_t K) {
+  for (size_t j = 0; j < gguf_reference::FMT_COUNT; ++j) {
+    const gguf_reference::Fmt g = gguf_reference::Fmt((i + j) % gguf_reference::FMT_COUNT);
+    if (K % quant_column_unit(kQuantFormats[g].block_elements) == 0) return g;
+  }
+  throw std::logic_error("no format fits the row");
+}
+
+// The model of `shape` and format f: gate, up and down in f and the next two
+// formats, cyclically, and the shared expert's in the three after them, each
+// the next that fits its rows; with upInGateFormats, up in the gate's
+// formats.
+inline Model makeModel(splash::metal::MetalBackend &backend, const splash::ops::MoeShape &shape, int f,
+                       bool upInGateFormats) {
+  const uint32_t hidden = shape.hiddenSize, intermediate = shape.expertIntermediateSize;
+  const uint32_t n[3] = {intermediate, intermediate, hidden}, k[3] = {hidden, hidden, intermediate};
+  Model m;
+  m.shape = shape;
+  for (size_t i = 0; i < m.formats.size(); ++i) m.formats[i] = fitting(f + i, k[i % 3]);
+  if (upInGateFormats) {
+    m.formats[1] = m.formats[0];
+    m.formats[4] = m.formats[3];
+  }
+  m.router = floating(backend, shape.experts, hidden, 0.05f);
+  if (shape.sharedGate) m.sharedGate = floating(backend, 1, hidden, 0.05f);
+  for (int p = 0; p < 3; ++p) {
+    m.routed[p] = quantized(backend, m.formats[p], shape.experts * n[p], k[p]);
+    m.shared[p] = quantized(backend, m.formats[3 + p], shape.sharedSlices * n[p], k[p]);
+  }
+  splash::ops::BlockMoeWeights gguf;
+  gguf.router = m.router.segment;
+  gguf.sharedScalarGate = m.sharedGate.segment;
+  gguf.gate = {m.routed[0].segment, m.shared[0].segment};
+  gguf.up = {m.routed[1].segment, m.shared[1].segment};
+  gguf.down = {m.routed[2].segment, m.shared[2].segment};
+  gguf.slotTable = splash::model::residentExpertSlots(backend, shape.experts);
+  gguf.slots = shape.experts;
+  gguf.chunks = splash::ops::residentExpertChunks(gguf);
+  m.weights = gguf;
+  return m;
+}
+
+// The weights of `m` with its routed experts copied into a floor chunk of
+// floorSlots slots and elastic chunks of chunkSlots slots each after it, the
+// last of the rest (ops::ExpertChunks): slot s, which holds expert s, at slot
+// s of chunk 0 below floorSlots and at slot (s - floorSlots) % chunkSlots of
+// chunk 1 + (s - floorSlots) / chunkSlots from it on, each chunk one buffer
+// of its nine regions in turn, as an expert store lays them out.
+inline splash::ops::BlockMoeWeights chunkedWeights(splash::metal::MetalBackend &backend, const Model &m,
+                                                   uint32_t floorSlots, uint32_t chunkSlots) {
+  constexpr uint64_t kRegionAlignment = 16 << 10;
+  const std::vector<splash::metal::MetalBuffer> &resident = *m.weights.chunks.planes();
+  const uint32_t slots = m.weights.slots;
+  // Each region's bytes per slot, in the chunks' order.
+  std::array<uint64_t, MOE_EXPERT_CHUNK_ADDRESSES> slotBytes{};
+  for (uint32_t z = 0; z < 3; ++z) {
+    const splash::ops::QuantizedSegment &routed = m.routed[z].segment;
+    const QuantFormat &format = kQuantFormats[routed.formatId];
+    const uint64_t groups = uint64_t{routed.outputSize / slots} * (routed.inputSize / 32);
+    slotBytes[3 * z] = groups * format.plane0_bytes;
+    slotBytes[3 * z + 1] = groups * format.plane1_bytes;
+    slotBytes[3 * z + 2] = groups / format.meta_groups * format.meta_bytes;
+  }
+  std::vector<splash::metal::MetalBuffer> planes;
+  for (uint32_t first = 0; first < slots; first += first ? chunkSlots : floorSlots) {
+    const uint64_t held = std::min(first ? chunkSlots : floorSlots, slots - first);
+    std::array<uint64_t, MOE_EXPERT_CHUNK_ADDRESSES> at{};
+    uint64_t bytes = 0;
+    for (size_t entry = 0; entry < at.size(); ++entry) {
+      at[entry] = bytes;
+      bytes += (held * slotBytes[entry] + kRegionAlignment - 1) / kRegionAlignment * kRegionAlignment;
+    }
+    const splash::metal::MetalBuffer chunk = zeros(backend, bytes, "moe-chunk");
+    for (size_t entry = 0; entry < at.size(); ++entry)
+      if (slotBytes[entry])
+        std::memcpy(static_cast<uint8_t *>(chunk.contents()) + at[entry],
+                    static_cast<const uint8_t *>(resident[entry].contents()) + first * slotBytes[entry],
+                    held * slotBytes[entry]);
+    for (size_t z = 0; z < 3; ++z) {
+      const splash::metal::MetalBuffer meta = backend.view(chunk, at[3 * z + 2], held * slotBytes[3 * z + 2]);
+      planes.push_back(backend.view(chunk, at[3 * z], held * slotBytes[3 * z]));
+      planes.push_back(slotBytes[3 * z + 1] ? backend.view(chunk, at[3 * z + 1], held * slotBytes[3 * z + 1])
+                                            : meta);
+      planes.push_back(meta);
+    }
+  }
+  splash::ops::BlockMoeWeights weights = m.weights;
+  weights.chunks = splash::ops::ExpertChunks::of(std::move(planes), floorSlots, chunkSlots, slots,
+                                                 weights.gate.routed, weights.up.routed, weights.down.routed);
+  return weights;
+}
+
+// The model's six formats, "gate/up/down/shared gate/shared up/shared down".
+inline std::string formatNames(const Model &m) {
+  std::string names;
+  for (const gguf_reference::Fmt format : m.formats)
+    names += std::string(names.empty() ? "" : "/") + gguf_reference::fmtName(format);
+  return names;
+}
+
+// A step's buffers, and the fp32 values of its input and residual rows.
+struct Buffers {
+  splash::ops::MoeBuffers moe;
+  std::vector<float> input, residual;
+};
+
+// The scratch `plan` runs in, zeroed.
+inline void allocate(splash::metal::MetalBackend &backend, Buffers &b, const splash::ops::MoePlan &plan) {
+  const auto &w = plan.workspace();
+  for (const splash::ops::MoeScratchField &field : splash::ops::kMoeScratchFields)
+    b.moe.scratch.*field.buffer = zeros(backend, w.*field.bytes, "moe-scratch");
+}
+
+} // namespace moe_fixture

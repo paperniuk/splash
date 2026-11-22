@@ -1,0 +1,248 @@
+// The KV tier over host-memory pages (engine::BasicKvPageTier) for the sanitizers: round trips,
+// failed restores and teardown with transfers in flight. kv_page_tier_test covers the GPU side.
+#include "HostKvPages.hpp"
+#include "TestChecks.hpp"
+#include "engine/KvPageTier.hpp"
+#include "model/SlotFile.hpp"
+#include "model/SsdReaders.hpp"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <iostream>
+#include <memory>
+#include <span>
+#include <stdexcept>
+#include <thread>
+#include <vector>
+
+using namespace splash;
+using engine::KvTransfer;
+using engine::WriteClass;
+using model::DiskBudget;
+using model::SlotFile;
+using splash::test::require;
+
+namespace {
+
+using Tier = engine::BasicKvPageTier<test::HostKvPages>;
+
+constexpr auto cached = DiskBudget::Draw::Cache;
+
+// A slot file of `slots` slots of the format's payload, checksummed by its
+// segments.
+std::shared_ptr<SlotFile> slotFile(const kv::SlotFormat &format, uint32_t slots,
+                                   std::shared_ptr<DiskBudget> &budget) {
+  const uint64_t bytes = SlotFile::slotBytesFor(format.payloadBytes());
+  budget = std::make_shared<DiskBudget>(slots * bytes);
+  return std::make_shared<SlotFile>(bytes, budget, SlotFile::Options{.segments = format.segments()});
+}
+
+// Drives the tier as the engine does until every transfer is ready.
+void runUntilReady(Tier &tier, std::span<const std::unique_ptr<KvTransfer>> transfers) {
+  tier.submitRestores();
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+  for (;;) {
+    tier.poll();
+    bool ready = true;
+    for (const std::unique_ptr<KvTransfer> &transfer : transfers)
+      ready = ready && transfer->ready();
+    if (ready)
+      return;
+    if (std::chrono::steady_clock::now() > deadline)
+      throw std::runtime_error("KV transfers did not complete");
+    std::this_thread::yield();
+  }
+}
+
+std::vector<std::byte> indexOf(const test::HostKvPages &pages, uint32_t page) {
+  std::vector<std::byte> bytes;
+  for (const std::span<std::byte> span : pages.indexSpans(page))
+    bytes.insert(bytes.end(), span.begin(), span.end());
+  return bytes;
+}
+
+// Pages round-trip byte for byte (whole, Slim and index restores); a restore of an unwritten slot
+// fails alone.
+void roundTrips(const std::shared_ptr<model::SsdReaders> &readers, kv::Layout layout) {
+  constexpr uint32_t kPages = 48;
+  test::HostKvPages pages(layout, 2 * kPages + 1);
+  const kv::SlotFormat format(layout);
+  std::shared_ptr<DiskBudget> budget;
+  Tier tier(pages, format, slotFile(format, kPages + 1, budget), readers);
+  std::vector<std::shared_ptr<engine::KvDiskSlot>> slots;
+  std::vector<std::unique_ptr<KvTransfer>> writes;
+  const auto slim = [&](uint32_t page) { return layout.slimmable() && page % 3 == 0; };
+  for (uint32_t page = 0; page < kPages; ++page) {
+    pages.fill(page, page + 1);
+    if (slim(page)) {
+      pages.setForm(page, kv::PageForm::Slim);
+      pages.setForm(kPages + page, kv::PageForm::Slim);
+    }
+    slots.push_back(tier.acquireSlot(pages.form(page), cached));
+    writes.push_back(tier.demote(page, slots.back(), WriteClass::Reclaim, {}));
+    require(writes.back() != nullptr, "a write within the tier's bound was refused");
+  }
+  runUntilReady(tier, writes);
+  for (const std::unique_ptr<KvTransfer> &write : writes)
+    require(write->finish(), "a write failed");
+
+  std::atomic<uint32_t> wakes{0};
+  std::vector<std::unique_ptr<KvTransfer>> restores;
+  for (uint32_t page = 0; page < kPages; ++page) {
+    if (layout.spillable() && page % 2)
+      pages.setForm(kPages + page, kv::PageForm::Index);
+    restores.push_back(tier.restore(slots[page], kPages + page, [&wakes] { wakes.fetch_add(1); }));
+  }
+  restores.push_back(tier.restore(tier.acquireSlot(kv::PageForm::Full, cached), 2 * kPages, {}));
+  runUntilReady(tier, restores);
+  for (uint32_t page = 0; page < kPages; ++page) {
+    const uint32_t into = kPages + page;
+    const bool index = pages.form(into) == kv::PageForm::Index;
+    const uint64_t bytes = layout.bytesPerModelPage(pages.form(into));
+    require(restores[page]->finish() &&
+                (index ? indexOf(pages, into) == indexOf(pages, page)
+                       : std::ranges::equal(pages.page(into).first(bytes), pages.page(page).first(bytes))),
+            "a page did not come back from its slot byte for byte");
+  }
+  require(!restores.back()->finish(), "a slot never written was restored");
+  require(wakes.load() == (layout.spillable() ? 2u : 1u), "a batch of restores did not wake the engine once");
+  std::cout << "round trips " << kv::formatName(layout.format) << " slot format v" << format.version() << '\n';
+}
+
+// A page's slot takes of the quota what it stores of the page: a quota of four Full pages' slots
+// holds the Slim pages its bytes allow beside a Full one, through releases and reuse by a page of
+// the other form, and each page comes back from the slot it was written to.
+void formsCountWhatTheyStore(const std::shared_ptr<model::SsdReaders> &readers, kv::Layout layout) {
+  constexpr uint32_t kPages = 16;
+  test::HostKvPages pages(layout, 2 * kPages);
+  const kv::SlotFormat format(layout);
+  // A slot takes its page's bytes in its form (kv::Layout), in whole host pages: what the tier
+  // counts, worked out apart from how it counts them (SlotFormat::payloadBytes,
+  // SlotFile::quotaBytesFor).
+  const auto hostPages = [&](kv::PageForm form) {
+    return (layout.bytesPerModelPage(form) + kHostPageBytes - 1) / kHostPageBytes * kHostPageBytes;
+  };
+  const uint64_t full = hostPages(kv::PageForm::Full), slim = hostPages(kv::PageForm::Slim);
+  auto budget = std::make_shared<DiskBudget>(4 * full);
+  Tier tier(pages, format, std::make_shared<SlotFile>(full, budget), readers);
+  require(slim < full && tier.slotBytes(kv::PageForm::Full) == full && tier.slotBytes(kv::PageForm::Slim) == slim,
+          "a slot does not take what it stores of a page of its form");
+  // Page 0 stays Full; the others are Slim, and each restores into the
+  // page kPages past it.
+  std::vector<std::shared_ptr<engine::KvDiskSlot>> slots(kPages);
+  for (uint32_t page = 0; page < kPages; ++page) {
+    pages.fill(page, page + 1);
+    pages.setForm(page, page ? kv::PageForm::Slim : kv::PageForm::Full);
+    pages.setForm(kPages + page, pages.form(page));
+  }
+  const auto store = [&](uint32_t page) {
+    slots[page] = tier.acquireSlot(pages.form(page), cached);
+    if (!slots[page])
+      return false;
+    std::vector<std::unique_ptr<KvTransfer>> write;
+    write.push_back(tier.demote(page, slots[page], WriteClass::Reclaim, {}));
+    require(write.back() != nullptr, "a write within the tier's bound was refused");
+    runUntilReady(tier, write);
+    require(write.back()->finish() && slots[page]->bytes() == (pages.form(page) == kv::PageForm::Slim ? slim : full),
+            "a page's write failed, or its slot took other than what it stores");
+    return true;
+  };
+  const auto intact = [&](uint32_t page) {
+    std::vector<std::unique_ptr<KvTransfer>> restore;
+    restore.push_back(tier.restore(slots[page], kPages + page, {}));
+    runUntilReady(tier, restore);
+    const uint64_t bytes = layout.bytesPerModelPage(pages.form(page));
+    return restore.back()->finish() &&
+           std::ranges::equal(pages.page(kPages + page).first(bytes), pages.page(page).first(bytes));
+  };
+  const uint32_t held = static_cast<uint32_t>(1 + 3 * full / slim);
+  require(held > 4 && held < kPages, "the layout's Slim pages are not a part of its Full ones");
+  for (uint32_t page = 0; page < held; ++page)
+    require(store(page), "a quota with room for a page's slot refused it");
+  require(!store(held) && budget->usedBytes() == full + (held - 1) * slim,
+          "the quota did not hold the Slim pages its bytes allow beside a Full one");
+  // A Slim page's room holds no Full page; the Full page's does, in the
+  // slot a Slim page left, and a Slim page goes into the Full page's.
+  pages.setForm(held, kv::PageForm::Full);
+  pages.setForm(kPages + held, kv::PageForm::Full);
+  slots[1].reset();
+  require(!store(held), "a Full page took the room of a Slim one");
+  slots[0].reset();
+  require(store(held) && store(held + 1) && !store(1) && budget->usedBytes() == full + (held - 1) * slim,
+          "the quota did not return what the released slots took");
+  for (uint32_t page = 2; page <= held + 1; ++page)
+    require(intact(page), "a page did not come back from a slot beside pages of another form");
+  slots.clear();
+  require(budget->usedBytes() == 0, "released slots kept quota");
+  std::cout << "forms count what they store " << kv::formatName(layout.format) << '\n';
+}
+
+// A tier goes away with transfers in flight, and right after its last restore, without anything
+// running past it.
+void teardown(const std::shared_ptr<model::SsdReaders> &readers, kv::Layout layout) {
+  test::HostKvPages pages(layout, 16);
+  const kv::SlotFormat format(layout);
+  std::shared_ptr<DiskBudget> budget;
+  const std::shared_ptr<SlotFile> file = slotFile(format, 16, budget);
+  {
+    Tier tier(pages, format, file, readers, 16);
+    std::vector<std::unique_ptr<KvTransfer>> transfers;
+    std::vector<std::shared_ptr<engine::KvDiskSlot>> slots;
+    for (uint32_t page = 0; page < 8; ++page) {
+      slots.push_back(tier.acquireSlot(kv::PageForm::Full, cached));
+      transfers.push_back(tier.demote(page, slots.back(), WriteClass::Reclaim, {}));
+      require(transfers.back() != nullptr, "a write within the tier's bound was refused");
+    }
+    for (uint32_t page = 8; page < 16; ++page)
+      transfers.push_back(tier.restore(slots[page - 8], page, {}));
+    tier.submitRestores();
+  }
+  require(budget->usedBytes() == 0, "the tier left its pages with disk IO still running");
+  for (int round = 0; round < 64; ++round) {
+    auto wakes = std::make_unique<std::atomic<uint32_t>>(0);
+    {
+      Tier tier(pages, format, file, readers);
+      const std::shared_ptr<engine::KvDiskSlot> slot = tier.acquireSlot(kv::PageForm::Full, cached);
+      std::vector<std::unique_ptr<KvTransfer>> transfers;
+      transfers.push_back(tier.demote(0, slot, WriteClass::Reclaim, {}));
+      runUntilReady(tier, transfers);
+      // The completion takes a while, as a wake that waits for a lock does.
+      transfers.push_back(tier.restore(slot, 1, [counter = wakes.get()] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        counter->fetch_add(1);
+      }));
+      runUntilReady(tier, transfers);
+    }
+    require(wakes->load() == 1, "a batch's end ran past the tier that started it");
+  }
+  std::cout << "teardown " << kv::formatName(layout.format) << '\n';
+}
+
+} // namespace
+
+int main() {
+  try {
+    const auto readers = std::make_shared<model::SsdReaders>(model::kSsdReaders);
+    for (const kv::Format format : {kv::Format::Int8, kv::Format::BFloat16}) {
+      // Qwen3.6-35B's layout, which keeps its spans' order, a windowed one
+      // with Slim pages, and Qwen3.8-Flash-Next's, whose slots hold block
+      // records.
+      for (const kv::Layout layout : {kv::Layout{10, 2, 256, format},
+                                      kv::Layout{6, 2, 256, format, 0, false, 512, 0b010110},
+                                      kv::Layout{12, 2, 256, format, 128, true, 0, 0, kv::Reads::SelectedBlocks}}) {
+        roundTrips(readers, layout);
+        teardown(readers, layout);
+        if (layout.slimmable())
+          formsCountWhatTheyStore(readers, layout);
+      }
+    }
+  } catch (const std::exception &error) {
+    std::cerr << "kv page tier host tests failed: " << error.what() << '\n';
+    return 1;
+  }
+  std::cout << "kv page tier host tests passed\n";
+  return 0;
+}

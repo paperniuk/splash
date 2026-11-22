@@ -1,24 +1,39 @@
 #pragma once
 
 #include "ops/Vision.hpp"
+#include "engine/AneFfnStartup.hpp"
 #include "engine/MemoryPlan.hpp"
 #include "engine/Cache.hpp"
+#include "engine/CacheDirectory.hpp"
+#include "engine/DiskSpace.hpp"
+#include "engine/Engine.hpp"
 #include "engine/MemoryGovernor.hpp"
-#include "model/KvPageTier.hpp"
+#include "engine/KvPageTier.hpp"
 #include "ops/PageStorage.hpp"
+#include "model/KvBlockCache.hpp"
+#include "model/ExpertStoreStats.hpp"
+#include "model/KvHistoryStream.hpp"
 #include "model/ModelFactory.hpp"
+#include "model/QwenState.hpp"
+#include "model/SparseRowStore.hpp"
+#include "model/SsdReaders.hpp"
 #include "engine/MemoryAudit.hpp"
+#include "engine/Protocol.hpp"
+#include "engine/ReleasableMemory.hpp"
+#include "metal/MetalBackend.hpp"
 #include "ops/ExecutionPlans.hpp"
 
-#include <array>
+#include <condition_variable>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 
 namespace splash::engine {
 
@@ -34,66 +49,147 @@ enum class RuntimeResourceStage {
 [[nodiscard]] std::string_view
 runtimeResourceStageName(RuntimeResourceStage stage);
 
-[[nodiscard]] inline std::string
-digestHex(const std::array<uint8_t, 32> &digest) {
-  constexpr char hex[] = "0123456789abcdef";
-  std::string result;
-  result.reserve(digest.size() * 2);
-  for (uint8_t byte : digest) {
-    result.push_back(hex[byte >> 4]);
-    result.push_back(hex[byte & 0x0f]);
-  }
-  return result;
-}
-
+// What /status reports of the loaded model, the build and the KV pages.
+// Both digests are SHA-256 in lowercase hex.
 struct RuntimeCacheIdentity {
+  // The combined manifest of every model the runtime loaded.
   std::string modelLayoutSha256;
   std::string buildId;
-  // One process-wide content namespace. KV blocks never copy model/build
-  // strings or physical layout metadata.
-  CacheNamespace cacheNamespace;
-  // Stable binary layout guard for physical KV pages.
-  kv::LayoutGuard kvLayout;
-  // SHA-256 of the versioned model/build/KV compatibility tuple.
-  std::string namespaceSha256;
+  kv::Layout kvLayout;
+  // The target's RoPE scaling, which every key the KV pages hold went
+  // through.
+  model::RopeScaling ropeScaling;
+  // The target model's manifest.
+  std::string targetModelSha256;
 };
 
 [[nodiscard]] RuntimeCacheIdentity
 makeRuntimeCacheIdentity(std::string_view combinedManifestSha256,
                          std::string_view targetManifestSha256,
                          std::string_view buildId,
-                         kv::Layout targetKvLayout);
+                         kv::Layout targetKvLayout,
+                         model::RopeScaling ropeScaling);
 
-// The memory plan counts each weight category from the loaded package, so
+// The name of the directory a persistent cache tier keeps its files in:
+// what its copies hold, from the models that computed them, the KV and
+// state layouts, the target's RoPE scaling and the format of the cache's
+// files. The build is not part of it; a change to what a copy holds bumps
+// the cache's format instead.
+[[nodiscard]] std::string
+persistentCacheNamespace(const RuntimeCacheIdentity &identity,
+                         const model::CompositeStateLayout &states);
+
+// A persistent cache tier's directory, and the files of its KV pages and
+// states there.
+struct PersistentCacheFiles final {
+  std::unique_ptr<CacheDirectory> directory;
+  std::shared_ptr<model::SlotFile> kv;
+  std::shared_ptr<model::SlotFile> states;
+};
+
+// The memory plan counts each weight category from the loaded model, so
 // every category the model has must report its allocation and identity.
-void requireLoadedModel(const model::ModelPackage &package);
+void requireLoadedModel(const model::LoadedModel &loaded);
+
+// The disk quota cached KV pages and states share (--max-cache-disk):
+// automatic, the tier sized by its volume up to kAutomaticCacheDiskBytes,
+// its staging set aside only where the memory plan has room for it and its
+// files opened only where their volume has, or `bytes`, zero for no tier.
+struct CacheDiskQuota final {
+  bool automatic = false;
+  uint64_t bytes = 0;
+};
 
 struct RuntimeResourcesConfig {
   kv::Format kvFormat = kv::Format::Int8;
+  ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
+  // Cached states keep stateFormat rather than codes (--cached-states exact).
+  bool exactCachedStates = false;
   std::filesystem::path metallibPath;
   std::filesystem::path modelRoot;
   model::ModelDescriptor model;
   std::string buildId;
   uint64_t maximumMemoryBytes = 0;
-  // Disk quota shared by cached KV pages and states; zero disables the tier.
-  uint64_t maximumCacheDiskBytes = 0;
-  // Patches per image the vision scratch covers. The engine admits images up
-  // to it when the model loaded vision and none otherwise; the wire parser's
-  // limit defaults to the same constant.
+  // No tier unless set.
+  CacheDiskQuota cacheDisk;
+  // The tier's write budget, the most it writes a day on average
+  // (--max-cache-disk-writes, model::DiskBudget::setWriteBudget); zero for
+  // none, when every write passes.
+  uint64_t cacheDiskWritesPerDay = 0;
+  // Where persistent caches live, one directory per persistentCacheNamespace():
+  // every start removes those nobody used for two weeks. Empty for none.
+  std::filesystem::path cacheRoot;
+  // The tier keeps its files under cacheRoot for the next process to take
+  // back (--persistent-cache), instead of temporary files that go with the
+  // process.
+  bool persistentCache = false;
+  // The volume a directory lives on (volumeOf), which the automatic quota
+  // reads for each place the tier may keep its files before it opens them,
+  // and the tier at each measure for the place they opened in (DiskSpace).
+  std::function<std::optional<DiskVolume>(const std::filesystem::path &directory)> diskVolume =
+      volumeOf;
+  // Patches per image, from --max-image-patches: the engine admits images up
+  // to it when the model loaded vision and none otherwise. The wire parser
+  // keeps the protocol ceiling.
   uint32_t maximumImagePatches = ops::kMaximumImagePatches;
+  // How long the engine keeps its memory without work (--idle-release): every
+  // buffer stays wired that long after the last command (the backend's
+  // residency keep-alive), and the weights' memory is freed once that long
+  // passes without a request (NativeRuntime::releaseIdleWeights). Infinite
+  // keeps both while the engine runs.
+  double idleReleaseSeconds = metal::kResidencyKeepAliveSeconds;
+  // Reclaimable host memory, sampled at every Metal operation during startup
+  // and by the governor afterwards.
+  MemoryGovernor::HostMemoryProvider hostMemory = queryHostMemory;
+  // --ple-memory: a target's PLE n-gram table, which its GGUF holds, streams
+  // from the file through a row cache of a size, or loads (off); auto leaves
+  // it to the memory plan (planStreamedMemory). Ignored, with a warning, for
+  // a target without one, and a size that holds the whole table loads it.
+  StreamedSetting pleMemory;
+  // --expert-memory: a MoE target's routed experts stream from their files
+  // through a store of exactly a size (its slots, staging and tables), all
+  // of it its floor, so it neither grows nor gives memory back; or load with
+  // their layers (off); auto leaves them to the memory plan, the floor to the
+  // store. A size that holds every expert loads them with their layers and
+  // says it is ignored, and so does a dense target.
+  StreamedSetting expertMemory;
+  // --sparse-kv-memory: the target of a spill-capable target's hot block
+  // cache, at least its floor; none (auto) keeps its floor.
+  std::optional<uint64_t> sparseKvMemory;
+  // --kv-spill always: every request of a spill-capable target spills, for
+  // validation (EngineSpillConfig::always).
+  bool kvSpillAlways = false;
+  // --kv-window-trim off: a windowed target's pages keep every layer's K/V,
+  // for validation that trimming changes no output (CacheWindowPolicy::trim).
+  bool kvWindowTrim = true;
+  // --verify-rows: the rows a decode cycle verifies (reportVerifyRows); a
+  // benchmark round verifies every row of a draft's block a lane (all) so
+  // that rounds repeat one another.
+  model::VerifyRows verifyRows = model::VerifyRows::Auto;
+  // --activations: whether the plans may round activations to int8
+  // where an int8-activation path takes them, or keep every activation bf16
+  // (ops::Int8Activations), for the life of the engine (ops::ExecutionPlans).
+  ops::Int8Activations int8Activations = ops::Int8Activations::On;
+  // The prefill FFN's Neural Engine split (startAneFfn): off with
+  // --disable-ane, and a benchmark round runs the split of the first so that
+  // rounds repeat one another.
+  AneFfnSetting aneFfn;
+  // A relaunch's context (--relaunch-context): the context the server's
+  // first engine served, which the server passes to its relaunches. The
+  // relaunch decides the rest as that engine did, for --max-context or as
+  // an automatic start, the SSD cache's staging among it, but the room the
+  // SSD cache's volume has left bounds its plan only above this context, and
+  // where its plan spills its SSD cache opens whatever room the volume has
+  // (RuntimeResources::create); without --max-context its split takes at
+  // most the units whose plan holds this context, the GPU alone where none
+  // does (startAneFfn); and it serves this context where its plan holds it
+  // (ServingRuntime::start). Zero for none.
+  uint32_t relaunchContext = 0;
   // The process's existing pressure observer runs before resource assembly;
   // it only publishes a level. Bootstrap checks it at Metal operation
   // boundaries; after Ready the transport control handler keeps it current.
   std::function<MemoryPressure()> memoryPressure;
   std::function<bool()> cancelled;
-  // Reclaimable host memory, sampled at every Metal operation during startup
-  // and by the governor afterwards. Empty means the live vm_statistics64
-  // estimate; tests substitute a fixed value.
-  MemoryGovernor::HostAvailableMemoryProvider hostAvailableMemory;
-  // Kernel choices to install over the operator policy. Used by the offline
-  // measurement tool and tests; production leaves it empty. Arenas are sized
-  // for the operator defaults plus these choices.
-  std::optional<ops::OperatorChoices> operatorChoices;
 };
 
 enum class RuntimeResourceFailure {
@@ -117,111 +213,234 @@ enum class RuntimeResourceFailure {
   }
 }
 
+// A step of resource assembly that failed, with what() its message. Startup
+// reports it with its step (RuntimeBootstrapReport::describe).
 class RuntimeResourcesError final : public std::runtime_error {
 public:
   RuntimeResourcesError(RuntimeResourceStage stage, std::string message,
-                        std::string statusJson = {},
                         std::string budgetDescription = {},
                         RuntimeResourceFailure failure =
-                            RuntimeResourceFailure::Other);
+                            RuntimeResourceFailure::Other,
+                        std::optional<protocol::StartShortfall> shortfall =
+                            std::nullopt);
+  // A step whose Metal command failed, with whether for want of GPU memory.
+  RuntimeResourcesError(RuntimeResourceStage stage, const metal::MetalBackendError &error,
+                        std::string budgetDescription = {});
 
+  [[nodiscard]] RuntimeResourceStage stage() const noexcept { return stage_; }
   [[nodiscard]] RuntimeResourceFailure failure() const noexcept {
     return failure_;
-  }
-  [[nodiscard]] const std::string &message() const noexcept { return message_; }
-  [[nodiscard]] const std::string &statusJson() const noexcept {
-    return statusJson_;
   }
   [[nodiscard]] const std::string &budgetDescription() const noexcept {
     return budgetDescription_;
   }
+  // What the plan's floors require against the budget, for a plan the budget
+  // cannot hold (stage MemoryPlanning, failure EngineCapacity).
+  [[nodiscard]] const std::optional<protocol::StartShortfall> &
+  shortfall() const noexcept {
+    return shortfall_;
+  }
+  // A Metal command of the step failed, as before any warmup the Neural
+  // Engine split's setup and calibration or the expert store's fill may: the
+  // start fails as Internal, whatever the step, or as CommandMemory, which it
+  // never retries, where the command failed for want of GPU memory
+  // (metal::MetalBackendError::outOfMemory).
+  [[nodiscard]] bool commandFailed() const noexcept { return commandFailed_; }
+  [[nodiscard]] bool commandOutOfMemory() const noexcept { return commandOutOfMemory_; }
 
 private:
+  RuntimeResourceStage stage_;
   RuntimeResourceFailure failure_;
-  std::string message_;
-  std::string statusJson_;
   std::string budgetDescription_;
+  std::optional<protocol::StartShortfall> shortfall_;
+  bool commandFailed_ = false;
+  bool commandOutOfMemory_ = false;
 };
 
-// Owns every process-wide native resource exactly once. Destruction order is
-// Cache -> logical KV pool -> state -> KV backing -> governor ->
-// model package -> Metal backend.
+// The bound of a Metal memory budget: --max-memory where it set the budget,
+// else this Mac's own.
+[[nodiscard]] constexpr protocol::ShortfallBound
+memoryBound(uint64_t configuredLimitBytes, uint64_t hardBudgetBytes) noexcept {
+  return configuredLimitBytes && hardBudgetBytes == configuredLimitBytes
+             ? protocol::ShortfallBound::MaxMemory
+             : protocol::ShortfallBound::DeviceMemory;
+}
+
+// Owns every process-wide native resource exactly once. Members go in
+// reverse declaration order: what the engine gives back while idle -> the
+// readers of spilled KV (history stream, hot block cache) -> Neural Engine
+// split -> Cache -> KV pool -> the disk tier's space -> KV disk tier -> state
+// storage -> KV page storage -> governor -> loaded model -> SSD readers ->
+// Metal backend -> a persistent tier's directory, whose lock goes last.
+// The readers of spilled KV drain their reads before the cache and the tier
+// whose copies they read go, and those drain theirs before the SSD readers
+// stop. The tier's files, whose writes hold back for the readers' urgent
+// reads, only watch them (SsdReaders::criticalBusyProbe), so they and their
+// slots may outlive them. The KV disk tier must go before the KV page
+// storage: its IO worker reads and writes pages in place in the extents, and
+// its destructor waits for every transfer in flight. A persistent tier's
+// files are sealed first, however the process ends, so that the copies the
+// cache lets go of stay for the next process.
 class RuntimeResources final {
 public:
+  // `requestedContextTokens` is the context the engine is asked to hold
+  // (--max-context), zero for the automatic context (AneFfnOutcome::context),
+  // which the Neural Engine split must leave, as it must a relaunch's
+  // (RuntimeResourcesConfig::relaunchContext). A persistent tier takes back
+  // what the last process left before create() returns.
   [[nodiscard]] static std::unique_ptr<RuntimeResources>
-  create(const RuntimeResourcesConfig &config);
+  create(const RuntimeResourcesConfig &config, uint32_t requestedContextTokens);
 
   RuntimeResources(const RuntimeResources &) = delete;
   RuntimeResources &operator=(const RuntimeResources &) = delete;
+  ~RuntimeResources();
+
+  // The engine is Ready: what the start allocated under its Floor claim is
+  // in place, so the claim's scope ends and the claim closes, and a
+  // persistent tier's directory marks this process serving, on probation for
+  // its first minute (CacheDirectory::beginServing).
+  void beginServing();
+  // The engine reported its own failure: within probation, the next start
+  // finds a persistent tier emptied (CacheDirectory::engineFailed).
+  void engineFailed() noexcept;
+  // At a clean stop, after the engine's flush (Engine::flushRestorePoints):
+  // the cache closes its tier (Cache::closePersistentTier), both files reach
+  // the drive and the directory records a clean end. False when they did
+  // not; true at once without a persistent tier.
+  [[nodiscard]] bool closePersistentCache();
 
   [[nodiscard]] metal::MetalBackend &backend() noexcept { return *backend_; }
   [[nodiscard]] const EngineMemoryPlan &memoryPlan() const noexcept {
     return memoryPlan_;
   }
-  [[nodiscard]] const model::ModelMemoryPlan &
-  modelMemoryPlan() const noexcept {
-    return modelMemoryPlan_;
-  }
   [[nodiscard]] MemoryGovernor &memoryGovernor() noexcept {
     return *memoryGovernor_;
-  }
-  [[nodiscard]] model::StateStorage &stateStorage() noexcept {
-    return *stateStorage_;
   }
   [[nodiscard]] engine::Cache &cache() noexcept {
     return *cache_;
   }
+  // Startup warmup holds its runway (KvPool::RunwayHold).
+  [[nodiscard]] KvPool &kvPool() noexcept { return *kvPool_; }
   [[nodiscard]] const RuntimeCacheIdentity &cacheIdentity() const noexcept {
     return cacheIdentity_;
   }
-  // What other applications left, measured before the engine took any;
-  // empty when the host could not be measured.
-  [[nodiscard]] std::optional<uint64_t> hostAvailableAtStart() const noexcept {
-    return hostAvailableAtStart_;
-  }
+  // The share the prefill FFN's Neural Engine split runs at and the least
+  // rows of a chunk it takes; 0 for none.
+  [[nodiscard]] double aneFfnShare() const noexcept { return aneFfn_ ? aneFfn_->share() : 0.0; }
+  [[nodiscard]] uint32_t aneFfnMinimumRows() const noexcept { return aneFfn_ ? aneFfn_->minimumRows() : 0; }
+  // How the start's split came out, and the automatic context.
+  [[nodiscard]] const AneFfnOutcome &aneFfnOutcome() const noexcept { return aneFfnOutcome_; }
+  // The split as it stands now, for /status.
+  [[nodiscard]] AneFfnSnapshot aneFfnSnapshot() const;
+  // Times the units of the split's pairs of chunks where the start has yet
+  // to (AneFfnStart::timePairs): `prefill` returns the seconds of a cold
+  // prefill of a full command on the model's runtime, which takes the split
+  // being timed from modelContext(). Nothing otherwise.
+  void timeAneFfnPairs(const std::function<double()> &prefill);
+  // The streamed PLE table's store (--ple-memory), if the model has one.
+  [[nodiscard]] std::optional<model::SparseRowStats> streamedTableStats() const;
+  // The streamed routed experts' store (--expert-memory), if the model has one.
+  [[nodiscard]] std::optional<model::ExpertStoreStats> streamedExpertStats() const;
+  // Which requests keep their KV on the SSD cache (EngineConfig::spill).
+  [[nodiscard]] EngineSpillConfig spillConfig() const noexcept;
+  // What the SSD cache holds and did of spilled KV (Cache::spillSnapshot), for
+  // /status, none for a target that keeps its KV in memory; engine thread.
+  [[nodiscard]] std::optional<KvSpillSnapshot> kvSpillSnapshot() const;
+  // The readers of spilled KV, which only a target whose KV spills has: the
+  // hot block cache and the history stream.
+  [[nodiscard]] std::optional<model::KvBlockCacheStats> kvBlockCacheStats() const;
+  [[nodiscard]] std::optional<model::KvHistoryStreamStats> kvHistoryStreamStats() const;
 
-  [[nodiscard]] model::RuntimeContext modelContext() noexcept;
+  [[nodiscard]] model::RuntimeContext modelContext();
+  // What the engine gives back while idle (NativeLoopConfig::weights): the
+  // weight images, and the Neural Engine split's program if it runs one.
+  [[nodiscard]] ReleasableMemory &releasableMemory() noexcept { return releasableMemory_; }
   [[nodiscard]] ActualMemoryReport
-  actualMemoryReport(const model::ModelMemoryActual &modelMemory,
-                     uint64_t estimatedWarmupPeakBytes) const;
-  // Offline tuning tool only, before any request: swaps between the operator
-  // defaults and the choices this instance was created with. Arenas were
-  // sized for exactly those two configurations, so nothing else may be
-  // installed after creation.
-  void installOperatorChoices(const ops::OperatorChoices &choices) {
-    operators_.install(choices);
-  }
+  actualMemoryReport(const model::ModelMemoryActual &modelMemory) const;
 
 private:
 
-  RuntimeResources(std::unique_ptr<metal::MetalBackend> backend,
-                   model::ModelPackage model, ops::ExecutionPlans operators,
+  RuntimeResources(PersistentCacheFiles persistentCache,
+                   std::unique_ptr<metal::MetalBackend> backend,
+                   std::shared_ptr<model::SsdReaders> readers,
+                   model::LoadedModel model, ops::ExecutionPlans operators,
                    EngineMemoryPlan memoryPlan,
-                   model::ModelMemoryPlan modelMemoryPlan,
                    RuntimeCacheIdentity cacheIdentity,
-                   std::unique_ptr<MemoryGovernor> memoryGovernor,
+                   std::unique_ptr<MemoryGovernor> memoryGovernor, ClaimId startClaim,
+                   std::unique_ptr<MemoryGovernor::Scope> startScope,
                    std::unique_ptr<kv::PageStorage> kvPages,
-                   std::unique_ptr<model::StateStorage> stateStorage,
-                   std::unique_ptr<model::KvPageTier> kvTier,
+                   std::unique_ptr<model::QwenStateStorage> stateStorage,
+                   std::unique_ptr<KvPageTier> kvTier,
+                   std::unique_ptr<DiskSpace> diskSpace,
                    std::unique_ptr<KvPool> kvPool,
                    std::unique_ptr<engine::Cache> cache,
-                   uint32_t maximumImagePatches,
-                   std::optional<uint64_t> hostAvailableAtStart);
+                   std::unique_ptr<ops::AneFfn> aneFfn, std::unique_ptr<ops::AneFfn> aneFfnPair,
+                   AneFfnOutcome aneFfnOutcome,
+                   std::unique_ptr<model::KvBlockCache> blockCache,
+                   std::unique_ptr<model::KvHistoryStream> historyStream, bool spillAlways,
+                   model::VerifyRows verifyRows);
+  // Takes back the restore points the last process left in a persistent
+  // tier (Cache::adopt) and opens its files for this one.
+  void adoptPersistentCache();
+  void stopProbation() noexcept;
 
+  PersistentCacheFiles persistentCache_;
   std::unique_ptr<metal::MetalBackend> backend_;
-  model::ModelPackage model_;
+  // The engine's one pool of SSD readers: the model's streamed weights, the
+  // KV tier and the readers of spilled KV read on it.
+  std::shared_ptr<model::SsdReaders> readers_;
+  model::LoadedModel model_;
   ops::ExecutionPlans operators_;
   EngineMemoryPlan memoryPlan_;
-  model::ModelMemoryPlan modelMemoryPlan_;
   RuntimeCacheIdentity cacheIdentity_;
   std::unique_ptr<MemoryGovernor> memoryGovernor_;
+  // The start's Floor claim and its scope, from the governor's construction
+  // until serving begins; the scope goes before the governor.
+  ClaimId startClaim_;
+  std::unique_ptr<MemoryGovernor::Scope> startScope_;
   std::unique_ptr<kv::PageStorage> kvPages_;
-  std::unique_ptr<model::StateStorage> stateStorage_;
-  std::unique_ptr<model::KvPageTier> kvTier_;
+  std::unique_ptr<model::QwenStateStorage> stateStorage_;
+  std::unique_ptr<KvPageTier> kvTier_;
+  // What the cache measures the disk tier's volume with (Cache::keepDiskLimit).
+  std::unique_ptr<DiskSpace> diskSpace_;
   std::unique_ptr<KvPool> kvPool_;
   std::unique_ptr<engine::Cache> cache_;
-  uint32_t maximumImagePatches_ = 0;
-  std::optional<uint64_t> hostAvailableAtStart_;
+  std::unique_ptr<ops::AneFfn> aneFfn_;
+  // The split that takes the commands aneFfn_ runs as pairs of chunks
+  // (AneFfnStart::pair); what times its units until a start has; and the one
+  // the model's commands run on, which modelContext() hands over by address:
+  // aneFfnPair_, or the one being timed.
+  std::unique_ptr<ops::AneFfn> aneFfnPair_;
+  std::function<void(const AneFfnPairPrefill &)> timeAneFfnPairs_;
+  ops::AneFfn *servingPair_ = nullptr;
+  // A spill-capable target's readers of its spilled KV; none for another.
+  std::unique_ptr<model::KvBlockCache> blockCache_;
+  std::unique_ptr<model::KvHistoryStream> historyStream_;
+  // Over model_'s images, its expert store if it has one, aneFfn_ and
+  // aneFfnPair_.
+  ReleasableMemory releasableMemory_;
+  AneFfnOutcome aneFfnOutcome_;
+  // --kv-spill always.
+  bool spillAlways_ = false;
+  // --verify-rows, which modelContext() passes on.
+  model::VerifyRows verifyRows_ = model::VerifyRows::Auto;
+  // Ends a probation once it has lasted, unless the process stops first.
+  std::thread probation_;
+  std::mutex probationMutex_;
+  std::condition_variable probationWake_;
+  bool probationStopped_ = false;
 };
+
+// The model's side of the split of `loaded`'s target on `backend`, valid
+// while `backend`, `loaded` and `operators` are: its timing and prepared split
+// run on a prefill arena of their own, its programs wait for the ANE's
+// service until `cancelled` returns true, and its calibrations are
+// remembered beside the programs (ane::recall) under its layers' shapes and
+// formats and the Int8Activations its GPU part plans with
+// (ops::AneFfn::calibrationKey), the device, the macOS version, the engine's
+// `buildId` and the most units the plan holds.
+[[nodiscard]] AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &loaded,
+                                      const ops::ExecutionPlans &operators, kv::Format format,
+                                      std::string_view buildId, std::function<bool()> cancelled);
 
 } // namespace splash::engine

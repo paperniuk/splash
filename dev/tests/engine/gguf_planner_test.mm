@@ -1,15 +1,30 @@
-// The GGUF image planner on the small dense and MoE targets and a rotated
-// dense one: where each tensor goes and in which row order, which F32 tensors
-// it narrows to bf16, and the sources it refuses.
+// The GGUF image planner on the small dense and MoE targets, a rotated dense
+// one and a small Flash-Next one: where each tensor goes and in which row
+// order, which F32 tensors it narrows to bf16, which float projections it
+// quantizes to Q8_0, where a streamed table's rows are, which part of a split
+// GGUF each tensor is read from, and the sources it refuses.
 //   gguf-planner
 #include "GgufFixtures.hpp"
 #include "metal/abi/Gguf.h"
+#include "model/GgufPreparation.hpp"
+#include "model/GgufTarget.hpp"
+#include "model/Qwen4Exp.hpp"
+#include "model/WeightStore.hpp"
 
+#include <fcntl.h>
+#include <unistd.h>
+
+#include <bit>
+#include <memory>
 #include <optional>
+#include <utility>
 
 using namespace gguf_fixtures;
 
 namespace {
+
+// Q8_1, a type the loader does not read.
+constexpr uint32_t kQ8_1 = ggmlType("Q8_1");
 
 // The images of the GGUF at path, planned for geometry; the planner's error
 // when it refuses the file.
@@ -18,14 +33,54 @@ struct Plan {
   std::optional<std::string> error;
 };
 
-Plan plan(const std::filesystem::path &path, const model::gguf::TargetGeometry &geometry) {
+Plan plan(const std::filesystem::path &path, const model::QwenTargetDimensions &geometry,
+          model::gguf::PlanOptions options = {}) {
   try {
     model::WeightSource source(path);
     const model::GgufFile gguf(source);
-    return {model::gguf::planImages(gguf, geometry), std::nullopt};
+    return {model::gguf::planImages(gguf, architecture(geometry), geometry, options), std::nullopt};
   } catch (const model::GgufError &error) {
     return {{}, error.what()};
   }
+}
+
+// The same repack: format, shape and sources' rows.
+bool sameRepack(const model::gguf::Repack &left, const model::gguf::Repack &right) {
+  if (left.format != right.format || left.rows != right.rows || left.columns != right.columns ||
+      left.sources.size() != right.sources.size())
+    return false;
+  for (size_t index = 0; index < left.sources.size(); ++index) {
+    const model::gguf::TensorRows &a = left.sources[index], &b = right.sources[index];
+    if (a.name != b.name || a.offset != b.offset || a.first != b.first || a.rows != b.rows || a.rowBytes != b.rowBytes)
+      return false;
+  }
+  return true;
+}
+
+// With streamed experts each layer's routed experts are the repacks the
+// resident plan writes, out of the image, which keeps every other section and
+// declares the resident image's bytes.
+bool streamsExperts(const Plan &resident, const Plan &streamed) {
+  if (resident.error || streamed.error || resident.images.size() != streamed.images.size()) return false;
+  for (size_t index = 0; index < resident.images.size(); ++index) {
+    const model::gguf::Image &whole = resident.images[index], &image = streamed.images[index];
+    // Either declares the resident image's bytes (the weights' manifest).
+    if (whole.residentBytes != whole.bytes || image.residentBytes != whole.bytes) return false;
+    std::vector<const model::gguf::Repack *> routed, rest;
+    for (const model::gguf::Repack &repack : whole.repacks)
+      (repack.sources.front().name.find("_exps.") != std::string::npos ? routed : rest).push_back(&repack);
+    if (routed.empty()) {
+      if (image.experts || image.bytes != whole.bytes) return false;
+      continue;
+    }
+    if (!image.experts || routed.size() != 3 || image.repacks.size() != rest.size() || image.bytes >= whole.bytes)
+      return false;
+    for (size_t projection = 0; projection < 3; ++projection)
+      if (!sameRepack(*routed[projection], image.experts->projections[projection])) return false;
+    for (size_t other = 0; other < rest.size(); ++other)
+      if (!sameRepack(*rest[other], image.repacks[other])) return false;
+  }
+  return true;
 }
 
 // Whether a refusal names every part.
@@ -44,20 +99,20 @@ const model::gguf::Copy *copyIn(const Plan &result, const std::string &name) {
 
 // Value heads regrouped from llama.cpp's tiled order from row `from` on.
 bool grouped(const model::gguf::RowOrder &order, uint64_t from, uint32_t headRows,
-             const model::gguf::TargetGeometry &g) {
+             const model::QwenTargetDimensions &g) {
   return order.from == from && order.headRows == headRows && order.keyHeads == g.gdnKeyHeads &&
          order.valueHeadsPerKey == g.gdnValueHeads / g.gdnKeyHeads;
 }
 
 // A copy of the tensor's rows as the GGUF stores them.
 bool asStored(const model::gguf::Copy *copy, const test_gguf::Bytes &data) {
-  return copy && !copy->bfloat16 && copy->source.order.from == UINT64_MAX &&
+  return copy && copy->conversion == model::gguf::Conversion::None && copy->source.order.from == UINT64_MAX &&
          copy->source.rows * copy->source.rowBytes == data.size();
 }
 
 void checkDense(const std::filesystem::path &directory) {
   SmallTarget target = smallTarget(false);
-  const model::gguf::TargetGeometry &g = target.geometry;
+  const model::QwenTargetDimensions &g = target.geometry;
   const auto path = directory / "dense.gguf";
   writeGguf(path, target.tensors, g);
   const Plan dense = plan(path, g);
@@ -65,32 +120,41 @@ void checkDense(const std::filesystem::path &directory) {
   if (dense.error) return;
   const model::gguf::Image &gdn = dense.images[0];
 
-  // One 256-row Q8_0 tensor of the beta then the alpha rows, each in grouped
-  // head order.
-  const auto *alphaBeta = repackOf(gdn, "blk.0.ssm_beta.weight");
-  const auto heads = [&](const model::gguf::TensorRows &rows, const char *name) {
-    return rows.name == name && rows.rows == g.gdnValueHeads && grouped(rows.order, 0, 1, g);
-  };
-  check(alphaBeta && alphaBeta->format == GGUF_FMT_Q80 && alphaBeta->rows == QUANT_TILE_ROWS &&
-            alphaBeta->sources.size() == 2 && heads(alphaBeta->sources[0], "blk.0.ssm_beta.weight") &&
-            heads(alphaBeta->sources[1], "blk.0.ssm_alpha.weight"),
-        "planner alpha/beta: one 256-row Q8_0 tensor of beta then alpha rows in grouped order");
-
   for (const Tensor &tensor : target.tensors)
     if (isNorm(tensor.name))
       check(asStored(copyIn(dense, tensor.name), tensor.data), "planner keeps F32 values as stored: " + tensor.name);
 
   const uint32_t keyRows = g.convolutionDimension - g.gdnValueHeads * g.gdnHeadDimension;
   const auto *convolution = copyOf(gdn, "blk.0.ssm_conv1d.weight");
-  check(convolution && convolution->bfloat16 && convolution->source.rows == g.convolutionDimension &&
+  check(convolution && convolution->conversion == model::gguf::Conversion::NarrowToBfloat16 &&
+            convolution->source.rows == g.convolutionDimension &&
             grouped(convolution->source.order, keyRows, g.gdnHeadDimension, g),
         "planner narrows the convolution to bf16 and groups its value heads");
   const auto *decay = copyOf(gdn, "blk.0.ssm_a");
-  check(decay && !decay->bfloat16 && grouped(decay->source.order, 0, 1, g),
+  check(decay && decay->conversion == model::gguf::Conversion::None && grouped(decay->source.order, 0, 1, g),
         "planner keeps the decay F32 and groups its value heads");
   const auto *bias = copyOf(gdn, "blk.0.ssm_dt.bias");
-  check(bias && bias->bfloat16 && grouped(bias->source.order, 0, 1, g),
+  check(bias && bias->conversion == model::gguf::Conversion::NarrowToBfloat16 && grouped(bias->source.order, 0, 1, g),
         "planner narrows the time bias to bf16 and groups its value heads");
+
+  // A token table of every type the gathers read, F16 and BF16 among them, but llama.cpp's NVFP4, whose rows the
+  // writer converts: copied as stored.
+  std::vector<uint32_t> tableTypes;
+  for (uint32_t format = 0; format < GGUF_FMT_COUNT; ++format)
+    if (const std::optional<uint32_t> type = ggufType(format); type && *type != model::ggml::kNVFP4)
+      tableTypes.push_back(*type);
+  for (const uint32_t type : tableTypes) {
+    std::vector<Tensor> tensors = target.tensors;
+    Tensor &table = tensorNamed(tensors, "token_embd.weight");
+    const model::GgmlTypeTraits &traits = *model::ggmlTypeTraits(type);
+    table.type = type;
+    table.data.resize(uint64_t{g.vocabularySize} * g.hiddenSize / traits.blockElements * traits.blockBytes);
+    writeGguf(path, tensors, g);
+    const Plan tables = plan(path, g);
+    check(!tables.error && asStored(copyIn(tables, "token_embd.weight"), table.data),
+          "planner copies a token table as stored: " + model::ggmlTypeName(type) +
+              (tables.error ? ": " + *tables.error : ""));
+  }
 
   // A key or value projection of other than attentionKvHeads heads.
   for (const std::string name : {"blk.1.attn_k.weight", "blk.1.attn_v.weight"}) {
@@ -106,21 +170,90 @@ void checkDense(const std::filesystem::path &directory) {
   }
 }
 
+// alpha/beta of any one GGUF tensor type of a format but BF16 and F16
+// (GGUF's NVFP4 as NVFP4), on either architecture: one plane tile of rows of
+// that format, the beta then the alpha rows at its native row bytes in grouped
+// head order; a BF16 pair, one BF16 tensor of the beta then the alpha rows as
+// stored; a pair of two types or of F16, one F32 tensor of the beta then the
+// alpha rows, each decoded unless F32; a type the loader does not read,
+// refused by name.
+void checkQuantizedAlphaBeta(const std::filesystem::path &directory) {
+  for (bool moe : {false, true}) {
+    const SmallTarget target = smallTarget(moe);
+    const model::QwenTargetDimensions &g = target.geometry;
+    const auto path = directory / "alpha-beta.gguf";
+    const auto tensorsWith = [&](uint32_t betaType, uint32_t alphaType) {
+      std::vector<Tensor> tensors = target.tensors;
+      for (const char *name : {"blk.0.ssm_beta.weight", "blk.0.ssm_alpha.weight"}) {
+        Tensor &tensor = tensorNamed(tensors, name);
+        tensor.type = tensor.name.ends_with("_beta.weight") ? betaType : alphaType;
+        const model::GgmlTypeTraits &traits = *model::ggmlTypeTraits(tensor.type);
+        tensor.data.resize(uint64_t{g.gdnValueHeads} * g.hiddenSize / traits.blockElements * traits.blockBytes);
+      }
+      return tensors;
+    };
+    for (uint32_t format = 0; format < GGUF_FMT_COUNT; ++format) {
+      const std::optional<uint32_t> stored = ggufType(format);
+      if (!stored || format == GGUF_FMT_BF16 || format == GGUF_FMT_F16) continue;
+      const uint32_t type = *stored;
+      writeGguf(path, tensorsWith(type, type), g);
+      const Plan result = plan(path, g);
+      const auto *pair = result.error ? nullptr : repackOf(result.images[0], "blk.0.ssm_beta.weight");
+      // Rows of the format's native blocks (llama.cpp's NVFP4 as NVFP4's).
+      const auto heads = [&](const model::gguf::TensorRows &rows, const char *name) {
+        return rows.name == name && rows.type == kQuantFormats[format].ggml_type && rows.rows == g.gdnValueHeads &&
+               rows.rowBytes == gguf_reference::rowBytes(Fmt(format), g.hiddenSize) && grouped(rows.order, 0, 1, g);
+      };
+      check(pair && pair->format == format && pair->rows == QUANT_TILE_ROWS && pair->columns == g.hiddenSize &&
+                pair->sources.size() == 2 && heads(pair->sources[0], "blk.0.ssm_beta.weight") &&
+                heads(pair->sources[1], "blk.0.ssm_alpha.weight"),
+            "planner alpha/beta: one plane tile of " + model::ggmlTypeName(type) + " beta then alpha rows (" +
+                architecture(g) + ")" + (result.error ? ": " + *result.error : ""));
+    }
+    using model::gguf::Conversion;
+    for (const auto &[beta, alpha] : {std::pair{kIQ4_XS, kQ8_0}, std::pair{kQ4_K, model::ggml::kF32},
+                                      std::pair{model::ggml::kBF16, model::ggml::kNVFP4},
+                                      std::pair{model::ggml::kF32, model::ggml::kBF16},
+                                      std::pair{model::ggml::kF16, kQ8_0},
+                                      std::pair{model::ggml::kBF16, model::ggml::kBF16},
+                                      std::pair{model::ggml::kF16, model::ggml::kF16}}) {
+      writeGguf(path, tensorsWith(beta, alpha), g);
+      const Plan result = plan(path, g);
+      const bool bfloat16 = beta == model::ggml::kBF16 && alpha == model::ggml::kBF16;
+      const auto conversion = [&](uint32_t type) {
+        return type == model::ggml::kF32 || bfloat16 ? Conversion::None : Conversion::DequantizeToFloat32;
+      };
+      const uint64_t rows = uint64_t{g.gdnValueHeads} * g.hiddenSize * (bfloat16 ? sizeof(uint16_t) : sizeof(float));
+      const auto *b = copyIn(result, "blk.0.ssm_beta.weight"), *a = copyIn(result, "blk.0.ssm_alpha.weight");
+      check(b && a && b->conversion == conversion(beta) && a->conversion == conversion(alpha) &&
+                a->destination == b->destination + rows && grouped(b->source.order, 0, 1, g) &&
+                grouped(a->source.order, 0, 1, g) && !repackOf(result.images[0], "blk.0.ssm_beta.weight"),
+            std::string("planner makes alpha/beta one ") + (bfloat16 ? "BF16" : "F32") + " tensor: " +
+                model::ggmlTypeName(beta) + " beta, " + model::ggmlTypeName(alpha) + " alpha" +
+                (result.error ? ": " + *result.error : ""));
+    }
+    writeGguf(path, tensorsWith(kQ8_0, kQ8_1), g);
+    check(names(plan(path, g), {"ssm_alpha.weight (Q8_1) in 1 layer"}) &&
+              !names(plan(path, g), {"ssm_beta.weight"}),
+          "planner refuses an alpha of a type it does not read by its name alone");
+  }
+}
+
 void checkMoe(const std::filesystem::path &directory) {
   SmallTarget target = smallTarget(true);
-  const model::gguf::TargetGeometry &g = target.geometry;
+  const model::QwenTargetDimensions &g = target.geometry;
   const auto path = directory / "moe.gguf";
 
-  model::gguf::TargetGeometry wrongExperts = g;
+  model::QwenTargetDimensions wrongExperts = g;
   wrongExperts.experts = 5;
   writeGguf(path, target.tensors, wrongExperts);
   check(names(plan(path, g), {"expert_count"}), "planner names a metadata mismatch");
-  model::gguf::TargetGeometry dense = g;
-  dense.experts = 0;
+  model::QwenTargetDimensions dense = g;
+  dense.ffnKind = model::QwenFfnKind::Dense;
   dense.intermediateSize = g.expertIntermediateSize;
   writeGguf(path, target.tensors, dense);
-  check(names(plan(path, g), {"architecture", dense.architecture(), g.architecture()}),
-        "planner checks the architecture against the package");
+  check(names(plan(path, g), {"architecture", architecture(dense), architecture(g)}),
+        "planner checks the architecture against the model's target");
 
   writeGguf(path, target.tensors, g);
   const Plan moe = plan(path, g);
@@ -129,11 +262,80 @@ void checkMoe(const std::filesystem::path &directory) {
   const model::gguf::Image &layer = moe.images[0];
   const auto *beta = copyOf(layer, "blk.0.ssm_beta.weight"), *alpha = copyOf(layer, "blk.0.ssm_alpha.weight");
   check(beta && alpha && alpha->destination == beta->destination + target.data(beta->source.name).size() &&
-            grouped(beta->source.order, 0, 1, g) && grouped(alpha->source.order, 0, 1, g) && !beta->bfloat16 &&
-            !alpha->bfloat16,
+            grouped(beta->source.order, 0, 1, g) && grouped(alpha->source.order, 0, 1, g) &&
+            beta->conversion == model::gguf::Conversion::None && alpha->conversion == model::gguf::Conversion::None,
         "planner F32 alpha/beta tensor: beta then alpha rows in grouped order");
   for (const std::string name : {"blk.0.ffn_gate_inp.weight", "blk.0.ffn_gate_inp_shexp.weight"})
     check(asStored(copyOf(layer, name), target.data(name)), "planner copies the F32 tensor as stored: " + name);
+
+  // 16-bit floats as some GGUFs store them: a BF16 router as stored, which the
+  // float projection runs; a BF16 shared-expert scalar gate and BF16 and F16
+  // norms widened to the F32 values they hold, and a Q8_0 scalar gate decoded
+  // to them. A router of another type is refused by name.
+  {
+    const auto sixteenPath = directory / "moe-16-bit-floats.gguf";
+    std::vector<Tensor> sixteen = target.tensors;
+    const std::pair<std::string, uint32_t> types[] = {{"blk.0.ffn_gate_inp.weight", model::ggml::kBF16},
+                                                      {"blk.0.ffn_gate_inp_shexp.weight", model::ggml::kBF16},
+                                                      {"blk.0.attn_norm.weight", model::ggml::kF16},
+                                                      {"blk.0.post_attention_norm.weight", model::ggml::kBF16}};
+    for (const auto &[name, type] : types) {
+      Tensor &tensor = tensorNamed(sixteen, name);
+      tensor.type = type;
+      tensor.data.resize(tensor.data.size() / 2);
+    }
+    writeGguf(sixteenPath, sixteen, g);
+    const Plan narrow = plan(sixteenPath, g);
+    check(!narrow.error, "planner plans 16-bit float routers, gates and norms" +
+                             (narrow.error ? ": " + *narrow.error : ""));
+    if (!narrow.error) {
+      const auto *router = copyOf(narrow.images[0], "blk.0.ffn_gate_inp.weight");
+      check(asStored(router, tensorNamed(sixteen, "blk.0.ffn_gate_inp.weight").data) &&
+                router->source.type == model::ggml::kBF16,
+            "planner keeps a BF16 router as stored");
+      for (const auto &[name, type] : types) {
+        if (name == "blk.0.ffn_gate_inp.weight") continue;
+        const auto *copy = copyOf(narrow.images[0], name);
+        check(copy && copy->conversion == model::gguf::Conversion::WidenToFloat32,
+              "planner widens the " + model::ggmlTypeName(type) + " " + name + " to F32");
+      }
+    }
+    // A Q8_0 scalar gate, as quantized GGUFs store it: its native
+    // rows, decoded to the F32 values they hold.
+    Tensor &gate = tensorNamed(sixteen, "blk.0.ffn_gate_inp_shexp.weight");
+    gate.type = kQ8_0;
+    gate.data.resize(gguf_reference::rowBytes(gguf_reference::Q80, g.hiddenSize));
+    writeGguf(sixteenPath, sixteen, g);
+    const Plan decoded = plan(sixteenPath, g);
+    const auto *decodedGate = decoded.error ? nullptr : copyOf(decoded.images[0], gate.name);
+    check(decodedGate && decodedGate->conversion == model::gguf::Conversion::DequantizeToFloat32 &&
+              decodedGate->source.rows == 1 && decodedGate->source.rowBytes == gate.data.size(),
+          "planner decodes a Q8_0 shared-expert scalar gate to F32" + (decoded.error ? ": " + *decoded.error : ""));
+    tensorNamed(sixteen, "blk.0.ffn_gate_inp.weight").type = model::ggml::kF16;
+    writeGguf(sixteenPath, sixteen, g);
+    check(names(plan(sixteenPath, g), {"ffn_gate_inp.weight (F16) in 1 layer"}),
+          "planner refuses an F16 router by name");
+
+    // A BF16 router of 320 columns, not whole blocks of the 256 values BF16's
+    // planes hold: rows of its values as stored all the same. The tensors of
+    // hidden inputs are Q8_0, whose planes tile 64 columns.
+    model::QwenTargetDimensions narrowHidden = g;
+    narrowHidden.hiddenSize = 320;
+    TensorTypes narrowTypes{{"ffn_gate_inp.weight", model::ggml::kBF16}};
+    for (const char *name : {"attn_qkv.weight", "attn_gate.weight", "ssm_out.weight", "ffn_gate_exps.weight",
+                             "ffn_up_exps.weight", "ffn_down_exps.weight", "ffn_gate_shexp.weight",
+                             "ffn_up_shexp.weight", "ffn_down_shexp.weight", "output.weight", "token_embd.weight"})
+      narrowTypes[name] = kQ8_0;
+    std::vector<Tensor> narrowTensors = targetTensors(narrowHidden, narrowTypes);
+    writeGguf(sixteenPath, narrowTensors, narrowHidden);
+    const Plan narrowPlan = plan(sixteenPath, narrowHidden);
+    const auto *narrowRouter =
+        narrowPlan.error ? nullptr : copyOf(narrowPlan.images[0], "blk.0.ffn_gate_inp.weight");
+    check(asStored(narrowRouter, tensorNamed(narrowTensors, "blk.0.ffn_gate_inp.weight").data) &&
+              narrowRouter->source.rowBytes == narrowHidden.hiddenSize * sizeof(uint16_t),
+          "planner keeps a BF16 router of 320 columns as stored" +
+              (narrowPlan.error ? ": " + *narrowPlan.error : ""));
+  }
 
   // Each quantized tensor is repacked on its own, a 3-D expert tensor as one
   // tensor of experts * N rows.
@@ -149,26 +351,68 @@ void checkMoe(const std::filesystem::path &directory) {
               std::to_string(tensor.dims[0]));
   }
   check(layer.repacks.size() == quantized, "planner repacks only the layer's quantized tensors");
+  const Plan streamed = plan(path, g, {.streamExperts = true});
+  check(streamsExperts(moe, streamed),
+        "planner leaves streamed experts out of the layers' images, as the repacks it would write, and declares the "
+        "images' bytes with them");
+  // So the weights' manifest, the persistent cache's namespace, is the same with and without --expert-memory: the
+  // target's loader records each image with its resident bytes (GgufTargetLoader::open).
+  const auto manifest = [](const Plan &planned) {
+    std::vector<model::WeightFileRecord> records;
+    for (const model::gguf::Image &image : planned.images)
+      records.push_back({"target/" + image.name, image.magic, image.layer, image.type, image.residentBytes, "sources"});
+    return model::weightManifestFingerprint(records);
+  };
+  check(manifest(moe) == manifest(streamed), "planner gives the weights the same manifest whether the experts stream or not");
+
+  // llama.cpp's fused ffn_gate_up_exps: the gate tensor takes each expert's first width rows of it, the up tensor
+  // the next width; one of a type the loader does not read is refused by name.
+  const uint64_t width = g.expertIntermediateSize;
+  std::vector<Tensor> fused = withFusedGateUp(target.tensors, 0, g.experts);
+  writeGguf(path, fused, g);
+  const Plan fusedPlan = plan(path, g);
+  std::vector<const model::gguf::Repack *> halves;
+  if (!fusedPlan.error)
+    for (const model::gguf::Repack &repack : fusedPlan.images[0].repacks)
+      if (repack.sources.front().name == "blk.0.ffn_gate_up_exps.weight") halves.push_back(&repack);
+  bool split = halves.size() == 2;
+  for (size_t half = 0; split && half < 2; ++half) {
+    split = halves[half]->rows == g.experts * width && halves[half]->sources.size() == g.experts;
+    for (uint64_t expert = 0; split && expert < g.experts; ++expert) {
+      const model::gguf::TensorRows &rows = halves[half]->sources[expert];
+      split = rows.first == (2 * expert + half) * width && rows.rows == width &&
+              rows.rowBytes == gguf_reference::rowBytes(Fmt(gguf_format_of(rows.type)), g.hiddenSize);
+    }
+  }
+  check(split, "planner splits llama.cpp's fused gate/up experts into each expert's gate and up rows" +
+                   (fusedPlan.error ? ": " + *fusedPlan.error : ""));
+  check(streamsExperts(fusedPlan, plan(path, g, {.streamExperts = true})),
+        "planner streams fused gate/up experts as each expert's gate and up rows");
+  tensorNamed(fused, "blk.0.ffn_gate_up_exps.weight").type = kQ8_1;
+  tensorNamed(fused, "blk.0.ffn_gate_up_exps.weight").data.resize(2 * g.experts * width * g.hiddenSize / 32 * 36);
+  writeGguf(path, fused, g);
+  check(names(plan(path, g), {"ffn_gate_up_exps.weight (Q8_1) in 1 layer"}),
+        "planner refuses a fused gate/up experts tensor of a type it does not read by name");
 }
 
 // The rotary embedding and norms the kernels compute: a GGUF declares their
 // RoPE base, rotated dimensions and RMS epsilon, and no RoPE scaling.
 void checkRotary(const std::filesystem::path &directory) {
   const SmallTarget target = smallTarget(false);
-  const model::gguf::TargetGeometry &g = target.geometry;
+  const model::QwenTargetDimensions &g = target.geometry;
   const auto path = directory / "rotary.gguf";
   const auto planned = [&](const std::vector<test_gguf::Key> &keys) {
     splash::test::writeFile(path, test_gguf::file(keys, target.tensors));
     return plan(path, g);
   };
-  const std::string scaling = g.architecture() + std::string(".rope.scaling.type");
+  const std::string scaling = architecture(g) + ".rope.scaling.type";
   std::vector<test_gguf::Key> keys = metadata(g);
   keys.push_back(test_gguf::stringKey(scaling, "none"));
   check(!planned(keys).error, "planner accepts a GGUF that declares no RoPE scaling");
   keys.back() = test_gguf::stringKey(scaling, "yarn");
   check(names(planned(keys), {"rope.scaling.type yarn (expected none)"}), "planner refuses RoPE scaling");
 
-  model::gguf::TargetGeometry other = g;
+  model::QwenTargetDimensions other = g;
   other.rotaryPairs = 64;
   other.rotaryTheta = 1e6F;
   keys = metadata(other);
@@ -187,11 +431,29 @@ void checkRotary(const std::filesystem::path &directory) {
         "planner requires the rotary and norm metadata");
 }
 
+// The prism.hadamard metadata of a rotation of explicit signs, every
+// rotated input one rotation block wide, of the weights and the token table.
+std::vector<test_gguf::Key> rotationKeys(const std::vector<std::string> &weights) {
+  const auto key = [](const char *name) { return std::string("prism.hadamard.") + name; };
+  return {test_gguf::uint32Key(key("version"), 1),
+          test_gguf::uint32Key(key("block_size"), GGUF_ROTATION_BLOCK),
+          test_gguf::stringKey(key("transform"), "normalized-sylvester-walsh-hadamard"),
+          test_gguf::stringKey(key("axis"), "input-last-dimension"),
+          test_gguf::stringKey(key("sign_mode"), "explicit"),
+          test_gguf::boolKey(key("gdn_v_grouped"), true),
+          test_gguf::int32ArrayKey(key("sign_widths"), {GGUF_ROTATION_BLOCK}),
+          test_gguf::int32ArrayKey(key("sign_values"), std::vector<int32_t>(GGUF_ROTATION_BLOCK, 1)),
+          test_gguf::stringArrayKey(key("weight_names"), weights),
+          test_gguf::stringArrayKey(key("inverse_weight_names"), {"token_embd.weight"})};
+}
+
 // A dense target stored for rotated inputs, every rotated input one rotation
 // block wide: the rotation must name exactly the tensors the planner repacks,
-// so Q8_0 alpha/beta, whose segment reads the rotated input, and not F32 ones.
+// so quantized alpha/beta (Q8_0 and IQ4_XS here), whose segment reads the
+// rotated input, and not F32 ones, nor BF16 (Prism's) or F16 ones, which load
+// as F32. A rotation the kernels do not run, or of a MoE target, is refused.
 void checkRotation(const std::filesystem::path &directory) {
-  model::gguf::TargetGeometry g;
+  model::QwenTargetDimensions g;
   g.layers = 2;
   g.hiddenSize = GGUF_ROTATION_BLOCK;
   g.vocabularySize = 256;
@@ -207,42 +469,625 @@ void checkRotation(const std::filesystem::path &directory) {
   g.rotaryTheta = 1e7F;
   g.fullAttentionPeriod = 2; // layer 1
   const auto path = directory / "rotated.gguf";
-  // PQ2_0 projections and token table, alpha/beta of type `alphaBeta`, and a
-  // rotation that names every quantized tensor but the table, alpha/beta only
-  // when `namesAlphaBeta`.
-  const auto planned = [&](uint32_t alphaBeta, bool namesAlphaBeta) {
-    TensorTypes types{{"ssm_beta.weight", alphaBeta}, {"ssm_alpha.weight", alphaBeta}};
+  // The target of geometry `t` with PQ2_0 projections and token table, its
+  // other quantized tensors of `types`, and a rotation that names every
+  // quantized tensor of one rotation block's width but the table, alpha/beta
+  // only when `namesAlphaBeta`, with `changes` in place of the rotation keys
+  // they name or added.
+  const auto planned = [&](const model::QwenTargetDimensions &t, TensorTypes types, bool namesAlphaBeta,
+                           const std::vector<test_gguf::Key> &changes = {}) {
     for (const char *name : {"attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight", "attn_qkv.weight",
                              "attn_gate.weight", "ssm_out.weight", "ffn_gate.weight", "ffn_up.weight",
                              "ffn_down.weight", "output.weight", "token_embd.weight"})
       types[name] = model::ggml::kPQ2_0;
-    const std::vector<Tensor> tensors = targetTensors(g, types);
+    const std::vector<Tensor> tensors = targetTensors(t, types);
     std::vector<std::string> weights;
     for (const Tensor &tensor : tensors)
       if (gguf_format_of(tensor.type) != GGUF_FMT_COUNT && tensor.name != "token_embd.weight" &&
+          tensor.dims.size() == 2 && tensor.dims[0] == GGUF_ROTATION_BLOCK &&
           (namesAlphaBeta || !(tensor.name.ends_with("_alpha.weight") || tensor.name.ends_with("_beta.weight"))))
         weights.push_back(tensor.name);
-    std::vector<test_gguf::Key> keys = metadata(g);
-    const auto key = [](const char *name) { return std::string("prism.hadamard.") + name; };
-    keys.push_back(test_gguf::uint32Key(key("version"), 1));
-    keys.push_back(test_gguf::uint32Key(key("block_size"), GGUF_ROTATION_BLOCK));
-    keys.push_back(test_gguf::stringKey(key("transform"), "normalized-sylvester-walsh-hadamard"));
-    keys.push_back(test_gguf::stringKey(key("axis"), "input-last-dimension"));
-    keys.push_back(test_gguf::stringKey(key("sign_mode"), "explicit"));
-    keys.push_back(test_gguf::boolKey(key("gdn_v_grouped"), true));
-    keys.push_back(test_gguf::int32ArrayKey(key("sign_widths"), {GGUF_ROTATION_BLOCK}));
-    keys.push_back(test_gguf::int32ArrayKey(key("sign_values"), std::vector<int32_t>(GGUF_ROTATION_BLOCK, 1)));
-    keys.push_back(test_gguf::stringArrayKey(key("weight_names"), weights));
-    keys.push_back(test_gguf::stringArrayKey(key("inverse_weight_names"), {"token_embd.weight"}));
+    std::vector<test_gguf::Key> keys = metadata(t);
+    std::vector<test_gguf::Key> rotation = rotationKeys(weights);
+    for (const test_gguf::Key &change : changes) {
+      const auto same = std::find_if(rotation.begin(), rotation.end(),
+                                     [&](const test_gguf::Key &key) { return key.name == change.name; });
+      if (same == rotation.end()) rotation.push_back(change);
+      else *same = change;
+    }
+    keys.insert(keys.end(), rotation.begin(), rotation.end());
     splash::test::writeFile(path, test_gguf::file(keys, tensors));
-    return plan(path, g);
+    return plan(path, t);
   };
-  const Plan floats = planned(model::ggml::kF32, false);
-  check(!floats.error, "planner plans a rotation of F32 alpha/beta" + (floats.error ? ": " + *floats.error : ""));
-  const Plan q8 = planned(model::ggml::kQ8_0, true);
-  check(!q8.error, "planner plans a rotation that names Q8_0 alpha/beta" + (q8.error ? ": " + *q8.error : ""));
-  check(names(planned(model::ggml::kQ8_0, false), {"the rotation must name every quantized tensor"}),
-        "planner refuses a rotation that leaves out Q8_0 alpha/beta");
+  const auto alphaBeta = [](uint32_t type) {
+    return TensorTypes{{"ssm_beta.weight", type}, {"ssm_alpha.weight", type}};
+  };
+  for (uint32_t type : {model::ggml::kF32, model::ggml::kBF16, model::ggml::kF16}) {
+    const Plan floats = planned(g, alphaBeta(type), false);
+    check(!floats.error, "planner plans a rotation of " + model::ggmlTypeName(type) + " alpha/beta" +
+                             (floats.error ? ": " + *floats.error : ""));
+  }
+  for (uint32_t type : {kQ8_0, kIQ4_XS}) {
+    const std::string gates = model::ggmlTypeName(type) + " alpha/beta";
+    const Plan named = planned(g, alphaBeta(type), true);
+    check(!named.error, "planner plans a rotation that names " + gates + (named.error ? ": " + *named.error : ""));
+    check(names(planned(g, alphaBeta(type), false), {"the rotation must name every quantized tensor"}),
+          "planner refuses a rotation that leaves out " + gates);
+  }
+  const auto key = [](const char *name) { return std::string("prism.hadamard.") + name; };
+  for (const auto &[change, refusal] : std::vector<std::pair<test_gguf::Key, std::string_view>>{
+           {test_gguf::uint32Key(key("version"), 2), "unsupported prism.hadamard.version"},
+           {test_gguf::uint32Key(key("seed"), 7), "unsupported rotation metadata: prism.hadamard.seed"},
+           {test_gguf::stringKey(key("sign_mode"), "identity"), "unsupported rotation: the kernels run explicit signs"},
+           {test_gguf::boolKey(key("gdn_v_grouped"), false), "rotated GDN inputs must keep their value heads grouped"}})
+    check(names(planned(g, alphaBeta(model::ggml::kF32), false, {change}), {refusal}),
+          "planner refuses a rotation whose " + change.name + " the kernels do not run");
+  model::QwenTargetDimensions moe = g;
+  moe.ffnKind = model::QwenFfnKind::SparseMoe;
+  moe.experts = 4;
+  moe.expertsPerToken = 2;
+  moe.expertIntermediateSize = 256;
+  TensorTypes experts = alphaBeta(model::ggml::kF32);
+  for (const char *name : {"ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight",
+                           "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight"})
+    experts[name] = kQ4_K;
+  check(names(planned(moe, experts, false), {"rotated weights are supported for dense targets only"}),
+        "planner refuses a rotated MoE target");
+}
+
+// The rows of a table that streams (gguf::tableRows), Flash-Next's PLE table
+// (--ple-memory): where the file holds them, as its image copies them, BF16's
+// and F16's 160 values as stored though no whole native block; refused for a
+// type its image does not copy as stored and for another width.
+void checkPleTableRows(const std::filesystem::path &directory) {
+  const uint32_t columns = model::Qwen4ExpLayout{}.pleHeadDimension;
+  std::mt19937 rng(7);
+  const auto planned = [&](uint32_t type, uint64_t tableColumns, uint64_t rows, uint64_t rowBytes,
+                           std::optional<model::gguf::StreamedRows> &out, test_gguf::Bytes &table) {
+    table.resize(rows * rowBytes);
+    for (uint8_t &byte : table) byte = uint8_t(rng());
+    const auto path = directory / "ple.gguf";
+    // A tensor before the table, so that it starts past the data's start.
+    test_gguf::Bytes before(4 * 90);
+    splash::test::writeFile(path,
+                            test_gguf::file({}, {{"token_embd.weight", {columns, 4}, kIQ4_NL, before},
+                                                 {"per_layer_token_embd.weight", {tableColumns, rows}, type, table}}));
+    model::WeightSource source(path);
+    const model::GgufFile gguf(source);
+    try {
+      out = model::gguf::tableRows(gguf, "per_layer_token_embd.weight", columns);
+      return std::string();
+    } catch (const model::GgufError &error) {
+      return std::string(error.what());
+    }
+  };
+  std::optional<model::gguf::StreamedRows> rows;
+  test_gguf::Bytes table;
+  check(planned(kIQ4_NL, columns, 1000, 90, rows, table).empty() && rows && rows->rows == 1000 &&
+            rows->rowBytes == 90 && rows->format == GGUF_FMT_IQ4NL && rows->file == 0 &&
+            rows->tensor == "per_layer_token_embd.weight",
+        "an IQ4_NL PLE table streams as 90-byte rows");
+  if (rows) {
+    test_gguf::Bytes read(table.size());
+    const int file = open((directory / "ple.gguf").c_str(), O_RDONLY);
+    const bool same = file >= 0 && pread(file, read.data(), read.size(), off_t(rows->offset)) == ssize_t(read.size()) &&
+                      read == table;
+    if (file >= 0) close(file);
+    check(same, "the streamed PLE rows are where the file holds the table");
+  }
+  rows.reset();
+  check(planned(kQ8_0, columns, 100, 170, rows, table).empty() && rows && rows->rowBytes == 170 &&
+            rows->format == GGUF_FMT_Q80,
+        "a Q8_0 PLE table streams as 170-byte rows");
+  for (const uint32_t type : {model::ggml::kBF16, model::ggml::kF16}) {
+    rows.reset();
+    check(planned(type, columns, 100, 320, rows, table).empty() && rows && rows->rowBytes == 320 &&
+              rows->format == gguf_format_of(type),
+          "a " + model::ggmlTypeName(type) + " PLE table streams as 320-byte rows");
+  }
+  rows.reset();
+  check(planned(0, columns, 10, uint64_t{columns} * 4, rows, table).find("does not stream") != std::string::npos,
+        "an F32 PLE table does not stream");
+  check(planned(kIQ4_NL, 128, 10, 72, rows, table).find("unexpected shape") != std::string::npos,
+        "a PLE table of another width does not stream");
+}
+
+// The plan's repack of the named tensor in any image, or nullptr.
+const model::gguf::Repack *repackIn(const Plan &result, const std::string &name) {
+  for (const model::gguf::Image &image : result.images)
+    if (const auto *repack = repackOf(image, name)) return repack;
+  return nullptr;
+}
+
+// Qwen3.8-Flash-Next's hyper-connection projections (GgufImage.cpp
+// hyperImage) on the small qwen4exp target (qwen4ExpGeometry): of BF16 or
+// F16, Q8_0 planes whose rows the reader builds as the reference GGUF
+// quantization of Q8_0 does from the values (gguf_reference::quantizeQ8_0,
+// which gguf-reference pins to it); of Q8_0, the rows as stored; of F32,
+// refused.
+void checkHyperConnections(const std::filesystem::path &directory) {
+  const model::QwenTargetDimensions g = qwen4ExpGeometry();
+  const auto path = directory / "hyper.gguf";
+  // The plan's rows read `source`, which the last plan opened.
+  std::unique_ptr<model::WeightSource> source;
+  const auto planned = [&](const TensorTypes &hyperTypes, std::vector<Tensor> &tensors) -> Plan {
+    TensorTypes types = qwen4ExpTypes();
+    types.insert(hyperTypes.begin(), hyperTypes.end());
+    tensors = targetTensors(g, types);
+    // Random native blocks and F32 values, and BF16 or F16 ones of q8_0Values.
+    uint32_t seed = 1300;
+    for (Tensor &tensor : tensors) {
+      uint64_t count = 1;
+      for (uint64_t dim : tensor.dims) count *= dim;
+      const uint32_t format = gguf_format_of(tensor.type);
+      tensor.data.clear();
+      if (tensor.type == model::ggml::kBF16 || tensor.type == model::ggml::kF16)
+        for (float value : q8_0Values(count, ++seed)) {
+          const uint16_t bits =
+              tensor.type == model::ggml::kF16 ? gguf_reference::f2h(value) : splash::test::floatToBf16(value);
+          tensor.data.insert(tensor.data.end(), {uint8_t(bits), uint8_t(bits >> 8)});
+        }
+      else if (format == GGUF_FMT_COUNT) tensor.data = floatValues(count, ++seed, readAsBfloat16(tensor));
+      else tensor.data = fixture(Fmt(format), uint32_t(count / tensor.dims[0]), uint32_t(tensor.dims[0]), ++seed);
+    }
+    source.reset();
+    writeGguf(path, tensors, g);
+    try {
+      source = std::make_unique<model::WeightSource>(path);
+      const model::GgufFile gguf(*source);
+      return {model::gguf::planImages(gguf, architecture(g), g), std::nullopt};
+    } catch (const model::GgufError &error) {
+      return {{}, error.what()};
+    }
+  };
+  std::vector<Tensor> tensors;
+  const Plan mixed = planned({{"hc_attn_down.weight", model::ggml::kBF16}, {"hc_attn_up.weight", model::ggml::kBF16},
+                              {"hc_ffn_down.weight", model::ggml::kF16}, {"hc_ffn_up.weight", model::ggml::kF16},
+                              {"output_hc_down.weight", kQ8_0}, {"output_hc_up.weight", kQ8_0}},
+                             tensors);
+  check(!mixed.error, "planner plans a target of BF16, F16 and Q8_0 hyper-connections" +
+                          (mixed.error ? ": " + *mixed.error : ""));
+  if (mixed.error) return;
+  std::vector<std::string> projections{"output_hc_down.weight", "output_hc_up.weight"};
+  for (uint32_t layer = 0; layer < g.layers; ++layer)
+    for (const char *stem : {"hc_attn_down", "hc_attn_up", "hc_ffn_down", "hc_ffn_up"})
+      projections.push_back("blk." + std::to_string(layer) + "." + stem + ".weight");
+  for (const std::string &name : projections) {
+    const Tensor &tensor = tensorNamed(tensors, name);
+    const uint64_t rows = tensor.dims[1], columns = tensor.dims[0];
+    const model::gguf::Repack *repack = repackIn(mixed, name);
+    const bool stored = tensor.type == kQ8_0;
+    // The Q8_0 rows of the values the tensor holds, or its rows as stored.
+    std::vector<uint8_t> expected = tensor.data;
+    if (!stored) {
+      std::vector<float> values(rows * columns);
+      for (size_t i = 0; i < values.size(); ++i) {
+        const uint16_t bits = uint16_t(tensor.data[2 * i] | tensor.data[2 * i + 1] << 8);
+        values[i] = tensor.type == model::ggml::kF16 ? gguf_reference::h2f(bits)
+                                                     : std::bit_cast<float>(uint32_t(bits) << 16);
+      }
+      expected = gguf_reference::quantizeQ8_0(values);
+    }
+    std::vector<uint8_t> rowsRead(expected.size());
+    const bool shaped = repack && repack->format == GGUF_FMT_Q80 && repack->rows == rows &&
+                        repack->columns == columns && repack->sources.size() == 1 &&
+                        repack->sources[0].type == kQ8_0 &&
+                        repack->sources[0].rowBytes == gguf_reference::rowBytes(Fmt(GGUF_FMT_Q80), uint32_t(columns)) &&
+                        (stored ? !repack->sources[0].ggufFloatRowBytes
+                                : repack->sources[0].ggufFloatType == tensor.type &&
+                                      repack->sources[0].ggufFloatRowBytes == columns * 2);
+    if (shaped) model::readRepackRows(*repack, 0, rows, rowsRead.data());
+    check(shaped && rowsRead == expected, "planner repacks " + model::ggmlTypeName(tensor.type) + " " + name +
+                                              (stored ? " as stored" : " as the reference Q8_0 of its values"));
+  }
+  check(names(planned({{"hc_ffn_up.weight", model::ggml::kF32}}, tensors),
+              {"hc_ffn_up.weight (F32) in 2 layers"}),
+        "planner refuses an F32 hyper-connection projection by name");
+}
+
+// Qwen3.8-Flash-Next's PLE embedding on the small qwen4exp target
+// (qwen4ExpGeometry): its projections, norms and convolution in the layer it
+// feeds, and its table's rows as stored in an image of their own after the
+// embedding's. With the table streamed, that image loads none of its bytes
+// but stays planned, for the weights' records, its rows where the file holds
+// them, and every other image is the same. A table that does not stream,
+// GGUF's NVFP4, which the writer rebuilds, is refused by name where it
+// would, and loads in its image, which the weights' sizes fall back on
+// (model::streamableWeights). A BF16 or F16 table of Flash-Next's 160 values
+// loads and streams as stored. A GGUF that declares another PLE layer is
+// refused.
+void checkPleTable(const std::filesystem::path &directory) {
+  const model::QwenTargetDimensions g = qwen4ExpGeometry();
+  TensorTypes types = qwen4ExpTypes();
+  for (const char *name : {"hc_attn_down.weight", "hc_attn_up.weight", "hc_ffn_down.weight", "hc_ffn_up.weight",
+                           "output_hc_down.weight", "output_hc_up.weight"})
+    types[name] = kQ8_0;
+  std::vector<Tensor> tensors = targetTensors(g, types);
+  const auto path = directory / "ple.gguf";
+  writeGguf(path, tensors, g);
+  const Plan loaded = plan(path, g), streamed = plan(path, g, {.streamTable = true});
+  for (const Plan *result : {&loaded, &streamed})
+    check(!result->error, "planner plans the PLE embedding" + (result->error ? ": " + *result->error : ""));
+  if (loaded.error || streamed.error) return;
+  const std::string p = "blk." + std::to_string(g.pleLayer) + ".";
+  const model::gguf::Image &layer = loaded.images[g.pleLayer];
+  check(repackOf(layer, p + "ple_key.weight") && repackOf(layer, p + "ple_value.weight") &&
+            copyOf(layer, p + "ple_norm_key.weight") && copyOf(layer, p + "ple_norm_query.weight") &&
+            copyOf(layer, p + "ple_norm_conv.weight") && copyOf(layer, p + "ple_conv1d.weight"),
+        "planner plans the PLE projections, norms and convolution in the layer they feed");
+  const model::gguf::Image &table = loaded.images.back();
+  check(loaded.images.size() == g.layers + 3 && table.name == "ple.bin" && !table.streamedRows &&
+            model::gguf::loadedBytes(table) == table.bytes &&
+            asStored(copyOf(table, "per_layer_token_embd.weight"),
+                     tensorNamed(tensors, "per_layer_token_embd.weight").data),
+        "planner copies the PLE table's rows as stored into an image after the embedding's");
+  const model::gguf::Image &streamedTable = streamed.images.back();
+  const std::optional<model::gguf::StreamedRows> &rows = streamedTable.streamedRows;
+  bool same = streamed.images.size() == loaded.images.size();
+  for (size_t index = 0; same && index + 1 < loaded.images.size(); ++index)
+    same = !streamed.images[index].streamedRows && streamed.images[index].bytes == loaded.images[index].bytes;
+  check(same && rows && rows->tensor == "per_layer_token_embd.weight" && rows->rows == kPleTableRows &&
+            rows->rowBytes == gguf_reference::rowBytes(Fmt(GGUF_FMT_Q80), g.pleHeadDimension) &&
+            rows->format == GGUF_FMT_Q80 &&
+            model::gguf::loadedBytes(streamedTable) == 0 && streamedTable.bytes == table.bytes,
+        "planner streams the PLE table's rows instead of loading its image, which its record keeps");
+  // NVFP4 rows are whole blocks of 256 values.
+  model::QwenTargetDimensions wide = g;
+  wide.pleHeadDimension = 256;
+  TensorTypes rebuilt = types;
+  rebuilt["per_layer_token_embd.weight"] = model::ggml::kNVFP4;
+  writeGguf(path, targetTensors(wide, rebuilt), wide);
+  const Plan whole = plan(path, wide), refused = plan(path, wide, {.streamTable = true});
+  check(!whole.error && whole.images.back().name == "ple.bin" && !whole.images.back().streamedRows &&
+            model::gguf::loadedBytes(whole.images.back()) && refused.error &&
+            refused.error->find("does not stream: per_layer_token_embd.weight") != std::string::npos,
+        "planner loads an NVFP4 PLE table and refuses by name to stream it" +
+            (whole.error ? ": " + *whole.error : std::string()));
+  model::QwenTargetDimensions flashNext = g;
+  flashNext.pleHeadDimension = 160;
+  for (const uint32_t type : {model::ggml::kBF16, model::ggml::kF16}) {
+    TensorTypes float16 = types;
+    float16["per_layer_token_embd.weight"] = type;
+    std::vector<Tensor> wideTensors = targetTensors(flashNext, float16);
+    writeGguf(path, wideTensors, flashNext);
+    const Plan copied = plan(path, flashNext), stream = plan(path, flashNext, {.streamTable = true});
+    const std::optional<model::gguf::StreamedRows> streamedRows =
+        stream.error ? std::nullopt : stream.images.back().streamedRows;
+    check(!copied.error && asStored(copyOf(copied.images.back(), "per_layer_token_embd.weight"),
+                                    tensorNamed(wideTensors, "per_layer_token_embd.weight").data) &&
+              streamedRows && streamedRows->rowBytes == 320 && streamedRows->format == gguf_format_of(type),
+          "planner loads and streams a " + model::ggmlTypeName(type) + " PLE table of 160 values as stored" +
+              (copied.error ? ": " + *copied.error : stream.error ? ": " + *stream.error : std::string()));
+  }
+  model::QwenTargetDimensions other = g;
+  other.pleLayer = 1;
+  splash::test::writeFile(path, test_gguf::file(metadata(other), tensors));
+  check(names(plan(path, g), {"ple.layers"}), "planner refuses a GGUF that declares another PLE layer");
+}
+
+// The dense target split in two as GGUF's split files store it, half
+// its tensors in each part, last part written first: findTargetGgufs takes
+// the parts in split order, past a file that is not a GGUF, and refuses
+// another GGUF beside them, parts of another count, or parts of several
+// names, as the installer does (upstream.split_order). The plan of the parts
+// writes the whole file's images, each tensor read from the part that holds
+// it, at its offset in that part.
+void checkSplit(const std::filesystem::path &directory) {
+  SmallTarget target = smallTarget(false);
+  const model::QwenTargetDimensions &g = target.geometry;
+  const auto whole = directory / "whole.gguf";
+  writeGguf(whole, target.tensors, g);
+  const auto split = directory / "split";
+  std::filesystem::create_directory(split);
+  const std::vector<std::filesystem::path> parts{split / "target-00001-of-00002.gguf",
+                                                 split / "target-00002-of-00002.gguf"};
+  const auto half = target.tensors.begin() + target.tensors.size() / 2;
+  const std::vector<Tensor> held[2]{{target.tensors.begin(), half}, {half, target.tensors.end()}};
+  std::map<std::string, uint32_t> partOf;
+  for (uint16_t number : {1, 0}) {
+    std::vector<test_gguf::Key> keys = number ? std::vector<test_gguf::Key>{} : metadata(g);
+    for (test_gguf::Key &key : test_gguf::splitKeys(number, 2, int32_t(target.tensors.size())))
+      keys.push_back(std::move(key));
+    splash::test::writeFile(parts[number], test_gguf::file(keys, held[number]));
+    for (const Tensor &tensor : held[number]) partOf[tensor.name] = number;
+  }
+  splash::test::writeFile(split / "target-00002-of-00002.gguf.incomplete", "a download in progress");
+  check(model::findTargetGgufs(split) == parts, "findTargetGgufs takes a split GGUF's parts in split order");
+  const auto refused = [&] {
+    try {
+      (void)model::findTargetGgufs(split);
+    } catch (const model::GgufError &error) {
+      return std::string_view(error.what()).find("not the parts of one split GGUF") != std::string_view::npos;
+    }
+    return false;
+  };
+  std::filesystem::copy_file(whole, split / "whole.gguf");
+  check(refused(), "findTargetGgufs refuses another GGUF beside a split GGUF's parts");
+  std::filesystem::remove(split / "whole.gguf");
+  std::filesystem::rename(parts[1], split / "target-00002-of-00003.gguf");
+  check(refused(), "findTargetGgufs refuses the parts of a split GGUF of another count");
+  std::filesystem::rename(split / "target-00002-of-00003.gguf", parts[1]);
+  // Whether the other name sorts before the first part's or after it.
+  for (const auto &[other, listed] : {std::pair{"other", "other, target"}, std::pair{"tested", "target, tested"}}) {
+    const auto renamed = split / (std::string(other) + "-00002-of-00002.gguf");
+    std::filesystem::rename(parts[1], renamed);
+    std::string refusal;
+    try {
+      (void)model::findTargetGgufs(split);
+    } catch (const model::GgufError &error) {
+      refusal = error.what();
+    }
+    std::filesystem::rename(renamed, parts[1]);
+    check(refusal == "target directory mixes the parts of several split GGUFs (" + std::string(listed) +
+                         "); a split GGUF is the parts of one name, NAME-0000K-of-0000N.gguf: " + split.string(),
+          "findTargetGgufs refuses the parts of several names");
+  }
+
+  // Both plans read their files, which stay open.
+  const model::OpenGguf wholeGguf({whole}), splitGguf(model::findTargetGgufs(split));
+  const model::GgufFile &file = splitGguf.file();
+  const std::vector<model::gguf::Image> reference = model::gguf::planImages(wholeGguf.file(), architecture(g), g),
+                                        images = model::gguf::planImages(file, architecture(g), g);
+  // Whether a source of the parts' plan reads the part that holds its
+  // tensor, whose bytes are at the source's offset in that part.
+  bool partRead[2]{};
+  const auto fromItsPart = [&](const model::gguf::TensorRows &rows) {
+    const uint32_t number = partOf.at(rows.name);
+    const test_gguf::Bytes &data = target.data(rows.name);
+    test_gguf::Bytes read(data.size());
+    if (rows.file != &file.source(number)) return false;
+    rows.file->readData(rows.offset, read);
+    partRead[number] = true;
+    return read == data;
+  };
+  bool same = images.size() == reference.size();
+  for (size_t index = 0; same && index < images.size(); ++index) {
+    const model::gguf::Image &image = images[index], &expected = reference[index];
+    same = image.name == expected.name && image.bytes == expected.bytes &&
+           image.fills.size() == expected.fills.size() && image.copies.size() == expected.copies.size() &&
+           image.repacks.size() == expected.repacks.size();
+    for (size_t fill = 0; same && fill < image.fills.size(); ++fill)
+      same = image.fills[fill].offset == expected.fills[fill].offset &&
+             image.fills[fill].bytes == expected.fills[fill].bytes;
+    for (size_t copy = 0; same && copy < image.copies.size(); ++copy)
+      same = image.copies[copy].destination == expected.copies[copy].destination &&
+             image.copies[copy].source.name == expected.copies[copy].source.name &&
+             fromItsPart(image.copies[copy].source);
+    for (size_t at = 0; same && at < image.repacks.size(); ++at) {
+      const model::gguf::Repack &repack = image.repacks[at], &wholeRepack = expected.repacks[at];
+      uint64_t rows = 0;
+      for (const model::gguf::TensorRows &source : repack.sources) rows += source.rows;
+      same = repack.format == wholeRepack.format && repack.columns == wholeRepack.columns &&
+             repack.plane0 == wholeRepack.plane0 && repack.sources.size() == wholeRepack.sources.size() &&
+             std::all_of(repack.sources.begin(), repack.sources.end(), fromItsPart);
+      if (!same) break;
+      // The rows the GPU repacks, which each source reads from its file.
+      std::vector<uint8_t> read(rows * model::ggufRowBytes(kQuantFormats[repack.format], repack.columns)),
+          wholeRead(read.size());
+      model::readRepackRows(repack, 0, rows, read.data());
+      model::readRepackRows(wholeRepack, 0, rows, wholeRead.data());
+      same = read == wholeRead;
+    }
+  }
+  check(same && partRead[0] && partRead[1],
+        "planner reads each tensor of a split GGUF from its part into the whole file's images");
+}
+
+// A small flint target, its GGUF as llama.cpp writes Flint's: four layers
+// that attend, 1 and 2 over a sliding window with RoPE and 0 and 3 over every
+// key without, as its two layer patterns state, each with its sinks after its
+// attention and its norm before the FFN named ffn_norm; layers 0 and 1 a
+// dense FFN, 2 and 3 a MoE of four experts, routed by sigmoid, whose shared
+// expert is two routed experts wide and has no gate.
+model::QwenTargetDimensions flintGeometry() {
+  model::QwenTargetDimensions g;
+  g.layers = 4;
+  g.hiddenSize = 256;
+  g.vocabularySize = 256;
+  g.attentionWidth = 512; // four query heads of 128
+  g.attentionQueryHeads = 4;
+  g.attentionKvHeads = 1;
+  g.attentionHeadDimension = 128;
+  g.attentionGate = false;
+  g.rotaryPairs = 64;
+  g.rotaryTheta = 1e4F;
+  g.slidingWindow = 33;
+  g.slidingLayers = 0b0110;
+  g.unrotatedLayers = 0b1001;
+  g.fullAttentionPeriod = 1;
+  g.ffnKind = model::QwenFfnKind::SparseMoe;
+  g.intermediateSize = 256;
+  g.experts = 4;
+  g.expertsPerToken = 2;
+  g.expertIntermediateSize = 256;
+  g.moeRouter = splash::ops::MoeRouter::SigmoidNormalized;
+  g.sharedExpertSlices = 2;
+  g.sharedExpertGate = false;
+  g.leadingDenseLayers = 2;
+  return g;
+}
+
+// Flint's GGUF plans its layers as llama.cpp writes them: every layer's
+// attention (ungated queries) and sinks, the norm before the FFN, the
+// leading layers' dense FFN and the others' MoE, whose shared expert runs as
+// two slices of the routed width and has no gate; its streamed experts are
+// the MoE layers' alone. Its metadata names each mismatch, its layer
+// patterns' among them, scaled routing weights and a RoPE over part of a
+// head, and its tensors a missing sink, sinks of BF16 (llama.cpp writes them
+// F32) and a router bias no block reads, which the plan refuses rather
+// than drops.
+void checkFlint(const std::filesystem::path &directory) {
+  const model::QwenTargetDimensions g = flintGeometry();
+  std::vector<Tensor> tensors = targetTensors(
+      g, {{"attn_q.weight", kQ8_0},         {"attn_k.weight", kQ8_0},         {"attn_v.weight", kQ8_0},
+          {"attn_output.weight", kQ8_0},    {"ffn_gate.weight", kQ8_0},       {"ffn_up.weight", kQ8_0},
+          {"ffn_down.weight", kQ8_0},       {"ffn_gate_exps.weight", kQ4_K},  {"ffn_up_exps.weight", kQ4_K},
+          {"ffn_down_exps.weight", kQ5_K},  {"ffn_gate_shexp.weight", kQ8_0}, {"ffn_up_shexp.weight", kQ8_0},
+          {"ffn_down_shexp.weight", kQ8_0}, {"output.weight", kQ8_0},         {"token_embd.weight", kQ8_0}});
+  randomize(tensors, 1100);
+  const auto path = directory / "flint.gguf";
+  const auto planned = [&](const std::vector<test_gguf::Key> &keys, const std::vector<Tensor> &written,
+                           model::gguf::PlanOptions options = {}) {
+    splash::test::writeFile(path, test_gguf::file(keys, written));
+    return plan(path, g, options);
+  };
+  const Plan flint = planned(metadata(g), tensors);
+  check(!flint.error && flint.images.size() == g.layers + 2,
+        "planner plans the Flint target" + (flint.error ? ": " + *flint.error : ""));
+  if (flint.error) return;
+  for (uint32_t layer = 0; layer < g.layers; ++layer) {
+    const model::gguf::Image &image = flint.images[layer];
+    const std::string p = "blk." + std::to_string(layer) + ".";
+    const auto *query = repackOf(image, p + "attn_q.weight");
+    check(query && query->rows == g.attentionWidth && image.type == 1,
+          "planner plans layer " + std::to_string(layer) + "'s queries without a gate");
+    for (const std::string name : {"attn_norm.weight", "attn_sinks.weight", "ffn_norm.weight"})
+      check(asStored(copyOf(image, p + name), tensorNamed(tensors, p + name).data),
+            "planner copies the F32 tensor as stored: " + p + name);
+    const bool moe = layer >= g.leadingDenseLayers;
+    check(bool(repackOf(image, p + "ffn_gate.weight")) != moe && bool(copyOf(image, p + "ffn_gate_inp.weight")) == moe,
+          "planner plans layer " + std::to_string(layer) + "'s " + (moe ? "MoE" : "dense FFN"));
+    if (!moe) continue;
+    const auto *gate = repackOf(image, p + "ffn_gate_shexp.weight");
+    const auto *down = repackOf(image, p + "ffn_down_shexp.weight");
+    check(gate && gate->rows == 2 * g.expertIntermediateSize && down && down->rows == 2 * g.hiddenSize &&
+              down->columns == g.expertIntermediateSize && down->sources.size() == 2 &&
+              down->sources[0].windows == 2 && down->sources[0].window == 0 && down->sources[1].window == 1,
+          "planner plans layer " + std::to_string(layer) + "'s shared expert as two slices of the routed width");
+  }
+  const auto expertsOf = [](const Plan &result) {
+    std::vector<bool> streams;
+    for (uint32_t layer = 0; layer < 4; ++layer) streams.push_back(result.images[layer].experts.has_value());
+    return streams;
+  };
+  const Plan streamed = planned(metadata(g), tensors, {.streamExperts = true});
+  check(!streamed.error && streamsExperts(flint, streamed) &&
+            expertsOf(streamed) == std::vector<bool>{false, false, true, true} &&
+            model::gguf::streamedExperts(std::span(streamed.images).subspan(2, 2)).size() == 2,
+        "planner streams the experts of the MoE layers alone");
+
+  const auto withKey = [&](const test_gguf::Key &replacement) {
+    std::vector<test_gguf::Key> keys = metadata(g);
+    for (test_gguf::Key &key : keys)
+      if (key.name == replacement.name) key = replacement;
+    return keys;
+  };
+  check(names(planned(withKey(test_gguf::boolArrayKey("flint.attention.rope_pattern", {true, true, true, false})),
+                      tensors),
+              {"does not match the target: attention.rope_pattern"}),
+        "planner names a RoPE pattern of other layers");
+  std::vector<test_gguf::Key> unpatterned = metadata(g);
+  std::erase_if(unpatterned, [](const test_gguf::Key &key) { return key.name.ends_with("_pattern"); });
+  check(names(planned(unpatterned, tensors),
+              {"attention.sliding_window_pattern, attention.rope_pattern"}),
+        "planner names each missing layer pattern");
+  check(names(planned(withKey(test_gguf::uint32Key("flint.expert_gating_func", 1)), tensors),
+              {"expert_gating_func 1 (expected 2)"}),
+        "planner refuses a softmax router");
+  check(names(planned(withKey(test_gguf::uint32Key("flint.leading_dense_block_count", 1)), tensors),
+              {"leading_dense_block_count 1 (expected 2)"}),
+        "planner names other leading dense layers");
+  check(names(planned(withKey(test_gguf::float32Key("flint.expert_weights_scale", 2.5F)), tensors),
+              {"expert_weights_scale 2.5 (expected 1)"}),
+        "planner refuses scaled routing weights");
+  // Its GGUFs state no rotated dimensions; one that does states the whole
+  // head's.
+  std::vector<test_gguf::Key> rotary = metadata(g);
+  rotary.push_back(test_gguf::uint32Key("flint.rope.dimension_count", 2 * g.rotaryPairs));
+  check(!planned(rotary, tensors).error, "planner plans a Flint GGUF that states its rotated dimensions");
+  rotary.back() = test_gguf::uint32Key("flint.rope.dimension_count", g.rotaryPairs);
+  check(names(planned(rotary, tensors), {"rope.dimension_count 64 (expected 128)"}),
+        "planner names a RoPE over part of the head");
+  std::vector<Tensor> sinkless = tensors;
+  std::erase_if(sinkless, [](const Tensor &tensor) { return tensor.name == "blk.3.attn_sinks.weight"; });
+  check(names(planned(metadata(g), sinkless), {"attn_sinks.weight (missing) in 1 layer"}),
+        "planner names a missing sink");
+  std::vector<Tensor> bfloat16Sinks = tensors;
+  Tensor &sinks = tensorNamed(bfloat16Sinks, "blk.3.attn_sinks.weight");
+  sinks.type = model::ggml::kBF16;
+  sinks.data.resize(sizeof(uint16_t) * g.attentionQueryHeads);
+  check(names(planned(metadata(g), bfloat16Sinks), {"attn_sinks.weight (BF16) in 1 layer"}),
+        "planner refuses sinks of BF16");
+  std::vector<Tensor> biased = tensors;
+  biased.push_back({"blk.2.ffn_exp_probs_b.bias", {g.experts}, model::ggml::kF32, test_gguf::Bytes(4 * g.experts)});
+  check(names(planned(metadata(g), biased), {"ffn_exp_probs_b.bias (unused) in 1 layer"}),
+        "planner refuses a router bias no block reads");
+  // The multi-token prediction block the header declares after the target's
+  // layers is not the target's to read; a block past those is refused.
+  std::vector<test_gguf::Key> predicting = withKey(test_gguf::uint32Key("flint.block_count", g.layers + 1));
+  predicting.push_back(test_gguf::uint32Key("flint.nextn_predict_layers", 1));
+  for (const uint32_t block : {g.layers, g.layers + 1}) {
+    std::vector<Tensor> withBlock = tensors;
+    withBlock.push_back({"blk." + std::to_string(block) + ".nextn.eh_proj.weight", {g.hiddenSize}, model::ggml::kF32,
+                         test_gguf::Bytes(4 * g.hiddenSize)});
+    const Plan plan = planned(predicting, withBlock);
+    check(block == g.layers ? !plan.error : names(plan, {"nextn.eh_proj.weight (unused) in 1 layer"}),
+          "planner leaves the declared prediction block alone and refuses one past it");
+  }
+}
+
+// llama.cpp NVFP4 weights each beside an F32 .scale and the .input_scale of
+// NVIDIA's W4A4 activations, of one value or one per expert of an experts
+// tensor: the planner reads the .input_scale, which a weights-only decode
+// does not apply, and plans the file. An .input_scale beside a weight of
+// another type is refused as unused, and one of another count than its
+// .scale by name.
+void checkNvfp4InputScale(const std::filesystem::path &directory) {
+  // `name` as llama.cpp NVFP4, beside an F32 .scale and .input_scale of
+  // `values` values each.
+  const auto nvfp4 = [](std::vector<Tensor> &tensors, const std::string &name, uint64_t values) {
+    Tensor &weight = tensorNamed(tensors, name);
+    uint64_t rows = 1;
+    for (size_t i = 1; i < weight.dims.size(); ++i) rows *= weight.dims[i];
+    weight.type = model::ggml::kNVFP4;
+    weight.data = blockNvfp4Fixture(uint32_t(rows), uint32_t(weight.dims[0]), 47);
+    const std::string stem = name.substr(0, name.size() - std::string_view(".weight").size());
+    for (const char *suffix : {".scale", ".input_scale"})
+      tensors.push_back({stem + suffix, {values}, model::ggml::kF32, floatValues(values, 48)});
+  };
+  for (const bool moe : {false, true}) {
+    SmallTarget target = smallTarget(moe);
+    const model::QwenTargetDimensions &g = target.geometry;
+    const std::string kind = moe ? "MoE" : "dense";
+    std::vector<Tensor> &tensors = target.tensors;
+    if (moe) {
+      for (const char *name : {"blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight", "blk.0.ffn_down_exps.weight"})
+        nvfp4(tensors, name, g.experts);
+      for (const char *name : {"blk.0.attn_gate.weight", "blk.0.ffn_up_shexp.weight", "output.weight"})
+        nvfp4(tensors, name, 1);
+    } else {
+      for (const char *name : {"blk.0.attn_gate.weight", "blk.0.ffn_up.weight", "blk.1.attn_output.weight"})
+        nvfp4(tensors, name, 1);
+    }
+    const auto path = directory / (kind + "-nvfp4-input-scale.gguf");
+    const auto planned = [&](const std::vector<Tensor> &withTensors) {
+      writeGguf(path, withTensors, g);
+      return plan(path, g);
+    };
+    const Plan scaled = planned(tensors);
+    check(!scaled.error, "planner plans the " + kind + " target's NVFP4 weights beside an .input_scale" +
+                             (scaled.error ? ": " + *scaled.error : ""));
+    // One of another count than its .scale.
+    const std::string input = moe ? "blk.0.ffn_gate_exps.input_scale" : "blk.0.ffn_up.input_scale";
+    const uint64_t other = moe ? 1 : 2;
+    std::vector<Tensor> miscounted = tensors;
+    tensorNamed(miscounted, input) = {input, {other}, model::ggml::kF32, floatValues(other, 49)};
+    check(names(planned(miscounted),
+                {input + (moe ? " must hold one F32 value per expert for " : " must hold one F32 value for ")}),
+          "planner refuses an .input_scale of another count than its .scale: " + input);
+    if (moe) continue;
+    // One beside a Q4_K weight.
+    std::vector<Tensor> beside = tensors;
+    beside.push_back({"blk.0.attn_qkv.input_scale", {1}, model::ggml::kF32, floatValues(1, 50)});
+    check(tensorNamed(beside, "blk.0.attn_qkv.weight").type == kQ4_K &&
+              names(planned(beside), {"attn_qkv.input_scale (unused) in 1 layer"}),
+          "planner refuses an .input_scale beside a Q4_K weight as unused");
+    // One with no weight.
+    std::vector<Tensor> alone = tensors;
+    alone.push_back({"blk.0.attn_k_proj.input_scale", {1}, model::ggml::kF32, floatValues(1, 51)});
+    check(names(planned(alone), {"attn_k_proj.input_scale (unused) in 1 layer"}),
+          "planner refuses an .input_scale with no weight as unused");
+  }
 }
 
 } // namespace
@@ -252,8 +1097,15 @@ int main() {
     const splash::test::TemporaryDirectory directory("splash-gguf-planner");
     guarded("planner on the dense target", [&] { checkDense(directory.path()); });
     guarded("planner on the MoE target", [&] { checkMoe(directory.path()); });
+    guarded("planner on quantized alpha/beta", [&] { checkQuantizedAlphaBeta(directory.path()); });
     guarded("planner on the rotary metadata", [&] { checkRotary(directory.path()); });
     guarded("planner on a rotated target", [&] { checkRotation(directory.path()); });
+    guarded("planner on a streamed PLE table", [&] { checkPleTableRows(directory.path()); });
+    guarded("planner on Flash-Next hyper-connections", [&] { checkHyperConnections(directory.path()); });
+    guarded("planner on Flash-Next's PLE table", [&] { checkPleTable(directory.path()); });
+    guarded("planner on a split GGUF", [&] { checkSplit(directory.path()); });
+    guarded("planner on Flint", [&] { checkFlint(directory.path()); });
+    guarded("planner on NVFP4 activation scales", [&] { checkNvfp4InputScale(directory.path()); });
     std::printf("%s (%d failures)\n", failures ? "GGUF planner tests FAILED" : "GGUF planner tests passed", failures);
     return failures ? 1 : 0;
   }

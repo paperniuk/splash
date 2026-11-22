@@ -1,0 +1,121 @@
+#pragma once
+
+#include "engine/Engine.hpp"
+#include "engine/RuntimeResources.hpp"
+#include "model/ModelDescriptor.hpp"
+
+#include <cstdint>
+#include <filesystem>
+#include <optional>
+#include <stdexcept>
+
+namespace splash::engine {
+
+// A command line the native process cannot run.
+class UsageError final : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
+
+// A model root serve-native cannot serve: MODEL_DIRECTORY names no directory
+// holding the model's target/ and draft/, or one whose model
+// model::inspectModelRoot refuses.
+class ModelRootError final : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
+
+// What the serve-native command line asks for. server/server.py
+// `_native_command` writes it, and dev/tests/engine/native_command_golden.txt
+// pins the lines both sides agree on.
+struct NativeArguments final {
+  std::filesystem::path modelRoot;
+  // The model the directory holds, served for MAX_CONTEXT (model::servedFor):
+  // with YaRN for a context past its native window.
+  model::ModelDescriptor model;
+  // Zero for auto.
+  uint32_t maxContext = 0;
+  // --relaunch-context TOKENS: the context the server's first engine served,
+  // which the server passes to every relaunch beside that engine's
+  // MAX_CONTEXT (RuntimeResourcesConfig::relaunchContext); zero for none.
+  uint32_t relaunchContext = 0;
+  uint64_t maxMemoryBytes = 0;
+  // Automatic without MAX_CACHE_DISK_BYTES, as the server's default.
+  CacheDiskQuota maxCacheDisk{.automatic = true};
+  // --max-cache-disk-writes BYTES: the SSD cache's write budget, the most it
+  // writes a day on average; zero for none.
+  uint64_t maxCacheDiskWritesBytes = 0;
+  // --persistent-cache on|off: whether the cache tier keeps its files for the
+  // next process, instead of temporary ones.
+  bool persistentCache = false;
+  // --cache-dir: where persistent caches live; empty for the default,
+  // ~/Library/Caches/Splash/prefix-cache.
+  std::filesystem::path cacheRoot;
+  kv::Format kvFormat = kv::Format::Int8;
+  ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
+  // --cached-states exact: cached states keep stateFormat, not codes.
+  bool exactCachedStates = false;
+  double decodeShare = EngineConfig{}.decodeShare;
+  uint32_t maxImagePatches = ops::kMaximumImagePatches;
+  // --idle-release SECONDS|off, infinite for off.
+  double idleReleaseSeconds = RuntimeResourcesConfig{}.idleReleaseSeconds;
+  // --idle-sleep prevent|allow: whether the engine keeps the Mac from sleeping
+  // automatically while it holds a request.
+  bool preventIdleSleep = true;
+  // --ane on|off: whether a dense target's prefill FFN may split with the
+  // Neural Engine when that is faster (splash serve --disable-ane turns it
+  // off).
+  bool neuralEngine = true;
+  // --ane-ffn-share SHARE and --ane-ffn-minimum-rows ROWS: the split's share
+  // and least chunk rows as given, none to calibrate them
+  // (AneFfnSetting::fromGiven); neither with --ane off.
+  std::optional<double> aneFfnShare;
+  std::optional<uint32_t> aneFfnMinimumRows;
+  // --prefill-mode bounded|full and --prefill-bound-ms: the isolated prefill
+  // command bound (Scheduler.hpp), infinite for full.
+  double prefillCommandMilliseconds = EngineConfig{}.prefillCommandMilliseconds;
+  // --prefill-bound-scope buffer|command: whether that bound holds each
+  // command buffer or the whole command (EngineConfig::prefillBoundPerBuffer).
+  bool prefillBoundPerBuffer = EngineConfig{}.prefillBoundPerBuffer;
+  // --contended-prefill-rows ROWS: the rows below which a contended prefill
+  // command never shrinks (EngineConfig::contendedPrefillRows). Zero for the
+  // GPU family's default (defaultContendedFloorRows).
+  uint32_t contendedPrefillRows = 0;
+  // --ple-memory BYTES|auto|off and --expert-memory BYTES|auto|off: a
+  // target's per-layer embedding (PLE) table through a row cache of BYTES and
+  // a MoE target's routed experts through a store of BYTES, which
+  // stream the rest from the SSD, as the memory planner decides (auto,
+  // without the option) or loaded whole (off)
+  // (RuntimeResourcesConfig::pleMemory, expertMemory).
+  StreamedSetting pleMemory;
+  StreamedSetting expertMemory;
+  // --sparse-kv-memory BYTES|auto: the target of a block-sparse target's hot
+  // block cache; none, auto, its floor (RuntimeResourcesConfig::sparseKvMemory).
+  std::optional<uint64_t> sparseKvMemory;
+  // --kv-spill always: every request of a target that can spill keeps its
+  // KV on the SSD cache, for validation; without it, the requests memory
+  // cannot hold (EngineSpillConfig::always).
+  bool kvSpillAlways = false;
+  // --kv-window-trim on|off: whether a windowed target's pages give up their
+  // windowed layers' K/V once every window has passed them; off, for
+  // validation, keeps them Full, which changes no output
+  // (RuntimeResourcesConfig::kvWindowTrim).
+  bool kvWindowTrim = true;
+  // --verify-rows auto|all: the rows of the draft's block a decode
+  // cycle verifies (RuntimeResourcesConfig::verifyRows).
+  model::VerifyRows verifyRows = model::VerifyRows::Auto;
+  // --activations auto|bf16: whether activations may round to int8 where
+  // an int8-activation path takes them
+  // (RuntimeResourcesConfig::int8Activations).
+  ops::Int8Activations int8Activations = ops::Int8Activations::On;
+};
+
+// Reads `serve-native MODEL_DIRECTORY MAX_CONTEXT|auto MAX_MEMORY_BYTES|auto
+// [MAX_CACHE_DISK_BYTES] [--name value]...`, whose command main has matched,
+// and inspects the model the directory, its model root, holds. Throws
+// UsageError for a command line it refuses and ModelRootError for the model
+// root it names.
+[[nodiscard]] NativeArguments parseNativeArguments(int argc,
+                                                   const char *const *argv);
+
+} // namespace splash::engine

@@ -68,6 +68,7 @@ if [ -z "$version" ]; then
     version=$(tr -d '[:space:]' < "$work/latest")
     [ -n "$version" ] || fail "the release index is empty."
 fi
+# package.archive_name for the Makefile's MACOS_MIN_VERSION; a test checks it.
 name="splash-$version-arm64-macos26"
 
 mkdir -p "$APP"
@@ -119,7 +120,7 @@ if ! mv -f "$wrapper.tmp" "$wrapper"; then
     rm -f "$wrapper.tmp"
     fail "could not write $wrapper; Splash $name was not installed."
 fi
-for old in "$APP"/splash-*-arm64-macos26; do
+for old in "$APP"/splash-*-arm64-macos*; do
     [ -d "$old" ] && [ "$old" != "$APP/$name" ] && rm -rf "$old"
 done
 exit 0
@@ -151,11 +152,14 @@ case ":$PATH:" in
     *":$dir:"*) ;;
     *) echo "Add it to your PATH first:  export PATH=\"$dir:\$PATH\"" ;;
 esac
-echo "  splash serve --model incoai/Qwen3.6-35B-A3B-Splash"
+echo "  splash serve --model unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M"
 echo "  splash claude|opencode|codex|hermes|pi   connect a coding agent to it"
 if [ -f "$APP/current/install/completions/splash.bash" ] && [ -f "$APP/current/install/completions/_splash" ]; then
     echo "  Optional shell completion (Zsh needs compinit initialized):"
     echo '    Bash: source "$HOME/Library/Application Support/Splash/app/current/install/completions/splash.bash"'
     echo '    Zsh:  source "$HOME/Library/Application Support/Splash/app/current/install/completions/_splash"'
+    if [ -f "$APP/current/install/completions/splash.fish" ]; then
+        echo '    Fish: source "$HOME/Library/Application Support/Splash/app/current/install/completions/splash.fish"'
+    fi
 fi
 echo "  Upgrade: run this installer again.  Uninstall: rm -rf \"$APP\" \"$wrapper\""

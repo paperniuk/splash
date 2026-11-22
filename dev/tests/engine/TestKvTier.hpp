@@ -1,87 +1,243 @@
 #pragma once
 
+#include "engine/KvTier.hpp"
 #include "model/Model.hpp"
 
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <memory>
+#include <optional>
+#include <set>
+#include <span>
+#include <stdexcept>
 #include <vector>
 
 namespace splash::test {
 
-// A KV disk tier without a disk: slots count against a quota, every
-// transfer holds one staging slot until it finishes, and transfers finish
-// when the test says so.
-class TestKvTier final : public model::KvTier {
+// A tier copy in memory (model::KvCopy), read on any thread as SlotFile::readAt reads a slot;
+// failAll and failNext make reads fail. Set the bytes before reads start.
+class TestKvCopy : public model::KvCopy {
+public:
+  static constexpr uint64_t kReadAlignment = 4096;
+
+  TestKvCopy() : id_(++ids()) {}
+  explicit TestKvCopy(std::vector<std::byte> content) : TestKvCopy() { bytes = std::move(content); }
+
+  uint64_t id() const noexcept override { return id_; }
+  std::optional<std::span<const std::byte>> readAt(uint64_t offset, uint64_t count,
+                                                   std::span<std::byte> buffer) const noexcept override {
+    reads_.fetch_add(1, std::memory_order_relaxed);
+    if (failReads()) return std::nullopt;
+    const uint64_t first = offset / kReadAlignment * kReadAlignment;
+    const uint64_t end = std::min<uint64_t>((offset + count + kReadAlignment - 1) / kReadAlignment * kReadAlignment,
+                                            bytes.size());
+    if (offset + count > bytes.size() || end - first > buffer.size()) return std::nullopt;
+    std::memcpy(buffer.data(), bytes.data() + first, end - first);
+    return std::span<const std::byte>(buffer.data() + (offset - first), count);
+  }
+  [[nodiscard]] uint64_t reads() const noexcept { return reads_.load(std::memory_order_relaxed); }
+
+  std::vector<std::byte> bytes;
+  std::atomic<bool> failAll{false};
+  mutable std::atomic<uint32_t> failNext{0};
+
+private:
+  static std::atomic<uint64_t> &ids() noexcept {
+    static std::atomic<uint64_t> next{0};
+    return next;
+  }
+  [[nodiscard]] bool failReads() const noexcept {
+    if (failAll.load(std::memory_order_relaxed)) return true;
+    uint32_t left = failNext.load(std::memory_order_relaxed);
+    while (left && !failNext.compare_exchange_weak(left, left - 1, std::memory_order_relaxed)) {
+    }
+    return left != 0;
+  }
+
+  uint64_t id_;
+  mutable std::atomic<uint64_t> reads_{0};
+};
+
+// A KV disk tier without a disk: slots count against a quota of slots (or, in bytes, a DiskBudget:
+// 100 for a Full page's slot and 30 for a Slim page's, standing in for what SlotFile counts of a
+// page of each form, which kv-page-tier-host holds a real tier to), transfers finish when the test
+// says so, and each slot is its own TestKvCopy that readers may outlive. Tests on it check the
+// cache's count of its slots, not the slot file's.
+class TestKvTier final : public engine::KvTier {
 public:
   struct Transfer final {
     bool ready = false;
     bool success = true;
     bool finished = false;
+    bool submitted = true;
+    // A write's class; none for a restore.
+    std::optional<engine::WriteClass> write;
+    // When it lands, on a tier with a rate.
+    std::optional<double> dueMilliseconds;
   };
 
-  uint64_t slotBytes() const noexcept override { return 100; }
+  TestKvTier() = default;
+  explicit TestKvTier(bool persistent) : persistentTier(persistent) {}
+
+  uint64_t slotBytes(kv::PageForm form) const override { return form == kv::PageForm::Slim ? 30 : 100; }
   bool writable() const noexcept override { return writableFile; }
-  bool canDemote() const noexcept override { return writableFile && staging < stagingSlots; }
-  std::shared_ptr<model::KvDiskSlot> acquireSlot() override {
-    if (slots >= capacity) return {};
-    return std::make_shared<Slot>(*this);
+  bool persistent() const noexcept override { return persistentTier; }
+  void label(const std::shared_ptr<engine::KvDiskSlot> &slot, std::vector<std::byte> label) override {
+    static_cast<Slot &>(*slot).label = std::move(label);
   }
-  std::unique_ptr<model::KvTransfer>
-  demote(uint32_t, std::shared_ptr<model::KvDiskSlot>, std::function<void()>) override {
-    if (!canDemote()) return {};
+  bool canDemote(engine::WriteClass write) const noexcept override {
+    const auto kind = static_cast<size_t>(write);
+    return writableFile && inFlight() < transferLimit && writesInFlight_[kind] < writeLimits[kind];
+  }
+  bool canRestore() const noexcept override { return inFlight() < transferLimit; }
+  std::shared_ptr<engine::KvDiskSlot> acquireSlot(kv::PageForm form, model::DiskBudget::Draw draw) override {
+    draws.push_back(draw);
+    if (budget ? !budget->reserve(slotBytes(form), draw) : slots >= capacity) return {};
+    return std::make_shared<Slot>(*this, slotBytes(form));
+  }
+  std::unique_ptr<engine::KvTransfer>
+  demote(uint32_t page, std::shared_ptr<engine::KvDiskSlot>, engine::WriteClass write,
+         std::function<void()>) override {
+    if (!canDemote(write)) return {};
     ++demotions;
-    return start();
+    writes.push_back({page, write});
+    return start(write);
   }
-  std::unique_ptr<model::KvTransfer>
-  restore(std::shared_ptr<model::KvDiskSlot>, uint32_t, std::function<void()>) override {
-    if (staging >= stagingSlots) return {};
+  std::unique_ptr<engine::KvTransfer>
+  restore(std::shared_ptr<engine::KvDiskSlot>, uint32_t page, std::function<void()>) override {
+    ++restoreCalls;
+    if (!canRestore()) return {};
     ++restores;
-    return start();
+    restoredPages.push_back(page);
+    std::unique_ptr<engine::KvTransfer> transfer = start(std::nullopt);
+    transfers.back()->submitted = false;
+    return transfer;
   }
-  bool copiesQueued() const noexcept override { return queued; }
+  void submitRestores() override {
+    for (const auto &transfer : transfers)
+      transfer->submitted = true;
+  }
+  std::shared_ptr<const model::KvCopy> copy(const std::shared_ptr<engine::KvDiskSlot> &slot) const override {
+    return std::static_pointer_cast<const Slot>(slot);
+  }
   void poll() override {}
 
-  // Finishes every transfer still in flight.
+  // A slot's copy, to give it bytes or make its reads fail.
+  [[nodiscard]] static TestKvCopy &copyOf(const std::shared_ptr<engine::KvDiskSlot> &slot) {
+    return static_cast<Slot &>(*slot);
+  }
+
+  // Finishes every transfer still in flight, of the restores those submitted.
   void complete(bool success = true) {
-    for (auto &transfer : transfers) {
-      if (transfer->finished || transfer->ready) continue;
+    for (auto &transfer : open()) {
+      if (transfer->finished || transfer->ready || !transfer->submitted) continue;
       transfer->ready = true;
       transfer->success = success;
     }
-    queued = false;
   }
-  [[nodiscard]] uint32_t inFlight() const noexcept {
-    uint32_t count = 0;
-    for (const auto &transfer : transfers) count += !transfer->finished;
-    return count;
+  // With a rate, a transfer lands a slot's bytes at bytesPerMillisecond
+  // after it starts, by the test's clock: the next of those to land, and
+  // those due by `nowMilliseconds` landed (a restore once submitted).
+  [[nodiscard]] std::optional<double> nextLanding() const {
+    std::optional<double> next;
+    for (const auto &transfer : open())
+      if (!transfer->finished && !transfer->ready && transfer->submitted && transfer->dueMilliseconds)
+        next = std::min(next.value_or(*transfer->dueMilliseconds), *transfer->dueMilliseconds);
+    return next;
+  }
+  void land(double nowMilliseconds) {
+    for (auto &transfer : open())
+      if (!transfer->finished && !transfer->ready && transfer->submitted && transfer->dueMilliseconds &&
+          *transfer->dueMilliseconds <= nowMilliseconds)
+        transfer->ready = true;
+  }
+  // Fails every write of the class still in flight.
+  void fail(engine::WriteClass write) {
+    for (auto &transfer : transfers) {
+      if (transfer->finished || transfer->ready || transfer->write != write) continue;
+      transfer->ready = true;
+      transfer->success = false;
+    }
+  }
+  [[nodiscard]] uint32_t inFlight() const noexcept { return inFlight_; }
+  // The labels of the slots a persistent tier holds, as the next process
+  // finds them, and a slot that process takes back, of a page of the form
+  // its label names, within the tier's budget if it has one.
+  [[nodiscard]] std::vector<std::vector<std::byte>> labels() const {
+    std::vector<std::vector<std::byte>> result;
+    for (const Slot *slot : live_)
+      if (!slot->label.empty()) result.push_back(slot->label);
+    return result;
+  }
+  [[nodiscard]] std::shared_ptr<engine::KvDiskSlot> adopt(kv::PageForm form = kv::PageForm::Full) {
+    if (budget && !budget->reserve(slotBytes(form)))
+      throw std::logic_error("a test tier takes back only what its budget holds");
+    return std::make_shared<Slot>(*this, slotBytes(form));
   }
 
   uint32_t slots = 0;
   uint32_t capacity = 4;
-  uint32_t staging = 0;
-  uint32_t stagingSlots = 2;
+  // Reserves the slots instead of capacity, as SlotFile does.
+  std::shared_ptr<model::DiskBudget> budget;
+  uint32_t transferLimit = 2;
+  // Writes in flight of each class at most (engine::WriteClass): by
+  // default a production tier's shares (KvPageTier), 16 persistent copies
+  // and 32 pages written through.
+  std::array<uint32_t, 3> writeLimits{~0u, 16, 32};
   uint32_t demotions = 0;
+  // Every write started, its page and class, and every draw a slot was
+  // asked for.
+  struct Write final {
+    uint32_t page = 0;
+    engine::WriteClass write = engine::WriteClass::Reclaim;
+  };
+  std::vector<Write> writes;
+  std::vector<model::DiskBudget::Draw> draws;
+  // Restores started, every restore() call, and the pages of those started.
   uint32_t restores = 0;
+  uint32_t restoreCalls = 0;
+  std::vector<uint32_t> restoredPages;
   bool writableFile = true;
-  bool queued = false;
+  bool persistentTier = false;
   std::vector<std::shared_ptr<Transfer>> transfers;
+  std::optional<double> bytesPerMillisecond;
+  std::function<double()> clock;
 
 private:
-  struct Slot final : model::KvDiskSlot {
-    explicit Slot(TestKvTier &owner) : tier(owner) { ++tier.slots; }
-    ~Slot() override { --tier.slots; }
+  struct Slot final : engine::KvDiskSlot, TestKvCopy {
+    Slot(TestKvTier &owner, uint64_t taken) : tier(owner), budget(owner.budget), taken_(taken) {
+      ++tier.slots;
+      tier.live_.insert(this);
+    }
+    ~Slot() override {
+      --tier.slots;
+      tier.live_.erase(this);
+      if (budget) budget->release(taken_);
+    }
+    uint64_t bytes() const noexcept override { return taken_; }
     TestKvTier &tier;
+    std::shared_ptr<model::DiskBudget> budget;
+    std::vector<std::byte> label;
+
+  private:
+    uint64_t taken_;
   };
-  class Ticket final : public model::KvTransfer {
+  class Ticket final : public engine::KvTransfer {
   public:
-    Ticket(TestKvTier &owner, std::shared_ptr<Transfer> transfer)
-        : tier_(owner), transfer_(std::move(transfer)) {}
+    Ticket(TestKvTier &owner, std::shared_ptr<Transfer> transfer,
+           std::optional<engine::WriteClass> write)
+        : tier_(owner), transfer_(std::move(transfer)), write_(write) {}
     bool ready() const noexcept override { return transfer_->ready; }
     bool finish() override {
       if (!transfer_->finished) {
         transfer_->finished = true;
-        --tier_.staging;
+        --tier_.inFlight_;
+        if (write_) --tier_.writesInFlight_[static_cast<size_t>(*write_)];
       }
       return transfer_->success;
     }
@@ -89,15 +245,58 @@ private:
   private:
     TestKvTier &tier_;
     std::shared_ptr<Transfer> transfer_;
+    std::optional<engine::WriteClass> write_;
   };
 
-  std::unique_ptr<model::KvTransfer> start() {
+  // A write of its class, or a restore.
+  std::unique_ptr<engine::KvTransfer> start(std::optional<engine::WriteClass> write) {
     auto transfer = std::make_shared<Transfer>();
+    transfer->write = write;
+    if (bytesPerMillisecond)
+      transfer->dueMilliseconds = clock() + double(slotBytes(kv::PageForm::Full)) / *bytesPerMillisecond;
     transfers.push_back(transfer);
-    ++staging;
-    queued = true;
-    return std::make_unique<Ticket>(*this, std::move(transfer));
+    ++inFlight_;
+    if (write) ++writesInFlight_[static_cast<size_t>(*write)];
+    return std::make_unique<Ticket>(*this, std::move(transfer), write);
   }
+
+  // The transfers from the first one not finished on: every one before it
+  // is, so a long run's scans skip them.
+  [[nodiscard]] std::span<const std::shared_ptr<Transfer>> open() const {
+    if (open_ > transfers.size())
+      open_ = 0;
+    while (open_ < transfers.size() && transfers[open_]->finished)
+      ++open_;
+    return std::span(transfers).subspan(open_);
+  }
+
+  uint32_t inFlight_ = 0;
+  std::array<uint32_t, 3> writesInFlight_{};
+  std::set<const Slot *> live_;
+  mutable size_t open_ = 0;
 };
+
+// A fixture's tier: its quota of slots, its transfers in flight, and with a
+// rate, a transfer lands bytes / rate after it starts. A persistent tier
+// copies points ahead whatever memory holds.
+struct TierOptions final {
+  uint32_t capacity = 4, transferLimit = 2;
+  std::optional<double> bytesPerMillisecond;
+  bool persistent = false;
+};
+
+// A request's page sources (model::KvPageSources), page by page.
+inline std::shared_ptr<const model::KvPageSources> sourcesOf(const std::vector<model::KvPageSource> &pages) {
+  std::vector<std::shared_ptr<const model::KvPageSources::Chunk>> chunks;
+  for (size_t first = 0; first < pages.size(); first += model::KvPageSources::kChunkPages) {
+    auto chunk = std::make_shared<model::KvPageSources::Chunk>();
+    for (size_t page = first; page < std::min(pages.size(), first + model::KvPageSources::kChunkPages); ++page) {
+      chunk->pages[page - first] = pages[page];
+      chunk->indexPages += pages[page].indexed();
+    }
+    chunks.push_back(std::move(chunk));
+  }
+  return std::make_shared<const model::KvPageSources>(std::move(chunks), static_cast<uint32_t>(pages.size()));
+}
 
 } // namespace splash::test

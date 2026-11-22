@@ -1,11 +1,11 @@
 """Writers of the files the weight preparation and GGUF metadata tests read:
-safetensors checkpoints, GGUF files and prepared weight files."""
+safetensors checkpoints, GGUF files and weight files."""
 
 import json
 import struct
 
 # model::kWeightFileAlignment (runtime/model/WeightLayout.hpp): every section
-# of a prepared weight file starts at a multiple of it.
+# of a weight file starts at a multiple of it.
 WEIGHT_FILE_ALIGNMENT = 16384
 # The alignment of GGUF tensor data without a general.alignment key.
 GGUF_ALIGNMENT = 32
@@ -18,7 +18,7 @@ GGUF_TYPE_ARRAY = 9
 
 
 def weight_file(magic, layer, kind, sections):
-    """A prepared weight file: its 16-byte header (the eight-byte magic, then
+    """A weight file: its 16-byte header (the eight-byte magic, then
     layer and type), then each section at the next alignment boundary."""
     data = bytearray(struct.pack("<8sII", magic.encode(), layer, kind))
     data.extend(bytes(WEIGHT_FILE_ALIGNMENT - len(data)))
@@ -44,13 +44,6 @@ def write_safetensors(path, tensors):
         }
         payload.extend(data)
     path.write_bytes(safetensors_bytes(header, payload))
-
-
-def read_safetensors(path):
-    """The header and the tensor data of a safetensors file."""
-    data = path.read_bytes()
-    length = struct.unpack("<Q", data[:8])[0]
-    return json.loads(data[8 : 8 + length]), data[8 + length :]
 
 
 def _gguf_string(text):

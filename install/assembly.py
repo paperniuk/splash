@@ -11,22 +11,22 @@ The paths an assembly links, and what reads each:
   config.json            the target configuration: the MLX config.json, or
                          the one derived from the GGUF (ModelDescriptor.mm
                          inspectSourceModel)
-  target/config.json     the same MLX file again, where
-                         SafetensorsCheckpoint.mm reads a checkpoint's
-                         configuration
-  target/<shard>         the MLX safetensors shards (SafetensorsCheckpoint.mm)
-  target/<name>.gguf     the GGUF target (GgufTarget.cpp findTargetGguf)
+  target/<shard>         the MLX safetensors shards except those holding only
+                         vision_tower.* (SafetensorsCheckpoint.mm)
+  target/<name>.gguf     the GGUF target, or the parts of a split one
+                         (GgufTarget.cpp findTargetGgufs)
   tokenizer/config.json  the same configuration again, from which the
                          server's AutoTokenizer.from_pretrained chooses the
                          tokenizer class
   tokenizer/<file>       the MLX tokenizer files, or tokenizer.json,
                          tokenizer_config.json and chat_template.jinja derived
-                         from the GGUF (server.py --tokenizer)
+                         from the GGUF (server.py main)
   draft/config.json, draft/<name>.safetensors
                          the DFlash2 checkpoint (ModelDescriptor.mm,
-                         DraftCheckpoint.cpp)
-  vision/config.json, vision/<shard>
-                         the MLX shards holding vision_tower.*
+                         DraftCheckpoint.cpp), with the mask token's
+                         embedding, draft/mask_embedding.safetensors, when
+                         the release ships one
+  vision/<shard>         the MLX shards holding vision_tower.*
                          (VisionLoader.cpp, through SafetensorsCheckpoint.mm)
   vision/mmproj.gguf     the GGUF vision projector (VisionLoader.cpp)
 """
@@ -40,12 +40,7 @@ import shutil
 import tempfile
 from pathlib import Path
 
-if __package__:
-    from . import gguf, hub, models
-else:
-    import gguf
-    import hub
-    import models
+from . import families, gguf, hub, models
 
 GGUF_VISION = "vision/mmproj.gguf"
 TARGET_FORMATS = ("mlx-affine", "gguf")
@@ -111,18 +106,23 @@ def _write_durably(path, data):
         os.fsync(stream.fileno())
 
 
-def file_record(path: Path):
+def file_record(path: Path, recorded=None):
     """What model.json records of a linked file: its path, size and times,
     which verify compares on every start, and its content digest, which
-    verify(full=True) recomputes (_digest_of)."""
+    verify(full=True) recomputes (_digest_of). recorded, the record an
+    earlier assembly keeps of the file, gives the digest without reading the
+    file while it keeps the path, size and times recorded, as verify trusts
+    them to."""
     stat = path.stat()
-    return {
+    record = {
         "path": str(path.absolute()),
         "bytes": stat.st_size,
         "mtime_ns": stat.st_mtime_ns,
         "ctime_ns": stat.st_ctime_ns,
-        "digest": _digest(path),
     }
+    if recorded and all(recorded[key] == value for key, value in record.items()):
+        return record | {"digest": recorded["digest"]}
+    return record | {"digest": _digest(path)}
 
 
 def _digest(path):
@@ -154,8 +154,6 @@ def verify(assembly: Path, *, full=False):
     record = models.read_json(assembly / "model.json")
     if not _well_formed(record):
         raise models.ModelError("invalid resolved model record")
-    if _packed_draft(record["files"]):
-        raise models.ModelError("its draft is not a DFlash2 checkpoint")
     for name, entry in record["files"].items():
         path = assembly / name
         stat = path.stat()
@@ -215,20 +213,16 @@ def _well_formed(record):
     )
 
 
-def _packed_draft(files):
-    """Whether the assembly links a packed draft, draft/model.bin and
-    draft/layer-N.bin, as assemblies did before drafts were prepared from
-    their DFlash2 checkpoints; the runtime loads only a checkpoint now."""
-    return any(name.startswith("draft/") and name.endswith(".bin") for name in files)
-
-
-def pins(record):
-    """The Hub snapshot of each source an assembly links files from, with its
-    repository ID: the snapshots its installation pins. Each is found from a
-    linked file's path, not the cache location: HF_HUB_CACHE may name another
-    folder now than when the assembly was built."""
+def _snapshots(record):
+    """(repository ID, commit) of each Hub source an assembly links files
+    from -> the snapshot its files lie in. Each is found from a linked file's
+    path, not the cache location: HF_HUB_CACHE may name another folder now
+    than when the assembly was built."""
     sources = {
-        (hub.folder_name(source["repo"]), source["revision"]): source["repo"]
+        (hub.folder_name(source["repo"]), source["revision"]): (
+            source["repo"],
+            source["revision"],
+        )
         for source in record["sources"].values()
         if source["revision"] is not None
     }
@@ -237,19 +231,48 @@ def pins(record):
         path = hub.snapshot_of(entry["path"])
         key = path and (path.parent.parent.name, path.name)
         if key in sources:
-            snapshots[path] = sources[key]
-    return sorted(snapshots.items())
+            snapshots[sources[key]] = path
+    return snapshots
 
 
-def recorded_pins(link: Path):
-    """pins of the assembly a selection link names, as its record states
-    them whether or not the assembly still verifies; none without a record
-    of the shape build writes."""
+def pins(record):
+    """The Hub snapshot of each source an assembly links files from
+    (_snapshots), with its repository ID: the snapshots its installation
+    pins."""
+    return sorted((path, repo) for (repo, _), path in _snapshots(record).items())
+
+
+def source(record, role):
+    """An assembly's source, "target" or "draft", read without the Hub from
+    what the assembly links: its local directory, or the snapshot its files
+    lie in (_snapshots), however the Hub cache is configured now."""
+    named = record["sources"][role]
+    repo, revision = named["repo"], named["revision"]
+    if revision is None:
+        return hub.Repository.local_directory(repo)
+    path = _snapshots(record).get((repo, revision))
+    if path is None:
+        raise models.ModelError(f"the installation links no file of {repo}@{revision}")
+    return hub.Repository.cached(repo, revision, path)
+
+
+def recorded(link: Path):
+    """The record of the assembly a selection link names, whether or not the
+    assembly still verifies; None without a record of the shape build
+    writes."""
     try:
         record = models.read_json(link / "model.json")
     except models.ModelError:
-        return []
-    return pins(record) if _well_formed(record) else []
+        return None
+    return record if _well_formed(record) else None
+
+
+def family(path: Path):
+    """The family the assembly path names was installed as, its record's
+    (families.FAMILIES); None without a record of the shape build writes, or
+    for a family this release does not serve."""
+    record = recorded(path)
+    return record and families.named(record["family"])
 
 
 def _metadata_inputs(files):
@@ -284,17 +307,27 @@ def metadata_key(file_records):
     )
 
 
-def derived_metadata(models_root: Path, files):
+def derived_metadata(models_root: Path, files, records):
     """The key and the files, by assembly path, of the metadata derived from
     the GGUF files among files (assembly path -> source file): derived once,
-    and again when its entry is damaged. Call it under the installation lock."""
-    inputs = [files[name] for name in _metadata_inputs(files)]
-    sources = [file_record(path) for path in inputs]
+    and again when its entry is damaged. records maps each source file to
+    its record (file_record). Call it under the installation lock."""
+    names = _metadata_inputs(files)
+    inputs = [files[name] for name in names]
+    sources = [records[path] for path in inputs]
     key = _metadata_key(sources)
+    # A split target's metadata is its first file's (split order is name
+    # order); the vision projector comes last.
+    derive = [inputs[0]] + ([files[GGUF_VISION]] if GGUF_VISION in files else [])
 
     def write(stage):
-        contents = gguf.derived_files(*inputs)
-        if [file_record(path) for path in inputs] != sources:
+        contents = gguf.derived_files(*derive)
+        # A source written while it was read no longer has its record's times.
+        current = [
+            file_record(path, source)
+            for path, source in zip(inputs, sources, strict=True)
+        ]
+        if current != sources:
             raise models.ModelError("GGUF source changed while reading metadata")
         for name, data in contents.items():
             _write_durably(stage / name, data)
@@ -320,19 +353,32 @@ def _check_metadata(entry):
             raise models.ModelError("prepared GGUF metadata changed: " + name)
 
 
-def hold(link: Path, models_root: Path):
-    """The directory a selection link serves from, and what holds it: for an
-    assembly, its model.json opened under a shared lock. While that file is
-    open, in this process or one that inherited it, collect_garbage keeps the
-    assembly. The link is read under the installation lock, where collection
-    runs, so there is no moment the assembly is neither linked nor held. A
-    legacy package is served from the link itself: (link, None)."""
-    if models.installation_kind(link) != models.ASSEMBLY:
-        return link, None
-    with models.installation_lock(models_root):
-        assembly = link.resolve(strict=True)
-        record = (assembly / "model.json").open("rb")
-        fcntl.flock(record, fcntl.LOCK_SH)
+def hold(path: Path):
+    """The assembly path names, an assembly or a selection link to one, and
+    what holds it: its model.json opened under a shared lock, which keeps
+    the assembly from collect_garbage while open in this process or one that
+    inherited it. path is read under the installation lock of the models
+    root the assembly was built in, where collection runs, so the assembly
+    is never neither linked nor held; the lock needs write access to that
+    root. A ModelError refuses a path that names no assembly or cannot be
+    held."""
+    resolved = path.resolve().parent
+    if resolved.name != ".resolved":
+        raise models.ModelError(f"{path} is not a model directory Splash prepared")
+    models_root = resolved.parent
+    try:
+        with models.installation_lock(models_root):
+            assembly = path.resolve(strict=True)
+            record = (assembly / "model.json").open("rb")
+            fcntl.flock(record, fcntl.LOCK_SH)
+    except (FileNotFoundError, NotADirectoryError) as error:
+        raise models.ModelError(
+            f"{path} names no model Splash prepared: prepare the model again"
+        ) from error
+    except OSError as error:
+        raise models.ModelError(
+            f"cannot hold {path} in {models_root}: {error}"
+        ) from error
     return assembly, record
 
 
@@ -348,29 +394,85 @@ def is_held(assembly: Path) -> bool:
     return False
 
 
-def collect_garbage(models_root: Path):
-    """Remove what no installation uses: assemblies that no selection links
-    and no server holds, metadata entries the remaining assemblies do not
-    link, and staging an interrupted installation left. Call it under the
-    installation lock, where all of these are written."""
+def collect_garbage(models_root: Path, *, updating=False) -> int:
+    """Remove what no installation uses, and return the bytes this frees in
+    the Hub cache: assemblies that no selection links and no server holds,
+    with the files of their Hub snapshots no remaining assembly links
+    (hub.release); metadata entries the remaining assemblies do not link;
+    and staging an interrupted installation left. Each is a directory
+    (_directories): anything else there, such as the .DS_Store Finder
+    leaves, is not an installation's. A remaining assembly whose record
+    cannot be read links files no one can tell, so then no Hub cache file
+    goes. Call it under the installation lock, where all of these are
+    written. An update (updating) leaves a snapshot another tool may share
+    whole (hub.release). It only frees space: a failure is a warning
+    (models.freeing), and the rest goes on."""
     resolved, derived = models_root / ".resolved", models_root / ".metadata"
-    linked = {link.resolve() for link in models.selection_links(models_root)}
-    used = set()
-    for assembly in sorted(resolved.iterdir()) if resolved.is_dir() else ():
+    links = models.selection_links(models_root)
+    linked = {link.resolve() for link in links}
+    # The records of the assemblies removed; the files the others link, and
+    # whether their records name them all; the metadata entries they link.
+    gone, kept, known, used = [], set(), True, set()
+    for assembly in _directories(resolved.glob("*")):
         if assembly not in linked and not is_held(assembly):
-            shutil.rmtree(assembly)
+            gone += [record] if (record := recorded(assembly)) else []
+            with models.freeing():
+                shutil.rmtree(assembly)
             continue
         # A damaged record protects no metadata: its assembly is rebuilt.
         try:
             files = models.read_json(assembly / "model.json").get("files")
         except models.ModelError:
+            files = None
+        if not isinstance(files, dict):
+            known = False
             continue
-        for entry in files.values() if isinstance(files, dict) else ():
-            path = Path(entry.get("path", "")) if isinstance(entry, dict) else None
-            if path and path.is_relative_to(derived):
-                used.add(path.relative_to(derived).parts[0])
-    for entry in sorted(derived.iterdir()) if derived.is_dir() else ():
+        for entry in files.values():
+            path = entry.get("path") if isinstance(entry, dict) else None
+            if not isinstance(path, str):
+                known = False
+                continue
+            kept.add(Path(path))
+            if Path(path).is_relative_to(derived):
+                used.add(Path(path).relative_to(derived).parts[0])
+    for entry in _directories(derived.glob("*")):
         if entry.name not in used:
-            shutil.rmtree(entry)
-    for stage in models_root.glob(f"*/{models.LINK_STAGING}*"):
-        shutil.rmtree(stage)
+            with models.freeing():
+                shutil.rmtree(entry)
+    for stage in _directories(models_root.glob(f"*/{models.LINK_STAGING}*")):
+        with models.freeing():
+            shutil.rmtree(stage)
+    if not known:
+        return 0
+    owners = {hub.pin_owner(link) for link in links}
+    entries = [path for record in gone for path in _hub_entries(record)]
+    # A failure to tell the files kept apart frees none of them.
+    with models.freeing():
+        return hub.release(entries, kept, owners, keep_shared=updating)
+    return 0
+
+
+def _hub_entries(record):
+    """The files an assembly links from its Hub sources' snapshots
+    (_snapshots), as its record names them: the snapshots' entries, not the
+    blobs they name. A local source's files are never among them, nor a path
+    that climbs out of its snapshot, as a record is only a file on disk."""
+    snapshots = set(_snapshots(record).values())
+    return {
+        Path(entry["path"])
+        for entry in record["files"].values()
+        if hub.snapshot_of(entry["path"]) in snapshots
+        and _stays_in_its_snapshot(entry["path"])
+    }
+
+
+def _stays_in_its_snapshot(path):
+    """Whether path goes no higher than the Hub snapshot it names: a `..`
+    before the snapshot is the cache's own, as where HF_HOME has one."""
+    return ".." not in Path(path).absolute().relative_to(hub.snapshot_of(path)).parts
+
+
+def _directories(paths):
+    """The directories among paths, in name order: the entries and staging
+    installations write, which are never links."""
+    return sorted(p for p in paths if p.is_dir() and not p.is_symlink())

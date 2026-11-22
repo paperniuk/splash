@@ -2,9 +2,8 @@
 
 #include "metal/CommandGraph.hpp"
 #include "metal/abi/ExecutionGeometry.h"
+#include "ops/LaneRows.hpp"
 
-#include <array>
-#include <compare>
 #include <cstdint>
 #include <span>
 
@@ -19,18 +18,7 @@ struct DraftAttentionShape final {
   uint32_t kvHeads = 0;
   uint32_t headDimension = 0;
 
-  auto operator<=>(const DraftAttentionShape &) const = default;
-};
-
-// These configurations vary the surrounding convolution, QKV preparation and
-// reorder phases. The compiled attention core stays M32/N128/D128 with eight
-// query rows, 256 threads, a fixed number of ring splits per KV head and the
-// semantic 2048 window.
-struct DraftAttentionConfiguration final {
-  // Zero uses the full element/task grid. Nonzero selects a persistent group
-  // count for the surrounding phases.
-  uint32_t groups = 0;
-  bool operator==(const DraftAttentionConfiguration &) const = default;
+  bool operator==(const DraftAttentionShape &) const = default;
 };
 
 struct DraftAttentionWorkspace final {
@@ -41,27 +29,22 @@ struct DraftAttentionWorkspace final {
   uint64_t queryValuesBytes = 0;
 };
 
-// Constructed only by DraftAttention::plan so configuration, physical rows
-// and workspace cannot disagree. The grouped-queries tensor also carries the
+// Constructed only by DraftAttention::plan so the shape, physical rows and
+// workspace cannot disagree. The grouped-queries tensor also carries the
 // split partials of the attention core behind the query rows, so the core
 // needs no device scratch beyond these tensors.
 class DraftAttentionPlan final {
 public:
   [[nodiscard]] DraftAttentionShape shape() const noexcept { return shape_; }
   [[nodiscard]] uint32_t lanes() const noexcept { return lanes_; }
-  [[nodiscard]] DraftAttentionConfiguration configuration() const noexcept {
-    return configuration_;
-  }
   [[nodiscard]] DraftAttentionWorkspace workspace() const noexcept;
 
 private:
-  DraftAttentionPlan(DraftAttentionShape shape, uint32_t lanes,
-                     DraftAttentionConfiguration configuration)
-      : shape_(shape), lanes_(lanes), configuration_(configuration) {}
+  DraftAttentionPlan(DraftAttentionShape shape, uint32_t lanes)
+      : shape_(shape), lanes_(lanes) {}
 
   DraftAttentionShape shape_;
   uint32_t lanes_;
-  DraftAttentionConfiguration configuration_;
 
   friend class DraftAttention;
 };
@@ -88,6 +71,9 @@ struct DraftPrepareBuffers final {
 };
 
 struct DraftDecodeAttentionBuffers final {
+  // The prepared query rows, grouped by query head, and the split partials
+  // behind them. The attention leaves its rows in the query rows' place, in
+  // [row][query head][dimension] order, the output projection's input.
   metal::MetalBuffer groupedQueries;
   std::span<const metal::MetalBuffer> persistentKeys;
   std::span<const metal::MetalBuffer> persistentValues;
@@ -97,21 +83,9 @@ struct DraftDecodeAttentionBuffers final {
 
 class DraftAttention final {
 public:
-  [[nodiscard]] static std::span<const DraftAttentionConfiguration>
-  candidates(DraftAttentionShape shape);
-  [[nodiscard]] static DraftAttentionPlan
-  plan(DraftAttentionShape shape, uint32_t lanes,
-       DraftAttentionConfiguration configuration = {});
+  [[nodiscard]] static DraftAttentionPlan plan(DraftAttentionShape shape,
+                                               uint32_t lanes);
 
-  static void captureTargetHidden(
-      metal::CommandGraph &graph, metal::MetalBuffer source,
-      metal::MetalBuffer captured, uint32_t rows, uint32_t captureSlot,
-      uint32_t sourceStart, uint32_t destinationStart, uint32_t hiddenWidth,
-      uint32_t targetWidth);
-  static void gatherLastRows(metal::CommandGraph &graph,
-                             metal::MetalBuffer source,
-                             metal::MetalBuffer destination, uint32_t rows,
-                             uint32_t width);
   static void addConvolution(metal::CommandGraph &graph,
                              DraftConvolutionBuffers buffers,
                              const DraftAttentionPlan &plan,
@@ -119,29 +93,62 @@ public:
   static void addPrepare(metal::CommandGraph &graph,
                          DraftPrepareBuffers buffers,
                          const DraftAttentionPlan &plan);
-  static void addDecode(
-      metal::CommandGraph &graph, DraftDecodeAttentionBuffers buffers,
-      std::span<const uint32_t> cacheLengths, uint32_t cacheStride,
-      const DraftAttentionPlan &plan);
-  static void addReorder(metal::CommandGraph &graph,
-                         metal::MetalBuffer grouped,
-                         metal::MetalBuffer packed,
-                         const DraftAttentionPlan &plan);
+  static void addDecode(metal::CommandGraph &graph,
+                        DraftDecodeAttentionBuffers buffers,
+                        std::span<const uint32_t> cacheLengths,
+                        const DraftAttentionPlan &plan);
+  // The context writers. A row of contextKv holds its keys, then its values
+  // (kvHeads * headDimension each); its normalized, rotated keys and its
+  // values go to its position's slot of the ring.
   static void addContextPrefill(
-      metal::CommandGraph &graph, metal::MetalBuffer contextQkv,
+      metal::CommandGraph &graph, metal::MetalBuffer contextKv,
       metal::MetalBuffer keyNorm, metal::MetalBuffer ropeCos,
       metal::MetalBuffer ropeSin, metal::MetalBuffer keys,
-      metal::MetalBuffer values, uint32_t tokens, uint32_t cacheStride,
-      uint32_t startPosition, DraftAttentionShape shape);
+      metal::MetalBuffer values, uint32_t tokens, uint32_t startPosition,
+      DraftAttentionShape shape);
+  // Each lane's retained rows of a decode step (a GPU mask of its rows, which
+  // acceptance writes) among its rows of the step (laneRows, SplashLaneRows,
+  // which the step's proposer writes): the path's context rows among the
+  // lane's of contextKv, its i-th at the lane's start position plus i,
+  // rotated by the lane's RoPE row i (a lane's RoPE rows hold its verify
+  // block's positions, SPLASH_TARGET_VERIFY_ROWS a lane).
   static void addContextCommit(
-      metal::CommandGraph &graph, metal::MetalBuffer contextQkv,
+      metal::CommandGraph &graph, metal::MetalBuffer contextKv,
       metal::MetalBuffer keyNorm, metal::MetalBuffer ropeCos,
       metal::MetalBuffer ropeSin,
       std::span<const metal::MetalBuffer> persistentKeys,
       std::span<const metal::MetalBuffer> persistentValues,
-      metal::MetalBuffer retainedCounts,
-      std::span<const uint32_t> startPositions, uint32_t cacheStride,
-      DraftAttentionShape shape, uint32_t lanes);
+      metal::MetalBuffer retainedRows, metal::MetalBuffer laneRows,
+      std::span<const uint32_t> startPositions, const StepRows &step,
+      DraftAttentionShape shape);
+
+  // A context window: for each slot of a ring, the bf16 context row of
+  // `width` values the slot's keys and values are computed from, in 4-bit
+  // codes of 64-value groups with each group's fp16 scale and minimum
+  // (metal/abi/DraftAttention.h). Positions map to slots as in the rings.
+  [[nodiscard]] static uint64_t contextWindowBytes(uint32_t width);
+  // Stores `rows` context rows in the slots of positions startPosition on.
+  static void addWindowStore(metal::CommandGraph &graph,
+                             metal::MetalBuffer context,
+                             metal::MetalBuffer window, uint32_t rows,
+                             uint32_t startPosition, uint32_t width);
+  // Stores the first `rows` (at most a verify block's) of the context rows a
+  // lane retained of its rows of a decode step of `contextRows` context rows
+  // (`retained`, its acceptance's mask of them, metal/abi/VerifyTree.h, among
+  // its rows `laneRows`, SplashLaneRows), the path's i-th at position
+  // startPosition + i, as addWindowStore does.
+  static void addWindowCommit(metal::CommandGraph &graph,
+                              metal::MetalBuffer context,
+                              metal::MetalBuffer window,
+                              metal::MetalBuffer retained,
+                              metal::MetalBuffer laneRows,
+                              uint32_t contextRows, uint32_t rows,
+                              uint32_t startPosition, uint32_t width);
+  // Loads the rows of positions startPosition on back into `rows` rows.
+  static void addWindowLoad(metal::CommandGraph &graph,
+                            metal::MetalBuffer window,
+                            metal::MetalBuffer context, uint32_t rows,
+                            uint32_t startPosition, uint32_t width);
 };
 
 } // namespace splash::ops

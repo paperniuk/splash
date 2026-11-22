@@ -1,11 +1,15 @@
-#!/usr/bin/env python3
-"""HTTP routes, protocol responses and serving-process startup."""
+"""HTTP routing and serving-process startup. One table names each endpoint's
+handler; each API's handlers, request conversion and answers live in its
+module in dialects/."""
 
 import argparse
+import errno
 import json
+import math
 import os
 import queue
 import re
+import resource
 import secrets
 import select
 import signal
@@ -13,116 +17,122 @@ import socket
 import sys
 import threading
 import time
-import weakref
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from collections.abc import Callable
+from dataclasses import asdict, dataclass
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import unquote
 
-from huggingface_hub.utils import validate_repo_id
 from transformers import AutoTokenizer
 
-if __package__:
-    from . import images as image_input
-    from . import json_codec, judgments
-    from . import runtime as engine_runtime
-    from .api_shapes import (
-        anthropic_response,
-        anthropic_stop,
-        anthropic_to_chat_body,
-        anthropic_to_chat_prompt,
-        anthropic_usage,
-        completion_response,
-        finish_reason,
-        responses_item,
-        responses_output,
-        responses_response,
-        stream_chunk,
-    )
-    from .backend import NativeBackend, remaining_request_time
-    from .chat_templates import REASONING_EFFORTS, ChatTemplateError, ChatTemplates
-    from .constraints import ConstraintFactory, validate_tokenizer
-    from .diagnostics import log_unexpected, print_request, print_status
-    from .errors import APIError, ContextLengthError
-    from .frontend import Frontend, validate_served_model_name
-    from .http_security import authenticate, validate_api_key, validate_headers
-    from .latency import RequestLatency
-    from .metrics import (
-        is_finite_number,
-        metrics_dict,
-        prometheus_metrics,
-        timings_dict,
-        usage_dict,
-    )
-    from .output import (
-        ReasoningSplitter,
-        StreamingToolCallProjector,
-        argument_deltas,
-        parse_tool_calls,
-        validate_response_content,
-        validate_tool_calls,
-    )
-    from .thinking import ThinkingCodec, ThinkingKeyError, load_thinking_key
-else:
-    import images as image_input
-    import json_codec
-    import judgments
-    from api_shapes import (
-        anthropic_response,
-        anthropic_stop,
-        anthropic_to_chat_body,
-        anthropic_to_chat_prompt,
-        anthropic_usage,
-        completion_response,
-        finish_reason,
-        responses_item,
-        responses_output,
-        responses_response,
-        stream_chunk,
-    )
-    from backend import NativeBackend, remaining_request_time
-    from chat_templates import REASONING_EFFORTS, ChatTemplateError, ChatTemplates
-    from constraints import ConstraintFactory, validate_tokenizer
-    from diagnostics import log_unexpected, print_request, print_status
-    from errors import APIError, ContextLengthError
-    from frontend import Frontend, validate_served_model_name
-    from http_security import authenticate, validate_api_key, validate_headers
-    from latency import RequestLatency
-    from metrics import (
-        is_finite_number,
-        metrics_dict,
-        prometheus_metrics,
-        timings_dict,
-        usage_dict,
-    )
-    from output import (
-        ReasoningSplitter,
-        StreamingToolCallProjector,
-        argument_deltas,
-        parse_tool_calls,
-        validate_response_content,
-        validate_tool_calls,
-    )
-    from thinking import ThinkingCodec, ThinkingKeyError, load_thinking_key
+from install import assembly
+from install.models import ModelError
 
-    import runtime as engine_runtime
+from . import dialects, json_codec, serve_options, serve_record, unix_socket
+from . import runtime as engine_runtime
+from .backend import (
+    NativeBackend,
+    NativeResult,
+    ThinkingEndError,
+    thinking_end_tokens,
+)
+from .chat_templates import ChatTemplateError, ChatTemplates, read_template_file
+from .connections import ConnectionSlots, HttpAdmission, RequestBodyReservation
+from .constraints import (
+    ConstraintFactory,
+    TokenizerContractError,
+    check_capabilities,
+    validate_tokenizer,
+)
+from .diagnostics import console_stats, log_unexpected, print_request, print_status
+from .documents import MAX_PAGES, MAX_PDF_BYTES
+from .errors import (
+    OPENAI_ERRORS,
+    RETRY_STATUSES,
+    APIError,
+    ErrorDialect,
+    RequestValidationError,
+    field_error,
+    remaining_request_time,
+)
+from .frontend import Frontend
+from .http_security import (
+    OriginRefused,
+    RefusedOriginLog,
+    authenticate,
+    socket_hosts,
+    validate_headers,
+)
+from .images import MAX_IMAGE_BYTES
+from .latency import RequestLatency
+from .metrics import prometheus_metrics
+from .origins import ANY_ORIGIN
+from .output import (
+    ReasoningSplitter,
+    StreamingToolCallProjector,
+    validate_response_content,
+)
+from .protocol import MAX_IMAGE_SPANS
+from .thinking import ThinkingCodec, ThinkingKeyError, load_thinking_key
 
-
-DEFAULT_MAX_REQUEST_BYTES = 128 * 1024 * 1024
-# Match the former generation ingress envelope (32 slots × 16 MiB).
+# Request bodies held at once, from upload through preparation and, for what
+# a generation retains of them, until it ends, take at most max(this, twice
+# --max-request-size) bytes, so two of the largest requests always fit.
 DEFAULT_REQUEST_BODY_BUDGET = 512 * 1024 * 1024
-MAX_CONTEXT_TOKENS = 262144
 HTTP_IO_TIMEOUT = 30.0
 HTTP_UPLOAD_BYTES_PER_SECOND = 512 * 1024
-# How long a response sent before the request body was read waits for the
-# client to finish uploading it.
-HTTP_UNREAD_BODY_DRAIN_SECONDS = 2.0
 # Native events wake a waiting request at once; this only bounds how late a
 # client disconnect is noticed.
 CLIENT_DISCONNECT_POLL = 0.1
+# How long an answered connection may take its client to close.
+ANSWERED_LINGER_SECONDS = 2.0
+# The soft descriptor limit the server raises its own to: macOS starts a
+# process with 256, fewer than its connection slots, the answered connections
+# lingering after a burst and the engine's pipes and files can need. 10240 is
+# macOS's OPEN_MAX.
+DESCRIPTOR_LIMIT = 10240
+# The status of a server that stopped restarting its engine, apart from a
+# stop's 0 and a failed start's 1: what supervises the server, as launchd's
+# KeepAlive does, decides whether to start it again. 69 is sysexits'
+# EX_UNAVAILABLE.
+ENGINE_STOPPED_STATUS = os.EX_UNAVAILABLE
 SSE_KEEPALIVE_SECONDS = 2.0
-NATIVE_START_TIMEOUT = 600.0
+# A client gone without a FIN or RST (a Mac asleep, off its network) sends
+# nothing a non-streaming request reads; keepalive probes the idle connection
+# and drops it once its peer stops answering, 60 s after its last data.
+TCP_KEEPALIVE_OPTIONS = (
+    (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+    (socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, 30),
+    (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10),
+    (socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3),
+)
 ROOT = Path(__file__).parents[1]
 CHAT_HTML = Path(__file__).with_name("chat.html").read_bytes()
+CHAT_ASSETS = {
+    f"/chat-assets/{name}": (Path(__file__).parent / "chat-assets" / name).read_bytes()
+    for name in (
+        "markdown-it-15.0.2.min.js",
+        "highlight-11.12.0.min.js",
+        "markdown-links.js",
+        "github-11.12.0.min.css",
+        "github-dark-11.12.0.min.css",
+    )
+}
+# The chat page's brand mark, in its text colors, which the page shows too.
+# Browsers, and other clients, ask for a site's icon at /favicon.ico.
+FAVICON_SVG = Path(__file__).with_name("favicon.svg").read_bytes()
+
+
+def _content_length(value):
+    """A Content-Length value as a byte count; None when it is not a
+    decimal count, or has more digits than int() converts."""
+    if not value.isascii() or not value.isdigit():
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
 
 
 def _normalize_path(raw_path):
@@ -151,29 +161,102 @@ def _normalize_path(raw_path):
     return normalized
 
 
+@dataclass(frozen=True, slots=True)
+class Route:
+    """An endpoint, as FrontendHandler serves it. Its errors and
+    request_id_header hold for its whole path, so every route on one path
+    states the same ones: path_errors and _send read the first."""
+
+    # What serves a request, called with the FrontendHandler that reads it.
+    # A POST route's also takes the request's body and deadline: it answers
+    # the request, or prepares the generation the request asks for and
+    # returns its job and the function that answers with the job's output.
+    # Another route's takes what its path pattern captures.
+    handler: Callable
+    # How the endpoint's API answers errors, on its path by any method.
+    errors: ErrorDialect = OPENAI_ERRORS
+    # Whether it answers without the API key: the chat page and the probes.
+    public: bool = False
+    # Whether it answers from the prompt alone: it needs no engine, so the
+    # engine's state refuses none of its requests, which hold slots of the
+    # token-count gate instead of the request gate.
+    prompt_only: bool = False
+    # Whether it takes no fields: a request carries no body or an empty JSON
+    # object.
+    fieldless: bool = False
+    # A header that gives every answer on its path, by any method and errors
+    # too, a fresh request id: TypeSafe's SDK reads one on the routes it
+    # calls.
+    request_id_header: str | None = None
+
+
+@dataclass(slots=True)
+class Collected:
+    """A generation as FrontendHandler.collect gathered it."""
+
+    reasoning: str
+    content: str
+    tool_calls: list
+    result: NativeResult
+    # The output ended inside its reasoning.
+    reasoning_open: bool
+    # The token limit or a stop sequence ended the output inside a call.
+    cut_in_call: bool
+    # The id of that call, whose arguments are unfinished; None when it cut
+    # none, or none whose name it had read.
+    cut_call: str | None
+
+    @property
+    def cut(self):
+        """Whether the output's end cut its last block short: the token limit
+        cuts any block, a stop sequence only a call, as text may end where
+        the client asks. A call cut at its name has no block, and a stop
+        sequence there leaves the block before it whole."""
+        return self.result.reason == "length" or self.cut_call is not None
+
+    @property
+    def called(self):
+        """Whether the output's tool calls count as made: the token limit did
+        not end the output, and it cut none."""
+        return (
+            bool(self.tool_calls)
+            and not self.cut_in_call
+            and self.result.reason != "length"
+        )
+
+
 class FrontendHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    methods = "GET, HEAD, POST, DELETE, OPTIONS"
 
     def setup(self):
-        self._response_started = False
-        self._unread_body = False
+        self.response_started = False
+        # What the response owes its request's origin, once the request has
+        # passed validate_headers.
+        self._allow_origin = None
+        self._unread_body = 0
+        # The native job submitted last, which a failure cancels.
+        self._submitted = None
         self._last_sse_write = time.monotonic()
-        super().setup()
-        self.connection.settimeout(self.server.io_timeout)
-        self._header_timer = threading.Timer(
-            self.server.io_timeout, self._expire_headers
+        # A UNIX socket's peer is a process on this Mac, whose end closes the
+        # connection, and macOS refuses the TCP options on one.
+        keepalive = (
+            () if self.request.family == socket.AF_UNIX else TCP_KEEPALIVE_OPTIONS
         )
-        self._header_timer.daemon = True
-        self._header_timer.start()
-
-    def _expire_headers(self):
         try:
-            self.connection.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
+            for level, option, value in keepalive:
+                self.request.setsockopt(level, option, value)
+        except OSError as error:
+            # macOS refuses options on a connection its client reset before
+            # it was served (EINVAL): it ends as any reset does. Any other
+            # refusal is the server's to report.
+            if error.errno != errno.EINVAL:
+                raise
+            raise ConnectionResetError from error
+        super().setup()
+        self.connection.settimeout(HTTP_IO_TIMEOUT)
 
     def finish(self):
-        self._header_timer.cancel()
         if self._unread_body:
             self._discard_unread_body()
         super().finish()
@@ -181,14 +264,21 @@ class FrontendHandler(BaseHTTPRequestHandler):
     def _discard_unread_body(self):
         # Closing with request bytes unread resets the connection, and the
         # reset can destroy the response before a client still uploading
-        # reads it. Half-close, then discard the upload for a bounded time.
-        deadline = time.monotonic() + HTTP_UNREAD_BODY_DRAIN_SECONDS
+        # reads it. Half-close, then receive the rest of the upload on the
+        # terms a body is read, waiting on the client as a connection with
+        # no request yet does.
+        self.server.connections.draining(self.connection)
         try:
             self.connection.shutdown(socket.SHUT_WR)
-            while (remaining := deadline - time.monotonic()) > 0:
-                self.connection.settimeout(remaining)
-                if not self.rfile.read1(65536):
+            while self._unread_body > 0:
+                remaining = self._upload_deadline - time.monotonic()
+                if remaining <= 0:
                     return
+                self.connection.settimeout(min(remaining, HTTP_IO_TIMEOUT))
+                chunk = self.rfile.read1(min(65536, self._unread_body))
+                if not chunk:
+                    return
+                self._unread_body -= len(chunk)
         except OSError:
             pass
 
@@ -196,117 +286,145 @@ class FrontendHandler(BaseHTTPRequestHandler):
         pass
 
     def parse_request(self):
-        try:
-            parsed = super().parse_request()
-        finally:
-            self._header_timer.cancel()
-        if not parsed:
+        if not super().parse_request():
             return False
         if self.request_version not in {"HTTP/1.0", "HTTP/1.1"}:
             self.close_connection = True
             self.send_error(505, "HTTP version not supported")
             return False
-        # finish() drains a body that no handler read before responding.
-        self._unread_body = bool(
-            self.headers.get_all("Content-Length")
-            or self.headers.get_all("Transfer-Encoding")
+        # The body still to come, which finish() receives if no handler
+        # reads it before responding: its stated length or, without a valid
+        # one, as much as the server accepts, in the time an upload gets,
+        # counted from here.
+        lengths = self.headers.get_all("Content-Length", [])
+        length = _content_length(lengths[0]) if len(lengths) == 1 else None
+        if length is not None:
+            self._unread_body = length
+        elif lengths or self.headers.get_all("Transfer-Encoding"):
+            self._unread_body = self.server.max_request_bytes
+        self._upload_deadline = time.monotonic() + self._upload_seconds(
+            min(self._unread_body, self.server.max_request_bytes)
         )
         try:
-            allowed_hosts = self.server.allowed_hosts | {
-                self.connection.getsockname()[0].lower()
-            }
-            validate_headers(self.headers, allowed_hosts)
-            path = self.path.partition("?")[0]
-            public = self.command == "OPTIONS" or (
-                self.command in ("GET", "HEAD")
-                and path in ("/", "/index.html", "/health", "/ready")
+            allowed_hosts = self.server.allowed_hosts | socket_hosts(
+                self.connection.getsockname()
             )
+            self._allow_origin = validate_headers(
+                self.headers, allowed_hosts, self.server.allowed_origins
+            )
+            route, _ = find_route(self.route, self.command)
+            public = self.command == "OPTIONS" or (route is not None and route.public)
             if not public:
                 authenticate(self.headers, self.server.api_key)
         except APIError as error:
+            if isinstance(error, OriginRefused):
+                self.server.refused_origins.report(error.origin)
             self.close_connection = True
-            self._safe_error(
-                error, self.path.partition("?")[0].startswith("/v1/messages"), log=False
-            )
+            self.safe_error(error, log=False)
             return False
         return True
+
+    def send_error(self, code, message=None, explain=None):
+        # The stdlib's send_error, which answers requests it cannot parse or
+        # route and parse_request's 505, writes an HTML page. After a request
+        # line it cannot parse, or HTTP/0.9's, request_version is HTTP/0.9,
+        # and it writes that page with no status line or headers. Answer as
+        # any other error, over HTTP/1.1, a method or version the server does
+        # not implement as a server error.
+        self.request_version = self.protocol_version
+        status = HTTPStatus(code)
+        error_code = status.name.lower() if code >= 500 else "invalid_request_error"
+        self.safe_error(APIError(code, message or status.phrase, error_code), log=False)
 
     @property
     def app(self):
         return self.server.app
 
-    def _send(self, status, data, content_type):
+    @property
+    def route(self):
+        """The request's path as routing, authentication and error dialects
+        all read it; empty before a request line parses."""
+        return _normalize_path(getattr(self, "path", ""))
+
+    @property
+    def errors(self):
+        """How errors on the request's path are answered (path_errors)."""
+        return path_errors(self.route)
+
+    def end_headers(self):
+        # A browser hands a page the response from another origin only when
+        # the response names that origin, so every response to an admitted
+        # origin does, errors and event streams too, and exposes the retry
+        # and authentication hints, which CORS hides by default.
+        if self._allow_origin is not None:
+            self.send_header("Access-Control-Allow-Origin", self._allow_origin)
+            if self._allow_origin != ANY_ORIGIN:
+                self.send_header("Vary", "Origin")
+            self.send_header(
+                "Access-Control-Expose-Headers", "Retry-After, WWW-Authenticate"
+            )
+        super().end_headers()
+
+    def _send(self, status, data, content_type, retry_after=1):
         self.send_response(status)
-        if status == 503:
-            self.send_header("Retry-After", "1")
+        if status in RETRY_STATUSES:
+            self.send_header("Retry-After", str(retry_after))
         if status == 401:
             self.send_header("WWW-Authenticate", "Bearer")
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Connection", "close")
-        path = _normalize_path(getattr(self, "path", ""))
-        if (
-            path == "/v1/systemone"
-            or path == "/v1/models"
-            or path.startswith("/v1/models/")
-        ):
-            self.send_header("x-typesafe-request-id", f"req_{secrets.token_hex(12)}")
-        self._response_started = True
+        route, _ = find_route(self.route)
+        if route is not None and route.request_id_header is not None:
+            self.send_header(route.request_id_header, f"req_{secrets.token_hex(12)}")
+        self.response_started = True
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(data)
 
-    def _json(self, status, payload):
+    def send_json(self, status, payload, retry_after=1):
         try:
             data = json_codec.encode(payload)
         except json_codec.JSONEncodingError as error:
             log_unexpected(error)
-            self._error(
+            self.safe_error(
                 APIError(500, "internal server error", "internal_server_error"),
-                self.path.partition("?")[0].startswith("/v1/messages"),
+                log=False,
             )
             return
-        self._send(status, data, "application/json")
+        self._send(status, data, "application/json", retry_after)
 
-    def _error(self, error, anthropic=False):
-        error_type = error.protocol_type(anthropic)
-        message = error.message
-        if anthropic and isinstance(error, ContextLengthError):
-            message = (
-                f"prompt is too long: {error.input_tokens} tokens > "
-                f"{error.maximum_input_tokens} maximum input tokens"
-            )
-            if error.image_tokens_only:
-                message += " (image tokens alone; text not yet counted)"
-        self._json(
-            error.status,
-            {"type": "error", "error": {"type": error_type, "message": message}}
-            if anthropic
-            else {
-                "error": {
-                    "message": error.message,
-                    "type": error_type,
-                    "code": error.code,
-                }
-            },
+    def _log_api_error(self, code):
+        path = "".join(char if char.isprintable() else "?" for char in self.route)
+        # A request the engine took is named as the backend's lines name it,
+        # so that the app joins them.
+        job = self._submitted
+        engine_id = job.engine_request_id if job is not None else None
+        request = "" if engine_id is None else f"request {engine_id} · "
+        print_status(
+            f"Error · {request}{code} · {self.command} {path[:256]}", error=True
         )
 
-    def _log_api_error(self, error):
-        path = self.path.partition("?")[0].partition("#")[0]
-        path = "".join(char if char.isprintable() else "?" for char in path)
-        print_status(f"Error · {error.code} · {self.command} {path[:256]}", error=True)
-
-    def _safe_error(self, error, anthropic=False, *, log=True):
-        if self._response_started:
+    def safe_error(self, error, *, log=True):
+        """Answer with `error` as its path's API answers it, unless the
+        response has begun. `log` prints its line unless the backend has:
+        one line ends a request."""
+        if self.response_started:
             return
-        if log:
-            self._log_api_error(error)
+        status, code, payload = self.errors.answer(error)
+        if log and not error.logged:
+            self._log_api_error(code)
         try:
-            self._error(error, anthropic)
+            self.send_json(status, payload, error.retry_after)
         except (BrokenPipeError, ConnectionResetError, TimeoutError):
             pass
 
+    def _upload_seconds(self, length):
+        # Inactivity allowed at any point, plus the body at the upload rate.
+        return HTTP_IO_TIMEOUT + length / HTTP_UPLOAD_BYTES_PER_SECOND
+
     def _read_json_body(self, deadline):
+        """The request's body, a JSON object, read by `deadline`."""
         if self.headers.get_all("Transfer-Encoding"):
             raise APIError(400, "transfer encoding is not supported")
         encodings = self.headers.get_all("Content-Encoding", [])
@@ -327,9 +445,9 @@ class FrontendHandler(BaseHTTPRequestHandler):
         lengths = self.headers.get_all("Content-Length", [])
         if len(lengths) != 1:
             raise APIError(400, "exactly one Content-Length header is required")
-        if not lengths[0].isascii() or not lengths[0].isdigit():
+        length = _content_length(lengths[0])
+        if length is None:
             raise APIError(400, "invalid Content-Length header")
-        length = int(lengths[0])
         if length <= 0:
             raise APIError(400, "request body must not be empty")
         if length > self.server.max_request_bytes:
@@ -340,12 +458,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 "request_too_large",
             )
         # Bound total upload time even when a client keeps the socket active.
-        deadline = min(
-            deadline,
-            time.monotonic()
-            + self.server.io_timeout
-            + length / HTTP_UPLOAD_BYTES_PER_SECOND,
-        )
+        deadline = min(deadline, time.monotonic() + self._upload_seconds(length))
         self._body_reservation = RequestBodyReservation(
             self.server.request_bodies, length
         )
@@ -355,24 +468,46 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError
-                self.connection.settimeout(min(remaining, self.server.io_timeout))
+                self.connection.settimeout(min(remaining, HTTP_IO_TIMEOUT))
                 chunk = self.rfile.read1(min(65536, length - len(payload)))
                 if not chunk:
                     raise APIError(400, "request body ended before Content-Length")
                 payload.extend(chunk)
-            self._unread_body = False
         finally:
-            self.connection.settimeout(self.server.io_timeout)
-        text = payload.decode(json.detect_encoding(payload), "surrogatepass")
-        payload.clear()
-        return json_codec.loads(text)
+            self._unread_body = length - len(payload)
+            self.connection.settimeout(HTTP_IO_TIMEOUT)
+        try:
+            text = payload.decode(json.detect_encoding(payload), "surrogatepass")
+            payload.clear()
+            body = json_codec.loads(text)
+        except ValueError:
+            # Text that is not JSON, or JSON nested past json_codec.MAX_DEPTH.
+            raise RequestValidationError(
+                [field_error([], "invalid JSON request body")]
+            ) from None
+        if not isinstance(body, dict):
+            raise RequestValidationError(
+                [field_error([], "request body must be an object")]
+            )
+        return body
 
     def do_HEAD(self):
         self.do_GET()
 
     def do_OPTIONS(self):
         self.send_response(204)
-        self.send_header("Allow", "GET, HEAD, POST, DELETE, OPTIONS")
+        self.send_header("Allow", self.methods)
+        if (
+            self._allow_origin is not None
+            and "Access-Control-Request-Method" in self.headers
+        ):
+            # A browser's preflight, which asks what the request it holds back
+            # may use: every method the server has and, as in vLLM, any header.
+            self.send_header("Access-Control-Allow-Methods", self.methods)
+            requested = self.headers.get("Access-Control-Request-Headers")
+            if requested is not None and requested.isprintable():
+                self.send_header("Access-Control-Allow-Headers", requested)
+            self.send_header("Access-Control-Max-Age", "600")
         self.send_header("Content-Length", "0")
         self.send_header("Connection", "close")
         self.end_headers()
@@ -381,391 +516,238 @@ class FrontendHandler(BaseHTTPRequestHandler):
         return "Splash"
 
     def do_GET(self):
-        path = self.path.partition("?")[0]
-        if path in ("/", "/index.html"):
-            if self.server.webui:
-                self._send(200, CHAT_HTML, "text/html; charset=utf-8")
-            else:
-                self._safe_error(APIError(404, "not found", "not_found"))
-            return
-        if path == "/health":
-            self._json(200, {"status": "ok"})
-            return
-        if path == "/ready":
-            ready = self.app.backend.is_ready()
-            self._json(
-                200 if ready else 503,
-                {"status": "ready" if ready else "unavailable"},
-            )
-            return
-        if path == "/status":
-            self._json(200, self.server.status())
-            return
-        if path == "/metrics":
-            self._send(
-                200,
-                prometheus_metrics(self.server.status()).encode(),
-                "text/plain; version=0.0.4; charset=utf-8",
-            )
-            return
-        response_match = re.fullmatch(r"/v1/responses/(resp_[A-Za-z0-9_]+)", path)
-        if response_match:
-            stored = self.app.response_store.get(response_match.group(1))
-            if stored is None:
-                self._safe_error(APIError(404, "response not found", "not_found_error"))
-            else:
-                self._json(200, stored.response)
-            return
-        model_path = _normalize_path(self.path)
-        if model_path == "/v1/models" or model_path.startswith("/v1/models/"):
-            models = [
-                {
-                    "id": name,
-                    "object": "model",
-                    "created": 0,
-                    "owned_by": "splash",
-                    "max_model_len": self.app.max_context,
-                    "context_length": self.app.max_context,
-                    "vision": self.app.vision,
-                    "input_modalities": self.app.input_modalities,
-                    **({"root": self.app.model} if name != self.app.model else {}),
-                }
-                for name in self.app.model_names
-            ]
-            if model_path == "/v1/models":
-                # TypeSafe SDK compatibility: models.list() reads "models" entries.
-                typed = [
-                    {
-                        "name": item["id"],
-                        "description": "Splash resident model",
-                        "release_date": "",
-                    }
-                    for item in models
-                ]
-                self._json(200, {"object": "list", "data": models, "models": typed})
-            else:
-                name = model_path.removeprefix("/v1/models/")
-                model = next((item for item in models if item["id"] == name), None)
-                if model is None:
-                    self._safe_error(
-                        APIError(404, "model not found", "model_not_found")
-                    )
-                else:
-                    self._json(200, model)
-            return
-        self._safe_error(APIError(404, "not found", "not_found"))
+        self._dispatch("GET")
 
     def do_DELETE(self):
-        path = self.path.partition("?")[0]
-        response_match = re.fullmatch(r"/v1/responses/(resp_[A-Za-z0-9_]+)", path)
-        if response_match is None:
-            self._safe_error(APIError(404, "not found", "not_found"))
-            return
-        response_id = response_match.group(1)
-        if not self.app.response_store.delete(response_id):
-            self._safe_error(APIError(404, "response not found", "not_found_error"))
-            return
-        self._json(
-            200,
-            {"id": response_id, "object": "response", "deleted": True},
+        self._dispatch("DELETE")
+
+    def _dispatch(self, method):
+        """Serve a request of `method`, which carries no body, by its route."""
+        route, captured = find_route(self.route, method)
+        if route is None:
+            self.safe_error(APIError(404, "not found", "not_found"))
+        else:
+            route.handler(self, *captured)
+
+    def _get_page(self):
+        path = self.route
+        if not self.server.webui:
+            self.safe_error(APIError(404, "not found", "not_found"))
+        elif path == "/favicon.ico":
+            self._send(200, FAVICON_SVG, "image/svg+xml")
+        elif path in CHAT_ASSETS:
+            mime = "text/css" if path.endswith(".css") else "text/javascript"
+            self._send(200, CHAT_ASSETS[path], f"{mime}; charset=utf-8")
+        else:
+            self._send(200, CHAT_HTML, "text/html; charset=utf-8")
+
+    def _get_health(self):
+        self.send_json(200, {"status": "ok"})
+
+    def _get_ready(self):
+        ready = self.app.backend.is_ready()
+        self.send_json(
+            200 if ready else 503, {"status": "ready" if ready else "unavailable"}
         )
+
+    def _get_status(self):
+        self.send_json(200, self.server.status())
+
+    def _get_metrics(self):
+        self._send(
+            200,
+            prometheus_metrics(self.server.status()).encode(),
+            "text/plain; version=0.0.4; charset=utf-8",
+        )
+
+    def _models(self):
+        return [
+            {
+                "id": name,
+                "object": "model",
+                "created": 0,
+                "owned_by": "splash",
+                "max_model_len": self.app.max_context,
+                "context_length": self.app.max_context,
+                "vision": self.app.vision,
+                "input_modalities": self.app.input_modalities,
+                "limits": self._limits(),
+                "reasoning": self.app.reasoning,
+                **(
+                    {"root": self.app.response_model}
+                    if name != self.app.response_model
+                    else {}
+                ),
+            }
+            for name in self.app.model_names
+        ]
+
+    def _limits(self):
+        """What a request may carry, which a client can check an attachment
+        against before it sends: its bytes (--max-request-size); its images,
+        a PDF's pages counted among them; an image's bytes; a PDF's bytes,
+        which the request's PDFs share, and its pages."""
+        return {
+            "request_bytes": self.server.max_request_bytes,
+            "images": MAX_IMAGE_SPANS,
+            "image_bytes": MAX_IMAGE_BYTES,
+            "pdf_bytes": MAX_PDF_BYTES,
+            "pdf_pages": MAX_PAGES,
+        }
+
+    def _get_models(self):
+        models = self._models()
+        self.send_json(
+            200,
+            {
+                "object": "list",
+                "data": models,
+                "models": dialects.scoring.typed_models(models),
+            },
+        )
+
+    def _get_model(self, name):
+        model = next((item for item in self._models() if item["id"] == name), None)
+        if model is None:
+            self.safe_error(APIError(404, "model not found", "model_not_found"))
+        else:
+            self.send_json(200, model)
 
     def do_POST(self):
         started_at = time.monotonic()
-        job = None
-        body = None
-        self._body_reservation = None
-        submitted = False
-        # Route on the URL path so standard protocol query parameters do not
-        # turn a supported endpoint into an unknown one.
-        path = self.path.partition("?")[0]
-        count_tokens = path == "/v1/messages/count_tokens"
-        prompt_only = count_tokens or path in ("/tokenize", "/apply-template")
-        anthropic = path == "/v1/messages" or count_tokens
-        systemone = path == "/v1/systemone"
-        if path not in (
-            "/v1/chat/completions",
-            "/v1/responses",
-            "/v1/messages",
-            "/v1/messages/count_tokens",
-            "/tokenize",
-            "/apply-template",
-            "/v1/judgments",
-            "/v1/systemone",
-        ):
-            self._safe_error(APIError(404, "not found", "not_found"))
+        route, _ = find_route(self.route, "POST")
+        if route is None:
+            self.safe_error(APIError(404, "not found", "not_found"))
             return
-        if not prompt_only and not self.app.backend.can_submit():
-            failure = self.app.backend.engine_error
-            self._safe_error(
-                APIError(
-                    529 if systemone else 503,
-                    "engine is recovering; retry shortly"
-                    + (f" (last failure: {failure})" if failure else ""),
-                    "engine_recovering",
-                ),
-                anthropic,
-                log=False,
-            )
+        refusal = None if route.prompt_only else self.app.backend.refusal()
+        if refusal is not None:
+            self.safe_error(refusal, log=False)
             return
         # Hold one ingress slot through body parsing, preparation, and the
         # complete response. Slow uploads/readers cannot accumulate outside
         # the native pending limit, and control endpoints need no such slot.
-        admission = self.server.token_counts if prompt_only else self.server.requests
+        admission = (
+            self.server.token_counts if route.prompt_only else self.server.requests
+        )
         if not admission.acquire():
-            self._safe_error(
+            self.safe_error(
                 APIError(
-                    529 if systemone else 503,
+                    503,
                     "frontend request capacity is exhausted",
                     "frontend_overloaded",
-                ),
-                anthropic,
+                )
             )
             return
+        self._body_reservation = None
         try:
-            with self.app.latencies.measure("upload"):
-                body = self._read_json_body(started_at + self.app.request_timeout)
-            if not isinstance(body, dict):
-                if systemone:
-                    raise judgments.SystemOneError(
-                        [judgments.detail([], "request body must be an object")]
-                    )
-                raise APIError(400, "request body must be an object")
-            try:
-                deadline = self.app.request_deadline(body, started_at)
-            except APIError as error:
-                if systemone:
-                    raise judgments.SystemOneError(
-                        [judgments.detail(["timeout"], error.message)]
-                    ) from error
-                raise
-            if path == "/tokenize":
-                self._json(200, {"tokens": self.app.tokenize(body, deadline=deadline)})
-                return
-            if path == "/apply-template":
-                self._json(
-                    200, {"prompt": self.app.apply_template(body, deadline=deadline)}
-                )
-                return
-            if count_tokens:
-                tokens = self.app.count_tokens(
-                    anthropic_to_chat_prompt(
-                        body, thinking_resolver=self.app.thinking_codec.decode
-                    ),
-                    deadline=deadline,
-                )
-                self._json(200, {"input_tokens": tokens})
-                return
-            if path == "/v1/judgments":
-                job, row = self.app.prepare_judgment(body, deadline=deadline)
-                remaining_request_time(deadline)
-                if self._client_disconnected():
-                    raise ConnectionResetError("client disconnected before submission")
-                if not self.app.backend.submit(job):
-                    raise APIError(429, "request queue is full", "rate_limit_exceeded")
-                submitted = True
-                self._judgment_complete(job, row)
-                return
-            if systemone:
-                self._systemone(body, deadline)
-                return
-            responses = path == "/v1/responses"
-            stream = body.get("stream", False)
-            if stream is None and not anthropic:
-                stream = False
-            return_progress = body.get("return_progress", False)
-            if not isinstance(return_progress, bool) or (
-                return_progress and stream is not True
-            ):
-                raise APIError(
-                    400, "return_progress requires stream: true and must be a boolean"
-                )
-            if anthropic:
-                job, thinking, has_tools = self.app.prepare(
-                    anthropic_to_chat_body(
-                        body, thinking_resolver=self.app.thinking_codec.decode
-                    ),
-                    deadline=deadline,
-                    clamp_output_budget=True,
-                )
-                stream_options = None
-            elif responses:
-                job, thinking, has_tools = self.app.prepare_responses(
-                    body,
-                    deadline=deadline,
-                    reserve_input=self._body_reservation.grow,
-                )
-                stream_options = None
-            else:
-                stream_options = body.get("stream_options")
-                if stream_options is None:
-                    stream_options = {}
-                if (
-                    not isinstance(stream, bool)
-                    or not isinstance(stream_options, dict)
-                    or not isinstance(stream_options.get("include_usage", False), bool)
-                ):
-                    raise APIError(400, "invalid streaming options")
-                stream_options = {
-                    "include_usage": stream_options.get("include_usage", False)
-                }
-                job, thinking, has_tools = self.app.prepare(body, deadline=deadline)
-            body = None
-            self._body_reservation.retain_for(job)
-            self._body_reservation = None
-            job.return_progress = return_progress
-            job.latency = RequestLatency(self.app.latencies, started_at)
-            remaining_request_time(deadline)
-            if self._client_disconnected():
-                raise ConnectionResetError("client disconnected before submission")
-            if not self.app.backend.submit(job):
-                raise APIError(429, "request queue is full", "rate_limit_exceeded")
-            submitted = True
-            if anthropic and stream:
-                self._anthropic_stream(job, thinking, has_tools)
-            elif anthropic:
-                self._anthropic_complete(job, thinking, has_tools)
-            elif responses and stream:
-                self._responses_stream(job, thinking, has_tools)
-            elif responses:
-                self._responses_complete(job, thinking, has_tools)
-            elif stream:
-                self._stream(job, thinking, has_tools, stream_options)
-            else:
-                self._complete(job, thinking, has_tools)
-        except judgments.SystemOneError as error:
-            if submitted:
-                self.app.backend.cancel(job)
-            self._systemone_error(error)
+            generation = self._serve(route, started_at)
+            if generation is not None:
+                self._generate(*generation, started_at)
         except (BrokenPipeError, ConnectionResetError):
-            if submitted:
-                self.app.backend.cancel(job)
+            self._cancel_submitted()
         except TimeoutError:
-            if submitted:
-                self.app.backend.cancel(job)
+            self._cancel_submitted()
             error = APIError(408, "HTTP I/O timed out", "request_timeout")
-            self._safe_error(error, anthropic, log=not submitted)
+            self.safe_error(error, log=self._submitted is None)
         except APIError as error:
-            if submitted:
-                self.app.backend.cancel(job)
-            if systemone and error.status == 503:
-                error = APIError(529, error.message, error.code)
-            # The native outcome was already logged; a server-side failure
-            # after submission must still reach the console.
-            self._safe_error(error, anthropic, log=not submitted or error.status >= 500)
-        except (ValueError, RecursionError):
-            if submitted:
-                self.app.backend.cancel(job)
-            if systemone:
-                self._systemone_error(
-                    judgments.SystemOneError(
-                        [judgments.detail([], "invalid JSON request body")]
-                    )
-                )
-            else:
-                error = APIError(400, "invalid JSON request body")
-                self._safe_error(error, anthropic, log=not submitted)
+            self._cancel_submitted()
+            # A failure the backend ended the request with is logged, under
+            # the engine's id; another server-side failure after submission
+            # must still reach the console.
+            self.safe_error(error, log=self._submitted is None or error.status >= 500)
         except Exception as error:
-            if submitted:
-                self.app.backend.cancel(job)
+            self._cancel_submitted()
             log_unexpected(error)
             error = APIError(500, "internal server error", "internal_server_error")
-            self._safe_error(error, anthropic, log=False)
+            self.safe_error(error, log=False)
         finally:
-            body = None
             if self._body_reservation is not None:
                 self._body_reservation.release()
                 self._body_reservation = None
+            # The handler outlives the request, through what finish()
+            # still reads of an upload refused unread; the job must not, as
+            # freeing it returns the input it retains.
+            self._submitted = None
             admission.release()
             self.app.latencies.observe("http_request", time.monotonic() - started_at)
 
-    def _judgment_complete(self, job, row):
-        result = None
-        while result is None:
-            kind, value = self._next_event(job)
-            if kind == "done":
-                result = value
-        if result.reason == "cancelled":
-            if job.timed_out:
-                raise APIError(504, "request timed out", "request_timeout")
-            raise APIError(500, "request cancelled", "request_cancelled")
-        if result.reason != "stop" or len(result.option_logits) != len(
-            job.score_tokens
-        ):
-            raise APIError(500, "runtime protocol error", "protocol_error")
-        self._json(
-            200,
-            judgments.judgment_response(self.app.model, row, job.meta, result),
+    def _serve(self, route, started_at):
+        """Read the request and serve it: answer it, or prepare the
+        generation it asks for and return its job and the function that
+        answers with the job's output."""
+        if route.fieldless and not self._unread_body:
+            body = {}
+        else:
+            with self.app.latencies.measure("upload"):
+                body = self._read_json_body(started_at + self.app.request_timeout)
+            # A field set to null is one left out, as clients that write every
+            # field they do not set as null mean it.
+            body = {key: value for key, value in body.items() if value is not None}
+            if route.fieldless and body:
+                raise APIError(400, "this endpoint takes no fields")
+        return route.handler(self, body, self.app.request_deadline(body, started_at))
+
+    def _generate(self, job, respond, started_at):
+        """Submit a prepared generation and answer with its output. The
+        request's input bytes stay reserved only for what the job retains."""
+        self._body_reservation.retain_for(job)
+        self._body_reservation = None
+        job.latency = RequestLatency(self.app.latencies, started_at)
+        self.submit(job)
+        respond(job)
+
+    def submit(self, job):
+        """Submit `job` unless its deadline has passed or its client has
+        left; from then on a failure cancels it."""
+        remaining_request_time(job.deadline)
+        if self.client_disconnected():
+            raise ConnectionResetError("client disconnected before submission")
+        self.app.backend.submit(job)
+        self._submitted = job
+
+    def reserve_input(self, size):
+        """Reserve `size` more bytes of the request body budget for input the
+        request's preparation adds, such as the stored history it continues."""
+        self._body_reservation.grow(size)
+
+    def _cancel_submitted(self):
+        if self._submitted is not None:
+            self.app.backend.cancel(self._submitted)
+
+    def _post_tokenize(self, body, deadline):
+        self.send_json(200, {"tokens": self.app.tokenize(body, deadline=deadline)})
+
+    def _post_apply_template(self, body, deadline):
+        self.send_json(
+            200, {"prompt": self.app.apply_template(body, deadline=deadline)}
         )
 
-    def _systemone(self, body, deadline):
-        active_job = None
-        try:
-            entries = self.app.prepare_systemone(body, deadline=deadline)
-            remaining_request_time(deadline)
-            if self._client_disconnected():
-                raise ConnectionResetError("client disconnected before submission")
-            answers = {}
-            input_tokens = 0
-            for qid, spec, job in entries:
-                if job is None:
-                    answers[qid] = judgments.deterministic_answer(spec)
-                    continue
-                # One admitted job per HTTP request preserves the existing
-                # queue bound and lets later questions reuse the state prefix.
-                active_job = job
-                if not self.app.backend.submit(job):
-                    raise APIError(429, "request queue is full", "rate_limit_exceeded")
-                result = None
-                while result is None:
-                    kind, value = self._next_event(job)
-                    if kind == "done":
-                        result = value
-                if result.reason == "cancelled":
-                    if job.timed_out:
-                        raise APIError(504, "request timed out", "request_timeout")
-                    raise APIError(500, "request cancelled", "request_cancelled")
-                if result.reason != "stop" or len(result.option_logits) != len(
-                    job.score_tokens
-                ):
-                    raise APIError(500, "runtime protocol error", "protocol_error")
-                input_tokens += result.prompt_tokens
-                answers[qid] = judgments.systemone_answer(
-                    spec, judgments.softmax(list(result.option_logits))
-                )
-                active_job = None
-        except BaseException:
-            if active_job is not None:
-                self.app.backend.cancel(active_job)
-            raise
-        self._json(
-            200,
-            {
-                "model": self.app.model,
-                "answers": answers,
-                "usage": {"input_tokens": input_tokens, "output_tokens": 0},
-            },
-        )
-
-    def _systemone_error(self, error):
-        if self._response_started:
+    def _post_memory_release(self, body, deadline):
+        weights = self.app.backend.release_weights().get("weights") or {}
+        # A restore leaves the weights released until its last image is back.
+        if weights.get("released") is True and weights.get("restoring") is False:
+            self.send_json(200, {"released": True, "weights": weights})
             return
-        self._log_api_error(
-            APIError(422, error.details[0]["msg"], "unprocessable_entity")
+        # An answer about the engine's state, not a failure: the console does
+        # not log it.
+        self.safe_error(
+            APIError(
+                409,
+                "the engine is serving requests or restoring its weights; it "
+                "releases them only while idle",
+                "engine_busy",
+            ),
+            log=False,
         )
-        try:
-            self._json(422, {"detail": error.details})
-        except (BrokenPipeError, ConnectionResetError, TimeoutError):
-            pass
 
-    def _next_event(self, job, on_idle=None):
+    def next_event(self, job, on_idle=None):
         while True:
-            if self._client_disconnected():
+            if self.client_disconnected():
                 self.app.backend.cancel(job)
                 raise ConnectionResetError
             remaining = job.deadline - time.monotonic()
             if remaining <= 0:
-                self.app.backend.cancel(job, timed_out=True)
+                self.app.backend.cancel(job)
                 raise APIError(504, "request timed out", "request_timeout")
             try:
                 event = job.events.get(timeout=min(remaining, CLIENT_DISCONNECT_POLL))
@@ -775,8 +757,6 @@ class FrontendHandler(BaseHTTPRequestHandler):
             # are sent, the caller can still return its HTTP error status.
             if event is not None and event[0] == "error":
                 raise event[1]
-            if time.monotonic() >= job.deadline:
-                continue
             # Native token activity can be buffered by the tool projector.
             # Measure silence on the HTTP stream across calls, not time spent
             # waiting for an empty native-event queue.
@@ -788,7 +768,7 @@ class FrontendHandler(BaseHTTPRequestHandler):
             if event is not None:
                 return event
 
-    def _client_disconnected(self):
+    def client_disconnected(self):
         # A poll object holds no descriptor: running out of descriptors
         # must not read as a disconnect.
         poller = select.poll()
@@ -801,76 +781,81 @@ class FrontendHandler(BaseHTTPRequestHandler):
             )
         except BlockingIOError:
             return False
-        except ConnectionError:
+        except (ConnectionError, TimeoutError):
+            # A connection keepalive dropped fails its read with ETIMEDOUT.
             return True
 
-    def _finalize_content(self, content, job, has_tools, incomplete, projector=None):
-        structured = job.response_validator is not None
-        if not has_tools or (structured and not content.lstrip().startswith("<")):
-            if not incomplete:
+    def _finalize_content(self, content, job, result, projector, cut_in_call):
+        """The content and calls of the output, and the events the stream
+        still owes. The token limit cuts the output wherever it ends, and a
+        stop sequence the call it ends inside; text before a stop sequence is
+        the text the client asked for. An answer without calls is validated
+        against the response format only when the model ended it. `content`
+        is read only without a projector, which otherwise holds it."""
+        ended = result.reason != "length" and result.stop_sequence is None
+        if projector is None:
+            if ended:
                 validate_response_content(content, job.response_validator)
-                if has_tools:
-                    validate_tool_calls([], job.tool_policy)
-            return content, []
-        if incomplete:
-            if projector is None:
-                projector = StreamingToolCallProjector(
-                    job.tool_policy, job.public_id, structured
-                )
-                projector.put(content)
-            return projector.interrupted_result()
-        content, tool_calls = parse_tool_calls(content, job.public_id, job.tool_policy)
-        validate_tool_calls(tool_calls, job.tool_policy)
-        if structured:
-            if not tool_calls:
-                validate_response_content(content, job.response_validator)
-            elif content.strip():
-                raise APIError(
-                    500,
-                    "structured tool output contains text outside tool calls",
-                    "invalid_model_output",
-                )
-        return content, tool_calls
+            return content, [], []
+        content, tool_calls, events = projector.finish(
+            result.reason == "length" or cut_in_call
+        )
+        if ended and not tool_calls:
+            validate_response_content(content, job.response_validator)
+        return content, tool_calls, events
 
-    def _collect(
+    def collect(
         self,
         job,
-        thinking,
-        has_tools,
+        *,
+        on_start=None,
         on_text=None,
         on_tool_delta=None,
         on_idle=None,
         on_progress=None,
     ):
-        splitter = ReasoningSplitter(thinking)
-        tool_projector = (
+        """Gather a generation until it is done. The callbacks receive the
+        start, each piece of output, the idle waits and prompt progress:
+        streams send them, and complete Messages and Responses gather the
+        output into blocks."""
+        splitter = ReasoningSplitter(job.thinking, job.may_call_tools, job.chat_format)
+        # A chat answer is parsed as it arrives whether it streams or not:
+        # its calls where tools may be called, and in any answer, a </think>
+        # the model writes after its reasoning ended is dropped. A text
+        # completion, without a chat template, is its text as written.
+        projector = (
             StreamingToolCallProjector(
-                job.tool_policy, job.public_id, job.response_validator is not None
+                job.tool_policy,
+                job.public_id,
+                job.response_validator is not None,
+                job.chat_format.call_syntax,
             )
-            if has_tools and on_text is not None
+            if job.tool_policy is not None or job.reasoning is not None
             else None
         )
         reasoning, content, result = [], [], None
 
-        def append(field, text):
-            (reasoning if field == "reasoning_content" else content).append(text)
+        def publish(events):
             if on_text is None:
                 return
-            if field == "reasoning_content":
-                on_text(field, text)
-                return
-            if tool_projector is not None:
-                for kind, value in tool_projector.put(text):
-                    if kind == "content":
-                        on_text("content", value)
-                    else:
-                        on_tool_delta(value)
-                return
-            on_text(field, text)
+            for kind, value in events:
+                if kind == "tool":
+                    on_tool_delta(value)
+                else:
+                    on_text(kind, value)
+
+        def append(field, text):
+            if field == "content" and projector is not None:
+                publish(projector.put(text))
+            else:
+                (reasoning if field == "reasoning_content" else content).append(text)
+                publish([(field, text)])
 
         while result is None:
-            kind, value = self._next_event(job, on_idle)
-            if kind == "text":
+            kind, value = self.next_event(job, on_idle)
+            if kind == "start" and on_start is not None:
+                on_start()
+            elif kind == "text":
                 for field, text in splitter.put(value):
                     append(field, text)
             elif kind == "progress" and on_progress is not None:
@@ -879,326 +864,83 @@ class FrontendHandler(BaseHTTPRequestHandler):
                 result = value
         for field, text in splitter.finish():
             append(field, text)
-        if result.reason == "cancelled":
-            if job.timed_out:
-                raise APIError(504, "request timed out", "request_timeout")
-            raise APIError(500, "request cancelled", "request_cancelled")
-        content_text = "".join(content)
-        incomplete = result.reason == "length"
-        content_text, tool_calls = self._finalize_content(
-            content_text, job, has_tools, incomplete, tool_projector
+        cut_in_call = (
+            projector is not None
+            and projector.in_call
+            and (result.reason == "length" or result.stop_sequence is not None)
         )
-        if tool_projector is not None:
-            for ready in tool_projector.finish(content_text, tool_calls, incomplete):
-                on_text("content", ready)
-        return "".join(reasoning), content_text, tool_calls, result, splitter.reasoning
-
-    def _complete(self, job, thinking, has_tools):
-        reasoning_text, content_text, tool_calls, result, _ = self._collect(
-            job, thinking, has_tools
+        content_text, tool_calls, events = self._finalize_content(
+            "".join(content), job, result, projector, cut_in_call
         )
-        message = {"role": "assistant", "content": content_text or None}
-        if reasoning_text:
-            message["reasoning_content"] = reasoning_text
-        if tool_calls:
-            message["tool_calls"] = tool_calls
-        self._json(
-            200,
-            completion_response(self.app.model, job, result, message, bool(tool_calls)),
+        publish(events)
+        return Collected(
+            "".join(reasoning),
+            content_text,
+            tool_calls,
+            result,
+            splitter.reasoning,
+            cut_in_call,
+            None if projector is None else projector.call_id,
         )
 
-    def _anthropic_complete(self, job, thinking, has_tools):
-        reasoning, content, tool_calls, result, _ = self._collect(
-            job, thinking, has_tools
-        )
-        signature = (
-            self.app.thinking_codec.encode(reasoning)
-            if reasoning and job.thinking_display == "omitted"
-            else ""
-        )
-        self._json(
-            200,
-            anthropic_response(
-                self.app.model, job, reasoning, content, tool_calls, result, signature
-            ),
-        )
-
-    def _anthropic_stream(self, job, thinking, has_tools):
-        content_index = 0
-        active_kind = None
-        active_tool_index = None
-        streamed_tool_calls = 0
-        hidden_thinking = []
-        omitted = job.thinking_display == "omitted"
-
-        def send(event, payload):
-            self._responses_sse(event, {"type": event, **payload})
-
-        def keepalive():
-            self._start_event_stream()
-            send("ping", {})
-
-        def finish_active():
-            nonlocal active_kind, active_tool_index, content_index
-            if active_kind is None:
-                return
-            if active_kind == "thinking" and omitted:
-                signature = self.app.thinking_codec.encode("".join(hidden_thinking))
-                send(
-                    "content_block_delta",
-                    {
-                        "index": content_index,
-                        "delta": {"type": "signature_delta", "signature": signature},
-                    },
-                )
-                hidden_thinking.clear()
-            send("content_block_stop", {"index": content_index})
-            content_index += 1
-            active_kind = None
-            active_tool_index = None
-
-        def put_text(field, text):
-            nonlocal active_kind
-            kind = "thinking" if field == "reasoning_content" else "text"
-            if active_kind != kind:
-                finish_active()
-                active_kind = kind
-                block = (
-                    {"type": "thinking", "thinking": "", "signature": ""}
-                    if kind == "thinking"
-                    else {"type": "text", "text": ""}
-                )
-                send(
-                    "content_block_start",
-                    {"index": content_index, "content_block": block},
-                )
-                if kind == "thinking" and omitted:
-                    send(
-                        "content_block_delta",
-                        {
-                            "index": content_index,
-                            "delta": {"type": "thinking_delta", "thinking": ""},
-                        },
-                    )
-            if kind == "thinking" and omitted:
-                hidden_thinking.append(text)
-                return
-            delta = (
-                {"type": "thinking_delta", "thinking": text}
-                if kind == "thinking"
-                else {"type": "text_delta", "text": text}
-            )
-            send("content_block_delta", {"index": content_index, "delta": delta})
-
-        def put_tool_delta(delta):
-            nonlocal active_kind, active_tool_index, streamed_tool_calls
-            function = delta.get("function") or {}
-            index = delta["index"]
-            if function.get("name") is not None:
-                finish_active()
-                active_kind = "tool"
-                active_tool_index = index
-                streamed_tool_calls = max(streamed_tool_calls, index + 1)
-                send(
-                    "content_block_start",
-                    {
-                        "index": content_index,
-                        "content_block": {
-                            "type": "tool_use",
-                            "id": delta["id"],
-                            "name": function["name"],
-                            "input": {},
-                        },
-                    },
-                )
-            arguments = function.get("arguments")
-            if arguments:
-                if active_kind != "tool" or active_tool_index != index:
-                    raise APIError(
-                        500,
-                        "tool argument delta arrived before its tool header",
-                        "internal_server_error",
-                    )
-                send(
-                    "content_block_delta",
-                    {
-                        "index": content_index,
-                        "delta": {
-                            "type": "input_json_delta",
-                            "partial_json": arguments,
-                        },
-                    },
-                )
-
-        def run():
-            nonlocal content_index
-            # Cache accounting is known at native admission. Keep the socket
-            # alive while queued, but do not publish guessed input usage.
-            if self._next_event(job, keepalive)[0] != "start":
-                raise APIError(500, "runtime protocol error", "protocol_error")
-            self._start_event_stream()
-            send(
-                "message_start",
-                {
-                    "message": {
-                        "id": f"msg_{job.public_id}",
-                        "type": "message",
-                        "role": "assistant",
-                        "model": self.app.model,
-                        "content": [],
-                        "stop_reason": None,
-                        "stop_sequence": None,
-                        "usage": anthropic_usage(len(job.prompt_tokens), 0, job.cache),
-                    }
-                },
-            )
-            _, content, tool_calls, result, _ = self._collect(
-                job,
-                thinking,
-                has_tools,
-                put_text,
-                put_tool_delta,
-                keepalive,
-                lambda progress: send("ping", {"prompt_progress": progress}),
-            )
-            finish_active()
-            if not content and not tool_calls and content_index == 0:
-                send(
-                    "content_block_start",
-                    {
-                        "index": content_index,
-                        "content_block": {"type": "text", "text": ""},
-                    },
-                )
-                send("content_block_stop", {"index": content_index})
-                content_index += 1
-            for call in tool_calls[streamed_tool_calls:]:
-                send(
-                    "content_block_start",
-                    {
-                        "index": content_index,
-                        "content_block": {
-                            "type": "tool_use",
-                            "id": call["id"],
-                            "name": call["function"]["name"],
-                            "input": {},
-                        },
-                    },
-                )
-                send(
-                    "content_block_delta",
-                    {
-                        "index": content_index,
-                        "delta": {
-                            "type": "input_json_delta",
-                            "partial_json": call["function"]["arguments"],
-                        },
-                    },
-                )
-                send("content_block_stop", {"index": content_index})
-                content_index += 1
-            send(
-                "message_delta",
-                {
-                    "delta": {
-                        "stop_reason": anthropic_stop(result, tool_calls),
-                        "stop_sequence": result.stop_sequence,
-                    },
-                    "usage": {"output_tokens": result.completion_tokens},
-                },
-            )
-            send("message_stop", {})
-
-        def send_error(error):
-            send(
-                "error",
-                {
-                    "error": {
-                        "type": error.protocol_type(True),
-                        "message": error.message,
-                    }
-                },
-            )
-
-        self._guarded_stream(job, run, send_error)
-
-    def _responses_complete(self, job, thinking, has_tools):
-        reasoning, content, tool_calls, result, reasoning_active = self._collect(
-            job, thinking, has_tools
-        )
-        status = "incomplete" if result.reason == "length" else "completed"
-        reasoning_status = (
-            "incomplete" if status == "incomplete" and reasoning_active else "completed"
-        )
-        output = responses_output(
-            job, reasoning, content, tool_calls, status, reasoning_status
-        )
-        response = responses_response(
-            self.app.model,
-            job,
-            status,
-            output,
-            result=result,
-        )
-        self.app.persist_response(job, response, output)
-        self._json(
-            200,
-            response,
-        )
-
-    def _start_event_stream(self):
-        if self._response_started:
+    def start_event_stream(self):
+        if self.response_started:
             return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "close")
         self.end_headers()
-        self._response_started = True
+        self.response_started = True
 
-    def _sse(self, payload):
+    def _write_sse(self, frame):
+        self.wfile.write(frame)
+        self.wfile.flush()
+        self._last_sse_write = time.monotonic()
+
+    def sse(self, payload):
         data = (
             payload.encode("utf-8")
             if isinstance(payload, str)
             else json_codec.encode(payload)
         )
-        self.wfile.write(b"data: " + data + b"\n\n")
-        self.wfile.flush()
-        self._last_sse_write = time.monotonic()
+        self._write_sse(b"data: " + data + b"\n\n")
 
-    def _responses_sse(self, event, payload):
+    def event_sse(self, event, payload):
         data = json_codec.encode(payload)
-        self.wfile.write(f"event: {event}\ndata: ".encode() + data + b"\n\n")
-        self.wfile.flush()
-        self._last_sse_write = time.monotonic()
+        self._write_sse(f"event: {event}\ndata: ".encode() + data + b"\n\n")
 
-    def _sse_keepalive(self):
-        # SSE comments are invisible to SDK event decoders but still count as
-        # transport progress. Long prefill and resource waits must not look
-        # like dead connections to strict local-agent idle timers.
-        self._start_event_stream()
-        self.wfile.write(b": splash-keepalive\n\n")
-        self.wfile.flush()
-        self._last_sse_write = time.monotonic()
+    def sse_keepalive(self):
+        # An SSE comment is traffic, so socket read timeouts and proxies do
+        # not take a long prefill or resource wait for a dead connection, but
+        # event decoders skip it and clients that time out on missing data
+        # events ignore it. Streams send it only where no data event fits: the
+        # chat and text completion streams until the request starts, the
+        # Responses stream once output has begun.
+        self.start_event_stream()
+        self._write_sse(b": splash-keepalive\n\n")
 
-    def _guarded_stream(self, job, run, send_error):
+    def guarded_stream(self, job, run, send_error):
+        """Run a dialect's stream. A failure cancels the job; once the
+        response has begun, send_error writes it as the dialect's error
+        event, and before, the handler answers with its HTTP status."""
         try:
             run()
         except (BrokenPipeError, ConnectionResetError, TimeoutError):
             self.app.backend.cancel(job)
         except APIError as error:
             self.app.backend.cancel(job)
-            if not self._response_started:
+            if not self.response_started:
                 raise
-            if error.status >= 500:
-                self._log_api_error(error)
+            if error.status >= 500 and not error.logged:
+                self._log_api_error(error.code)
             try:
                 send_error(error)
             except (BrokenPipeError, ConnectionResetError, TimeoutError):
                 pass
         except Exception as error:
             self.app.backend.cancel(job)
-            if not self._response_started:
+            if not self.response_started:
                 raise
             log_unexpected(error)
             try:
@@ -1208,507 +950,119 @@ class FrontendHandler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError, TimeoutError):
                 pass
 
-    def _responses_stream(self, job, thinking, has_tools):
-        output, sequence = [], 0
-        active_kind, active_parts = None, []
-        active_call = None
-        streamed_tool_calls = 0
 
-        def send(event, **payload):
-            nonlocal sequence
-            self._responses_sse(
-                event, {"type": event, "sequence_number": sequence, **payload}
-            )
-            sequence += 1
+_MODEL_PATH = re.compile(r"/v1/models/(.*)", re.DOTALL)
+_PAGE = Route(FrontendHandler._get_page, public=True)
 
-        def begin():
-            if self._response_started:
-                return
-            self._start_event_stream()
-            send(
-                "response.created",
-                response=responses_response(self.app.model, job, "in_progress", []),
-            )
-            send(
-                "response.in_progress",
-                response=responses_response(self.app.model, job, "in_progress", []),
-            )
-
-        def keepalive():
-            begin()
-            if active_kind is None and not output:
-                send(
-                    "response.in_progress",
-                    response=responses_response(self.app.model, job, "in_progress", []),
-                )
-            else:
-                # Do not replace already-streamed output with an empty snapshot.
-                self._sse_keepalive()
-
-        def start_part(kind, item, index):
-            if kind == "reasoning":
-                send(
-                    "response.reasoning_summary_part.added",
-                    item_id=item["id"],
-                    output_index=index,
-                    summary_index=0,
-                    part={"type": "summary_text", "text": ""},
-                )
-            elif kind == "message":
-                send(
-                    "response.content_part.added",
-                    item_id=item["id"],
-                    output_index=index,
-                    content_index=0,
-                    part={"type": "output_text", "text": "", "annotations": []},
-                )
-
-        def finish_part(kind, item, index):
-            if kind == "function_call":
-                send(
-                    "response.function_call_arguments.done",
-                    item_id=item["id"],
-                    output_index=index,
-                    name=item["name"],
-                    arguments=item["arguments"],
-                )
-            elif kind == "reasoning":
-                text = item["summary"][0]["text"] if item["summary"] else ""
-                part = {"type": "summary_text", "text": text}
-                send(
-                    "response.reasoning_summary_text.done",
-                    item_id=item["id"],
-                    output_index=index,
-                    summary_index=0,
-                    text=text,
-                )
-                payload = {
-                    "item_id": item["id"],
-                    "output_index": index,
-                    "summary_index": 0,
-                    "part": part,
-                }
-                if item["status"] == "incomplete":
-                    payload["status"] = "incomplete"
-                send("response.reasoning_summary_part.done", **payload)
-            elif kind == "message":
-                part = item["content"][0]
-                send(
-                    "response.output_text.done",
-                    item_id=item["id"],
-                    output_index=index,
-                    content_index=0,
-                    text=part["text"],
-                    logprobs=[],
-                )
-                send(
-                    "response.content_part.done",
-                    item_id=item["id"],
-                    output_index=index,
-                    content_index=0,
-                    part=part,
-                )
-
-        def finish_active(status="completed", value=None):
-            nonlocal active_call, active_kind, active_parts
-            if active_kind is None:
-                return
-            index = len(output)
-            if active_kind == "function_call":
-                if value is None:
-                    value = {
-                        "id": active_call["id"],
-                        "type": "function",
-                        "function": {
-                            "name": active_call["function"]["name"],
-                            "arguments": "".join(active_parts),
-                        },
-                    }
-            item = responses_item(
-                job,
-                active_kind,
-                "".join(active_parts) if value is None else value,
-                index,
-                status,
-            )
-            finish_part(active_kind, item, index)
-            send("response.output_item.done", output_index=index, item=item)
-            output.append(item)
-            active_call, active_kind, active_parts = None, None, []
-
-        def emit_delta(kind, item, index, text):
-            if kind == "function_call":
-                event, extra = "response.function_call_arguments.delta", {}
-            elif kind == "reasoning":
-                event, extra = (
-                    "response.reasoning_summary_text.delta",
-                    {"summary_index": 0},
-                )
-            else:
-                event, extra = (
-                    "response.output_text.delta",
-                    {"content_index": 0, "logprobs": []},
-                )
-            send(
-                event,
-                item_id=item["id"],
-                output_index=index,
-                delta=text,
-                **extra,
-            )
-
-        def put_text(field, text):
-            nonlocal active_kind
-            kind = "reasoning" if field == "reasoning_content" else "message"
-            if kind != active_kind:
-                finish_active()
-                active_kind = kind
-                item = responses_item(job, kind, "", len(output), "in_progress")
-                if kind == "message":
-                    item["content"] = []
-                send(
-                    "response.output_item.added",
-                    output_index=len(output),
-                    item=item,
-                )
-                start_part(kind, item, len(output))
-            else:
-                item = responses_item(job, kind, "", len(output), "in_progress")
-            active_parts.append(text)
-            emit_delta(kind, item, len(output), text)
-
-        def put_tool_delta(delta):
-            nonlocal active_call, active_kind, active_parts, streamed_tool_calls
-            function = delta.get("function") or {}
-            index = delta["index"]
-            if function.get("name") is not None:
-                finish_active()
-                active_kind = "function_call"
-                active_parts = []
-                active_call = {
-                    "id": delta["id"],
-                    "type": "function",
-                    "function": {
-                        "name": function["name"],
-                        "arguments": "",
-                    },
-                }
-                streamed_tool_calls = max(streamed_tool_calls, index + 1)
-                item = responses_item(
-                    job,
-                    "function_call",
-                    active_call,
-                    len(output),
-                    "in_progress",
-                )
-                send(
-                    "response.output_item.added",
-                    output_index=len(output),
-                    item=item,
-                )
-            arguments = function.get("arguments")
-            if arguments:
-                if active_kind != "function_call" or index + 1 != streamed_tool_calls:
-                    raise APIError(
-                        500,
-                        "tool argument delta arrived before its tool header",
-                        "internal_server_error",
-                    )
-                active_parts.append(arguments)
-                item = responses_item(
-                    job,
-                    "function_call",
-                    active_call,
-                    len(output),
-                    "in_progress",
-                )
-                emit_delta("function_call", item, len(output), arguments)
-
-        def emit_item(kind, value, status="completed"):
-            index = len(output)
-            pending = value if kind == "function_call" else ""
-            pending_item = responses_item(job, kind, pending, index, "in_progress")
-            if kind == "message":
-                pending_item["content"] = []
-            send(
-                "response.output_item.added",
-                output_index=index,
-                item=pending_item,
-            )
-            start_part(kind, pending_item, index)
-            item = responses_item(job, kind, value, index, status)
-            if kind == "function_call":
-                for arguments in argument_deltas(item["arguments"]):
-                    emit_delta(kind, item, index, arguments)
-            elif value:
-                emit_delta(kind, item, index, value)
-            finish_part(kind, item, index)
-            send("response.output_item.done", output_index=index, item=item)
-            output.append(item)
-
-        def run():
-            if self._next_event(job, keepalive)[0] != "start":
-                raise APIError(500, "runtime protocol error", "protocol_error")
-            begin()
-            _, content, calls, result, reasoning_active = self._collect(
-                job,
-                thinking,
-                has_tools,
-                put_text,
-                put_tool_delta,
-                keepalive,
-                lambda progress: send(
-                    "response.in_progress",
-                    response=responses_response(self.app.model, job, "in_progress", []),
-                    prompt_progress=progress,
-                ),
-            )
-            status = "incomplete" if result.reason == "length" else "completed"
-            active_status = (
-                "completed"
-                if active_kind == "reasoning" and not reasoning_active
-                else status
-            )
-            active_value = None
-            if active_kind == "function_call" and streamed_tool_calls <= len(calls):
-                active_value = calls[streamed_tool_calls - 1]
-            finish_active(active_status, active_value)
-            if has_tools:
-                has_message = any(item["type"] == "message" for item in output)
-                if (
-                    content or (not calls and streamed_tool_calls == 0)
-                ) and not has_message:
-                    emit_item("message", content, status)
-                for call in calls[streamed_tool_calls:]:
-                    emit_item("function_call", call, status)
-            elif not any(item["type"] == "message" for item in output):
-                emit_item("message", "", status)
-            event = (
-                "response.incomplete"
-                if status == "incomplete"
-                else "response.completed"
-            )
-            response = responses_response(
-                self.app.model, job, status, output, result=result
-            )
-            self.app.persist_response(job, response, output)
-            send(
-                event,
-                response=response,
-            )
-
-        def send_error(error):
-            send(
-                "response.failed",
-                response=responses_response(
-                    self.app.model,
-                    job,
-                    "failed",
-                    output,
-                    error={
-                        "type": error.protocol_type(),
-                        "code": error.code,
-                        "message": error.message,
-                    },
-                ),
-            )
-
-        self._guarded_stream(job, run, send_error)
-
-    def _stream(self, job, thinking, has_tools, stream_options):
-        public_id = job.public_id
-
-        def run():
-            first = self._next_event(job, self._sse_keepalive)
-            if first[0] != "start":
-                raise APIError(500, "runtime protocol error", "protocol_error")
-            self._start_event_stream()
-            created = job.created_at
-            self._sse(
-                stream_chunk(
-                    self.app.model,
-                    public_id,
-                    created,
-                    {"role": "assistant", "content": ""},
-                )
-            )
-
-            def put_progress(progress):
-                chunk = stream_chunk(self.app.model, public_id, created, {})
-                chunk["prompt_progress"] = progress
-                self._sse(chunk)
-
-            def put_text(field, text):
-                self._sse(
-                    stream_chunk(
-                        self.app.model,
-                        public_id,
-                        created,
-                        {field: text},
-                    )
-                )
-
-            def put_tool_delta(delta):
-                self._sse(
-                    stream_chunk(
-                        self.app.model,
-                        public_id,
-                        created,
-                        {"tool_calls": [delta]},
-                    )
-                )
-
-            _, _, tool_calls, result, _ = self._collect(
-                job,
-                thinking,
-                has_tools,
-                put_text,
-                put_tool_delta,
-                self._sse_keepalive,
-                put_progress,
-            )
-            self._sse(
-                stream_chunk(
-                    self.app.model,
-                    public_id,
-                    created,
-                    {},
-                    finish_reason(result, tool_calls),
-                    timings=timings_dict(result),
-                )
-            )
-            if stream_options.get("include_usage"):
-                self._sse(
-                    stream_chunk(
-                        self.app.model,
-                        public_id,
-                        created,
-                        {},
-                        usage=usage_dict(result, job),
-                        metrics=metrics_dict(result),
-                    )
-                )
-            self._sse("[DONE]")
-
-        def send_error(error):
-            self._sse(
-                {
-                    "error": {
-                        "message": error.message,
-                        "type": error.protocol_type(),
-                        "code": error.code,
-                    }
-                }
-            )
-            self._sse("[DONE]")
-
-        self._guarded_stream(job, run, send_error)
+# Every endpoint, by its method and its path or path pattern.
+ROUTES = {
+    **{
+        ("GET", path): _PAGE
+        for path in ("/", "/index.html", "/favicon.ico", *CHAT_ASSETS)
+    },
+    ("GET", "/health"): Route(FrontendHandler._get_health, public=True),
+    ("GET", "/ready"): Route(FrontendHandler._get_ready, public=True),
+    ("GET", "/status"): Route(FrontendHandler._get_status),
+    ("GET", "/metrics"): Route(FrontendHandler._get_metrics),
+    ("GET", dialects.responses.RESPONSE_PATH): Route(dialects.responses.get),
+    ("DELETE", dialects.responses.RESPONSE_PATH): Route(dialects.responses.delete),
+    ("GET", "/v1/models"): Route(
+        FrontendHandler._get_models,
+        request_id_header=dialects.scoring.REQUEST_ID_HEADER,
+    ),
+    ("GET", _MODEL_PATH): Route(
+        FrontendHandler._get_model, request_id_header=dialects.scoring.REQUEST_ID_HEADER
+    ),
+    ("POST", "/v1/chat/completions"): Route(dialects.openai.post_chat),
+    ("POST", "/v1/chat/completions/count_tokens"): Route(
+        dialects.openai.post_chat_count_tokens, prompt_only=True
+    ),
+    ("POST", "/v1/completions"): Route(dialects.openai.post_completion),
+    ("POST", "/v1/responses"): Route(dialects.responses.post),
+    ("POST", "/v1/messages"): Route(
+        dialects.anthropic.post_messages, dialects.anthropic.ERRORS
+    ),
+    ("POST", "/v1/messages/count_tokens"): Route(
+        dialects.anthropic.post_count_tokens,
+        dialects.anthropic.ERRORS,
+        prompt_only=True,
+    ),
+    ("POST", "/tokenize"): Route(FrontendHandler._post_tokenize, prompt_only=True),
+    ("POST", "/apply-template"): Route(
+        FrontendHandler._post_apply_template, prompt_only=True
+    ),
+    ("POST", "/v1/judgments"): Route(dialects.scoring.post_judgments),
+    ("POST", "/v1/systemone"): Route(
+        dialects.scoring.post_systemone,
+        dialects.scoring.ERRORS,
+        request_id_header=dialects.scoring.REQUEST_ID_HEADER,
+    ),
+    ("POST", "/v1/memory/release"): Route(
+        FrontendHandler._post_memory_release, fieldless=True
+    ),
+}
 
 
-class HttpAdmission:
-    """Nonwaiting capacity gate, in request counts or input bytes."""
-
-    def __init__(self, capacity):
-        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity <= 0:
-            raise ValueError("HTTP admission capacity must be a positive integer")
-        self.capacity = capacity
-        self.active = 0
-        # Input finalizers can run during a stats snapshot on this thread.
-        self.lock = threading.RLock()
-        self.idle = threading.Event()
-        self.idle.set()
-
-    def acquire(self, amount=1):
-        with self.lock:
-            if self.active + amount > self.capacity:
-                return False
-            self.active += amount
-            self.idle.clear()
-            return True
-
-    def release(self, amount=1):
-        with self.lock:
-            if amount > self.active:
-                raise RuntimeError("HTTP admission slot released without acquisition")
-            self.active -= amount
-            if self.active == 0:
-                self.idle.set()
-
-    def stats(self):
-        with self.lock:
-            return {"active": self.active, "capacity": self.capacity}
+def find_route(path, method=None):
+    """The route serving `method` on `path`, a route of any method when None,
+    and what its path pattern captures; (None, ()) when no route does. HEAD
+    is served by GET's route."""
+    if method == "HEAD":
+        method = "GET"
+    for (route_method, key), route in ROUTES.items():
+        if method not in (None, route_method):
+            continue
+        if isinstance(key, str):
+            if key == path:
+                return route, ()
+        elif match := key.fullmatch(path):
+            return route, match.groups()
+    return None, ()
 
 
-class RequestBodyReservation:
-    """Account input bytes until preparation and any retained input are released."""
-
-    def __init__(self, admission, size):
-        if not admission.acquire(size):
-            raise APIError(
-                503,
-                "request body capacity is exhausted; retry shortly",
-                "frontend_overloaded",
-            )
-        self.admission = admission
-        self.size = size
-
-    def release(self):
-        self.admission.release(self.size)
-        self.size = 0
-
-    def grow(self, size):
-        if not self.admission.acquire(size):
-            raise APIError(
-                503,
-                "retained input capacity is exhausted; retry shortly",
-                "frontend_overloaded",
-            )
-        self.size += size
-
-    def retain_for(self, job):
-        # Generation retains schemas and, for Responses, conversation history.
-        # Text/image prompts have otherwise become tokens and prepared pixels.
-        policy = job.tool_policy
-        retained = (
-            job.response_history_items,
-            job.response_format,
-            policy.schemas if policy else None,
-            policy.namespaces if policy else None,
-            job.stop_sequences,
-        )
-        retained = [value for value in retained if value]
-        size = json_codec.encoded_size(retained) if retained else 0
-        if size > self.size:
-            self.grow(size - self.size)
-        else:
-            self.admission.release(self.size - size)
-        self.size = size
-        if size:
-            weakref.finalize(job, self.release)
+def path_errors(path):
+    """How every error on `path` is answered, whatever its method and
+    whether it arises before a handler runs or in one: as the API of its
+    route answers it, on Anthropic's other paths, those under /v1/messages,
+    as that API does, and elsewhere as OpenAI's."""
+    route, _ = find_route(path)
+    if route is not None:
+        return route.errors
+    if path.startswith("/v1/messages/"):
+        return dialects.anthropic.ERRORS
+    return OPENAI_ERRORS
 
 
-class FrontendServer(ThreadingHTTPServer):
-    daemon_threads = True
+class FrontendServer(HTTPServer):
     allow_reuse_address = True
+    # Connections the kernel holds until the accept loop takes them. A burst
+    # beyond this queue is reset by the kernel, unseen by the server, so ask
+    # for as many as uvicorn does; the kernel caps it (128 on macOS).
+    # Queued connections take no thread or descriptor.
+    request_queue_size = 2048
     # Keep control/catalog capacity separate from generation capacity.
     # Neither gate allocates workers in advance.
-    request_queue_size = 64
     control_connection_capacity = 64
+    # Answered connections, refused or served, that wait at once, on one
+    # thread, for their clients to close. A burst refuses all that arrive
+    # while every slot is held, and a client that sends its request after
+    # its connection closed is reset before it reads the 503, so enough
+    # linger for a burst well beyond the kernel's queue, within the
+    # descriptors the server raises its limit to.
+    answered_connection_capacity = 1024
 
     def __init__(
         self,
         address,
         app,
-        io_timeout=HTTP_IO_TIMEOUT,
         bind_and_activate=True,
-        request_capacity=32,
+        request_capacity=serve_options.DEFAULT_QUEUE_SIZE,
         allowed_hosts=(),
         api_key=None,
         webui=True,
-        max_request_bytes=DEFAULT_MAX_REQUEST_BYTES,
+        max_request_bytes=serve_options.DEFAULT_MAX_REQUEST_BYTES,
+        allowed_origins=(),
     ):
-        if not is_finite_number(io_timeout) or io_timeout <= 0:
-            raise ValueError("io_timeout must be positive and finite")
         if (
             isinstance(max_request_bytes, bool)
             or not isinstance(max_request_bytes, int)
@@ -1719,20 +1073,37 @@ class FrontendServer(ThreadingHTTPServer):
         self.request_bodies = HttpAdmission(
             max(DEFAULT_REQUEST_BODY_BUDGET, 2 * max_request_bytes)
         )
-        self.io_timeout = io_timeout
-        self.api_key = validate_api_key(api_key) if api_key is not None else None
+        self.api_key = api_key
         self.webui = webui
+        path = unix_socket.path(address[0])
+        if path is not None:
+            self.address_family = socket.AF_UNIX
+            address = path
+        # A UNIX socket's hold on its path, from its bind until it closes.
+        self._claim = None
         self.allowed_hosts = {
             host.lower().rstrip(".")
-            for host in (*allowed_hosts, address[0], "localhost", "127.0.0.1", "::1")
+            for host in (
+                *allowed_hosts,
+                *socket_hosts(address),
+                "localhost",
+                "127.0.0.1",
+                "::1",
+            )
             if host not in ("0.0.0.0", "::")
         }
+        # As serve_options.parse_allowed_origin returns them.
+        self.allowed_origins = frozenset(allowed_origins)
+        self.refused_origins = RefusedOriginLog()
         self.instance_id = secrets.token_hex(12)
         self.started_at = time.time()
         self.requests = HttpAdmission(request_capacity)
         self.token_counts = HttpAdmission(request_capacity)
-        self.connections = HttpAdmission(
-            request_capacity + self.control_connection_capacity
+        self.connections = ConnectionSlots(
+            request_capacity + self.control_connection_capacity,
+            self._serve_connection,
+            self.answered_connection_capacity,
+            ANSWERED_LINGER_SECONDS,
         )
         super().__init__(address, FrontendHandler, bind_and_activate)
         self.app = app
@@ -1743,8 +1114,8 @@ class FrontendServer(ThreadingHTTPServer):
             "id": self.instance_id,
             "pid": os.getpid(),
             "model": self.app.model,
-            "host": self.server_address[0],
-            "port": self.server_address[1],
+            "host": self.host,
+            "port": self.server_port,
             "started_at": self.started_at,
         }
         status["http"] = {
@@ -1754,248 +1125,263 @@ class FrontendServer(ThreadingHTTPServer):
             "token_counts": self.token_counts.stats(),
             "connections": self.connections.stats(),
         }
+        status["console"] = console_stats()
         return status
 
-    def process_request(self, request, client_address):
-        if not self.connections.acquire():
-            # Header-only/idle connections must also be bounded. Do not create
-            # a thread or block the accept loop to reject an excess socket.
-            # The request path has not been read, so no API dialect is known.
-            # Keep a generic server error and its stable diagnostic code.
-            payload = b'{"error":{"type":"server_error","code":"frontend_overloaded","message":"HTTP connection capacity is exhausted"}}'
-            response = (
-                b"HTTP/1.1 503 Service Unavailable\r\n"
-                b"Content-Type: application/json\r\nConnection: close\r\nRetry-After: 1\r\n"
-                + f"Content-Length: {len(payload)}\r\n\r\n".encode()
-                + payload
-            )
-            try:
-                request.setblocking(False)
-                request.sendall(response)
-            except OSError:
-                pass
-            finally:
-                self.shutdown_request(request)
-            return
-        try:
-            super().process_request(request, client_address)
-        except BaseException:
-            self.connections.release()
-            raise
+    @property
+    def host(self):
+        """Where it listens, as --host names it: the address it bound, or a
+        UNIX socket's unix:PATH."""
+        if self.address_family == socket.AF_UNIX:
+            return unix_socket.PREFIX + self.server_address
+        return self.server_address[0]
 
-    def process_request_thread(self, request, client_address):
+    def server_bind(self):
+        if self.address_family != socket.AF_UNIX:
+            return super().server_bind()
+        self._claim = unix_socket.Claim(self.server_address)
+        self._claim.bind(self.socket)
+        # A UNIX socket has no port, which /status reports as none.
+        self.server_port = None
+
+    def server_activate(self):
+        super().server_activate()
+        # accept() then returns at once when the kernel holds no connection.
+        self.socket.setblocking(False)
+
+    def _handle_request_noblock(self):
+        """Take every connection the kernel holds at each wakeup of the accept
+        loop, as asyncio's accept does, not one: a burst arrives faster than a
+        select per connection takes it, and macOS resets what overflows the
+        kernel's queue."""
+        while True:
+            try:
+                request, client_address = self.get_request()
+            except OSError:
+                return
+            # macOS gives a connection accepted from a nonblocking socket that
+            # socket's mode.
+            request.setblocking(True)
+            if not self.verify_request(request, client_address):
+                self.shutdown_request(request)
+                continue
+            try:
+                self.process_request(request, client_address)
+            except Exception:
+                self.handle_error(request, client_address)
+                self.shutdown_request(request)
+            except BaseException:
+                self.shutdown_request(request)
+                raise
+
+    def process_request(self, request, client_address):
+        if not self.connections.admit(
+            request, client_address, time.monotonic() + HTTP_IO_TIMEOUT
+        ):
+            self.connections.refuse(request)
+
+    def _serve_connection(self, request, client_address):
+        """Serve the connection `request`, ready for its thread, on a
+        connection worker, as ThreadingMixIn's thread for a request does."""
         try:
-            super().process_request_thread(request, client_address)
+            self.finish_request(request, client_address)
+        except Exception:
+            self.handle_error(request, client_address)
         finally:
-            self.connections.release()
+            self.shutdown_request(request)
+
+    def shutdown_request(self, request):
+        self.connections.close(request)
 
     def server_close(self):
         super().server_close()
-        self.connections.idle.wait(min(2.0, self.io_timeout))
+        if self._claim is not None:
+            self._claim.close()
+        self.connections.stop()
+        self.connections.idle.wait(min(2.0, HTTP_IO_TIMEOUT))
 
     def handle_error(self, request, client_address):
+        # A client that left is no error. Any other is one console line, as a
+        # request's unexpected error is: socketserver's own writes a traceback
+        # straight to stderr, on the connection worker.
         error = sys.exc_info()[1]
-        if isinstance(error, (BrokenPipeError, ConnectionResetError)):
-            return
-        super().handle_error(request, client_address)
-
-
-def _parse_max_context(value):
-    if value == "auto":
-        return None
-    try:
-        parsed = int(value)
-    except ValueError as error:
-        raise argparse.ArgumentTypeError(
-            f"must be 'auto' or an integer in [1, {MAX_CONTEXT_TOKENS}]"
-        ) from error
-    if not 1 <= parsed <= MAX_CONTEXT_TOKENS:
-        raise argparse.ArgumentTypeError(
-            f"must be 'auto' or an integer in [1, {MAX_CONTEXT_TOKENS}]"
-        )
-    return parsed
-
-
-def _parse_max_cache_disk(value):
-    if value.strip() == "0":
-        return 0
-    try:
-        result = _parse_max_memory(value)
-    except argparse.ArgumentTypeError:
-        result = None
-    if result is None:
-        raise argparse.ArgumentTypeError("use 0 to disable, or a size such as 5G")
-    return result
-
-
-def _parse_max_memory(value):
-    if value == "auto":
-        return None
-    normalized = value.strip().upper()
-    multipliers = {
-        "K": 1024,
-        "KB": 1024,
-        "KIB": 1024,
-        "M": 1024**2,
-        "MB": 1024**2,
-        "MIB": 1024**2,
-        "G": 1024**3,
-        "GB": 1024**3,
-        "GIB": 1024**3,
-    }
-    suffix = ""
-    for candidate in sorted(multipliers, key=len, reverse=True):
-        if normalized.endswith(candidate):
-            suffix = candidate
-            normalized = normalized[: -len(candidate)]
-            break
-    try:
-        number = int(normalized)
-    except ValueError as error:
-        raise argparse.ArgumentTypeError(
-            "must be 'auto' or a positive byte count such as 32G"
-        ) from error
-    result = number * multipliers.get(suffix, 1)
-    if number <= 0 or result > 2**63 - 1:
-        raise argparse.ArgumentTypeError(
-            "must be 'auto' or a positive byte count such as 32G"
-        )
-    return result
-
-
-def _parse_request_size(value):
-    size = _parse_max_memory(value)
-    if size is None:
-        raise argparse.ArgumentTypeError("must be a positive byte count such as 128M")
-    return size
-
-
-def _parse_model_id(value):
-    repo_id, separator, variant = value.partition(":")
-    if repo_id.count("/") != 1:
-        raise argparse.ArgumentTypeError(
-            "use a full Hugging Face repository ID: owner/repo[:variant]"
-        )
-    try:
-        validate_repo_id(repo_id)
-    except ValueError as error:
-        raise argparse.ArgumentTypeError(str(error)) from None
-    if separator and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", variant):
-        raise argparse.ArgumentTypeError(
-            "model variant must be a short name such as UD-Q4_K_M"
-        )
-    return value
+        if not isinstance(error, (BrokenPipeError, ConnectionResetError)):
+            log_unexpected(error)
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("target")
-    parser.add_argument("draft")
-    parser.add_argument("--tokenizer", required=True)
     parser.add_argument(
-        "--model", type=_parse_model_id, required=True, metavar="OWNER/REPO"
+        "model_root",
+        metavar="MODEL_DIRECTORY",
+        help="the directory of a model Splash prepared, or a selection link to "
+        "one: the server holds and serves the directory it names at startup",
     )
     parser.add_argument(
-        "--served-model-name",
-        action="append",
-        default=[],
-        type=validate_served_model_name,
-        help="additional API model name; responses still identify the loaded model (repeatable)",
+        "--model",
+        type=serve_options.parse_model_id,
+        required=True,
+        metavar="OWNER/REPO",
     )
-    parser.add_argument(
-        "--default-reasoning-effort",
-        choices=REASONING_EFFORTS,
-        default=os.environ.get("SPLASH_DEFAULT_REASONING_EFFORT"),
-        help="Chat/Responses effort when unspecified (default: SPLASH_DEFAULT_REASONING_EFFORT or model template)",
-    )
-    parser.add_argument("--max-context", type=_parse_max_context, default=None)
-    parser.add_argument("--max-memory", type=_parse_max_memory, default=None)
-    parser.add_argument(
-        "--kv-format",
-        choices=("int8", "bf16"),
-        default="int8",
-        help="target KV cache storage (default: int8); bf16 uses more memory",
-    )
-    parser.add_argument(
-        "--prefill-mode",
-        choices=("bounded", "full"),
-        default="bounded",
-        help="bounded (default) keeps each prefill GPU command within a few "
-        "seconds so macOS does not abort long-context prefill; full sends "
-        "whole 2048-token chunks as before",
-    )
-    parser.add_argument(
-        "--max-request-size",
-        type=_parse_request_size,
-        default=DEFAULT_MAX_REQUEST_BYTES,
-        help="maximum HTTP request body size (default: 128M); "
-        "shared input budget is max(512M, twice this limit)",
-    )
-    parser.add_argument(
-        "--max-cache-disk",
-        dest="max_cache_disk",
-        type=_parse_max_cache_disk,
-        default=0,
-    )
-    parser.add_argument("--max-image-pixels", type=int, default=image_input.MAX_PIXELS)
-    parser.add_argument("--max-new-tokens", type=int, default=65536)
-    parser.add_argument("--request-timeout", type=float, default=10000)
-    parser.add_argument("--queue-size", type=int, default=32)
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--allowed-host", action="append", default=[])
-    parser.add_argument("--api-key", default=os.environ.get("SPLASH_API_KEY"))
-    parser.add_argument("--no-webui", action="store_true")
-    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--port", type=int, default=serve_options.DEFAULT_PORT)
     parser.add_argument("--binary", default=str(ROOT / "build" / "splash"))
+    # The launcher's, not a serve option: where the app follows a start and
+    # reads why one failed (serve_record).
+    parser.add_argument("--serve-record", type=Path, metavar="PATH")
+    serve_options.add_serve_arguments(parser)
     args = parser.parse_args(argv)
-    if (
-        args.default_reasoning_effort is not None
-        and args.default_reasoning_effort not in REASONING_EFFORTS
-    ):
-        parser.error(
-            "invalid --default-reasoning-effort / SPLASH_DEFAULT_REASONING_EFFORT"
-        )
-    if args.api_key is not None:
-        try:
-            validate_api_key(args.api_key)
-        except ValueError as error:
-            parser.error(str(error))
-    if args.max_new_tokens <= 0:
-        parser.error("--max-new-tokens must be positive")
-    if not image_input.MIN_PIXELS <= args.max_image_pixels <= image_input.MAX_PIXELS:
-        parser.error(
-            "--max-image-pixels must be in "
-            f"[{image_input.MIN_PIXELS}, {image_input.MAX_PIXELS}]"
-        )
-    if not is_finite_number(args.request_timeout) or args.request_timeout <= 0:
-        parser.error("--request-timeout must be positive and finite")
-    if args.queue_size <= 0:
-        parser.error("--queue-size must be positive")
+    serve_options.check_serve_arguments(parser, args)
     if not 0 <= args.port <= 65535:
         parser.error("--port must be in [0, 65535]")
     return args
 
 
-def _native_command(args):
+# After macOS aborts a prefill command for stalling the display, each restart
+# halves the bound down to this floor, the contended-prefill bound.
+PREFILL_BOUND_FLOOR_MS = 500
+DISPLAY_STALL_ABORT = "ImpactingInteractivity"
+
+
+def _prefill_bound(args):
+    return (
+        serve_options.PREFILL_BOUND_DEFAULT_MS
+        if args.prefill_bound_ms is None
+        else args.prefill_bound_ms
+    )
+
+
+def _prefill_bound_scope(args):
+    return args.prefill_bound_scope or "buffer"
+
+
+def _native_command(
+    args,
+    model_root,
+    relaunch_context=None,
+    prefill_bound_ms=None,
+    prefill_bound_scope=None,
+):
+    """The engine's command line serving model_root, a relaunch's with
+    `relaunch_context`, the context the first engine served. A relaunch is
+    planned as the first engine was, for --max-context or the automatic
+    context, and serves what its plan holds of the first engine's context,
+    where its own automatic one would follow a Neural Engine split calibrated
+    anew. A relaunch after a display-stall abort runs `prefill_bound_ms` per
+    `prefill_bound_scope` (_shorter_prefill_after_display_stall)."""
+    if prefill_bound_ms is None:
+        prefill_bound_ms = _prefill_bound(args)
+    if prefill_bound_scope is None:
+        prefill_bound_scope = _prefill_bound_scope(args)
     command = [
         args.binary,
         "serve-native",
-        args.target,
-        args.draft,
-        "auto" if args.max_context is None else str(args.max_context),
-        "auto" if args.max_memory is None else str(args.max_memory),
+        str(model_root),
+        *serve_options.engine_argv(args),
     ]
-    if args.max_cache_disk:
-        command.append(str(args.max_cache_disk))
-    if args.kv_format != "int8":
-        command.extend(("--kv-format", args.kv_format))
+    if relaunch_context is not None:
+        command.extend(("--relaunch-context", str(relaunch_context)))
+    # The Neural Engine split's share and least rows, which --disable-ane
+    # overrides.
+    if args.ane_ffn_share is not None and not args.disable_ane:
+        command.extend(("--ane-ffn-share", str(args.ane_ffn_share)))
+    if args.ane_ffn_minimum_rows is not None and not args.disable_ane:
+        command.extend(("--ane-ffn-minimum-rows", str(args.ane_ffn_minimum_rows)))
     if args.prefill_mode != "bounded":
         command.extend(("--prefill-mode", args.prefill_mode))
+    elif prefill_bound_ms != serve_options.PREFILL_BOUND_DEFAULT_MS:
+        command.extend(("--prefill-bound-ms", str(prefill_bound_ms)))
+    if args.prefill_mode == "bounded" and prefill_bound_scope == "command":
+        command.extend(("--prefill-bound-scope", "command"))
     return command
+
+
+def _shorter_prefill_after_display_stall(args, model_root):
+    """Relaunch command policy: macOS aborts a GPU command that holds the
+    GPU while the display needs it, and how long it tolerates depends on
+    the Mac and display load. Some Macs abort a long command however it is
+    split into command buffers, so the first such abort bounds whole
+    commands instead; each later one halves the bound for the next engine."""
+    bound = _prefill_bound(args)
+    scope = _prefill_bound_scope(args)
+
+    def command_after_failure(failure, first_ready=None):
+        nonlocal bound, scope
+        if args.prefill_mode != "bounded" or DISPLAY_STALL_ABORT not in str(failure):
+            return None
+        if scope == "buffer":
+            scope = "command"
+        elif bound <= PREFILL_BOUND_FLOOR_MS:
+            return None
+        else:
+            bound = max(PREFILL_BOUND_FLOOR_MS, bound // 2)
+        print_status(
+            f"Prefill bound · {bound} ms per {scope} after a macOS display-stall abort",
+            error=True,
+        )
+        return _native_command(
+            args,
+            model_root,
+            None if first_ready is None else first_ready.max_context_tokens,
+            prefill_bound_ms=bound,
+            prefill_bound_scope=scope,
+        )
+
+    return command_after_failure
+
+
+def _raise_descriptor_limit():
+    """Raise the soft descriptor limit to DESCRIPTOR_LIMIT, or to the hard
+    limit when that is lower; a higher soft limit stays."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    wanted = DESCRIPTOR_LIMIT
+    if hard != resource.RLIM_INFINITY:
+        wanted = min(wanted, hard)
+    if soft < wanted:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (wanted, hard))
 
 
 def _interrupt(_signum, _frame):
     raise KeyboardInterrupt
+
+
+def _stop_with(pid):
+    """Stops the server with SIGTERM once process `pid` has ended: one stop,
+    which a server already stopping ignores.
+
+    The desktop app passes its own process ID as SPLASH_APP_PID, so a model
+    it started gives its memory back when the app crashes, rather than at
+    the app's next launch. A process already gone stops the server at once:
+    kqueue returns its watch at once, as an error event.
+    """
+
+    def watch():
+        queue = select.kqueue()
+        exited = select.kevent(
+            pid,
+            filter=select.KQ_FILTER_PROC,
+            flags=select.KQ_EV_ADD | select.KQ_EV_ONESHOT,
+            fflags=select.KQ_NOTE_EXIT,
+        )
+        queue.control([exited], 1, None)
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    threading.Thread(target=watch, name="stop-with-app", daemon=True).start()
+
+
+class ListenError(Exception):
+    """The HTTP server cannot listen at its address."""
+
+
+class OptionError(Exception):
+    """An option the served model's family cannot follow."""
+
+
+def _start_failed(args, error, failure):
+    """End a start that failed, saying why in the log and, for the app, in
+    the launcher's serve record (serve_record)."""
+    print_status(f"Error · {error}", error=True)
+    serve_record.failed(args.serve_record, failure)
+    raise SystemExit(1) from None
 
 
 def main():
@@ -2003,12 +1389,26 @@ def main():
     server = None
     runtime = None
     backend = None
+    # Why the backend stopped restarting the engine, once it has.
+    stopped = None
+
+    def stop_serving(reason):
+        nonlocal stopped
+        stopped = reason
+        os.kill(os.getpid(), signal.SIGTERM)
+
     # A server started in the background from a non-interactive shell inherits
     # SIGINT as ignored and Python then leaves it alone; install both stop
     # signals explicitly so scripts and supervisors can interrupt it.
     signal.signal(signal.SIGTERM, _interrupt)
     signal.signal(signal.SIGINT, _interrupt)
     try:
+        # The launcher blocks both across its exec: one sent while this module
+        # imported arrives here and ends the startup cleanly.
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, (signal.SIGINT, signal.SIGTERM))
+        if app := os.environ.get("SPLASH_APP_PID"):
+            _stop_with(int(app))
+        _raise_descriptor_limit()
         # Bind before loading the tokenizer or model so duplicates fail early.
         # Activate only after the runtime is ready, keeping a partially started
         # service from receiving requests.
@@ -2021,93 +1421,215 @@ def main():
             api_key=args.api_key,
             webui=not args.no_webui,
             max_request_bytes=args.max_request_size,
+            allowed_origins=args.allowed_origin,
         )
-        server.server_bind()
+        try:
+            server.server_bind()
+        except OSError as error:
+            raise ListenError(f"unable to start HTTP server: {error}") from None
+        if ANY_ORIGIN in args.allowed_origin and args.api_key is None:
+            print_status(
+                "Warning · --allowed-origin '*' without --api-key lets every web "
+                "page open in a browser that reaches this server use it",
+                error=True,
+            )
         thinking_codec = ThinkingCodec(load_thinking_key())
         print_status(f"Loading · {args.model}")
-        tokenizer = AutoTokenizer.from_pretrained(
-            args.tokenizer, local_files_only=True, trust_remote_code=False
+        serve_record.entered(args.serve_record, "loading")
+        # Nothing reads `held`: it keeps the assembly held until the server
+        # exits, so that no installation collects the assembly its tokenizer
+        # and engines, a relaunched one too, serve.
+        model_root, held = assembly.hold(Path(args.model_root))
+        # The family the installation found the model to be, whose chat
+        # format its output is read in.
+        family = assembly.family(model_root)
+        if family is None:
+            raise ModelError(
+                f"{args.model} is not prepared as a model of a family this "
+                "release serves: prepare it again"
+            )
+        if args.reasoning_effort is not None and not (
+            family.chat_format.reasoning_switch
+        ):
+            # No effort reaches a model that opens its reasoning itself, so
+            # the server cannot set every request's.
+            raise OptionError(
+                f"--reasoning-effort cannot set how {args.model} reasons: a "
+                f"{family.name} model decides each turn whether to reason, "
+                "whatever effort its prompt names"
+            )
+        # A file that cannot be read stops the start before the tokenizer
+        # loads; whether its template serves requests is found with the
+        # tokenizer (ChatTemplates).
+        custom = None
+        if args.chat_template_file is not None:
+            custom = read_template_file(args.chat_template_file)
+            print_status(f"Chat template file · {args.chat_template_file}")
+        # A tokenizer the loader cannot read fails with whatever its parsers
+        # raise, such as a KeyError for a tokenizer.json without added_tokens:
+        # each is the model's.
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(
+                model_root / "tokenizer", local_files_only=True, trust_remote_code=False
+            )
+        except Exception as error:
+            raise ModelError(
+                f"cannot load the tokenizer of {args.model}: "
+                f"{type(error).__name__}: {error}"
+            ) from error
+        validate_tokenizer(tokenizer, family.chat_format)
+        thinking_end = thinking_end_tokens(
+            tokenizer, args.thinking_end_text, family.chat_format
         )
-        validate_tokenizer(tokenizer)
-        chat_templates = ChatTemplates(tokenizer)
+        chat_templates = ChatTemplates(tokenizer, override=custom)
         print_status(f"Chat template · {chat_templates.describe()}")
+        # Unset, a budget ends thinking as the template closes it, so that the
+        # next request renders that close back as the tokens the reply ended
+        # its thinking with; Qwen's templates still trim a space or line break
+        # the cut leaves before it.
+        if thinking_end is None:
+            thinking_end = thinking_end_tokens(
+                tokenizer, chat_templates.select(None).thinking_end, family.chat_format
+            )
         runtime = engine_runtime.MultiplexedRuntime(
-            _native_command(args),
-            startup_timeout=NATIVE_START_TIMEOUT,
+            _native_command(args, model_root),
+            relaunch_command=lambda first: _native_command(
+                args, model_root, first.max_context_tokens
+            ),
             pending_limit=args.queue_size,
-            eager_start=False,
         )
+
+        def warming(event):
+            # As the warm-up begins and as each of its steps ends: it can take
+            # minutes on the first start after an update, so the console and
+            # the record, which the app shows, say how far it is. It runs on
+            # the reader thread, which must not block (on_warming):
+            # print_status only queues the line for the console's one writer,
+            # which drops it once 1024 lines wait (diagnostics.CONSOLE_LINES).
+            print_status(f"Warming up · {event.steps_done} of {event.steps} steps")
+            serve_record.warming(args.serve_record, event.steps_done, event.steps)
+
+        runtime.on_warming = warming
+        runtime.command_after_failure = _shorter_prefill_after_display_stall(
+            args, model_root
+        )
+
+        def engine_recovering(recovering):
+            # The record follows the engine once the server is ready, for
+            # what supervises it by the file (serve_record). It runs on the
+            # thread the change came on, which must not block (follow): a
+            # record that cannot be written is a queued warning line.
+            if recovering:
+                serve_record.recovering(args.serve_record)
+            else:
+                serve_record.recovered(args.serve_record)
+
         backend = NativeBackend(
             runtime,
             tokenizer,
             request_logger=print_request,
+            thinking_end=thinking_end,
         )
+        # A server that serves nothing more stops as on SIGTERM and exits
+        # ENGINE_STOPPED_STATUS below.
+        backend.on_stopped = stop_serving
         if not runtime.wait_ready():
             raise engine_runtime.EngineUnhealthy("native runtime did not become ready")
-        readiness = runtime.readiness
-        if (
-            readiness is None
-            or not 1 <= readiness.max_context_tokens <= MAX_CONTEXT_TOKENS
-            or (
-                args.max_context is not None
-                and readiness.max_context_tokens != args.max_context
-            )
-        ):
-            raise engine_runtime.EngineUnhealthy(
-                "native runtime reported an invalid context window"
-            )
-        effective_context = readiness.max_context_tokens
-        constraint_factory = ConstraintFactory(tokenizer)
+        # The engine is authoritative for what it serves: it refuses a
+        # --max-context it cannot serve.
+        served = runtime.capabilities
+        check_capabilities(tokenizer, family.chat_format, served)
         app = Frontend(
             tokenizer,
             backend,
             args.model,
-            effective_context,
-            args.max_new_tokens,
-            args.request_timeout,
-            readiness.max_concurrent_requests,
-            constraint_factory=constraint_factory,
+            # No deadline unless given, as in vLLM and SGLang; a request still
+            # ends when its client disconnects.
+            math.inf if args.request_timeout is None else args.request_timeout,
+            constraint_factory=ConstraintFactory(tokenizer, served),
             chat_templates=chat_templates,
+            chat_format=family.chat_format,
+            sampling_defaults=asdict(family.sampling),
             max_image_pixels=args.max_image_pixels,
             thinking_codec=thinking_codec,
+            response_store=dialects.responses.ResponseStore(),
             served_model_names=args.served_model_name,
+            announce_served_name=args.announce_served_name,
+            reasoning_effort=args.reasoning_effort,
             default_reasoning_effort=args.default_reasoning_effort,
-            vision=readiness.vision,
+            default_thinking_token_budget=args.thinking_token_budget,
         )
         server.app = app
         server.server_activate()
-        address = f"http://{args.host}:{server.server_port}"
-        context = (
-            f"{effective_context // 1024}K"
-            if effective_context % 1024 == 0
-            else f"{effective_context:,}"
+        # The app takes the server for ready from its record alone: one that
+        # cannot say so has not started (serve_record).
+        serve_record.ready(args.serve_record)
+        # Told at once of an engine that failed since its Ready.
+        backend.follow(engine_recovering)
+        address = (
+            server.host
+            if server.address_family == socket.AF_UNIX
+            else f"http://{args.host}:{server.server_port}"
         )
-        mode = "" if readiness.vision else " · language only"
+        tokens = served.max_context_tokens
+        context = f"{tokens // 1024}K" if tokens % 1024 == 0 else f"{tokens:,}"
+        mode = "" if served.vision else " · text only"
         print_status(f"Ready · {args.model} · context {context}{mode} · {address}")
         server.serve_forever()
+    except engine_runtime.EngineStartFailed as error:
+        _start_failed(args, error, serve_record.engine_failure(error.event, str(error)))
+    except ListenError as error:
+        _start_failed(args, error, serve_record.failure(serve_record.PORT, str(error)))
+    except OptionError as error:
+        _start_failed(
+            args, error, serve_record.failure(serve_record.CONFIGURATION, str(error))
+        )
     except (
-        engine_runtime.EngineRuntimeError,
-        ThinkingKeyError,
+        ModelError,
         ChatTemplateError,
+        ThinkingEndError,
+        TokenizerContractError,
     ) as error:
+        _start_failed(args, error, serve_record.failure(serve_record.MODEL, str(error)))
+    except (engine_runtime.EngineRuntimeError, ThinkingKeyError, OSError) as error:
+        _start_failed(
+            args, error, serve_record.failure(serve_record.INTERNAL, str(error))
+        )
+    except serve_record.NotRecorded as error:
+        # The record that cannot say ready cannot say why either: the app
+        # takes the exit for the failure, which the log words.
         print_status(f"Error · {error}", error=True)
         raise SystemExit(1) from None
-    except OSError as error:
-        print_status(f"Error · unable to start HTTP server: {error}", error=True)
-        raise SystemExit(1) from None
+    except Exception as error:
+        # An error no clause above names is a bug: the record still names the
+        # failure, so that the app reports it instead of a crash, and the
+        # traceback reaches the log.
+        serve_record.failed(
+            args.serve_record,
+            serve_record.failure(
+                serve_record.INTERNAL, f"{type(error).__name__}: {error}"
+            ),
+        )
+        raise
     except KeyboardInterrupt:
         pass
     finally:
         # main owns this process. Keep stop signals idempotent through child
         # cleanup and interpreter teardown, including after this function
         # returns, except that a second Ctrl+C during cleanup stops the engine
-        # without waiting for its paced release of memory.
+        # without waiting for its graceful exit.
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
         signal.signal(
             signal.SIGINT,
             signal.SIG_IGN if runtime is None else lambda *_: runtime.kill(),
         )
         try:
+            # Stop accepting before the engine stops, which can take seconds:
+            # a client that connects meanwhile is refused at once instead of
+            # waiting in the backlog to be reset. server_close still answers
+            # the requests in flight.
+            if server is not None:
+                server.socket.close()
             if backend is not None:
                 print_status("Stopping · releasing engine resources")
                 backend.close()
@@ -2115,6 +1637,11 @@ def main():
             signal.signal(signal.SIGINT, signal.SIG_IGN)
             if server is not None:
                 server.server_close()
+    if stopped is not None:
+        serve_record.failed(
+            args.serve_record, serve_record.failure(serve_record.STOPPED, stopped)
+        )
+        raise SystemExit(ENGINE_STOPPED_STATUS)
 
 
 if __name__ == "__main__":

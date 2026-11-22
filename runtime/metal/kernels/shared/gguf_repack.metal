@@ -1,6 +1,7 @@
-// Editing this file re-prepares every GGUF model.
 #pragma clang fp reassociate(off)
 #include "metal/abi/GgufRepack.h"
+#include "metal/abi/MoE.h"
+#include "metal/kernels/common/moe_expert_chunk.h"
 #include <metal_stdlib>
 
 using namespace metal;
@@ -33,35 +34,70 @@ static inline void gguf_copy_native(device const uchar *blk, uint j, constant Qu
   for (uint i = 0; i < f.plane1_bytes; ++i) out1[i] = blk[at1 + f.plane1_bytes * j + i];
   if (j == 0) for (uint i = 0; i < f.meta_bytes; ++i) meta[i] = blk[atMeta + i];
 }
-kernel void gguf_repack(device const uchar *src [[buffer(0)]], device uchar *dst [[buffer(1)]],
-                      constant GgufRepackParams &p [[buffer(2)]], uint t [[thread_position_in_grid]]) {
-  const uint G = p.input_size / 32;
-  if (t >= p.rows * G) return;
-  const uint n = t / G, g = t % G;
-  constant QuantFormat &f = kQuantFormats[p.fmt];
+// Nibbles 0..3 of x at bits 0, 8, 16, 24 to bits 0, 16, 4, 20: four consecutive 4-bit codes as a pair word holds
+// them (gguf_store_pairs).
+static inline uint gguf_nibble_pairs(uint x) {
+  return (x & 0xFu) | ((x >> 12) & 0xF0u) | ((x << 8) & 0xF0000u) | ((x >> 4) & 0xF00000u);
+}
+// Group j of a Q4_K (qs at byte 16) or Q5_K (qs at 48, with fifth bits) block from its words: a few shifts a word
+// instead of a byte load and a pack per element. Pair word c is qs words c and 4 + c; the fifth bits, bit j of
+// qh[4k..4k+3] gathered by the multiply, go to slots 8 (k % 4) + 4 (k / 4) on.
+static inline void gguf_repack_k_words(device const uchar *blk, uint qs_at, bool fifth, uint j, device uchar *out0,
+                                       device uchar *out1, device uchar *meta) {
+  device const uint *qs = (device const uint *)(blk + qs_at + (j / 2) * 32);
+  uint4 pairs;
+  for (uint c = 0; c < 4; ++c)
+    pairs[c] = gguf_nibble_pairs((qs[c] >> (4 * (j % 2))) & 0x0F0F0F0Fu) |
+               gguf_nibble_pairs((qs[4 + c] >> (4 * (j % 2))) & 0x0F0F0F0Fu) << 8;
+  *(device uint4 *)out0 = pairs;
+  if (fifth) {
+    device const uint *qh = (device const uint *)(blk + 16);
+    uint bits = 0;
+    for (uint k = 0; k < 8; ++k)
+      bits |= ((((qh[k] >> j) & 0x01010101u) * 0x204081u) >> 21 & 0xFu) << (8 * (k % 4) + 4 * (k / 4));
+    *(device uint *)out1 = bits;
+  }
+  device const uint *head = (device const uint *)blk;
+  if (j == 0) *(device uint4 *)meta = uint4(head[0], head[1], head[2], head[3]);
+}
+// Group g (32 wide) of row n of a tensor of G groups a row in format fmt: its native row from `row` on, written
+// into its plane0, plane1 and meta planes, each [rows / QUANT_TILE_ROWS][units][QUANT_TILE_ROWS]. Q4_K and Q5_K
+// blocks are read as words, Q2_0's, PQ2_0's and the 16-bit formats' as halfwords: their sizes are multiples of
+// those, and rows are whole blocks after a tensor start on 8 bytes, in the file (model/GgufFile.cpp) and in the
+// staging (pages of buffers bound at offset 0).
+static inline void gguf_repack_group(device const uchar *row, uint fmt, uint G, uint n, uint g, device uchar *plane0,
+                                     device uchar *plane1, device uchar *meta_plane) {
+  constant QuantFormat &f = kQuantFormats[fmt];
   const uint b = g / f.meta_groups, j = g % f.meta_groups;   // native block b holds meta unit b
-  device const uchar *blk = src + ulong(n) * p.src_row_bytes + ulong(b) * f.block_bytes;
-  device uchar *out0 = dst + quant_tile_index(n, g, G) * f.plane0_bytes;
-  device uchar *out1 = dst + p.dst_plane1 + quant_tile_index(n, g, G) * f.plane1_bytes;
-  device uchar *meta = dst + p.dst_meta + quant_tile_index(n, b, G / f.meta_groups) * f.meta_bytes;
+  device const uchar *blk = row + ulong(b) * f.block_bytes;
+  device uchar *out0 = plane0 + quant_tile_index(n, g, G) * f.plane0_bytes;
+  device uchar *out1 = plane1 + quant_tile_index(n, g, G) * f.plane1_bytes;
+  device uchar *meta = meta_plane + quant_tile_index(n, b, G / f.meta_groups) * f.meta_bytes;
   uchar lo[32], hi[32];   // per slot: the (low) code and its high bits
-  switch (p.fmt) {
-    case GGUF_FMT_Q4K: {
-      for (uint e = 0; e < 32; ++e) lo[quant_slot(e)] = (blk[16 + (j / 2) * 32 + e] >> (4 * (j % 2))) & 15;
-      gguf_store_pairs(lo, out0);
-      if (j == 0) for (uint i = 0; i < 16; ++i) meta[i] = blk[i];
-      break;
+  if (quant_affine_format(fmt)) {
+    // MLX affine {s, z, codes}: element e of group j is code 32 j + e of the codes' bit string. The planes keep its
+    // low 2 (2, 3 bits) or 4 bits (4, 5, 6) and the rest as Q2_K, Q3_K, Q4_K, Q5_K and Q6_K do; 8 bits as Q8_0.
+    const uint bits = quant_affine_bits(fmt), low = bits == 8 ? 8 : bits <= 3 ? 2 : 4;
+    device const uchar *codes = blk + 4;
+    for (uint e = 0; e < 32; ++e) {
+      const uint at = (32 * j + e) * bits, shift = at % 8;
+      const uint word = uint(codes[at / 8]) | (shift + bits > 8 ? uint(codes[at / 8 + 1]) << 8 : 0u);
+      const uint code = (word >> shift) & ((1u << bits) - 1);
+      lo[quant_slot(e)] = code & ((1u << low) - 1);
+      hi[quant_slot(e)] = code >> low;
     }
-    case GGUF_FMT_Q5K: {
-      for (uint e = 0; e < 32; ++e) {
-        lo[quant_slot(e)] = (blk[48 + (j / 2) * 32 + e] >> (4 * (j % 2))) & 15;
-        hi[quant_slot(e)] = (blk[16 + e] >> j) & 1;
-      }
-      gguf_store_pairs(lo, out0);
-      gguf_store_bits(hi, 1, out1);
-      if (j == 0) for (uint i = 0; i < 16; ++i) meta[i] = blk[i];
+    if (low == 4) gguf_store_pairs(lo, out0); else gguf_store_bits(lo, low, out0);
+    if (bits != low) gguf_store_bits(hi, bits - low, out1);
+    if (j == 0) for (uint i = 0; i < 4; ++i) meta[i] = blk[i];
+    return;
+  }
+  switch (fmt) {
+    case GGUF_FMT_Q4K:
+      gguf_repack_k_words(blk, 16, false, j, out0, out1, meta);
       break;
-    }
+    case GGUF_FMT_Q5K:
+      gguf_repack_k_words(blk, 48, true, j, out0, out1, meta);
+      break;
     case GGUF_FMT_IQ4XS: {
       for (uint l = 0; l < 16; ++l) { const uchar q = blk[8 + 16 * j + l]; lo[quant_slot(l)] = q & 15; lo[quant_slot(16 + l)] = q >> 4; }
       gguf_store_bits(lo, 4, out0);
@@ -102,16 +138,47 @@ kernel void gguf_repack(device const uchar *src [[buffer(0)]], device uchar *dst
       if (j == 0) { for (uint i = 0; i < 4; ++i) meta[i] = blk[80 + i]; for (uint i = 0; i < 16; ++i) meta[4 + i] = blk[i]; }
       break;
     }
-    case GGUF_FMT_PQ20: {   // block_pq2_0 {d, qs[32]}: element e of group j is bits 2 (e % 4) of qs[8 j + e / 4]
-      for (uint e = 0; e < 32; ++e) lo[quant_slot(e)] = (blk[2 + 8 * j + e / 4] >> (2 * (e % 4))) & 3;
-      gguf_store_bits(lo, 2, out0);
-      if (j == 0) { meta[0] = blk[0]; meta[1] = blk[1]; }
+    case GGUF_FMT_PQ20: case GGUF_FMT_Q20: {   // block_pq2_0 {d, qs[32]}, block_q2_0 {d, qs[16]}: element e of group
+                                               // j is bits 2 (e % 4) of qs[8 j + e / 4], so qs byte k goes whole to
+                                               // word k / 2 % 2 at bit 16 (k % 2) + 8 (k / 4)
+      device const ushort *qs = (device const ushort *)(blk + 2 + 8 * j);
+      const uint q0 = qs[0], q1 = qs[1], q2 = qs[2], q3 = qs[3];
+      *(device uint2 *)out0 = uint2((q0 & 0xFFu) | (q2 & 0xFFu) << 8 | (q0 >> 8) << 16 | (q2 >> 8) << 24,
+                                    (q1 & 0xFFu) | (q3 & 0xFFu) << 8 | (q1 >> 8) << 16 | (q3 >> 8) << 24);
+      if (j == 0) *(device ushort *)meta = *(device const ushort *)blk;
       break;
     }
     case GGUF_FMT_IQ4NL: case GGUF_FMT_Q40: case GGUF_FMT_Q41: case GGUF_FMT_MXFP4: {   // the meta unit, then qs[16]
       for (uint l = 0; l < 16; ++l) { const uchar q = blk[f.meta_bytes + l]; lo[quant_slot(l)] = q & 15; lo[quant_slot(16 + l)] = q >> 4; }
-      if (p.fmt == GGUF_FMT_Q40 || p.fmt == GGUF_FMT_Q41) gguf_store_pairs(lo, out0); else gguf_store_bits(lo, 4, out0);
+      if (fmt == GGUF_FMT_Q40 || fmt == GGUF_FMT_Q41) gguf_store_pairs(lo, out0); else gguf_store_bits(lo, 4, out0);
       for (uint i = 0; i < f.meta_bytes; ++i) meta[i] = blk[i];
+      break;
+    }
+    case GGUF_FMT_Q50: case GGUF_FMT_Q51: {   // the meta unit, qh[4], then qs[16]: element e's fifth bit is bit e of qh
+      device const uchar *qh = blk + f.meta_bytes, *qs = qh + 4;
+      for (uint l = 0; l < 16; ++l) { lo[quant_slot(l)] = qs[l] & 15; lo[quant_slot(16 + l)] = qs[l] >> 4; }
+      for (uint e = 0; e < 32; ++e) hi[quant_slot(e)] = (qh[e / 8] >> (e % 8)) & 1;
+      gguf_store_pairs(lo, out0);
+      gguf_store_bits(hi, 1, out1);
+      for (uint i = 0; i < f.meta_bytes; ++i) meta[i] = blk[i];
+      break;
+    }
+    case GGUF_FMT_NVFP4: {   // {E4M3 scales[16], g, codes[128]}: element e of group j in bits 4 (e % 2) of codes[16 j + e / 2]
+      for (uint e = 0; e < 32; ++e) lo[quant_slot(e)] = (blk[QUANT_NVFP4_CODES + 16 * j + e / 2] >> (4 * (e % 2))) & 15;
+      gguf_store_bits(lo, 4, out0);
+      if (j == 0) for (uint i = 0; i < QUANT_NVFP4_CODES; ++i) meta[i] = blk[i];   // the scales and g
+      break;
+    }
+    case GGUF_FMT_FP8: {   // {g, E4M3 values[256]}
+      for (uint e = 0; e < 32; ++e) lo[quant_slot(e)] = blk[QUANT_FP8_VALUES + 32 * j + e];
+      gguf_store_bits(lo, 8, out0);
+      if (j == 0) for (uint i = 0; i < QUANT_FP8_VALUES; ++i) meta[i] = blk[i];   // g
+      break;
+    }
+    case GGUF_FMT_BF16: case GGUF_FMT_F16: {   // 256 values, element e of group j value 32 j + e; no scale: g = 1
+      device const ushort *values = (device const ushort *)blk + 32 * j;
+      for (uint e = 0; e < 32; ++e) ((device ushort *)out0)[quant_slot(e)] = values[e];
+      if (j == 0) *((device float *)meta) = 1.0f;
       break;
     }
     case GGUF_FMT_IQ3XXS: case GGUF_FMT_IQ2XXS: case GGUF_FMT_IQ2XS:   // {d, qs[64 | 32], signs and scales[32] | scales[8]}
@@ -142,4 +209,31 @@ kernel void gguf_repack(device const uchar *src [[buffer(0)]], device uchar *dst
       break;
     }
   }
+}
+
+kernel void gguf_repack(device const uchar *src [[buffer(0)]], device uchar *dst [[buffer(1)]],
+                        constant GgufRepackParams &p [[buffer(2)]], uint t [[thread_position_in_grid]]) {
+  const uint G = p.input_size / 32;
+  if (t >= p.rows * G) return;
+  const uint n = t / G, g = t % G;
+  gguf_repack_group(src + ulong(n) * p.src_row_bytes, p.fmt, G, n, g, dst, dst + p.dst_plane1, dst + p.dst_meta);
+}
+
+// Streamed experts into their slots (model/ExpertStore.cpp): threadgroup (x, y, z) repacks MOE_EXPERT_LOAD_THREADS
+// (row, 32-wide K group) pairs of projection z of job y, as gguf_repack does, from the native rows the host staged
+// for it from staging + sources[3y + z] on into the planes of slot slots[y], in the chunks of the table at the index
+// after the parameters (metal/abi/MoE.h, moe_expert_chunk). The grid's jobs are the host's (an indirect grid it
+// writes in the step before).
+kernel void moe_expert_load(device const uchar *staging [[buffer(0)]], device const uint *slots [[buffer(1)]],
+                            device const ulong *sources [[buffer(2)]], constant MoeExpertLoadParams &p [[buffer(3)]],
+                            constant ulong *chunks [[buffer(4)]], uint3 group [[threadgroup_position_in_grid]],
+                            uint index [[thread_index_in_threadgroup]]) {
+  constant MoeExpertLoadProjection &q = p.projections[group.z];
+  const uint G = q.columns / 32, t = group.x * MOE_EXPERT_LOAD_THREADS + index;
+  if (t >= q.rows * G) return;
+  const uint n = t / G, g = t % G;
+  const MoeExpertChunk c = moe_expert_chunk(chunks, p.floor_slots, p.chunk_slots, slots[group.y], group.z);
+  const ulong local = c.local;
+  gguf_repack_group(staging + sources[group.y * 3 + group.z] + ulong(n) * q.row_bytes, q.format, G, n, g,
+                    c.w0 + local * q.slot_bytes[0], c.w1 + local * q.slot_bytes[1], c.meta + local * q.slot_bytes[2]);
 }

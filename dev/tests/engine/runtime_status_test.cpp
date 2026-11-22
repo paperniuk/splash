@@ -1,22 +1,34 @@
+#include "TestChecks.hpp"
 #include "TestModel.hpp"
+#include "TestStderr.hpp"
 #include "engine/RuntimeResources.hpp"
+#include "StderrLine.hpp"
 #include "engine/Status.hpp"
 
+#include <chrono>
 #include <cstdlib>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <iterator>
+#include <limits>
+#include <regex>
+#include <sstream>
 #include <stdexcept>
+#include <thread>
+#include <utility>
+#include <vector>
 
 using namespace splash;
 using namespace splash::engine;
 
 namespace {
 
-void require(bool value, const char *message) {
-  if (!value)
-    throw std::runtime_error(message);
-}
+using splash::test::capturedStderr;
+using splash::test::require;
 
-EngineMemoryPlan plan() {
+// The 27B's plan, or with another KV layout and a spill plan.
+EngineMemoryPlan plan(const kv::Layout &kvLayout = kv::Layout{16, 4, 256}, const KvSpillPlan &spill = {}) {
   DeviceCapabilities device;
   device.deviceName = "test";
   device.appleGpuFamily = 9;
@@ -28,9 +40,10 @@ EngineMemoryPlan plan() {
   device.maxThreadgroupMemoryBytes = 32 * 1024;
   device.maxThreadgroupWidth = 1024;
   device.hasUnifiedMemory = true;
-  device.supportsPlacementSparse = true;
-  return requireEngineMemoryPlan(
-      device, test::modelMemoryProfile(2 * kGiB, 1 * kGiB, 1 * kGiB));
+  ModelMemoryProfile profile = test::modelMemoryProfile(2 * kGiB, 1 * kGiB, 1 * kGiB);
+  profile.targetKvLayout = kvLayout;
+  profile.spill = spill;
+  return test::requireMemoryPlan(device, profile);
 }
 
 MemoryAuditResult audit(const EngineMemoryPlan &memoryPlan) {
@@ -39,25 +52,43 @@ MemoryAuditResult audit(const EngineMemoryPlan &memoryPlan) {
   actual.targetWeightsBytes = b.targetWeightsBytes;
   actual.draftWeightsBytes = b.draftWeightsBytes;
   actual.visionWeightsBytes = b.visionWeightsBytes;
-  actual.stateResidentBytes = b.activeStateCellBytes;
+  actual.stateAllocatedBytes = b.laneStateBytes;
   actual.sharedPrefillBytes = b.sharedPrefillBytes;
   actual.sharedDecodeBytes = b.sharedDecodeBytes;
-  actual.kvResidentBytes = b.kvExtentBytes;
+  actual.kvAllocatedBytes = b.kvExtentBytes;
   actual.backendAllocatedBytes =
       actual.targetWeightsBytes + actual.draftWeightsBytes +
-      actual.visionWeightsBytes + actual.stateResidentBytes +
+      actual.visionWeightsBytes + actual.stateAllocatedBytes +
       actual.sharedPrefillBytes + actual.sharedDecodeBytes +
-      actual.kvResidentBytes;
+      actual.kvAllocatedBytes;
   actual.deviceCurrentAllocatedBytes = actual.backendAllocatedBytes;
   actual.devicePeakAllocatedBytes = actual.backendAllocatedBytes;
-  // Model warmup estimates add the pipeline and runtime reserves.
-  actual.estimatedWarmupPeakBytes = actual.backendAllocatedBytes +
-                                    b.pipelineReserveBytes +
-                                    b.runtimeOverheadReserveBytes;
+  actual.backendPeakAllocatedBytes = actual.backendAllocatedBytes;
   return auditActualMemory(memoryPlan, actual);
 }
 
-void testCleanRuntimeStatus() {
+// The document of `sample` under `memoryPlan`, with an empty cache identity
+// unless one is given.
+std::string statusOf(const EngineMemoryPlan &memoryPlan, const StatusSample &sample, const WarmupReport &warmup = {},
+                     const MemoryAuditResult &memoryAudit = {}, const engine::RuntimeCacheIdentity &identity = {}) {
+  return runtimeStatusJson(
+      {.plan = memoryPlan, .cacheIdentity = identity, .warmup = warmup, .memoryAudit = memoryAudit}, sample);
+}
+
+// What one status document is written from: what the start fixed, and a
+// sample.
+struct StatusInputs {
+  EngineMemoryPlan memoryPlan;
+  engine::RuntimeCacheIdentity identity;
+  WarmupReport warmup;
+  MemoryAuditResult memoryAudit;
+  StatusSample sample;
+
+  [[nodiscard]] std::string json() const { return statusOf(memoryPlan, sample, warmup, memoryAudit, identity); }
+};
+
+// A representative status document, every section of it set.
+StatusInputs representativeStatus() {
   EngineMemoryPlan memoryPlan = plan();
   engine::EngineSnapshot engine;
   engine.maximumContextTokens = 102400;
@@ -68,89 +99,225 @@ void testCleanRuntimeStatus() {
   engine.cacheHits = 1;
   engine.coldMisses = 2;
   engine.reusedTokens = 64;
+  engine.deduplicatedKvTokens = 96;
   engine.junctionMaterializations = 1;
   engine.checkpointPublications = 3;
   engine.checkpointPublicationFailures = 1;
   engine.resourceReplayTokens = 1234;
+  engine.resourceSuspensions = 5;
+  engine.prioritySuspensions = 2;
   engine.deduplicatedStatePublications = 2;
   engine.recycledStatePublications = 1;
   engine.scheduler.waitingPrefix = 3;
   engine.diskStatePublications = 4;
+  engine.stateCaptures = 6;
+  engine.captureCuts = 1;
   engine.scheduler.prefillBatches = 4;
   engine.scheduler.prefillRows = 4096;
   engine.scheduler.decodeBatches = 4;
   engine.scheduler.decodeBatchesByWidth = {1, 1, 1, 1};
-  engine.scheduler.decodeMixedGreedySamplingBatches = 2;
-  engine.resources.pool = {256, 200, 24, 32, 128, 72, 1, 128 * 4096ULL,
-                           32 * 4096ULL};
-  engine.resources.kvCache = {32, 32 * 4096ULL};
+  engine.activeRequests = {{.id = 7,
+                            .phase = engine::Phase::Prefill,
+                            .priority = engine::RequestPriority::Foreground,
+                            .promptTokens = 4096,
+                            .promptProcessed = 2048,
+                            .maxNewTokens = 256,
+                            .ageMilliseconds = 1500.5},
+                           {.id = 9,
+                            .phase = engine::Phase::Decode,
+                            .promptTokens = 512,
+                            .promptProcessed = 512,
+                            .generatedTokens = 40,
+                            .maxNewTokens = 128,
+                            .ageMilliseconds = 2250.25}};
+  // Four extents of 32 pages: the 24 pages requests hold are in two of them.
+  engine.resources.pool = {128, 72, 24, 32, 128 * 4096ULL,
+                           32 * 4096ULL, 2, 64 * 4096ULL, 5, 3, 2.5, 0.75, 2, 9};
+  engine.resources.extentCompactMaxMilliseconds = 1.25;
   engine.resources.stateCache = {2, 0, 128, 1, 1, 2, 0};
   engine.resources.stateCache.checkpointEntries = 1;
   engine.resources.stateCache.checkpointBytes = 64;
   engine.resources.stateCache.checkpointEvictions = 4;
   engine.resources.stateCache.checkpointRetirements = 3;
-  engine.resources.lookup = {.lookups = 3, .kvHitTokens = 128, .stateHitTokens = 64, .lazyJunctions = 1};
+  engine.resources.stateCache.inUse = 2;
+  engine.resources.stateCache.inUseEvictions = 5;
+  engine.resources.lookup = {.probeHashedBlocks = 7,
+                             .kvHitTokens = 128,
+                             .stateDiskHits = 1,
+                             .lazyJunctions = 1};
   engine.resources.activeRequests = 1;
   engine.resources.kvTier.restores = 3;
   engine.resources.kvTier.readBytes = 12345;
   engine.resources.kvTier.writtenBytes = 67890;
+  engine.resources.kvTier.writeRate = {.hourBytes = 16384, .dayBytes = 65536};
+  engine.resources.kvTier.fileBytes = 24680;
+  engine.resources.kvTier.capacityBytes = 34359738368;
+  engine.resources.kvTier.limitBytes = 8589934592;
+  engine.resources.kvTier.usedBytes = 4096;
+  engine.resources.kvTier.volumeAvailableBytes = 46170898432;
+  engine.resources.kvTier.writesGated = engine::DiskWritesGate::Budget;
+  engine.resources.kvTier.writesDeferredMicroseconds = 2'500;
+  engine.resources.persistent = true;
+  engine.resources.kvTier.copies = 64;
+  engine.resources.adoption = {2, 96, 4096, 1};
+  engine.writeBehind = {1, 5, 3, 0};
+  // Sliding windows that trim, and a target whose KV can spill: a request
+  // spilled, one converted and one's output was bounded.
+  engine.resources.window = engine::KvWindowSnapshot{
+      .windowPages = 16, .trim = true, .pinnedBlocks = 4, .trimmedPages = 12, .upgrades = 1, .refusedStates = 1};
+  engine.spill = {.spill = 1, .resident = 2, .converted = 1, .bounded = 1};
+  // Prefill ran six units, three of them beside decoders; a command ran in
+  // passes and a superseding plan abandoned it between them; one plan was
+  // prepared again.
+  engine.scheduler.decodeGapTargetMilliseconds = 500.0;
+  // Four decode gaps past the bound: three a prefill unit caused, priced at
+  // 1.2 s and taking 1.5 s, and one a claim's wait caused.
+  engine.decodeGapCauses.gaps[static_cast<size_t>(engine::GapCause::PrefillUnit)] = 3;
+  engine.decodeGapCauses.milliseconds[static_cast<size_t>(engine::GapCause::PrefillUnit)] = 1950.5;
+  engine.decodeGapCauses.gaps[static_cast<size_t>(engine::GapCause::ClaimWait)] = 1;
+  engine.decodeGapCauses.milliseconds[static_cast<size_t>(engine::GapCause::ClaimWait)] = 700.0;
+  engine.decodeGapCauses.prefillMilliseconds = 1500.0;
+  engine.scheduler.contendedPrefill = {.count = 3, .totalMilliseconds = 1200, .maximumMilliseconds = 480,
+                                       .p50Milliseconds = 262.144, .p95Milliseconds = 524.288,
+                                       .p99Milliseconds = 524.288};
+  engine.scheduler.prefillUnits = 6;
+  engine.scheduler.passCommands = 1;
+  engine.scheduler.abandonedPassCommands = 1;
+  engine.scheduler.boundCuts = 1;
+  engine.scheduler.indexPageConflicts = 2;
+  engine.replans = 1;
+  // Twelve ticks submitted a command, the longest after 1.75 ms of planning.
+  engine.tickHostMilliseconds = {.count = 12, .totalMilliseconds = 4.5, .maximumMilliseconds = 1.75,
+                                 .p50Milliseconds = 0.512, .p95Milliseconds = 1.024, .p99Milliseconds = 2.048};
 
   WarmupReport warmup;
   warmup.maximumPrefill = WarmupStepStatus::Complete;
+  warmup.prefillRowClasses = WarmupStepStatus::Complete;
   warmup.decodeBatches.fill(WarmupStepStatus::Complete);
-  warmup.draftVerifyCommit = WarmupStepStatus::Complete;
   warmup.compositeStateRestore = WarmupStepStatus::Complete;
-  warmup.memoryBudgetValidated = true;
-  warmup.maximumPrefillDetail = "packed_rows=2048";
+  warmup.maximumPrefillDetail = "rows=2048";
 
   RuntimeMetricsSnapshot metrics;
   metrics.prefillInputTokens = 4096;
   metrics.decodeOutputTokens = 32;
+  metrics.decodeWallMilliseconds = 10.0;
+  metrics.decodeCycleMilliseconds = 12.5;
   metrics.draftedTokens = 28;
   metrics.acceptedDraftTokens = 20;
   metrics.draftAcceptanceRate = 20.0 / 28.0;
   metrics.currentDecodeBatch = {true, 3, 0, 4, 21, 15, 1.5, 2666.0};
+  metrics.decodeGap = {.count = 31, .totalMilliseconds = 1240, .maximumMilliseconds = 96.5,
+                       .p50Milliseconds = 32.768, .p95Milliseconds = 65.536, .p99Milliseconds = 131.072};
+  // Two first tokens: their own prefill and the rest held them.
+  metrics.ttftParts[static_cast<size_t>(engine::TtftPart::OwnPrefill)] = {
+      .count = 2, .totalMilliseconds = 900, .maximumMilliseconds = 600,
+      .p50Milliseconds = 524.288, .p95Milliseconds = 1048.576, .p99Milliseconds = 1048.576};
+  metrics.ttftParts[static_cast<size_t>(engine::TtftPart::Rest)] = {
+      .count = 2, .totalMilliseconds = 30, .maximumMilliseconds = 20,
+      .p50Milliseconds = 16.384, .p95Milliseconds = 32.768, .p99Milliseconds = 32.768};
 
   engine::RuntimeCacheIdentity identity;
   identity.modelLayoutSha256 = std::string(64, 'a');
   identity.buildId = "build";
-  identity.kvLayout = kv::makeLayoutGuard({16, 4, 256}, {});
-  identity.kvLayout.modelArtifactSha256.fill(0xbc);
-  identity.namespaceSha256 = std::string(64, 'd');
+  identity.kvLayout = kv::Layout{16, 4, 256};
+  identity.targetModelSha256 = std::string(64, 'b');
 
   metal::MetalMemoryStats metal;
   metal.allocatedBytes = 4 * kGiB;
   metal.peakAllocatedBytes = metal.allocatedBytes;
-  metal.sparseVirtualBytes = memoryPlan.breakdown().kvVirtualBytes;
-  metal.sparseResidentBytes = memoryPlan.breakdown().kvExtentBytes;
-  metal.peakSparseResidentBytes = metal.sparseResidentBytes;
-  metal.peakResidentBytes = metal.allocatedBytes + metal.sparseResidentBytes;
   metal.deviceCurrentAllocatedBytes = metal.allocatedBytes;
   metal.devicePeakAllocatedBytes = metal.allocatedBytes;
-  metal.sparseTileBytes = 65536;
-  metal.pendingSparseUnmaps = 1;
-  metal.pendingSparseUnmapSeconds = 0.0125;
-  metal.completedSparseUnmaps = 7;
-  metal.lastSparseUnmapSeconds = 0.05;
-  metal.maxSparseUnmapSeconds = 0.3;
-  metal.sparseMapWaitEvent = 149;
-  metal.pendingSparseMapWaitSeconds = 0.5;
-  metal.lastSparseMapWaitSeconds = 0.25;
-  metal.maxSparseMapWaitSeconds = 0.75;
 
   MemoryGovernorSnapshot governor;
   governor.limitBytes = memoryPlan.breakdown().hardBudgetBytes;
-  governor.observedResidentBytes = metal.allocatedBytes;
-  governor.headroomBytes = governor.limitBytes - governor.observedResidentBytes;
+  governor.chargedBytes = metal.allocatedBytes;
+  governor.headroomBytes = governor.limitBytes - governor.chargedBytes;
   governor.hostMeasurementValid = true;
   governor.hostAvailableBytes = 8 * kGiB;
   governor.hostReserveBytes = 2 * kGiB;
+  governor.hostSpareBytes = 8 * kGiB;
+  governor.hostSpareReserveBytes = 2 * kGiB;
   governor.hostHeadroomBytes = 6 * kGiB;
-  governor.growthAllowed = true;
+  governor.hostGrowthAllowed = true;
+  // The host as macOS counts it: the process's footprint, part of it
+  // compressed, the host's file-backed and inactive pages and its file
+  // cache's minimum.
+  governor.hostTelemetry = HostTelemetry{.physFootprintBytes = 5 * kGiB,
+                                         .compressedBytes = 256 * kMiB,
+                                         .fileBackedBytes = 3 * kGiB,
+                                         .inactiveBytes = 2 * kGiB,
+                                         .fileCacheMinimumBytes = 6 * kGiB};
+  // The ledger's KV account, of extents of 32 pages, and the experts' pool;
+  // two demotions return two extents, one of them
+  // owed to the requests that wait for memory.
+  governor.accounts = {{.name = "kv",
+                        .floorBytes = 32 * 4096ULL,
+                        .currentBytes = 128 * 4096ULL,
+                        .capBytes = 256 * 4096ULL,
+                        .unitBytes = 32 * 4096ULL,
+                        .grows = 5,
+                        .shrinks = 3},
+                       {.name = "experts",
+                        .floorBytes = 512 * kMiB,
+                        .currentBytes = 768 * kMiB,
+                        .capBytes = 1 * kGiB,
+                        .unitBytes = 256 * kMiB,
+                        .grows = 1,
+                        .shrinks = 2}};
+  governor.owed = {.transfers = 2, .bytes = 64 * 4096ULL, .toClaimsBytes = 32 * 4096ULL, .oldestMilliseconds = 12.5};
+  governor.claims = {.waiting = 2, .bytes = 32 * 4096ULL, .oldestMilliseconds = 1250.0};
+  // Of 40 takes on a count that covered what their claim lacked, one freed
+  // less; two releases taken first freed less than they counted.
+  governor.countChecks = {.coveredRuns = 40, .overcountedRuns = 1, .shortReleases = 2};
+
+  // A streamed table, the experts' store and KV on the SSD cache with its
+  // readers.
+  model::SparseRowStats table;
+  table.table = "per_layer_token_embd.weight";
+  table.tableBytes = 28800138240;
+  table.cacheBytes = 2147483648;
+  table.cacheCapacityRows = 18000000;
+  table.cachedRows = 1200;
+  table.uses[1] = {10, 1280, 1000, 750, 250, {10, 12.5, 3.25, 1.024, 2.048, 4.096}};
+  table.readBytes = 22500;
+  model::ExpertStoreStats experts{.capBytes = 1 * kGiB,
+                                  .floorBytes = 512 * kMiB,
+                                  .capChunks = 4,
+                                  .chunks = 3,
+                                  .arenaBytes = 768 * kMiB,
+                                  .stagingBytes = 32 * kMiB,
+                                  .slots = 3072,
+                                  .experts = 10240,
+                                  .resident = 3000,
+                                  .shrinks = 2,
+                                  .regrows = 1};
+  experts.uses[1] = {
+      .loads = 480, .routed = 4000, .read = 1000, .prefetched = 600, .readAhead = 900, .readBytes = 1973000000};
+  StatusSample::KvSpill spill;
+  spill.cache = {.spilledPages = 640,
+                 .spilledBytes = 272'629'760,
+                 .writeThroughPages = 640,
+                 .writeThroughBytes = 272'629'760,
+                 .spillMoves = 640,
+                 .indexRestores = 2,
+                 .activeLimitBytes = 32 * kGiB,
+                 .heldBytes = 272'629'760};
+  spill.blockCache = model::KvBlockCacheStats{
+      .bytes = 408'944'640,
+      .targetBytes = 408'944'640,
+      .floorBytes = 408'944'640,
+      .slotsPerLayer = 8'192,
+      .lanes = 1,
+      .reads = {.resolves = 24, .entries = 98'304, .hits = 60'000, .misses = 37'280, .readBytes = 310'000'000}};
+  spill.historyStream = model::KvHistoryStreamStats{
+      .commands = 2, .layers = 24, .pages = 7'500, .bytes = 249'600'000, .stagingBytes = 1'056'440'320, .buffers = 2};
 
   model::ModelTelemetry executorTelemetry;
-  executorTelemetry.stateResidentBytes = 350'224'384;
-  executorTelemetry.warmIdleStateCells = 1;
+  executorTelemetry.stateAllocatedBytes = 350'224'384;
+  executorTelemetry.idleGdnCells = 1;
+  executorTelemetry.idleCachedCells = 4;
+  executorTelemetry.idleDraftRings = 2;
+  executorTelemetry.idleContextWindows = 3;
   executorTelemetry.targetPrefillRows = 10000;
   executorTelemetry.draftContextRowsActive = 2048;
   executorTelemetry.draftContextRowsMaterialization = 31;
@@ -173,49 +340,87 @@ void testCleanRuntimeStatus() {
   executorTelemetry.totalDecodeWallSeconds = 1.5;
   executorTelemetry.imageEncodes = 3;
   executorTelemetry.imageEmbeddingReuses = 4;
-  const std::string json =
-      runtimeStatusJson(memoryPlan, engine, metal, warmup, audit(memoryPlan),
-                        metrics, executorTelemetry, identity, governor, true);
-  require(json.find("\"kv_disk_hit_tokens\":96") != std::string::npos &&
-              json.find("\"kv_restores\":3") != std::string::npos,
-          "disk token accounting must include transfers completed before admission retries");
-  require(json.find("\"read_bytes\":12345") != std::string::npos &&
-              json.find("\"written_bytes\":67890") != std::string::npos,
-          "disk byte accounting was not exposed");
-  require(json.find("\"kv_staging_bytes\":0,\"fixed_runtime_bytes\"") !=
-              std::string::npos,
-          "the memory plan status omitted the disk tier's KV staging");
-  require(json.find("\"kv\":{\"target_model_sha256\"") != std::string::npos &&
-              json.find("\"q8\":{\"target_model_sha256\"") != std::string::npos,
-          "INT8 status lost its generic or legacy identity");
-  auto bf16Identity = identity;
-  bf16Identity.kvLayout = kv::makeLayoutGuard({16, 4, 256, kv::Format::BFloat16}, {});
-  const auto bf16Status = runtimeStatusJson(memoryPlan, engine, metal, warmup, audit(memoryPlan),
-                        metrics, executorTelemetry, bf16Identity, governor, true);
-  require(bf16Status.find("\"format\":\"bf16\"") != std::string::npos &&
-              bf16Status.find("\"scale_type\":\"none\"") != std::string::npos &&
-              bf16Status.find("\"q8\":") == std::string::npos,
-          "BF16 cache identity advertised INT8 storage");
-  require(json.find("\"schema_version\":5") != std::string::npos &&
-              json.find("\"ready\":true") != std::string::npos,
-          "status readiness/schema is wrong");
-  require(json.find("\"ready\":true,\"maximum_context_tokens\":102400,") !=
-              std::string::npos,
-          "status advertised model capacity instead of the active engine limit");
-  require(json.find("\"images\":{\"encodes\":3,\"embedding_reuses\":4}") !=
-              std::string::npos,
-          "image telemetry is missing from status");
-  require(json.find("\"model_timing\":{\"scope\":\"model_lifetime\","
-                    "\"prefill\":{\"last_gpu_ms\":5250,\"last_wall_ms\":116921.479,"
-                    "\"total_gpu_ms\":500500,\"total_wall_ms\":700250},"
-                    "\"decode\":{\"last_gpu_ms\":72.5,\"last_wall_ms\":83,"
-                    "\"total_gpu_ms\":1125,\"total_wall_ms\":1500}}") !=
-              std::string::npos,
-          "status lost model GPU/wall timing, scope, or milliseconds units");
+  executorTelemetry.imageEmbeddingEvictions = 9;
+  executorTelemetry.visionArenaBytes = 5;
+  executorTelemetry.embeddingCacheBytes = 6;
+  executorTelemetry.stateHeldImageBytes = 7;
+  executorTelemetry.imageRowsBytes = 8;
+  executorTelemetry.aneFfnReruns = 1;
+  executorTelemetry.verifyBudget = true;
+  const AneFfnSnapshot aneFfn{AneFfnSnapshot::State::Stopped,
+                              "an evaluation did not complete within 2 s",
+                              0.235,
+                              1037,
+                              12,
+                              768,
+                              10752.5};
+  const ResourceWaitSnapshot wait{.memory = 2, .concurrency = 1, .heldBehindRefusal = 4,
+                                  .restoring = 1, .suspended = 1,
+                                  .oldestWaitMilliseconds = 1250.0, .draining = true};
+  const MemoryAuditResult memoryAudit = audit(memoryPlan);
+  return {.memoryPlan = std::move(memoryPlan),
+          .identity = std::move(identity),
+          .warmup = std::move(warmup),
+          .memoryAudit = memoryAudit,
+          .sample = {.engine = std::move(engine),
+                     .resourceWait = wait,
+                     .weights = {600.0, false, false, 2, 1},
+                     .metrics = metrics,
+                     .telemetry = executorTelemetry,
+                     .metalMemory = metal,
+                     .memoryGovernor = std::move(governor),
+                     .aneFfn = aneFfn,
+                     .thermalState = ThermalState::Fair,
+                     .loopMaxTickMilliseconds = 1843.25,
+                     .streamedTable = std::move(table),
+                     .streamedExperts = experts,
+                     .kvSpill = std::move(spill)}};
+}
 
-  const std::string unmeasured =
-      runtimeStatusJson(memoryPlan, engine, metal, warmup, audit(memoryPlan),
-                        metrics, {}, identity, governor, true);
+// The representative document and the golden copy of it that the server's
+// reading of it is tested on (dev/tests/server/test_status_contract.py).
+void testCleanRuntimeStatus(const char *goldenPath) {
+  const StatusInputs status = representativeStatus();
+  const std::string json = status.json();
+  std::ifstream golden(goldenPath);
+  const std::string expected{std::istreambuf_iterator<char>(golden), {}};
+  require(golden && json + '\n' == expected,
+          std::string(goldenPath) + " is not the status document, which is now:\n" + json);
+  // The isolated prefill bound (this fork's M1 prefill bound): 2000 ms in
+  // the golden document, null when unbounded.
+  StatusInputs unbounded = status;
+  unbounded.sample.engine.scheduler.prefillBoundMilliseconds = kUnboundedPrefillCommand;
+  require(unbounded.json().find("\"prefill_bound_ms\":null,") != std::string::npos,
+          "status did not report an unbounded prefill command as null");
+  StatusInputs bf16 = status;
+  bf16.identity.kvLayout = kv::Layout{16, 4, 256, kv::Format::BFloat16};
+  const std::string bf16Status = bf16.json();
+  require(bf16Status.find("\"format\":\"bf16\"") != std::string::npos &&
+              bf16Status.find("\"scale_type\":\"none\"") != std::string::npos,
+          "BF16 cache identity advertised INT8 storage");
+  // YaRN's factor, to the digits that read back as it, as a context of a
+  // million tokens takes it, and its original window, which every key went
+  // through; the rest of the document keeps its precision.
+  StatusInputs yarn = status;
+  yarn.identity.ropeScaling = {3.814697265625, 262144};
+  std::string yarnExpected = json;
+  const std::string unscaled = "\"rope_scaling\":null";
+  yarnExpected.replace(yarnExpected.find(unscaled), unscaled.size(),
+                       "\"rope_scaling\":{\"type\":\"yarn\",\"factor\":3.814697265625,"
+                       "\"original_context_tokens\":262144}");
+  require(yarn.json() == yarnExpected,
+          "the cache identity did not report YaRN, or the status after it lost its precision");
+  StatusInputs tokenMajor = status;
+  tokenMajor.identity.kvLayout.valuesTokenMajor = true;
+  const std::string tokenMajorStatus = tokenMajor.json();
+  require(tokenMajorStatus.find("\"dtype\":\"q8s8_f32_scale_per_token_head_k_token_major_v_token_major\"") !=
+                  std::string::npos &&
+              tokenMajorStatus.find("\"value_layout\":\"token_major\"") != std::string::npos,
+          "token-major values were reported dimension-major");
+
+  StatusInputs unmeasuredInputs = status;
+  unmeasuredInputs.sample.telemetry = {};
+  const std::string unmeasured = unmeasuredInputs.json();
   require(unmeasured.find("\"model_timing\":{\"scope\":\"model_lifetime\","
                           "\"prefill\":{\"last_gpu_ms\":0,\"last_wall_ms\":0,"
                           "\"total_gpu_ms\":0,\"total_wall_ms\":0},"
@@ -223,73 +428,87 @@ void testCleanRuntimeStatus() {
                           "\"total_gpu_ms\":0,\"total_wall_ms\":0}}") !=
               std::string::npos,
           "status invented model timings from request metrics");
-  require(json.find("\"pages_free\":200,\"pages_free_resident\":72,") !=
-              std::string::npos,
-          "status confused free virtual KV pages with resident free pages");
-  require(json.find("\"sparse_tile_bytes\":65536,\"pending_unmaps\":1,"
-                    "\"pending_unmap_ms\":12.5,\"unmaps_completed\":7,"
-                    "\"unmap_last_ms\":50,\"unmap_max_ms\":300,"
-                    "\"map_wait_event\":149,\"pending_map_wait_ms\":500,"
-                    "\"map_wait_last_ms\":250,\"map_wait_max_ms\":750}") !=
-              std::string::npos,
-          "status lost the paced sparse release diagnostics");
-  require(json.find("\"system_pressure\":\"normal\"") != std::string::npos &&
-              json.find("\"host_measurement_valid\":true") != std::string::npos &&
-              json.find("\"host_headroom_bytes\":" + std::to_string(6 * kGiB)) !=
-                  std::string::npos,
-          "status omitted the host-side growth constraints");
-  require(json.find("\"resident_bytes\":350224384") != std::string::npos &&
-              json.find("\"warm_idle_cells\":1") != std::string::npos &&
-              json.find("\"scope\":\"startup_warmup\"") != std::string::npos,
-          "live state residency or audit scope is missing from status");
-  require(json.find("\"checkpoint_entries\":1,\"checkpoint_bytes\":64,"
-                    "\"checkpoint_evictions\":4,\"checkpoint_retirements\":3") !=
-              std::string::npos,
-          "temporary state occupancy and retirement are missing from status");
-  require(json.find("\"block_tokens\":32") != std::string::npos &&
-              json.find("\"decode_batches_by_width\":{\"b1\":1,\"b2\":1,\"b3\":"
-                        "1,\"b4\":1}") != std::string::npos,
-          "Page32 or real B3 status is missing");
-  require(json.find("\"decode_mixed_greedy_sampling_batches\":2}") !=
-              std::string::npos,
-          "status lost the mixed greedy/sampling decode count");
-  auto idleEngine = engine;
-  idleEngine.scheduler = {};
-  const auto idleJson = runtimeStatusJson(
-      memoryPlan, idleEngine, metal, warmup, audit(memoryPlan), metrics,
-      executorTelemetry, identity, governor, true);
-  require(idleJson.find("\"decode_mixed_greedy_sampling_batches\":0}") !=
-              std::string::npos,
-          "status omitted the zero mixed decode count");
-  require(
-      json.find("\"dynamic_budget_bytes\"") != std::string::npos &&
-          json.find("\"resource_replay_tokens\":1234") != std::string::npos &&
-          json.find("\"waiting_prefix\":3") != std::string::npos &&
-          json.find("\"deduplicated_state_publications\":2,"
-                    "\"recycled_state_publications\":1,"
-                    "\"disk_state_publications\":4,") !=
-              std::string::npos &&
-          json.find("\"lazy_junctions\":1") != std::string::npos &&
-          json.find("\"checkpoint_publications\":3,"
-                    "\"checkpoint_publication_failures\":1") !=
-              std::string::npos &&
-          json.find("\"draft_context\":{\"target_prefill_rows\":10000,\"prompt_"
-                    "end_rows\":2048,\"materialization_rows\":31,\"avoided_rows\":"
-                    "7921,\"restore_skipped\":1,\"resets\":2}") !=
-              std::string::npos &&
-          json.find("\"constraint_masks\":{\"overlap_batches\":5,\"overlap_"
-                    "requests\":8,\"last_target_forward_gpu_ms\":72.5,"
-                    "\"total_target_forward_gpu_ms\":250,\"last_residual_"
-                    "wait_ms\":1.5,\"total_residual_wait_ms\":12}") !=
-              std::string::npos,
-      "elastic KV-first status is incomplete");
+  require(unmeasured.find("\"verify_rows\":\"all\"") != std::string::npos,
+          "status lost the rows decode cycles verify");
+}
 
-  warmup.decodeBatches[2] = WarmupStepStatus::Pending;
-  const std::string incomplete =
-      runtimeStatusJson(memoryPlan, engine, metal, warmup, audit(memoryPlan),
-                        metrics, executorTelemetry, identity, governor, true);
-  require(incomplete.find("\"ready\":false") != std::string::npos,
-          "missing native B3 warmup did not fail readiness");
+// Whole documents for the branches the representative one leaves out. A
+// spilling target: the plan's kv_spill, readers not yet built, a Spill
+// request, the Neural Engine split serving, SSD writes closed and two warmup
+// steps memory-limited. A resident target with windows: the plan's kv_window,
+// no kv_spill or kv.window, no host telemetry, the idle release off, the
+// split off, the streamed stores absent, SSD writes open, Metal failed with a
+// reason that needs escaping after it created two pipelines while serving,
+// YaRN, BF16 token-major KV, no requests, no ledger accounts and one warmup
+// step memory-limited.
+std::vector<std::pair<const char *, StatusInputs>> statusVariants() {
+  const StatusInputs representative = representativeStatus();
+
+  StatusInputs spilling = representative;
+  spilling.memoryPlan = plan(test::sparseKvLayout(), KvSpillPlan{.enabled = true,
+                                                                 .densePages = 64,
+                                                                 .windowPages = 65,
+                                                                 .groupPages = 256,
+                                                                 .slotBytes = 425'984,
+                                                                 .laneSlots = 4'096,
+                                                                 .hotFloorBytes = 408'944'640,
+                                                                 .hotTargetBytes = 817'889'280,
+                                                                 .hotLimitBytes = 1'635'778'560,
+                                                                 .stagingBuffers = 2,
+                                                                 .stagingBytes = 1'056'440'320,
+                                                                 .indexRunwayBytes = 6'291'456,
+                                                                 .floorTokens = 2'048,
+                                                                 .floorBytes = 1'500'000'000,
+                                                                 .memoryTokens = 300'000,
+                                                                 .diskTokens = 400'000});
+  spilling.memoryAudit = audit(spilling.memoryPlan);
+  spilling.sample.kvSpill->blockCache.reset();
+  spilling.sample.kvSpill->historyStream.reset();
+  spilling.sample.engine.activeRequests[1].kvMode = engine::KvMode::Spill;
+  spilling.sample.aneFfn = {AneFfnSnapshot::State::Split, "at share 0.41 for chunks of 640 rows or more", 0.41, 640, 3,
+                     192, 1234.5};
+  spilling.sample.engine.resources.kvTier.writesGated = engine::DiskWritesGate::Closed;
+  spilling.warmup.decodeBatches[2] = WarmupStepStatus::MemoryLimited;
+  spilling.warmup.decodeBatches[3] = WarmupStepStatus::MemoryLimited;
+
+  constexpr uint64_t windowedLayers = [] {
+    uint64_t layers = (uint64_t{1} << 48) - 4;
+    for (uint32_t layer = 5; layer < 48; layer += 4)
+      layers &= ~(uint64_t{1} << layer);
+    return layers;
+  }();
+  StatusInputs resident = representative;
+  resident.memoryPlan = plan(kv::Layout{49, 4, 128, kv::Format::Int8, 0, false, 512, windowedLayers});
+  resident.memoryAudit = audit(resident.memoryPlan);
+  resident.sample.kvSpill.reset();
+  resident.sample.engine.resources.window.reset();
+  resident.sample.engine.activeRequests.clear();
+  resident.sample.memoryGovernor.hostTelemetry.reset();
+  resident.sample.memoryGovernor.accounts.clear();
+  resident.sample.weights.idleReleaseSeconds = std::numeric_limits<double>::infinity();
+  resident.sample.aneFfn = {.reason = "as given"};
+  resident.sample.streamedTable.reset();
+  resident.sample.streamedExperts.reset();
+  resident.sample.engine.resources.kvTier.writesGated = engine::DiskWritesGate::No;
+  resident.sample.metalHealthy = false;
+  resident.sample.metalFailureReason = "command buffer \"decode\" failed:\n\tGPU timeout";
+  resident.sample.pipelinesCreatedWhileServing = 2;
+  resident.identity.ropeScaling = {3.814697265625, 262144};
+  resident.identity.kvLayout = kv::Layout{16, 4, 256, kv::Format::BFloat16};
+  resident.identity.kvLayout.valuesTokenMajor = true;
+  resident.warmup.maximumPrefill = WarmupStepStatus::Pending;
+  resident.warmup.compositeStateRestore = WarmupStepStatus::MemoryLimited;
+  return {{"spilling", std::move(spilling)}, {"resident", std::move(resident)}};
+}
+
+void testStatusVariants(const char *goldenPath) {
+  std::string documents;
+  for (const auto &[name, inputs] : statusVariants())
+    documents += std::string("{\"variant\":\"") + name + "\",\"status\":" + inputs.json() + "}\n";
+  std::ifstream golden(goldenPath);
+  const std::string expected{std::istreambuf_iterator<char>(golden), {}};
+  require(golden && documents == expected,
+          std::string(goldenPath) + " is not the variant documents, which are now:\n" + documents);
 }
 
 void testCurrentReadinessAndSimultaneousPeak() {
@@ -299,40 +518,34 @@ void testCurrentReadinessAndSimultaneousPeak() {
   WarmupReport warmup;
   warmup.maximumPrefill = WarmupStepStatus::Complete;
   warmup.decodeBatches.fill(WarmupStepStatus::Complete);
-  warmup.draftVerifyCommit = WarmupStepStatus::Complete;
   warmup.compositeStateRestore = WarmupStepStatus::Complete;
-  warmup.memoryBudgetValidated = true;
   MemoryGovernorSnapshot governor;
   governor.hostMeasurementValid = true;
   governor.hostAvailableBytes = 8 * kGiB;
   governor.hostReserveBytes = 2 * kGiB;
   metal::MetalMemoryStats memory;
-  // Dense usage previously reached 20 GiB with 2 GiB of KV. It then shrank
-  // to 18 GiB while KV grew to 4 GiB: the simultaneous peak stayed 22 GiB.
-  memory.allocatedBytes = 18 * kGiB;
-  memory.peakAllocatedBytes = 20 * kGiB;
-  memory.sparseResidentBytes = 4 * kGiB;
-  memory.peakSparseResidentBytes = 4 * kGiB;
-  memory.peakResidentBytes = 22 * kGiB;
+  // KV extents are ordinary allocations: their bytes are part of the
+  // backend's current and peak bytes.
+  memory.allocatedBytes = 22 * kGiB;
+  memory.peakAllocatedBytes = 22 * kGiB;
   memory.deviceCurrentAllocatedBytes = 22 * kGiB;
   memory.devicePeakAllocatedBytes = 22 * kGiB;
   auto status = [&] {
-    return runtimeStatusJson(memoryPlan, {}, memory, warmup, audit(memoryPlan),
-                             {}, {}, {}, governor, true);
+    return statusOf(memoryPlan, {.metalMemory = memory, .memoryGovernor = governor}, warmup, audit(memoryPlan));
   };
   const std::string healthy = status();
   require(healthy.find("\"ready\":true") != std::string::npos &&
               healthy.find("\"peak_bytes\":" + std::to_string(22 * kGiB)) !=
                   std::string::npos,
-          "disjoint dense/sparse peaks falsely exceeded the budget");
+          "allocations within the budget were not ready or lost their peak");
 
-  memory.allocatedBytes = 20 * kGiB;
-  memory.peakResidentBytes = 24 * kGiB;
+  memory.allocatedBytes = 24 * kGiB;
+  memory.peakAllocatedBytes = 24 * kGiB;
   memory.deviceCurrentAllocatedBytes = 24 * kGiB;
   memory.devicePeakAllocatedBytes = 24 * kGiB;
   require(status().find("\"ready\":false") != std::string::npos,
           "current over-budget allocation was marked ready");
-  memory.allocatedBytes = 18 * kGiB;
+  memory.allocatedBytes = 22 * kGiB;
   memory.deviceCurrentAllocatedBytes = 22 * kGiB;
   const std::string recovered = status();
   require(recovered.find("\"ready\":true") != std::string::npos &&
@@ -345,7 +558,7 @@ void testCurrentReadinessAndSimultaneousPeak() {
   // governor's critical verdict marks it not ready.
   governor.hostAvailableBytes = 2 * kGiB;
   governor.pressure = MemoryPressure::Warning;
-  governor.growthAllowed = false;
+  governor.hostGrowthAllowed = false;
   require(status().find("\"ready\":true") != std::string::npos,
           "reaching the host reserve under warning marked the server not ready");
   governor.hostAvailableBytes = 1 * kGiB;
@@ -354,38 +567,22 @@ void testCurrentReadinessAndSimultaneousPeak() {
           "critical memory pressure was marked ready");
   governor.hostAvailableBytes = 8 * kGiB;
   governor.pressure = MemoryPressure::Normal;
-  governor.growthAllowed = true;
+  governor.hostGrowthAllowed = true;
 }
 
-void testWarmupStatesPreserveReadinessAndMeasurementTruth() {
+void testWarmupStepsReportMeasurementTruth() {
   const EngineMemoryPlan memoryPlan = plan();
   WarmupReport warmup;
-  require(!warmup.ready(), "unexecuted warmup was ready");
   warmup.maximumPrefill = WarmupStepStatus::Complete;
+  warmup.prefillRowClasses = WarmupStepStatus::Complete;
   warmup.decodeBatches.fill(WarmupStepStatus::Complete);
-  warmup.draftVerifyCommit = WarmupStepStatus::Complete;
   warmup.compositeStateRestore = WarmupStepStatus::Complete;
-  warmup.memoryBudgetValidated = true;
-  require(warmup.ready(), "complete warmup was not ready");
-
-  for (WarmupStepStatus *required : {&warmup.maximumPrefill,
-                                    &warmup.decodeBatches[0],
-                                    &warmup.draftVerifyCommit}) {
-    for (WarmupStepStatus state : {WarmupStepStatus::Pending,
-                                  WarmupStepStatus::MemoryLimited}) {
-      *required = state;
-      require(!warmup.ready(), "required execution was skipped for readiness");
-    }
-    *required = WarmupStepStatus::Complete;
-  }
-
   MemoryGovernorSnapshot governor;
   governor.hostMeasurementValid = true;
   governor.hostAvailableBytes = 8 * kGiB;
   governor.hostReserveBytes = 2 * kGiB;
   auto status = [&] {
-    return runtimeStatusJson(memoryPlan, {}, {}, warmup, audit(memoryPlan),
-                             {}, {}, {}, governor, true);
+    return statusOf(memoryPlan, {.memoryGovernor = governor}, warmup, audit(memoryPlan));
   };
   require(status().find("\"memory_limited_steps\":[]") != std::string::npos,
           "fully measured warmup listed a memory-limited step");
@@ -404,20 +601,16 @@ void testWarmupStatesPreserveReadinessAndMeasurementTruth() {
     const std::string key = std::string("\"") + step.name + "\":";
     *step.state = WarmupStepStatus::Pending;
     const std::string pending = status();
-    require(!warmup.ready() &&
-                pending.find("\"ready\":false") != std::string::npos &&
-                pending.find(key + "false") != std::string::npos &&
+    require(pending.find(key + "false") != std::string::npos &&
                 pending.find("\"memory_limited_steps\":[]") != std::string::npos,
             "unexecuted optional warmup was treated as memory-limited");
 
     *step.state = WarmupStepStatus::MemoryLimited;
     const std::string limited = status();
-    require(warmup.ready() &&
-                limited.find("\"ready\":true") != std::string::npos &&
-                limited.find(key + "false") != std::string::npos &&
+    require(limited.find(key + "false") != std::string::npos &&
                 limited.find(std::string("\"memory_limited_steps\":[\"") +
                              step.name + "\"]") != std::string::npos,
-            "memory-limited warmup did not preserve readiness and measurement truth");
+            "memory-limited warmup was reported as measured or not listed");
 
     *step.state = WarmupStepStatus::Complete;
     require(status().find(key + "true") != std::string::npos,
@@ -426,17 +619,11 @@ void testWarmupStatesPreserveReadinessAndMeasurementTruth() {
   for (const auto &step : optional)
     *step.state = WarmupStepStatus::MemoryLimited;
   const std::string limited = status();
-  require(warmup.ready() &&
-              limited.find("\"memory_limited_steps\":[\"decode_b2\",\"decode_b3\","
-                           "\"decode_b4\",\"composite_state_restore\"]") !=
+  require(limited.find("\"memory_limited_steps\":[\"decode_b2\",\"decode_b3\","
+                       "\"decode_b4\",\"composite_state_restore\"]") !=
                   std::string::npos &&
               limited.find("\"decode_b1\":true") != std::string::npos,
-          "single-lane readiness omitted or mislabeled memory-limited steps");
-  warmup.memoryBudgetValidated = false;
-  require(!warmup.ready(), "memory-limited warmup bypassed the memory audit");
-  warmup.memoryBudgetValidated = true;
-  warmup.error = "injected failure";
-  require(!warmup.ready(), "memory-limited warmup ignored an execution error");
+          "single-lane status omitted or mislabeled memory-limited steps");
 }
 
 void testMemoryPressureTelemetry() {
@@ -448,9 +635,9 @@ void testMemoryPressureTelemetry() {
   governor.hostAvailableBytes = 2 * kGiB;
   governor.hostReserveBytes = 2 * kGiB;
   governor.pressure = MemoryPressure::Critical;
-  governor.growthAllowed = false;
+  governor.hostGrowthAllowed = false;
   auto status = [&] {
-    return runtimeStatusJson(memoryPlan, {}, {}, {}, {}, {}, {}, {}, governor, true);
+    return statusOf(memoryPlan, {.memoryGovernor = governor});
   };
   const std::string hostLimited = status();
   require(hostLimited.find("\"memory_pressure\":\"critical\"") !=
@@ -471,39 +658,455 @@ void testMemoryPressureTelemetry() {
   governor.pressure = MemoryPressure::Critical;
   require(status().find("\"host_measurement_valid\":false") != std::string::npos,
           "missing host measurement was reported as a valid zero");
+  require(status().find("\"host_telemetry\":null") != std::string::npos,
+          "host telemetry macOS did not report was reported as zeros");
 }
 
 void testResourceWaitDiagnostics() {
-  ResourceWaitSnapshot wait{.memory = 2, .concurrency = 1, .suspended = 1,
+  ResourceWaitSnapshot wait{.memory = 2, .concurrency = 1, .heldBehindRefusal = 4,
+                            .restoring = 1, .suspended = 1,
                             .oldestWaitMilliseconds = 1250.0, .draining = true};
   const auto memoryPlan = plan();
-  const std::string json = runtimeStatusJson(
-      memoryPlan, {}, {}, {}, {}, {}, {}, {}, {}, true, {}, wait);
+  const std::string json = statusOf(memoryPlan, {.resourceWait = wait});
   require(json.find("\"admission\":{\"waiting\":3,\"waiting_memory\":2,"
-                    "\"waiting_concurrency\":1,\"suspended\":1,\"draining\":true,"
-                    "\"oldest_wait_ms\":1250}") != std::string::npos,
+                    "\"waiting_concurrency\":1,\"held_behind_refusal\":4,\"restoring\":1,"
+                    "\"suspended\":1,\"draining\":true,"
+                    "\"oldest_wait_ms\":1250},\"loop\":{\"max_tick_ms\":0,\"stall_budget_ms\":30000,") !=
+              std::string::npos,
           "resource wait summary is missing or inaccurate");
-  MemoryStatusReporter reporter;
-  require(reporter.update({}, true).empty(), "healthy idle engine logged pressure");
-  require(!reporter.update(wait, false).empty(), "pressure transition was silent");
-  ++wait.memory;
-  wait.oldestWaitMilliseconds += 1000;
-  require(reporter.update(wait, false).empty(), "pressure retries flooded the log");
-  wait = {};
-  wait.concurrency = 4;
-  require(!reporter.update(wait, true).empty(), "end of memory wait was silent");
-  require(reporter.update(wait, true).empty(), "concurrency queue logged pressure");
+  const std::string ticked = statusOf(memoryPlan, {.resourceWait = wait, .loopMaxTickMilliseconds = 1843.25});
+  require(ticked.find("\"loop\":{\"max_tick_ms\":1843.25,\"stall_budget_ms\":30000,\"tick_host_ms\":{\"p50\":0,"
+                      "\"p95\":0,\"p99\":0,\"max\":0,\"total\":0,\"samples\":0}}") != std::string::npos &&
+              ticked.find("\"schema_version\":8") != std::string::npos,
+          "the loop's longest tick, its stall budget or its ticks' host time is missing, or changed the "
+          "status schema");
+  // A measurement that is not finite is null, and the rest of the document
+  // still reads.
+  for (const double unmeasured :
+       {std::numeric_limits<double>::quiet_NaN(), std::numeric_limits<double>::infinity()}) {
+    const std::string json = statusOf(memoryPlan, {.resourceWait = wait, .loopMaxTickMilliseconds = unmeasured});
+    require(json.find("\"loop\":{\"max_tick_ms\":null,\"stall_budget_ms\":30000,") != std::string::npos &&
+                json.find(":nan") == std::string::npos && json.find(":-nan") == std::string::npos &&
+                json.find(":inf") == std::string::npos && json.find(":-inf") == std::string::npos,
+            "a loop tick that is not finite is not null: " + json);
+  }
+}
+
+// The weights' idle release, null with --idle-release off, whether they are
+// released and whether a restore is under way, how often they were written
+// back and how often a restore gave up.
+void testWeightsStatus() {
+  const auto memoryPlan = plan();
+  const auto status = [&](WeightsSnapshot weights) {
+    return statusOf(memoryPlan, {.weights = weights});
+  };
+  require(status({600.0, true, false, 2, 1})
+                  .find("\"weights\":{\"idle_release_seconds\":600,\"released\":true,"
+                        "\"restoring\":false,\"restores\":2,\"restore_failures\":1}") !=
+              std::string::npos,
+          "the weights' status is missing or inaccurate");
+  require(status({600.0, true, true, 2, 1})
+                  .find("\"released\":true,\"restoring\":true,") != std::string::npos,
+          "a restore under way is missing from the weights' status");
+  require(status({1234567.5, false, false, 0}).find("\"idle_release_seconds\":1234567.5,") !=
+              std::string::npos,
+          "the idle release lost precision");
+  require(status({std::numeric_limits<double>::infinity(), false, false, 0})
+                  .find("\"weights\":{\"idle_release_seconds\":null,\"released\":false,"
+                        "\"restoring\":false,\"restores\":0,\"restore_failures\":0}") !=
+              std::string::npos,
+          "an idle release that is off is not null");
+}
+
+// Streamed routed experts' store (--expert-memory): null without one; with
+// one its cap and floor, its live chunks and those at the cap, its shrinks
+// and regrows, its live arena, staging, slots, residency, loads, hit rate,
+// the latencies of its host steps' round trips, the line of its loads' work
+// against their reads (the loads on it, a miss's price, its slope, and a
+// load's own work at that price) and its failure. An added field: the
+// schema version stays.
+void testStreamedExpertsStatus() {
+  const auto memoryPlan = plan();
+  const auto status = [&](const std::optional<model::ExpertStoreStats> &experts) {
+    return statusOf(memoryPlan, {.streamedExperts = experts});
+  };
+  require(status(std::nullopt).find(",\"streamed_experts\":null,") != std::string::npos,
+          "a model without streamed experts does not report null");
+  model::ExpertStoreStats experts{.capBytes = 18602770432,
+                                  .floorBytes = 15837691904,
+                                  .capChunks = 4,
+                                  .chunks = 3,
+                                  .arenaBytes = 17179869184,
+                                  .stagingBytes = 452984832,
+                                  .slots = 8192,
+                                  .experts = 25088,
+                                  .resident = 8000,
+                                  .shrinks = 2,
+                                  .regrows = 1};
+  experts.uses[1] = {.loads = 480,
+                     .routed = 4000,
+                     .read = 1000,
+                     .prefetched = 600,
+                     .readAhead = 900,
+                     .readBytes = 1973000000,
+                     .pickup = {.count = 500, .totalMilliseconds = 11.5, .maximumMilliseconds = 0.09,
+                                .p50Milliseconds = 0.032, .p95Milliseconds = 0.032, .p99Milliseconds = 0.064},
+                     .work = {.count = 500, .totalMilliseconds = 240, .maximumMilliseconds = 9.5,
+                              .p50Milliseconds = 0.512, .p95Milliseconds = 2.048, .p99Milliseconds = 8.192},
+                     .resume = {.count = 500, .totalMilliseconds = 48.5, .maximumMilliseconds = 12.5,
+                                .p50Milliseconds = 0.128, .p95Milliseconds = 0.128, .p99Milliseconds = 16.384}};
+  experts.failure = "injected";
+  const std::string none = "{\"p50\":0,\"p95\":0,\"p99\":0,\"max\":0,\"total\":0,\"samples\":0}";
+  require(status(experts).find(
+              "\"streamed_experts\":{\"cap_bytes\":18602770432,\"floor_bytes\":15837691904,\"chunks\":3,"
+              "\"cap_chunks\":4,\"shrinks\":2,\"regrows\":1,\"arena_bytes\":17179869184,"
+              "\"staging_bytes\":452984832,\"slots\":8192,"
+              "\"experts\":25088,\"resident\":8000,\"prefill\":{\"loads\":0,\"routed\":0,\"read\":0,\"prefetched\":0,"
+              "\"read_ahead\":0,\"hit_rate\":0,\"read_bytes\":0,\"host_steps\":{\"pickup_ms\":" +
+              none + ",\"work_ms\":" + none + ",\"resume_ms\":" + none +
+              "}},"
+              "\"decode\":{\"loads\":480,\"routed\":4000,\"read\":1000,\"prefetched\":600,"
+              "\"read_ahead\":900,\"hit_rate\":0.75,\"read_bytes\":1973000000,\"host_steps\":"
+              "{\"pickup_ms\":{\"p50\":0.032,\"p95\":0.032,\"p99\":0.064,\"max\":0.09,\"total\":11.5,"
+              "\"samples\":500},\"work_ms\":{\"p50\":0.512,\"p95\":2.048,\"p99\":8.192,\"max\":9.5,"
+              "\"total\":240,\"samples\":500},\"resume_ms\":{\"p50\":0.128,\"p95\":0.128,\"p99\":16.384,"
+              "\"max\":12.5,\"total\":48.5,\"samples\":500}}},\"failure\":\"injected\"}") != std::string::npos,
+          "streamed experts' status differs");
+}
+
+// A target whose KV can spill reports what spilling does under kv_spill,
+// and each active request's kv_mode; one whose KV stays in memory reports
+// neither, as before (its plan's kv_spill is null). The pages that hold only their
+// index are the pool's pages of that form in use, each a spilled block's,
+// which a request holds as the cache does: counted once. An added section:
+// the schema version stays.
+void testKvSpillStatus() {
+  engine::EngineSnapshot engine;
+  engine.activeRequests = {{.id = 7, .phase = engine::Phase::Decode, .promptTokens = 4096, .maxNewTokens = 256},
+                           {.id = 9,
+                            .phase = engine::Phase::Decode,
+                            .promptTokens = 1'000'000,
+                            .promptProcessed = 1'000'000,
+                            .maxNewTokens = 512,
+                            .kvMode = engine::KvMode::Spill}};
+  // That one spilled, 7 others did after they converted, the quota bounded
+  // the output of 6, 4 of them converted, and 5 ended at that bound, 2 of
+  // them converted; one was refused for want of quota, and another start
+  // waits for it. The counts differ, so one reported under another's key
+  // fails.
+  engine.spill = {.spill = 1,
+                  .resident = 3,
+                  .converted = 7,
+                  .bounded = 6,
+                  .lengthEnds = 5,
+                  .convertedBounded = 4,
+                  .convertedLengthEnds = 2,
+                  .refusedQuota = 1};
+  // 31,250 of its pages hold only their index, of 24 KiB, and a free extent of
+  // them is the runway.
+  engine.resources.pool.index = {.pagesAllocated = 31'506,
+                                 .pagesFree = 256,
+                                 .pagesActive = 31'250,
+                                 .pagesPrefix = 31'250,
+                                 .allocatedBytes = 31'506 * 24'576ULL};
+  ResourceWaitSnapshot wait;
+  wait.diskQuota = 1;
+  StatusSample::KvSpill spill;
+  spill.cache = {.spilledPages = 31'250,
+                 .spilledBytes = 13'312'000'000,
+                 .writeThroughPages = 31'250,
+                 .writeThroughBytes = 13'312'000'000,
+                 .writeThroughInFlight = 3,
+                 .spillMoves = 31'250,
+                 .releases = 3,
+                 .releasedPages = 1'536,
+                 .indexRestores = 12,
+                 .wholeRestores = 2,
+                 .restore = {.count = 2, .totalMilliseconds = 1.5, .maximumMilliseconds = 1, .p50Milliseconds = 0.5,
+                             .p95Milliseconds = 1, .p99Milliseconds = 1},
+                 .activeLimitBytes = 32 * kGiB,
+                 .heldBytes = 13'312'000'000,
+                 .committedBytes = 55'000'000};
+  spill.blockCache = model::KvBlockCacheStats{.bytes = 408'944'640,
+                                              .targetBytes = 408'944'640,
+                                              .floorBytes = 408'944'640,
+                                              .slotsPerLayer = 8'192,
+                                              .lanes = 1,
+                                              .reads = {.resolves = 24,
+                                                        .entries = 98'304,
+                                                        .paged = 1'024,
+                                                        .hits = 60'000,
+                                                        .misses = 37'280,
+                                                        .ghostHits = 512,
+                                                        .readBytes = 310'000'000}};
+  // Two commands read 24 layers' history in 5 s.
+  spill.historyStream = model::KvHistoryStreamStats{
+      .commands = 2,
+      .layers = 24,
+      .pages = 750'000,
+      .bytes = 24'960'000'000,
+      .stagingBytes = 1'056'440'320,
+      .buffers = 2,
+      .read = {.count = 24, .totalMilliseconds = 5'000, .maximumMilliseconds = 250, .p50Milliseconds = 262.144,
+               .p95Milliseconds = 262.144, .p99Milliseconds = 262.144}};
+  const auto status = [&](const EngineMemoryPlan &memoryPlan, const std::optional<StatusSample::KvSpill> &kvSpill) {
+    return statusOf(memoryPlan, {.engine = engine, .resourceWait = wait, .kvSpill = kvSpill});
+  };
+  const std::string resident = status(plan(), std::nullopt);
+  const size_t planned = resident.find("\"kv_spill\":null");
+  require(planned < resident.find("\"memory_actual\"") &&
+              resident.find("\"kv_spill\"", planned + 1) == std::string::npos &&
+              resident.find("\"kv_mode\"") == std::string::npos,
+          "a target whose KV stays in memory reported spilling");
+  const std::string json = status(plan(test::sparseKvLayout()), spill);
+  require(json.find("\"id\":7,") < json.find("\"kv_mode\":\"resident\"") &&
+              json.find("\"id\":9,") < json.find("\"kv_mode\":\"spill\""),
+          "the active requests' KV modes are missing");
+  const std::string none = "{\"p50\":0,\"p95\":0,\"p99\":0,\"max\":0,\"total\":0,\"samples\":0}";
+  const std::string expected =
+      "\"kv_spill\":{\"requests\":{\"spill\":1,\"resident\":3,\"converted\":7,\"bounded\":6,\"length_ends\":5,"
+      "\"converted_bounded\":4,\"converted_length_ends\":2,\"refused\":{\"quota\":1,\"write_budget\":0,"
+      "\"closed\":0},\"waiting_quota\":1},\"pages\":{\"index\":31250,"
+      "\"index_bytes\":768000000,\"spilled\":31250,\"spilled_bytes\":13312000000},\"write_through\":{\"pages\":31250,"
+      "\"bytes\":13312000000,\"in_flight\":3,\"failures\":0,\"paused\":false},\"spill_moves\":31250,\"unspills\":0,"
+      "\"releases\":3,\"released_pages\":1536,\"rewrites\":0,\"restores\":{\"index_pages\":12,\"whole_pages\":2,"
+      "\"ms\":{\"p50\":0.5,\"p95\":1,\"p99\":1,\"max\":1,\"total\":1.5,\"samples\":2}},\"quota\":"
+      "{\"active_limit_bytes\":34359738368,\"held_bytes\":13312000000,\"committed_bytes\":55000000,"
+      "\"revoked\":0},\"index_runway_bytes\":6291456,\"block_cache\":"
+      "{\"bytes\":408944640,\"target_bytes\":408944640,\"floor_bytes\":408944640,\"slots_per_layer\":8192,\"lanes\":1,"
+      "\"resolves\":24,\"entries\":98304,\"paged\":1024,\"hits\":60000,\"read\":37280,\"hit_rate\":0.6167763158,"
+      "\"ghost_hits\":512,\"read_bytes\":310000000,\"read_failures\":0,\"resolve_ms\":" +
+      none + ",\"read_ms\":" + none + ",\"host_steps\":{\"pickup_ms\":" + none + ",\"work_ms\":" + none +
+      ",\"resume_ms\":" + none +
+      "}},\"history_stream\":{\"commands\":2,\"layers\":24,\"pages\":750000,"
+      "\"bytes\":24960000000,\"staging_bytes\":1056440320,\"buffers\":2,\"read_ms\":{\"p50\":262.144,"
+      "\"p95\":262.144,\"p99\":262.144,\"max\":250,\"total\":5000,\"samples\":24},\"wait_ms\":" +
+      none + "}}";
+  require(json.find(expected) != std::string::npos, "the spilling target's kv_spill differs:\n" + json);
+}
+
+// A windowed target's KV reports its window under kv.window: the pages a
+// window keeps Full, whether the pages past every window give up their
+// windowed layers' K/V, the pool's Full and Slim pages in use and the Slim
+// pages' bytes, the blocks states' tails pin, and the pages trimmed, the
+// blocks that took the page of a writer that computed them again and the
+// states refused a tail that was not Full. Another target reports none. An
+// added field: the schema version stays.
+void testKvWindowStatus() {
+  engine::EngineSnapshot engine;
+  engine.resources.pool = {.pagesAllocated = 1024, .pagesFree = 124, .pagesActive = 300, .pagesPrefix = 700};
+  engine.resources.pool.slim = {.pagesAllocated = 768, .pagesFree = 68, .allocatedBytes = 768 * 473'088ULL};
+  const auto status = [&] {
+    return statusOf(plan(), {.engine = engine});
+  };
+  require(status().find("\"window_pages\"") == std::string::npos, "a target without a window reported one");
+  engine.resources.window = engine::KvWindowSnapshot{
+      .windowPages = 16, .trim = true, .pinnedBlocks = 48, .trimmedPages = 9000, .upgrades = 3, .refusedStates = 1};
+  require(status().find("\"window\":{\"window_pages\":16,\"trim\":true,\"full_pages\":200,\"slim_pages\":700,"
+                        "\"slim_bytes\":363331584,\"pinned_blocks\":48,\"trimmed_pages\":9000,\"upgrades\":3,"
+                        "\"refused_states\":1}") != std::string::npos,
+          "a windowed target's kv.window differs:\n" + status());
+}
+
+// A streamed table's store (--ple-memory): null without one; with one its
+// memory, per use its stages, rows, hit rate and stage latencies, its reads,
+// prefetches and failure. An added field: the schema version stays.
+void testStreamedTableStatus() {
+  const auto memoryPlan = plan();
+  const auto status = [&](const std::optional<model::SparseRowStats> &table) {
+    return statusOf(memoryPlan, {.streamedTable = table});
+  };
+  require(status(std::nullopt).find(",\"streamed_table\":null,") != std::string::npos,
+          "a model without a streamed table does not report null");
+  model::SparseRowStats table;
+  table.table = "per_layer_token_embd.weight";
+  table.tableBytes = 28800138240;
+  table.cacheBytes = 2147483648;
+  table.cacheCapacityRows = 18000000;
+  table.cachedRows = 1200;
+  table.uses[1] = {10, 1280, 1000, 750, 250, {10, 12.5, 3.25, 1.024, 2.048, 4.096}};
+  table.readBytes = 22500;
+  table.prefetchRequestedRows = 32768;
+  table.prefetchReadRows = 30000;
+  table.poisoned = true;
+  table.failure = "injected";
+  const std::string json = status(table);
+  require(json.find("\"streamed_table\":{\"table\":\"per_layer_token_embd.weight\",\"table_bytes\":28800138240,"
+                    "\"cache_bytes\":2147483648,\"cache_capacity_rows\":18000000,\"cached_rows\":1200,"
+                    "\"evictions\":0,\"prefill\":{\"stages\":0,") != std::string::npos &&
+              json.find("\"decode\":{\"stages\":10,\"requested_rows\":1280,\"unique_rows\":1000,"
+                        "\"hit_rows\":750,\"read_rows\":250,\"hit_rate\":0.75,\"stage_ms\":{\"p50\":1.024,"
+                        "\"p95\":2.048,\"p99\":4.096,\"max\":3.25,\"total\":12.5,\"samples\":10}}") !=
+                  std::string::npos &&
+              json.find("\"read_errors\":0,\"read_ms\":{\"p50\":0,\"p95\":0,\"p99\":0,\"max\":0,\"total\":0,"
+                        "\"samples\":0},\"prefetch_requested_rows\":32768,") != std::string::npos &&
+              json.find("\"prefetch_read_rows\":30000,\"prefetch_dropped_rows\":0,\"poisoned\":true,"
+                        "\"failure\":\"injected\"}") != std::string::npos &&
+              json.find("\"schema_version\":8,") != std::string::npos,
+          "the streamed table's status is missing or inaccurate");
+}
+
+// The prefill FFN's Neural Engine split: off with the start's reason and no
+// share, serving with the start's, stopped with why, and what it ran beside
+// the chunks the GPU ran again.
+void testAneFfnStatus() {
+  const auto memoryPlan = plan();
+  const auto status = [&](const AneFfnSnapshot &split, uint64_t reruns) {
+    model::ModelTelemetry telemetry;
+    telemetry.aneFfnReruns = reruns;
+    return statusOf(memoryPlan, {.telemetry = telemetry, .aneFfn = split});
+  };
+  require(status({.reason = "as given"}, 0)
+                  .find("\"ane_ffn\":{\"state\":\"off\",\"share\":0,\"minimum_rows\":0,"
+                        "\"reason\":\"as given\",\"split_commands\":0,\"reruns\":0,\"ane_ms\":0,"
+                        "\"evaluations\":0},\"kv\":") != std::string::npos,
+          "a split the start left off is missing or inaccurate");
+  require(status({AneFfnSnapshot::State::Split, "at share 0.41 for chunks of 640 rows or more", 0.41, 640, 3,
+                  192, 1234.5},
+                 0)
+                  .find("\"ane_ffn\":{\"state\":\"split\",\"share\":0.41,\"minimum_rows\":640,"
+                        "\"reason\":\"at share 0.41 for chunks of 640 rows or more\",\"split_commands\":3,"
+                        "\"reruns\":0,\"ane_ms\":1234.5,\"evaluations\":192}") != std::string::npos,
+          "a split that serves is missing or inaccurate");
+  require(status({AneFfnSnapshot::State::Stopped,
+                  "losing to the GPU alone (19.4 ms on the Neural Engine per 2048-row layer against 19.0 ms "
+                  "on the GPU alone)",
+                  0.26, 1037, 8, 512, 9932.8},
+                 0)
+                  .find("\"state\":\"stopped\",\"share\":0.26,\"minimum_rows\":1037,\"reason\":\"losing "
+                        "to the GPU alone (19.4 ms on the Neural Engine per 2048-row layer against 19.0 ms on the "
+                        "GPU alone)\",\"split_commands\":8,\"reruns\":0,\"ane_ms\":9932.8,"
+                        "\"evaluations\":512}") != std::string::npos,
+          "a split the breaker stopped is missing or inaccurate");
+  require(status({AneFfnSnapshot::State::Stopped, "an evaluation failed", 0.26, 1037, 2, 128, 100.0}, 1)
+                  .find("\"reason\":\"an evaluation failed\",\"split_commands\":2,\"reruns\":1,") !=
+              std::string::npos,
+          "a split that failed lost its rerun");
+}
+
+// The thermal state beside the memory pressure, in each of its spellings; a
+// hot Mac serves slower but stays ready.
+void testThermalStateStatus() {
+  const auto memoryPlan = plan();
+  const auto status = [&](ThermalState state) {
+    return statusOf(memoryPlan, {.thermalState = state});
+  };
+  for (const auto &[state, name] :
+       {std::pair{ThermalState::Nominal, "nominal"}, std::pair{ThermalState::Fair, "fair"},
+        std::pair{ThermalState::Serious, "serious"},
+        std::pair{ThermalState::Critical, "critical"}}) {
+    const std::string json = status(state);
+    require(json.find("\"memory_pressure\":\"normal\",\"thermal_state\":\"" +
+                      std::string(name) + "\",\"admission\":") != std::string::npos,
+            std::string("the thermal state ") + name + " is missing or misspelled");
+    require(json.find("\"ready\":true") != std::string::npos,
+            std::string("the thermal state ") + name + " made the engine unready");
+  }
+}
+
+// The log names the thermal state once per change: a start at nominal says
+// nothing, a warm start names its state, and a repeat says nothing.
+void testThermalStateTransitions() {
+  ThermalStateReporter cool;
+  require(cool.update(ThermalState::Nominal).empty() &&
+              cool.state() == ThermalState::Nominal,
+          "a start at nominal was logged");
+  require(cool.update(ThermalState::Fair) == "Thermal state: nominal → fair" &&
+              cool.update(ThermalState::Fair).empty() &&
+              cool.update(ThermalState::Serious) == "Thermal state: fair → serious" &&
+              cool.update(ThermalState::Nominal) == "Thermal state: serious → nominal" &&
+              cool.state() == ThermalState::Nominal,
+          "a thermal transition was not logged once");
+  ThermalStateReporter warm;
+  require(warm.state() == ThermalState::Nominal &&
+              warm.update(ThermalState::Serious) == "Thermal state: serious" &&
+              warm.state() == ThermalState::Serious &&
+              warm.update(ThermalState::Serious).empty(),
+          "a warm start was not logged once");
+}
+
+// The server reads the runtime's stderr from a pipe, which, once full, keeps a
+// write whole only up to PIPE_BUF (512 bytes on macOS): 8 threads write lines
+// of 2 KiB at once while the reader drains the pipe 256 bytes at a time, and
+// every line arrives whole.
+void testStderrLinesStayWhole() {
+  int ends[2];
+  require(::pipe(ends) == 0, "no pipe");
+  const int saved = ::dup(STDERR_FILENO);
+  ::dup2(ends[1], STDERR_FILENO);
+  ::close(ends[1]);
+  std::string received;
+  std::thread reader([&] {
+    char chunk[256];
+    for (ssize_t got; (got = ::read(ends[0], chunk, sizeof chunk)) > 0;) {
+      received.append(chunk, static_cast<size_t>(got));
+      std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+  });
+  std::vector<std::thread> writers;
+  for (int writer = 0; writer < 8; ++writer)
+    writers.emplace_back([writer] {
+      for (int line = 0; line < 50; ++line)
+        writeStderrLine("writer " + std::to_string(writer) + " line " +
+                        std::to_string(line) + ' ' + std::string(2048, char('a' + writer)));
+    });
+  for (std::thread &writer : writers)
+    writer.join();
+  // The pipe's last write end closes: the reader reads to its end.
+  ::dup2(saved, STDERR_FILENO);
+  ::close(saved);
+  reader.join();
+  ::close(ends[0]);
+  std::istringstream lines(received);
+  const std::regex head("writer ([0-7]) line [0-9]+ ");
+  int count = 0;
+  for (std::string line; std::getline(lines, line); ++count) {
+    std::smatch parts;
+    require(std::regex_search(line, parts, head, std::regex_constants::match_continuous) &&
+                line.substr(parts.length(0)) ==
+                    std::string(2048, char('a' + std::stoi(parts[1].str()))),
+            "a stderr line was broken");
+  }
+  require(count == 8 * 50, "stderr lines were lost or merged");
+}
+
+// A notice carries the time first, as the server's console lines do, and
+// stays on its line: an exception message's newline becomes a space.
+void testNoticesCarryTheTime() {
+  const std::string notice = capturedStderr([] {
+    logLine("Weights restored in ", std::fixed, std::setprecision(2), 1.5,
+            " s (first line\nsecond line)");
+  });
+  require(std::regex_match(notice,
+                           std::regex("[0-9]{2}:[0-9]{2}:[0-9]{2} Weights restored in "
+                                      "1\\.50 s \\(first line second line\\)\n")),
+          "a notice did not carry the time on one line: " + notice);
 }
 
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
+  if (argc != 3) {
+    std::cerr << "usage: " << argv[0] << " status_golden.json status_variants_golden.jsonl\n";
+    return 2;
+  }
   try {
-    testCleanRuntimeStatus();
+    testCleanRuntimeStatus(argv[1]);
+    testStatusVariants(argv[2]);
     testCurrentReadinessAndSimultaneousPeak();
-    testWarmupStatesPreserveReadinessAndMeasurementTruth();
+    testWarmupStepsReportMeasurementTruth();
     testMemoryPressureTelemetry();
     testResourceWaitDiagnostics();
+    testWeightsStatus();
+    testAneFfnStatus();
+    testStreamedTableStatus();
+    testStreamedExpertsStatus();
+    testKvSpillStatus();
+    testKvWindowStatus();
+    testThermalStateStatus();
+    testThermalStateTransitions();
+    testStderrLinesStayWhole();
+    testNoticesCarryTheTime();
     std::cout << "runtime status tests passed\n";
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

@@ -6,21 +6,18 @@ import io
 import math
 import threading
 import time
-from collections import OrderedDict
-from contextlib import closing
-from dataclasses import asdict, dataclass, replace
+from collections.abc import Callable
+from contextlib import closing, nullcontext
+from dataclasses import asdict, dataclass
 
-if __package__:
-    from .errors import APIError
-    from .protocol import ProtocolLimits
-else:
-    from errors import APIError
-    from protocol import ProtocolLimits
+from .errors import APIError
+from .lru import LRUCache
+from .protocol import MAX_IMAGE_SPANS
 
 MAX_REQUEST_DOCUMENT_BYTES = 64 * 1024 * 1024
 MAX_PDF_BYTES = MAX_REQUEST_DOCUMENT_BYTES
 # Every rendered page becomes one image in the native request.
-MAX_PAGES = ProtocolLimits().max_image_spans
+MAX_PAGES = MAX_IMAGE_SPANS
 MAX_PAGE_PIXELS = 1024 * 1024
 MAX_TEXT_CHARACTERS = 1_000_000
 MAX_RENDERED_BYTES = 32 * 1024 * 1024
@@ -31,13 +28,16 @@ PDF_DATA_URL_PREFIX = "data:application/pdf;base64,"
 
 @dataclass(slots=True)
 class DocumentBudget:
-    deadline: float | None = None
+    # The request's deadline; math.inf when it has none.
+    deadline: float
     remaining_bytes: int = MAX_REQUEST_DOCUMENT_BYTES
     remaining_pages: int = MAX_PAGES
+    # A context manager under which the request holds no preparation slot,
+    # to wait for and use the PDF worker; none to give back outside
+    # preparation.
+    without_slot: Callable = nullcontext
 
     def remaining_time(self):
-        if self.deadline is None:
-            return -1
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
             raise APIError(504, "request timed out", "request_timeout")
@@ -74,32 +74,30 @@ class RenderLimits:
     page_pixels: int
     text_characters: int
     rendered_bytes: int
-    request_bytes: int = MAX_REQUEST_DOCUMENT_BYTES
+    request_bytes: int
+    request_pages: int
 
 
-def _render_limits():
-    return RenderLimits(
-        MAX_PAGES, MAX_PAGE_PIXELS, MAX_TEXT_CHARACTERS, MAX_RENDERED_BYTES
-    )
-
-
-# Serialize cache misses so only one bounded PDF worker is active at a time.
-_pdf_lock = threading.Lock()
-_cache: OrderedDict[bytes, tuple[Page, ...]] = OrderedDict()
-_cache_bytes = 0
+# One bounded PDF worker runs at a time. A request decodes, hashes and looks
+# up its PDF before it waits for the worker, so a cached PDF never waits
+# behind another one's render, and waits for the worker and renders without
+# its preparation slot, so neither does another request's preparation.
+_render_lock = threading.Lock()
+# Rendered pages by the SHA-256 of their PDF.
+_cache_lock = threading.Lock()
+_cache = LRUCache(CACHE_BYTES, CACHE_ENTRIES)
 
 
 def _render(payload, budget):
-    if __package__:
-        from .document_worker import render
-    else:
-        from document_worker import render
+    from .document_worker import render
 
-    limits = _render_limits()
-    limits = replace(
-        limits,
-        pages=min(limits.pages, budget.remaining_pages),
-        request_bytes=budget.remaining_bytes,
+    limits = RenderLimits(
+        MAX_PAGES,
+        MAX_PAGE_PIXELS,
+        MAX_TEXT_CHARACTERS,
+        MAX_RENDERED_BYTES,
+        budget.remaining_bytes,
+        budget.remaining_pages,
     )
     values = render(payload, asdict(limits), budget.remaining_time())
     pages = tuple(Page(**value) for value in values)
@@ -177,40 +175,53 @@ def render_pages(payload, budget, limits):
         raise APIError(400, "PDF document could not be rendered") from error
 
 
+def _cached(key, budget):
+    """The cached pages of the PDF with digest `key`, charged to `budget`;
+    None when none are cached."""
+    with _cache_lock:
+        pages = _cache.get(key)
+    if pages is None:
+        return None
+    budget.charge_pages(len(pages))
+    budget.charge(sum(page.size for page in pages))
+    return pages
+
+
+def _cache_pages(key, pages):
+    """Keep the rendered `pages` of the PDF with digest `key`, unless they
+    alone outgrow the cache."""
+    size = sum(page.size for page in pages)
+    with _cache_lock:
+        _cache.put(key, pages, size)
+
+
 def _pages(encoded, budget):
-    global _cache_bytes
-    if not _pdf_lock.acquire(
-        timeout=min(budget.remaining_time(), threading.TIMEOUT_MAX)
-    ):
-        raise APIError(504, "request timed out", "request_timeout")
+    budget.remaining_time()
     try:
-        budget.remaining_time()
-        try:
-            payload = base64.b64decode(encoded, validate=True)
-        except ValueError as error:
-            raise APIError(400, "PDF data is not valid base64") from error
-        if len(payload) > MAX_PDF_BYTES:
-            raise APIError(400, "PDF document exceeds the size limit")
-        budget.charge(len(payload))
-        key = hashlib.sha256(payload).digest()
-        cached = _cache.get(key)
-        if cached is not None:
-            budget.charge_pages(len(cached))
-            budget.charge(sum(page.size for page in cached))
-            _cache.move_to_end(key)
-            return cached
-        pages = _render(payload, budget)
-        budget.charge_pages(len(pages))
-        size = sum(page.size for page in pages)
-        if size <= CACHE_BYTES:
-            _cache[key] = pages
-            _cache_bytes += size
-            while _cache_bytes > CACHE_BYTES or len(_cache) > CACHE_ENTRIES:
-                _, evicted = _cache.popitem(last=False)
-                _cache_bytes -= sum(page.size for page in evicted)
+        payload = base64.b64decode(encoded, validate=True)
+    except ValueError as error:
+        raise APIError(400, "PDF data is not valid base64") from error
+    if len(payload) > MAX_PDF_BYTES:
+        raise APIError(400, "PDF document exceeds the size limit")
+    budget.charge(len(payload))
+    key = hashlib.sha256(payload).digest()
+    if (pages := _cached(key, budget)) is not None:
         return pages
-    finally:
-        _pdf_lock.release()
+    with budget.without_slot():
+        if not _render_lock.acquire(
+            timeout=min(budget.remaining_time(), threading.TIMEOUT_MAX)
+        ):
+            raise APIError(504, "request timed out", "request_timeout")
+        try:
+            # Another request may have rendered the same PDF meanwhile.
+            if (pages := _cached(key, budget)) is not None:
+                return pages
+            pages = _render(payload, budget)
+            budget.charge_pages(len(pages))
+            _cache_pages(key, pages)
+            return pages
+        finally:
+            _render_lock.release()
 
 
 def document_parts(block):
@@ -247,8 +258,6 @@ def document_parts(block):
 
 def pdf_content(encoded, *, budget):
     """Render an inline PDF through the shared bounded document pipeline."""
-    if len(encoded) > 4 * ((MAX_PDF_BYTES + 2) // 3):
-        raise APIError(400, "PDF document exceeds the size limit")
     parts = []
     for page in _pages(encoded, budget):
         parts.append({"type": "text", "text": page.text})
@@ -256,8 +265,33 @@ def pdf_content(encoded, *, budget):
     return parts
 
 
-def file_content(file, *, budget):
-    """Render a file part's inline PDF as canonical text/image parts."""
+def render_files(messages, *, deadline, without_slot):
+    """`messages`, canonical (each file part's data already checked), with
+    each file part replaced by its PDF's pages as text and image parts, all
+    under one request budget; the PDF worker is waited for and used under
+    `without_slot`, which gives a request in preparation its slot back
+    meanwhile."""
+    budget = DocumentBudget(deadline=deadline, without_slot=without_slot)
+    rendered = []
+    for message in messages:
+        content = message.get("content")
+        if isinstance(content, list) and any(
+            part["type"] == "file" for part in content
+        ):
+            parts = []
+            for part in content:
+                if part["type"] == "file":
+                    parts.extend(pdf_content(part["file"]["file_data"], budget=budget))
+                else:
+                    parts.append(part)
+            message = {**message, "content": parts}
+        rendered.append(message)
+    return rendered
+
+
+def checked_file(file):
+    """A file part's inline PDF, checked without decoding it: its base64
+    data."""
     if not isinstance(file, dict):
         raise APIError(400, "file must be an object")
     if file.get("file_id") is not None or file.get("file_url") is not None:
@@ -274,4 +308,6 @@ def file_content(file, *, budget):
         if not data.startswith(PDF_DATA_URL_PREFIX):
             raise APIError(400, "only application/pdf file data is supported")
         data = data[len(PDF_DATA_URL_PREFIX) :]
-    return pdf_content(data, budget=budget)
+    if len(data) > 4 * ((MAX_PDF_BYTES + 2) // 3):
+        raise APIError(400, "PDF document exceeds the size limit")
+    return data

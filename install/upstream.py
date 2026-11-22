@@ -2,33 +2,28 @@
 trained for its architecture, as an assembly (assembly.py).
 
 The Hub owns downloads and snapshots; this module inspects the target,
-selects its components and decides when to follow the Hub, and the native
-source adapters own tensor validation and preparation. A target is
-identified by its own metadata (a GGUF header or an MLX config), read before
-any weight download, and paired with the draft trained for its family
-(families.py); repository names play no part. Every start follows the
-target's revision, then its draft's, with one Hub request each, and
-publishes a new commit's assembly atomically; the installed assembly starts
-when the Hub cannot answer or the new commit cannot be installed.
+selects its components and decides when to follow the Hub. The engine owns
+the model rules, which it applies to the configurations and a GGUF's headers
+before any weight download (check_model), and its source adapters own tensor
+validation and preparation. A target's family is the one the
+engine finds its configuration to describe (families.py), never its
+repository name. Every start follows the target's revision, then its
+draft's, with one Hub request each, and publishes a new commit's assembly
+atomically; the installed assembly starts when the Hub cannot answer or the
+new commit cannot be installed. local.py does the same from local files.
 """
 
 from __future__ import annotations
 
 import json
 import os
-from contextlib import contextmanager
+import re
+import tempfile
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
-if __package__:
-    from . import assembly, families, gguf, hub, legacy, models
-else:
-    import assembly
-    import families
-    import gguf
-    import hub
-    import legacy
-    import models
+from . import assembly, families, gguf, hub, models
 
 # The tokenizer files an MLX target may supply, linked when present.
 TOKENIZER_FILES = (
@@ -40,6 +35,24 @@ TOKENIZER_FILES = (
     "added_tokens.json",
     "special_tokens_map.json",
 )
+# The name prefixes of a safetensors checkpoint's vision tower tensors: MLX's,
+# and transformers' (as NVIDIA's Model Optimizer keeps them).
+VISION_TOWER = ("vision_tower.", "model.visual.")
+# Where an MLX repository keeps its image processor's configuration: a file of
+# its own, or the image_processor object of processor_config.json, where newer
+# Transformers releases save it.
+PROCESSOR_FILES = ("preprocessor_config.json", "processor_config.json")
+# A DFlash2 release's BF16 embedding of its mask token, beside its weights,
+# which its draft reads in place of the target's token table row
+# (DraftCheckpoint.hpp kDraftMaskEmbedding; docs/models.md, Drafts).
+DRAFT_MASK_EMBEDDING = "mask_embedding.safetensors"
+# What a prepare did with the model, which `prepare --json-progress` reports
+# last for the app to word (models.main): published a new installation of it;
+# found the Hub to have nothing newer; could not check, the Hub not answering
+# for the target or its draft, or not asked (HF_HUB_OFFLINE, or a commit
+# revision, whose draft is not asked either); or could not install what moved
+# on and kept the installed one.
+UPDATED, UP_TO_DATE, UNREACHABLE, KEPT = "updated", "up_to_date", "unreachable", "kept"
 
 
 @dataclass(frozen=True)
@@ -50,180 +63,435 @@ class Target:
     format: str
     # The record's vision_format: "none", "safetensors" or "gguf".
     vision_format: str
-    # The configuration that identifies the target's family.
-    config: dict
+    # The configuration the engine reads, the assembly's config.json: the MLX
+    # repository's, or the one derived from the GGUF's metadata.
+    config: Path
+    # The directory of a GGUF's headers, which the engine plans the target
+    # from as it plans the GGUF at every start (check_model); None for MLX.
+    gguf_headers: Path | None
+    # The family the engine finds the configuration to describe.
+    family: families.ModelFamily
     # Assembly path -> repository file, for every path a repository file
     # serves (the layout in assembly.py). A GGUF's configuration and tokenizer
     # are derived from it at installation instead.
     files: dict[str, str]
 
 
-def _root_ggufs(files):
+def root_ggufs(files):
     """The GGUF files at a repository's root, named *.gguf as the native
-    loader finds a target; subfolders (split BF16, MTP heads) never count."""
+    loader finds a target. Files in a subfolder count only as the parts of a
+    split GGUF in its VARIANT/ folder (split_gguf); others (MTP heads) never
+    do."""
     return sorted(n for n in files if "/" not in n and n.endswith(".gguf"))
 
 
-def _projector_named(name):
+def projector_named(name):
     """Whether a root GGUF is named as a vision projector: mmproj-*.gguf, or
     MODEL-mmproj-*.gguf as Prism ML names theirs."""
     return "mmproj" in Path(name).stem.lower()
 
 
+SPLIT_NAME = re.compile(r"-(\d{5})-of-(\d{5})\.gguf$")
+
+
+def model_of(name):
+    """The model a GGUF file holds, by which :VARIANT names a target: its
+    name without .gguf and, for a split GGUF's part, without
+    -0000K-of-0000N."""
+    match = SPLIT_NAME.search(name)
+    return name[: match.start()] if match else name.removesuffix(".gguf")
+
+
+def target_of(name):
+    """The target a GGUF file is one of, by which a repository root's files
+    group into targets, remote and local alike: its model (model_of), and
+    whether it is a split GGUF's part. A whole file is a target of its own,
+    apart from any split parts of its model, such as the file they merge
+    into."""
+    return model_of(name), SPLIT_NAME.search(name) is not None
+
+
+@dataclass(frozen=True)
+class GgufTarget:
+    """A GGUF target among a repository's files, which :VARIANT selects by
+    its name: one file or a split GGUF's parts at the root (root_targets), or
+    a split GGUF's parts in a folder of its own (folder_targets)."""
+
+    # Its model's name (model_of) at the root; its folder's name in a folder.
+    name: str
+    # Whether its files are a split GGUF's parts: a root target's named
+    # NAME-0000K-of-0000N (target_of), and a folder's always, as a folder
+    # holds a split GGUF's parts by convention.
+    split: bool
+    # Its files, in name order, which is a whole split GGUF's split order.
+    files: tuple[str, ...]
+
+    def __str__(self):
+        """How a list of targets names it: X, or X (split, N parts)."""
+        if not self.split:
+            return self.name
+        count = len(self.files)
+        return f"{self.name} (split, {count} part{'' if count == 1 else 's'})"
+
+
+def root_targets(files):
+    """The GGUF targets at a repository's root (target_of), in name order, a
+    whole file before the split GGUF of its name. Vision projectors are never
+    targets."""
+    targets = {}
+    for name in root_ggufs(files):
+        if not projector_named(name):
+            targets.setdefault(target_of(name), []).append(name)
+    return [
+        GgufTarget(model, split, tuple(names))
+        for (model, split), names in sorted(targets.items())
+    ]
+
+
+def folder_targets(files):
+    """The split GGUFs a repository keeps in folders named after their
+    variants, as repositories publish the files too large for one
+    (VARIANT/MODEL-VARIANT-00001-of-0000N.gguf ...): each folder's GGUF files
+    but vision projectors, in name order. :VARIANT names a folder whatever
+    its case, so folders whose names differ in case alone are one target,
+    named as the first is."""
+    targets = {}
+    for name in sorted(files):
+        folder, _, file = name.partition("/")
+        if (
+            file
+            and "/" not in file
+            and file.endswith(".gguf")
+            and not projector_named(file)
+        ):
+            targets.setdefault(folder.lower(), (folder, []))[1].append(name)
+    return [
+        GgufTarget(folder, True, tuple(names))
+        for folder, names in sorted(targets.values())
+    ]
+
+
+def target_files(target):
+    """The files of a root target (root_targets) as the native loader reads
+    them: its one file, or its split GGUF's parts, all present, in split
+    order."""
+    if not target.split:
+        return list(target.files)
+    return split_order(target.files, f"the split GGUF {target.name}")
+
+
 def select_gguf(files, variant):
-    """The target GGUF among a repository's root files, and whether it was
-    taken by its -VARIANT ending from several, which the caller reports.
-    :VARIANT names the file whose name is the model name all of them share,
-    then -VARIANT (X-Q4_K_M for Q4_K_M, not X-UD-Q4_K_M); failing that, the
-    only file whose name ends in -VARIANT. A repository of one GGUF names no
-    variant apart from its model, so its one match needs no report. Without
-    :VARIANT, the only target GGUF. Anything else is an error listing the
-    candidates."""
-    candidates = [n for n in _root_ggufs(files) if not _projector_named(n)]
+    """The target GGUF among a repository's targets, as the list of its files
+    in split order (target_files; split_gguf), and whether it was taken by
+    its -VARIANT ending from several targets, which the caller reports.
+    :VARIANT names, in this order: the root target (root_targets) whose name
+    is the model name all of them share, then -VARIANT (X-Q4_K_M for Q4_K_M,
+    not X-UD-Q4_K_M); the folder named VARIANT (split_gguf); the only root
+    target whose name ends in -VARIANT. A repository of one root name and no
+    folder names no variant apart from its model, so its one match needs no
+    report. Without :VARIANT, the root targets' only name. A name selects
+    its target by named_target. Anything else is an error listing every
+    target :VARIANT can select, root targets then folders."""
+    targets = root_targets(files)
+    names = sorted({target.name for target in targets})
     if variant is None:
-        if len(candidates) == 1:
-            return candidates[0], False
+        if target := named_target(targets, names):
+            return target_files(target), False
         choice = "select a GGUF with OWNER/REPO:VARIANT"
     else:
-        parts = [Path(name).stem.split("-") for name in candidates]
-        shared = len(os.path.commonprefix(parts))
+        words = [name.split("-") for name in names]
+        shared = len(os.path.commonprefix(words))
         exact = [
             name
-            for name, words in zip(candidates, parts, strict=True)
-            if "-".join(words[shared:]).lower() == variant.lower()
+            for name, own in zip(names, words, strict=True)
+            if "-".join(own[shared:]).lower() == variant.lower()
         ]
-        if len(exact) == 1:
-            return exact[0], False
+        if target := named_target(targets, exact):
+            return target_files(target), False
+        if split := split_gguf(files, variant):
+            return split, False
         suffix = "-" + variant.lower()
-        ending = [n for n in candidates if Path(n).stem.lower().endswith(suffix)]
-        if len(ending) == 1:
-            return ending[0], len(candidates) > 1
+        ending = [name for name in names if name.lower().endswith(suffix)]
+        if target := named_target(targets, ending):
+            several = len(names) + len(selectable_folders(files)) > 1
+            return target_files(target), several
         choice = "no single GGUF matches :" + variant
-    listed = ", ".join(candidates) or "none"
-    raise models.ModelError(f"{choice} (files in the repository root: {listed})")
+    listed = ", ".join(map(str, targets + selectable_folders(files))) or "none"
+    raise models.ModelError(f"{choice} (GGUF targets: {listed})")
+
+
+def named_target(targets, names):
+    """The root target (root_targets) that names, distinct names of root
+    targets, select when they are one name: the name's whole file before the
+    split GGUF of that name, as both hold one model, a merge and its parts;
+    None for no name or several. :VARIANT selects by the names it matches,
+    and a repository or a local directory without one by all of its root
+    targets' names."""
+    if len(names) != 1:
+        return None
+    [name] = names
+    return min((t for t in targets if t.name == name), key=lambda t: t.split)
+
+
+def selectable_folders(files):
+    """The folder targets (folder_targets) :VARIANT selects (split_gguf):
+    those whose files are one whole split GGUF, not an incomplete one, nor a
+    folder of other GGUF files such as an MTP head."""
+    selectable = []
+    for target in folder_targets(files):
+        try:
+            split_gguf(files, target.name)
+        except models.ModelError:
+            continue
+        selectable.append(target)
+    return selectable
+
+
+def split_gguf(files, variant):
+    """The parts of the split GGUF a repository keeps in the folder :VARIANT
+    names (folder_targets), in split order; None when there is no such
+    folder. Every part from 1 to N must be present."""
+    for target in folder_targets(files):
+        if target.name.lower() == variant.lower():
+            return split_order(target.files, f"the split GGUF in {variant}/")
+    return None
+
+
+def split_order(names, split):
+    """names, the files of one split GGUF, in split order: the parts of one
+    name, each NAME-0000K-of-0000N.gguf, every part from 1 to N present once.
+    The engine holds a target's files to the same rule (findTargetGgufs).
+    split names the split GGUF in a refusal."""
+    matches = {name: SPLIT_NAME.search(name) for name in names}
+    for name, match in matches.items():
+        if not match:
+            raise models.ModelError(
+                f"{name} is not one part of {split} (NAME-0000K-of-0000N.gguf)"
+            )
+    if len(own := {model_of(Path(name).name) for name in names}) > 1:
+        raise models.ModelError(
+            f"{split} mixes the parts of several split GGUFs "
+            f"({', '.join(sorted(own))}); a split GGUF is the parts of one name, "
+            "NAME-0000K-of-0000N.gguf"
+        )
+    parts = {}
+    for name, match in matches.items():
+        number = int(match.group(1))
+        if number in parts:
+            raise models.ModelError(
+                f"{parts[number][1]} and {name} are both part {number} of {split}"
+            )
+        parts[number] = (int(match.group(2)), name)
+    counts = {count for count, _ in parts.values()}
+    if len(counts) != 1 or sorted(parts) != list(range(1, counts.pop() + 1)):
+        raise models.ModelError(f"{split} is incomplete: " + ", ".join(sorted(names)))
+    return [parts[number][1] for number in sorted(parts)]
 
 
 def select_vision(repo):
     """The name and header of the GGUF repository's vision projector, chosen
     by content among its root GGUF files named mmproj, whatever the publisher
-    calls them: a clip model whose weights are BF16, or F32, which
-    preparation converts only where every value is exact; BF16 is preferred.
-    The tower runs in BF16 and preparation never rounds a weight: F16 has a
-    narrower exponent than BF16, so an F16 projector has already rounded
-    small weights, as a quantized one has. Each header costs a few range
+    calls them: a projector Splash loads (read_projector) of BF16, F32 or F16
+    weights, preferred in that order. Each header costs a few range
     requests."""
-    usable, found = {"BF16": [], "F32": []}, []
-    for name in filter(_projector_named, _root_ggufs(repo.files)):
-        with repo.open(name) as stream:
-            header = gguf.Metadata(stream, tensors=True)
-        architecture = header.values.get("general.architecture")
-        types = {
-            gguf.TENSOR_TYPES.get(kind, f"type {kind}")
-            for kind in header.tensors.values()
-        }
-        found.append(f"{name} ({architecture}: {', '.join(sorted(types))})")
-        if architecture == "clip" and types and types <= {"BF16", "F32"}:
-            usable["BF16" if "BF16" in types else "F32"].append((name, header))
+    usable, found = {"BF16": [], "F32": [], "F16": []}, []
+    for name in filter(projector_named, root_ggufs(repo.files)):
+        header, precision, kind = read_projector(repo, name)
+        found.append(f"{name} ({kind})")
+        if precision:
+            usable[precision].append((name, header))
     for precision, projectors in usable.items():
         if len(projectors) == 1:
             return projectors[0]
         if projectors:
-            raise models.ModelError(
+            raise models.VisionError(
                 f"several {precision} vision projectors, "
                 + ", ".join(name for name, _ in projectors)
-                + ", describe no single tower; use --language-only to serve text only"
+                + ", describe no single tower"
             )
-    raise models.ModelError(
-        "the GGUF repository has no BF16 or F32 vision projector ("
+    raise models.VisionError(
+        "the GGUF repository has no BF16, F32 or F16 vision projector ("
         + ("; ".join(found) or "no GGUF named mmproj")
-        + "); use --language-only to serve text only"
+        + ")"
     )
 
 
-def inspect_target(repo, variant, language_only):
+def read_projector(repo, name):
+    """The header of the GGUF name in repo; the precision of a vision
+    projector Splash loads (a clip model of BF16, F32 or F16 weights), else
+    None; and how a refusal describes it, ARCHITECTURE: TYPES. The tower runs
+    in BF16 and preparation never rounds a weight: it converts F32 and F16
+    only where every value is exact, as in an F16 projector made from a BF16
+    tower, where F16 rounds the smallest BF16 weights onto its subnormal grid
+    and what that keeps is still a BF16."""
+    with repo.open(name) as stream:
+        header = gguf.Metadata(stream, tensors=True)
+    architecture = header.values.get("general.architecture")
+    types = {
+        gguf.TENSOR_TYPES.get(kind, f"type {kind}") for kind in header.tensors.values()
+    }
+    precision = None
+    if architecture == "clip" and types and types <= {"BF16", "F32", "F16"}:
+        precision = next(p for p in ("F16", "BF16", "F32") if p in types)
+    return header, precision, f"{architecture}: {', '.join(sorted(types))}"
+
+
+def check_model(target_format, vision_format, config, *, gguf_headers=None, draft=None):
+    """The family the engine finds a model's configuration to describe, by
+    the rules it holds the model's assembly to at every start (its
+    model-check command): config, the target's configuration, with the
+    source formats the record names; gguf_headers, the directory of a GGUF
+    target's headers (gguf_target), each tensor of which it plans as it
+    loads it; and draft, its draft's config.json once chosen. A ModelError
+    gives the engine's reason when it refuses them."""
+    arguments = ["model-check", target_format, vision_format, str(config)]
+    if gguf_headers is not None:
+        arguments.append(str(gguf_headers))
+    if draft is not None:
+        arguments.append(str(draft))
+    name = json.loads(models.run_engine(arguments, "model check"))["family"]
+    if (family := families.named(name)) is None:
+        raise models.ModelError(f"no DFlash2 draft is known for the {name} family")
+    return family
+
+
+def inspect_target(repo, variant, language_only, scratch):
     """What the target repository supplies, from metadata alone: a GGUF
-    header read by range requests, or an MLX config and shard index. A
-    :VARIANT names a GGUF, and so does a repository without a safetensors
-    checkpoint."""
-    if variant is not None or not any(n.endswith(".safetensors") for n in repo.files):
-        return _gguf_target(repo, variant, language_only)
-    return _mlx_target(repo, language_only)
+    header read by range requests, or an MLX config and shard index, and the
+    family the engine finds its configuration to describe. A :VARIANT names a
+    GGUF, and so does a repository without a safetensors checkpoint; a GGUF's
+    configuration and headers are written into scratch. The target's text
+    configuration is checked first, then its vision tower and the tower's
+    configuration, so a model Splash cannot serve is refused for that,
+    whatever its tower; a refusal of the tower alone names --language-only."""
+    try:
+        if variant is not None or not any(
+            n.endswith(".safetensors") for n in repo.files
+        ):
+            return _gguf_target(repo, variant, language_only, scratch)
+        return mlx_target(repo, language_only)
+    except models.VisionError as error:
+        raise models.VisionError(
+            f"{error}; use --language-only to serve text only"
+        ) from None
 
 
-def _gguf_target(repo, variant, language_only):
-    name, by_ending = select_gguf(repo.files, variant)
+def _gguf_target(repo, variant, language_only, scratch):
+    names, by_ending = select_gguf(repo.files, variant)
+    name = names[0] if len(names) == 1 else f"{len(names)} split files {names[0]} ..."
     if by_ending:
         print(
             f"No GGUF is named for :{variant} alone; using {name}, the only one "
             f"whose name ends in -{variant}.",
             flush=True,
         )
-    with repo.open(name) as stream:
-        header = gguf.Metadata(stream, tensors=True)
-    # The family bounds the layers whose tensors the screening lists.
-    families.family_for(gguf.model_config(header))
-    gguf.require_loadable(header)
-    files = {"target/" + name: name}
-    vision_header = None
-    if not language_only:
-        files[assembly.GGUF_VISION], vision_header = select_vision(repo)
-        _validate_processor(gguf.processor_config(vision_header))
-    config = gguf.model_config(header, vision_header)
-    print(f"Selected {name} from {repo.name}.", flush=True)
-    return Target("gguf", "none" if language_only else "gguf", config, files)
-
-
-def _mlx_target(repo, language_only):
-    required = {"config.json", "tokenizer.json", "tokenizer_config.json"}
-    if not language_only:
-        required.add("preprocessor_config.json")
-    if missing := required - repo.files:
-        # --language-only drops the processor requirement and no other.
-        hint = (
-            "; use --language-only to serve text only"
-            if missing == {"preprocessor_config.json"}
-            else ""
-        )
-        raise models.ModelError(
-            f"target repository {repo.name} is missing: {', '.join(sorted(missing))}. "
-            "Configuration, tokenizer and processor must come from the target "
-            f"repository{hint}."
-        )
-    config = models.read_json(repo.file("config.json"))
-    # MLX states its quantization under "quantization"; a transformers
-    # quantization_config alone describes another method (GPTQ, AWQ, ...).
-    quant = config.get("quantization")
-    if (
-        not isinstance(quant, dict)
-        or quant.get("mode", "affine") != "affine"
-        or quant.get("bits") != 4
-        or quant.get("group_size") != 64
-    ):
-        raise models.ModelError(
-            "this model requires an MLX affine 4-bit/group-64 checkpoint or a supported GGUF"
-        )
-    files = {
-        path: "config.json"
-        for path in ("config.json", "target/config.json", "tokenizer/config.json")
-    }
-    files |= {"tokenizer/" + n: n for n in TOKENIZER_FILES if n in repo.files}
-    if not language_only:
-        _validate_processor(models.read_json(repo.file("preprocessor_config.json")))
-        shards = _weight_files(repo, "vision_tower.")
-        if not shards:
-            raise models.ModelError(
-                f"{repo.name} has no vision tower; use --language-only to serve text only"
-            )
-        files["vision/config.json"] = "config.json"
-        files |= {"vision/" + n: n for n in shards}
-    files |= {"target/" + n: n for n in _weight_files(repo)}
-    return Target(
-        "mlx-affine", "none" if language_only else "safetensors", config, files
+    target = gguf_target(
+        repo, names, scratch, projector=None if language_only else select_vision
     )
+    print(f"Selected {name} from {repo.name}.", flush=True)
+    return target
 
 
-def _weight_files(repo, prefix=""):
-    """The checkpoint's shards holding a tensor whose name starts with prefix."""
+def gguf_target(repo, names, scratch, *, projector=None):
+    """The GGUF target whose files in repo are names, one or a split GGUF's
+    parts in split order, its configuration and headers written into
+    scratch. projector, for a model that serves images, gives the name and
+    header of its vision projector in repo (select_vision): called once the
+    text configuration passed, for a family whose models have a vision
+    tower; the others serve text only."""
+    # A split GGUF's parts lie side by side in target/, where the native
+    # loader finds them by their -0000K-of-0000N names, and their headers in
+    # scratch's target/, where the engine's model check finds them.
+    files = {"target/" + Path(part).name: part for part in names}
+    target = scratch / "target"
+    target.mkdir()
+    headers = []
+    for part in names:
+        with repo.open(part) as stream:
+            headers.append(gguf.Metadata(stream, tensors=True))
+        (target / Path(part).name).write_bytes(headers[-1].raw)
+    # The first part's metadata describes the model.
+    config = scratch / "config.json"
+    config.write_bytes(models.json_bytes(gguf.model_config(headers[0])))
+    gguf.require_quantized(headers)
+    family = check_model("gguf", "none", config, gguf_headers=target)
+    vision_format = "none"
+    if projector is not None and family.vision:
+        name, vision_header = projector(repo)
+        try:
+            _validate_processor(gguf.processor_config(vision_header))
+            config.write_bytes(
+                models.json_bytes(gguf.model_config(headers[0], vision_header))
+            )
+            check_model("gguf", "gguf", config, gguf_headers=target)
+        except models.ModelError as error:
+            raise models.VisionError(f"vision projector {name}: {error}") from None
+        files[assembly.GGUF_VISION] = name
+        vision_format = "gguf"
+    return Target("gguf", vision_format, config, target, family, files)
+
+
+def mlx_target(repo, language_only):
+    """The MLX target in repo, which serves images unless language_only."""
+    required = {"config.json", "tokenizer.json", "tokenizer_config.json"}
+    missing = sorted(required - repo.files)
+    # Serving text only drops the processor requirement and no other.
+    processor = language_only or any(n in repo.files for n in PROCESSOR_FILES)
+    if missing or not processor:
+        # A checkpoint that lacks only the processor can serve text.
+        refusal = models.ModelError if missing else models.VisionError
+        if not processor:
+            missing.append(" or ".join(PROCESSOR_FILES))
+        raise refusal(
+            f"target repository {repo.name} is missing: {', '.join(missing)}. "
+            "Configuration, tokenizer and processor must come from the target "
+            "repository"
+        )
+    config = repo.file("config.json")
+    family = check_model("mlx-affine", "none", config)
+    files = {path: "config.json" for path in ("config.json", "tokenizer/config.json")}
+    files |= {"tokenizer/" + n: n for n in TOKENIZER_FILES if n in repo.files}
+    # The target's shards: those holding a tensor other than the tower's. A
+    # tower in a shard of its own is not the target's (an OptiQ checkpoint
+    # keeps it in a subdirectory).
+    files |= {"target/" + n: n for n in _weight_files(repo, exclude=VISION_TOWER)}
+    vision_format = "none"
+    if not language_only:
+        # The text passed, so a refusal of the tower's processor, shards or
+        # configuration refuses the vision alone.
+        try:
+            _validate_processor(_image_processor(repo))
+            shards = _weight_files(repo, VISION_TOWER)
+        except models.ModelError as error:
+            raise models.VisionError(str(error)) from None
+        if not shards:
+            raise models.VisionError(f"{repo.name} has no vision tower")
+        vision_format = "safetensors"
+        try:
+            check_model("mlx-affine", vision_format, config)
+        except models.ModelError as error:
+            raise models.VisionError(str(error)) from None
+        files |= {"vision/" + n: n for n in shards}
+    return Target("mlx-affine", vision_format, config, None, family, files)
+
+
+def _image_processor(repo):
+    """An MLX target's image processor configuration, from the first of
+    PROCESSOR_FILES the repository has."""
+    if "preprocessor_config.json" in repo.files:
+        return models.read_json(repo.file("preprocessor_config.json"))
+    config = models.read_json(repo.file("processor_config.json")).get("image_processor")
+    if not isinstance(config, dict):
+        raise models.VisionError(
+            f"{repo.name}'s processor_config.json has no image_processor"
+        )
+    return config
+
+
+def _weight_files(repo, prefix="", exclude=None):
+    """The checkpoint's shards holding a tensor whose name starts with prefix,
+    and not with exclude (each a string or a tuple of them). exclude filters
+    an index's shards; a single model.safetensors is always the checkpoint's."""
     if "model.safetensors.index.json" in repo.files:
         index = models.read_json(repo.file("model.safetensors.index.json"))
         weights = index.get("weight_map")
@@ -231,9 +499,14 @@ def _weight_files(repo, prefix=""):
             raise models.ModelError("invalid safetensors shard index")
         if not all(isinstance(name, str) for name in weights.values()):
             raise models.ModelError("invalid safetensors shard filename")
-        names = {file for tensor, file in weights.items() if tensor.startswith(prefix)}
+        names = {
+            file
+            for tensor, file in weights.items()
+            if tensor.startswith(prefix)
+            and not (exclude and tensor.startswith(exclude))
+        }
     elif "model.safetensors" in repo.files:
-        # One file: its header says whether it holds such a tensor.
+        # One file: its header is read only to look for prefix.
         holds = not prefix or any(
             tensor.startswith(prefix)
             for tensor in _safetensors_tensors(repo, "model.safetensors")
@@ -241,11 +514,14 @@ def _weight_files(repo, prefix=""):
         names = {"model.safetensors"} if holds else set()
     else:
         raise models.ModelError("model has no safetensors checkpoint")
-    if not all(
-        name in repo.files and "/" not in name and name.endswith(".safetensors")
+    if unusable := sorted(
+        name
         for name in names
+        if name not in repo.files or "/" in name or not name.endswith(".safetensors")
     ):
-        raise models.ModelError("checkpoint has missing or unsupported shards")
+        raise models.ModelError(
+            "checkpoint has missing or unsupported shards: " + ", ".join(unusable)
+        )
     return names
 
 
@@ -254,8 +530,9 @@ def _safetensors_tensors(repo, name):
     little-endian), then a JSON object, read on demand, without a download."""
     with repo.open(name) as stream:
         size = int.from_bytes(stream.read(8), "little")
-        # The native checkpoint reader's bound on one header.
-        if not 2 <= size <= 1 << 20:
+        # The native checkpoint reader's bound on one header, the safetensors
+        # format's own.
+        if not 2 <= size <= 100_000_000:
             raise models.ModelError(f"invalid safetensors header in {name}")
         try:
             header = json.loads(stream.read(size))
@@ -283,19 +560,18 @@ def _validate_processor(config):
 
 
 def prepare(selection):
-    """Start selection's model, installing what it needs.
-
-    Every start resolves the target's revision, then the default branch of
-    its draft's repository, with one Hub request each (hub.Repository.resolve
-    decides when none is made). The installed assembly of those commits
-    starts; a new commit is installed and published atomically; when the Hub
-    cannot answer, or a new commit cannot be installed, the verified
-    installation starts instead. A legacy Splash package is installed by
-    legacy.prepare."""
+    """Start selection's model, installing what it needs: the installed
+    assembly of the resolved commits, or a new commit installed and published
+    atomically, or the verified installation when the Hub cannot answer or the
+    new commit cannot be installed; and return what it did (UPDATED and the
+    other outcomes). A Splash package is refused (models.refuse_package)."""
     kind = models.installation_kind(selection.link)
     if kind == models.PACKAGE:
-        legacy.prepare(selection)
-        return
+        models.refuse_package(
+            selection.model,
+            models.read_json(selection.link / "manifest.json"),
+            selection.link,
+        )
     installed = None
     if kind == models.ASSEMBLY:
         try:
@@ -309,38 +585,77 @@ def prepare(selection):
         installation=selection.link,
         installed=installed_commit,
     )
-    if installed is None and _is_legacy_package(target, selection.model):
-        legacy.prepare(selection)
-    elif installed is not None and target.revision == installed_commit:
-        _start_installed(selection, target, installed)
-    else:
-        _install_commit(selection, target, installed)
+    if installed is None and "manifest.json" in target.files:
+        with hub.as_model_errors(f"cannot install {selection.model}"):
+            manifest = models.read_json(target.file("manifest.json"))
+        models.refuse_package(selection.model, manifest)
+    if installed is not None and target.revision == installed_commit:
+        return _start_installed(selection, target, installed)
+    return _install_commit(selection, target, installed)
 
 
-def _is_legacy_package(repo, model):
-    """Whether the target repository is a legacy Splash package, whose
-    manifest.json names a package format."""
-    if "manifest.json" not in repo.files:
-        return False
-    with hub.as_model_errors(f"cannot install {model}"):
-        manifest = models.read_json(repo.file("manifest.json"))
-    return legacy.is_package_manifest(manifest)
+def remove(selection):
+    """Remove selection's installation, and what of its sources nothing else
+    uses, and return the bytes freed in the Hub cache: its selection link,
+    then its pins, and its assembly, which nothing links or holds any more,
+    with the files of its Hub snapshots no remaining installation links
+    (assembly.collect_garbage). The model alone takes every selection of it
+    (_selections_of). An installation a server holds is refused: it is
+    stopped first. Once a link is gone the model is removed, and what follows
+    only frees space: a failure is a warning, and the rest goes on."""
+    root = selection.models_root
+    with models.installation_lock(root):
+        if models.installation_kind(selection.link) != models.ASSEMBLY:
+            raise models.ModelError(f"{selection.model} is not installed in {root}")
+        links = _selections_of(selection)
+        if any(assembly.is_held(link.resolve()) for link in links):
+            raise models.ModelError(
+                f"{selection.model} is being served: stop it, then remove it"
+            )
+        for link in links:
+            # A record that cannot be read names no pins: its snapshots then
+            # keep their files, as another models root's do.
+            record = assembly.recorded(link)
+            link.unlink()
+            for path, _ in assembly.pins(record) if record else ():
+                with models.freeing():
+                    ref = hub.pinned(path, link)
+                    ref.unlink(missing_ok=True)
+                    with suppress(OSError):
+                        ref.parent.rmdir()
+        return assembly.collect_garbage(root)
+
+
+def _selections_of(selection):
+    """The selection links removing selection takes: its own, and for the
+    model alone, named without source options, every selection of that model.
+    A start with Text only or a draft of its own has a link no list shows,
+    whose files nothing could delete once the model's row is gone. Its own
+    comes last, so that a removal cut short can be asked for again."""
+    links = []
+    if not (selection.revision or selection.language_only or selection.draft_model):
+        links = [
+            link
+            for link in models.selection_links(selection.models_root)
+            if link != selection.link
+            and (record := assembly.recorded(link))
+            and record["model"] == selection.model
+        ]
+    return [*links, selection.link]
 
 
 def _start_installed(selection, target, installed):
     """Start the verified installation of the target's commit, assembled again
     first when its draft moved or this release changes it (_changes). The
     draft's repository is asked only when the Hub answered for the target, so
-    a commit revision holds its draft too. The installation's links name its
-    files; only assembling it again reads the commits' snapshots in the
-    current Hub cache."""
+    a commit revision holds its draft too. Only assembling it again reads the
+    Hub cache: the snapshots the installation links (assembly.source)."""
     if target.unreachable_reason:
         print(
             f"Could not reach the Hub ({target.unreachable_reason}); "
             f"using the installed {selection.repo_id}@{target.revision[:12]}.",
             flush=True,
         )
-    recorded = installed["sources"]["target"]
     family = families.named(installed["family"])
     draft = family and _resolve_draft(family, selection, installed, target)
     if draft and draft.unreachable_reason:
@@ -349,23 +664,30 @@ def _start_installed(selection, target, installed):
             f"using the installed draft {_at(draft)}.",
             flush=True,
         )
+    answered = _answered(target) and not (draft and draft.unreachable_reason)
     if changes := _changes(installed, family, draft):
         print(f"Updating {selection.model}: {'; '.join(changes)}.", flush=True)
-        with _keeping_installation(
-            selection, installed, f"update it ({'; '.join(changes)})"
+        if not _keeping_installation(
+            selection,
+            installed,
+            f"update it ({'; '.join(changes)})",
+            lambda: _install(
+                selection, assembly.source(installed, "target"), installed, draft
+            ),
         ):
-            _install(selection, hub.Repository.recorded(recorded), installed, draft)
-        return
+            return KEPT
+        return UPDATED if answered else UNREACHABLE
     if (replaced := _retain_installed(selection)) is None:
         print(
             f"Splash model {selection.model} is already installed in {selection.link}",
             flush=True,
         )
-        return
+        return UP_TO_DATE if answered else UNREACHABLE
     # A concurrent installation replaced or damaged the assembly after it was
     # verified: no verified installation is left to keep.
     print(f"Reinstalling {selection.model}: {replaced}", flush=True)
-    _install(selection, hub.Repository.recorded(recorded), installed, draft)
+    _install(selection, assembly.source(installed, "target"), installed, draft)
+    return UPDATED if answered else UNREACHABLE
 
 
 def _install_commit(selection, target, installed):
@@ -386,19 +708,22 @@ def _install_commit(selection, target, installed):
         )
     if installed is None:
         _install(selection, target, None)
-        return
-    with _keeping_installation(
-        selection, installed, f"install {selection.repo_id}@{target.revision}"
+    elif not _keeping_installation(
+        selection,
+        installed,
+        f"install {selection.repo_id}@{target.revision}",
+        lambda: _install(selection, target, installed),
     ):
-        _install(selection, target, installed)
+        return KEPT
+    return UPDATED if _answered(target) else UNREACHABLE
 
 
-@contextmanager
-def _keeping_installation(selection, installed, attempt):
-    """Run the block; if it fails, start the verified installation instead,
-    with a warning naming the attempt that failed."""
+def _keeping_installation(selection, installed, attempt, install):
+    """Run install(), and return whether it succeeded; if it fails, start
+    the verified installation instead, with a warning naming the attempt
+    that failed."""
     try:
-        yield
+        install()
     except (models.ModelError, OSError) as error:
         commit = installed["sources"]["target"]["revision"]
         models.warn(
@@ -407,6 +732,8 @@ def _keeping_installation(selection, installed, attempt):
         )
         if _retain_installed(selection) is not None:
             raise
+        return False
+    return True
 
 
 def _retain_installed(selection):
@@ -428,54 +755,103 @@ def _install(selection, repo, installed, draft=None):
     it, or None to resolve it here, asking the Hub only when it answered for
     repo."""
     # Every Hub request (header reads, downloads) happens here.
-    with hub.as_model_errors(f"cannot install {selection.model}"):
-        target = inspect_target(repo, selection.variant, selection.language_only)
-        family = families.family_for(target.config)
+    with (
+        hub.as_model_errors(f"cannot install {selection.model}"),
+        tempfile.TemporaryDirectory(prefix="splash-target-") as scratch,
+    ):
+        target = inspect_target(
+            repo, selection.variant, selection.language_only, Path(scratch)
+        )
         if draft is None:
-            draft = _resolve_draft(family, selection, installed, repo)
-        draft, files = _draft(family, installed, draft)
+            draft = _resolve_draft(target.family, selection, installed, repo)
+        draft, files = _draft(target, installed, draft)
+        vision = "disabled" if target.vision_format == "none" else "enabled"
         print(
-            f"Installing {selection.model} as {family.name} ({target.format}); "
-            f"draft {draft.name}; "
-            f"vision {'disabled' if selection.language_only else 'enabled'}.",
+            f"Installing {selection.model} as {target.family.name} ({target.format}); "
+            f"draft {draft.name}; vision {vision}.",
             flush=True,
         )
         downloaded = repo.download(set(target.files.values()))
     files |= {path: downloaded[name] for path, name in target.files.items()}
-    record = {
+    publish(
+        selection.models_root,
+        selection.link,
+        assembly_record(selection.model, target, repo, draft),
+        files,
+    )
+
+
+def assembly_record(model, target, repo, draft):
+    """The record of model's assembly of target, inspected in repo, and the
+    draft repository draft, but for the files it links (publish)."""
+    return {
         "version": 1,
-        "model": selection.model,
-        "family": family.name,
+        "model": model,
+        "family": target.family.name,
         "target_format": target.format,
         "vision_format": target.vision_format,
         "sources": {"target": repo.identity(), "draft": draft.identity()},
     }
-    models_root = selection.models_root
+
+
+def publish(models_root, link, record, files):
+    """Publish the assembly of record and files (assembly path -> source
+    file) at link, a selection link under models_root, and return it. A file
+    the assembly it replaces records, unchanged since, is not read again for
+    its digest (assembly.file_record); any other is read before the
+    installation lock is taken, which other installations and starting
+    servers wait for, and its record is taken again under the lock."""
     models_root.mkdir(parents=True, exist_ok=True)
+    # One record per linked file, however many assembly paths link it.
+    records = _file_records(assembly.recorded(link), set(files.values()))
     # Everything written under the models root is written under the lock.
     with models.installation_lock(models_root):
-        if target.format == "gguf":
-            record["metadata"], derived = assembly.derived_metadata(models_root, files)
-            files |= derived
-        # One record per linked file, however many assembly paths link it.
-        records = {path: assembly.file_record(path) for path in set(files.values())}
+        # The record of the assembly the link names, which this one replaces.
+        previous = assembly.recorded(link)
+        # A file changed since its record was taken is read again.
+        records = {
+            path: assembly.file_record(path, entry) for path, entry in records.items()
+        }
+        if record["target_format"] == "gguf":
+            record["metadata"], derived = assembly.derived_metadata(
+                models_root, files, records
+            )
+            files = files | derived
+            records |= _file_records(previous, derived.values())
         record["files"] = {name: records[path] for name, path in sorted(files.items())}
         # A new installation requires its pins before it is published; its
         # older pins are retired once it is, in the repositories the
         # assembly it replaces linked too.
         pins = [
-            hub.pin(snapshot, repo_id, selection.link)
+            hub.pin(snapshot, repo_id, link)
             for snapshot, repo_id in assembly.pins(record)
         ]
         replaced = [
-            hub.pinned(snapshot, selection.link)
-            for snapshot, _ in assembly.recorded_pins(selection.link)
+            hub.pinned(snapshot, link)
+            for snapshot, _ in (assembly.pins(previous) if previous else ())
         ]
-        models.link_selection(
-            selection.link, assembly.build(models_root, record, files)
-        )
+        published = assembly.build(models_root, record, files)
+        models.link_selection(link, published)
+        # Published: what follows only frees space; its failures are
+        # warnings. The assembly replaced goes once no server holds it, with
+        # the files of its snapshots the new one does not link, where nothing
+        # says another tool shares them.
         hub.retire_other_pins(pins, replaced)
-        assembly.collect_garbage(models_root)
+        assembly.collect_garbage(models_root, updating=True)
+    return published
+
+
+def _file_records(previous, paths):
+    """The record of each of paths (assembly.file_record), keeping the
+    digest previous, an assembly's record or None, holds of one unchanged
+    since."""
+    recorded = {}
+    for entry in previous["files"].values() if previous else ():
+        recorded[entry["path"]] = entry
+    return {
+        path: assembly.file_record(path, recorded.get(str(path.absolute())))
+        for path in paths
+    }
 
 
 def _changes(installed, family, draft):
@@ -502,12 +878,11 @@ def _changes(installed, family, draft):
 
 def _resolve_draft(family, selection, installed, target):
     """The draft's repository, --draft-model or else the family's DFlash2
-    release, at the commit its default branch names now: one Hub request, as
-    for the target, made only when the Hub answered for the target. Else the
-    installed draft stands in, unlisted, or without one a commit the Hub
-    cache holds for this selection; the installed draft also stands in, with
-    the reason, when the draft cannot be resolved."""
-    name = selection.draft_model or family.draft.repo
+    release, at its default branch's commit: one Hub request, made only when
+    the Hub answered for the target. Otherwise, or when it cannot be
+    resolved, the installed draft stands in; without one, a commit the Hub
+    cache holds, else it fails with the target's reason and class."""
+    name = selection.draft_model or family.draft_repo
     recorded = installed and installed["sources"]["draft"]
     asked = _answered(target)
     if recorded and not asked:
@@ -521,6 +896,7 @@ def _resolve_draft(family, selection, installed, target):
             unreachable=None
             if asked
             else target.unreachable_reason or "the Hub did not list the target",
+            unreachable_kind=target.unreachable_kind,
         )
     except models.ModelError as error:
         if not recorded:
@@ -533,16 +909,17 @@ def _resolve_draft(family, selection, installed, target):
         )
 
 
-def _draft(family, installed, draft):
+def _draft(target, installed, draft):
     """The draft repository and its downloaded files, by assembly path: draft,
     as this start resolved it, when it is not the installed draft, or else
     the installed one, which is kept too when draft cannot be fetched
-    (downloaded and checked)."""
+    (downloaded and checked for the target)."""
+    family = target.family
     recorded = installed and installed["sources"]["draft"]
     if draft.identity() != recorded:
         try:
             with hub.as_model_errors(f"cannot fetch the {family.name} draft"):
-                return draft, _draft_files(draft, family)
+                return draft, draft_files(draft, target)
         except models.ModelError as error:
             if not recorded:
                 raise
@@ -550,8 +927,8 @@ def _draft(family, installed, draft):
                 f"cannot use the {family.name} draft {_at(draft)}; "
                 f"keeping the installed one: {error}"
             )
-    repo = hub.Repository.recorded(recorded)
-    return repo, _draft_files(repo, family)
+    repo = assembly.source(installed, "draft")
+    return repo, draft_files(repo, target)
 
 
 def _answered(repo):
@@ -565,12 +942,13 @@ def _at(repo):
     return f"{repo.name}@{repo.revision[:12]}" if repo.revision else repo.name
 
 
-def _draft_files(repo, family):
-    """The family's DFlash2 checkpoint in repo, downloaded, by assembly path:
-    config.json and the safetensors weights, model.safetensors or the shards
-    its index names, at the root of the repository or --draft-model
-    directory, as a DFlash2 release holds them. Its configuration must state
-    the family's draft signature."""
+def draft_files(repo, target):
+    """The DFlash2 draft in repo for target's family, downloaded, by assembly
+    path: config.json, the safetensors weights and the mask embedding when
+    shipped (DRAFT_MASK_EMBEDDING), at the repository's root. The weights
+    download only once the engine accepts its configuration with the
+    target's (check_model)."""
+    family = target.family
     try:
         if "config.json" not in repo.files:
             raise models.ModelError("no config.json")
@@ -580,30 +958,20 @@ def _draft_files(repo, family):
             f"{repo.name} does not contain a DFlash2 checkpoint for {family.name}"
             f" ({error})"
         ) from error
-    config = models.read_json(repo.file("config.json"))
-    differences = [
-        f"{key} {_config_value(config, key)!r}, not {expected!r}"
-        for key, expected in family.draft.signature
-        if not _same(_config_value(config, key), expected)
-    ]
-    if differences:
-        raise models.ModelError(
-            f"draft configuration is incompatible with {family.name}: "
-            + "; ".join(differences)
+    config = repo.file("config.json")
+    try:
+        check_model(
+            target.format,
+            target.vision_format,
+            target.config,
+            gguf_headers=target.gguf_headers,
+            draft=config,
         )
-    downloaded = repo.download({"config.json", *weights})
+    except models.ModelError as error:
+        raise models.ModelError(
+            f"{repo.name}'s draft configuration is incompatible with {family.name}: "
+            f"{error}"
+        ) from error
+    mask = {DRAFT_MASK_EMBEDDING} & set(repo.files)
+    downloaded = repo.download({"config.json", *weights, *mask})
     return {"draft/" + name: path for name, path in downloaded.items()}
-
-
-def _config_value(config, key):
-    """config's value at a key dotted into its objects, lists as tuples, or
-    None."""
-    value = config
-    for part in key.split("."):
-        value = value.get(part) if isinstance(value, dict) else None
-    return tuple(value) if isinstance(value, list) else value
-
-
-def _same(value, expected):
-    """JSON equality that tells booleans from numbers."""
-    return value == expected and isinstance(value, bool) == isinstance(expected, bool)

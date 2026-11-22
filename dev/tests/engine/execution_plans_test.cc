@@ -1,41 +1,47 @@
+#include "TestChecks.hpp"
+#include "metal/abi/HyperConnection.h"
 #include "ops/ExecutionPlans.hpp"
+#include "ops/LaneRows.hpp"
 
 #include <algorithm>
 #include <array>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace {
 using namespace splash;
 using namespace splash::ops;
 
-void require(bool condition, const char *message) {
-  if (!condition) throw std::runtime_error(message);
-}
-template <typename Function> void rejects(Function function) {
-  bool rejected = false;
-  try { function(); }
-  catch (const std::invalid_argument &) { rejected = true; }
-  require(rejected, "invalid operator choice or lookup was accepted");
-}
+using splash::test::rejects;
+using splash::test::require;
 
+// The target attention shapes: query heads over a KV layout.
+struct AttentionShape final {
+  uint32_t queryHeads;
+  kv::Layout layout;
+};
 constexpr std::array attentionShapes{
-    AttentionShape{24, 4, 256}, AttentionShape{16, 2, 256}};
+    AttentionShape{24, {1, 4, 256}}, AttentionShape{16, {1, 2, 256}}};
 constexpr std::array draftShapes{
     DraftAttentionShape{5120, 1280, 6144, 4096, 32, 8, 128},
     DraftAttentionShape{2048, 512, 6144, 4096, 32, 8, 128}};
 constexpr MoeShape routedShape{2048, 256, 8, 512};
+// A decode step's most rows: four lanes of a verify block's most.
+constexpr uint32_t kStepRows = SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS;
+// A MoE target of F32 routers.
+constexpr uint32_t kRouterFormat = QuantizedSegment::kFloat32;
 constexpr std::array moeShapes{
     routedShape, MoeShape{768, 7, 3, 256}, MoeShape{256, 1, 1, 256}};
 constexpr std::array matrices{
     LinearMatrix{17408, 5120}, LinearMatrix{6144, 5120},
     LinearMatrix{6144, 2048}, LinearMatrix{512, 2048},
     LinearMatrix{768, 768}};
-// The affine gate/up projection of `matrix`, which gateUpWorkspace sizes.
-constexpr ProjectionShape affineGateUp(LinearMatrix matrix) {
-  return {matrix.outputSize, matrix.inputSize, WeightLayout::Affine64};
-}
+// The gate/up projection of `matrix`, which gateUpWorkspace sizes.
+constexpr ProjectionShape gateUp(LinearMatrix matrix) { return {matrix.outputSize, matrix.inputSize}; }
 constexpr std::array attentionFields{
     &AttentionWorkspace::partialsBytes, &AttentionWorkspace::statisticsBytes};
 constexpr std::array draftFields{
@@ -45,19 +51,25 @@ constexpr std::array draftFields{
     &DraftAttentionWorkspace::queryKeysBytes,
     &DraftAttentionWorkspace::queryValuesBytes};
 
-kv::Layout layout(AttentionShape shape, uint32_t layers = 1) {
-  return {layers, shape.kvHeads, shape.headDimension, shape.format};
+// A sequence of `rows` rows after `history` tokens, staged in whole KV
+// blocks, and decode lanes of 8 rows after each of `histories`.
+kv::ChunkedPrefillParams sequenceOf(uint32_t history, uint32_t rows) {
+  return PagedAttention::chunkParams(history, rows, (rows + 31) / 32 * 32, (history + rows + 31) / 32);
 }
+std::vector<kv::ChunkedPrefillParams> lanesAfter(std::span<const uint32_t> histories) {
+  std::vector<kv::ChunkedPrefillParams> lanes;
+  for (const uint32_t history : histories) lanes.push_back(sequenceOf(history, 8));
+  return lanes;
+}
+// The workspace of `lanes` lanes of `stride`'s each.
+AttentionWorkspace workspaceOf(AttentionWorkspace stride, uint32_t lanes) {
+  return {stride.partialsBytes * lanes, stride.statisticsBytes * lanes};
+}
+
 DeviceCapabilities device(uint32_t family = 10) {
   DeviceCapabilities value;
   value.appleGpuFamily = family;
   return value;
-}
-template <typename Workspace, size_t N>
-void equalWorkspace(const Workspace &actual, const Workspace &expected,
-                    const std::array<uint64_t Workspace::*, N> &fields) {
-  for (auto field : fields)
-    require(actual.*field == expected.*field, "workspace bound changed");
 }
 template <typename Workspace, size_t N>
 void covers(const Workspace &stride, const Workspace &needed, uint32_t lanes,
@@ -69,493 +81,297 @@ void covers(const Workspace &stride, const Workspace &needed, uint32_t lanes,
 
 void baselinePlans() {
   for (uint32_t family : {9U, 10U, 11U}) {
-    const ExecutionPlans plans(device(family));
-    const Linear baseline(device(family));
+    const ExecutionPlans plans(device(family), Int8Activations::On);
+    const Linear baseline(device(family), Int8Activations::On);
     for (auto matrix : matrices) {
       uint64_t gateBound = 0;
-      for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
+      for (uint32_t rows = 8; rows <= kMaximumDecodeTileRows; rows += 8) {
         for (auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
                               LinearEpilogue::GateUp}) {
-          const LinearWorkload w{matrix, lanes * 8, LinearPhase::Decode, epilogue};
+          const LinearWorkload w{matrix, rows, epilogue};
           require(plans.linear().plan(w).configuration() ==
                       baseline.plan(w).configuration(),
-                  "empty linear choices changed the device baseline");
+                  "the plans' decode Linear departed from the device policy");
           if (epilogue == LinearEpilogue::GateUp)
             gateBound = std::max(gateBound, baseline.plan(w).gateScratchBytes());
         }
       }
-      require(plans.gateUpWorkspace(affineGateUp(matrix)) == gateBound &&
-                  gateBound == (family == 9 ? 0 : uint64_t{32} * matrix.outputSize * 2),
-              "gate/up workspace disagrees with fused or decomposed baseline");
+      require(plans.gateUpWorkspace(gateUp(matrix), kMaximumDecodeTileRows) == gateBound &&
+                  gateBound == uint64_t{kMaximumDecodeTileRows} * matrix.outputSize * 2,
+              "gate/up workspace disagrees with the baseline's gate pass");
       for (uint32_t rows : {1U, 17U, 2048U})
         for (auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
                               LinearEpilogue::UpWithGate}) {
-          const LinearWorkload w{matrix, rows, LinearPhase::Prefill, epilogue};
+          const LinearWorkload w{matrix, rows, epilogue};
           require(plans.linear().plan(w).configuration() ==
                       baseline.plan(w).configuration(),
-                  "empty choices changed prefill baseline");
+                  "the plans' prefill Linear departed from the device policy");
         }
     }
-    for (auto shape : attentionShapes) {
-      const auto memory = plans.prefillAttentionWorkspace(2048, shape.queryHeads,
-                                                         layout(shape));
-      equalWorkspace(memory, PagedAttention::prefillWorkspace(
-                                 2048, shape.queryHeads, layout(shape)),
-                     attentionFields);
-      for (uint32_t rows = 1; rows <= 2048; ++rows) {
-        const auto selected = plans.prefillAttention(rows, shape.queryHeads,
-                                                     layout(shape), 2049);
-        const auto expected = PagedAttention::prefillPlan(rows, shape.queryHeads,
-                                                         layout(shape), 2049);
-        require(selected.configuration == expected.configuration &&
-                    selected.sameExecutionAs(expected),
-                "empty choices changed attention baseline");
-        covers(memory, selected.workspace, 1, attentionFields);
-      }
-      const auto stride = plans.verifyAttentionWorkspacePerLane(shape.queryHeads,
-                                                                layout(shape));
-      equalWorkspace(stride,
-                     PagedAttention::verifyWorkspace(1, shape.queryHeads, layout(shape)),
-                     attentionFields);
+    for (const auto &[queryHeads, kvLayout] : attentionShapes) {
+      const auto chunk = plans.sequenceAttentionWorkspace(queryHeads, kvLayout);
+      for (uint32_t rows = 1; rows <= 2048; ++rows)
+        for (const uint32_t history : {0U, 32768U, 1'000'000U}) {
+          const std::array sequence{sequenceOf(history, rows)};
+          covers(chunk, plans.attention(sequence, queryHeads, kvLayout, chunk).workspace(), 1, attentionFields);
+        }
+      const auto stride = plans.laneAttentionWorkspace(queryHeads, kvLayout);
       for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
         const std::array<uint32_t, 4> histories{0, 31, 2048, 8192};
-        const auto selected = plans.verifyAttention(lanes, shape.queryHeads,
-                                                    layout(shape), histories);
-        require(selected.splits == 32, "verify baseline changed");
-        require(selected.configuration == VerifyAttentionConfig{},
-                "verify baseline changed with GPU family");
-        covers(stride, selected.workspace, lanes, attentionFields);
+        const auto chunks = lanesAfter(std::span(histories).first(lanes));
+        const auto selected = plans.attention(chunks, queryHeads, kvLayout, workspaceOf(stride, lanes));
+        require(std::ranges::all_of(selected.sequences(), [](const auto &lane) { return lane.splits == 32; }) &&
+                    selected.dispatches().size() == 1,
+                "a decode step's lanes no longer attend in one dispatch of 32 splits");
+        covers(stride, selected.workspace(), lanes, attentionFields);
       }
       {
-        const std::array<uint32_t, 4> deep{131072, 0, 0, 0};
-        const auto scaled = plans.verifyAttention(1, shape.queryHeads,
-                                                  layout(shape), deep);
-        require(scaled.splits == kv::kQ8VerifyMaximumSplits &&
-                    scaled.laneSplits[0] == scaled.splits,
-                "verify splits did not scale with history");
-        covers(stride, scaled.workspace, 1, attentionFields);
+        const std::array<uint32_t, 1> deep{131072};
+        const auto scaled = plans.attention(lanesAfter(deep), queryHeads, kvLayout, stride);
+        require(scaled.sequences()[0].splits == kv::kAttentionMaximumSplits,
+                "a decode lane's splits did not scale with history");
+        covers(stride, scaled.workspace(), 1, attentionFields);
       }
     }
     for (auto shape : draftShapes) {
       const auto stride = plans.draftAttentionWorkspacePerLane(shape);
-      equalWorkspace(stride, DraftAttention::plan(shape, 1).workspace(),
-                     draftFields);
-      for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-        const auto selected = plans.draftAttention(shape, lanes);
-        require(selected.configuration() == DraftAttentionConfiguration{}, "draft baseline changed");
-        covers(stride, selected.workspace(), lanes, draftFields);
-      }
+      for (uint32_t lanes = 1; lanes <= 4; ++lanes)
+        covers(stride, plans.draftAttention(shape, lanes).workspace(), lanes, draftFields);
     }
     for (auto shape : moeShapes) {
-      const auto stride = plans.moeDecodeWorkspacePerLane(shape);
-      require(stride == plans.moeDecode(shape, 1).workspace(), "workspace bound changed");
-      const auto prefill = plans.moePrefillWorkspace(shape, 2048);
-      for (uint32_t rows = 1; rows <= 2048; ++rows)
-        covers(prefill, plans.moePrefill(shape, rows).workspace(), 1, kMoeWorkspaceFields);
+      // A bound holds the plan of every step up to its rows: a decode step's
+      // and a prompt chunk's.
+      for (const uint32_t most : {kStepRows, 2048U}) {
+        const auto bound = plans.moeWorkspace(shape, kRouterFormat, most);
+        for (uint32_t rows = 1; rows <= most; ++rows)
+          covers(bound, plans.moe(shape, kRouterFormat, rows).workspace(), 1, kMoeWorkspaceFields);
+      }
+      // A decode step's plan is its rows': 8-row tiles while they route at
+      // most once per expert, as the routed shape's 32 rows do and the tiny
+      // shapes' 8 do not.
       for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-        const auto selected = plans.moeDecode(shape, lanes);
-        require(selected.tileRows() == 8 &&
-                    selected.configuration().m8Simdgroups == moeDecodeSimdgroups(family),
+        const auto selected = plans.moe(shape, kRouterFormat, lanes * 8);
+        require(selected.tileRows() == (lanes * 8 * shape.expertsPerToken > shape.experts ? 32U : 8U),
                 "MoE decode baseline changed");
-        covers(stride, selected.workspace(), lanes, kMoeWorkspaceFields);
       }
     }
   }
 }
 
-// Apple9 decode plans run the four-simdgroup 8-row expert tiles; every other
-// family, and prefill on every family, keeps the shipped N128 x 8 tile. The
-// choice is the device's: candidates carry it and installed tables cannot
-// override it.
-void moeDeviceTiles() {
-  for (uint32_t family : {0U, 7U, 8U, 9U, 10U, 11U}) {
-    const auto expected = family == 9 ? MoeExpertSimdgroups::Four
-                                      : MoeExpertSimdgroups::Eight;
-    // Apple7/8 run the register affine expert tiles in both phases (as does
-    // an unknown family, which startup refuses).
-    const auto kernel = family < 9 ? MoeExpertKernel::Register : MoeExpertKernel::Mpp;
-    require(moeDecodeSimdgroups(family) == expected,
-            "decode expert simdgroups are not gated on GPU family 9");
-    ExecutionPlans plans(device(family));
-    for (auto shape : moeShapes) {
-      for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-        const MoeWorkload workload{shape, lanes * 8, MoePhase::Decode};
-        require(plans.moeDecode(shape, lanes).configuration().m8Simdgroups == expected &&
-                    plans.moeDecode(shape, lanes).configuration().kernel == kernel,
-                "MoE decode plan departed from the device tile policy");
-        for (const auto &candidate : plans.moeCandidates(workload)) {
-          require(candidate.configuration().m8Simdgroups == expected,
-                  "MoE decode candidate departed from the device tile policy");
-          OperatorChoices choices;
-          choices.moe.push_back({workload, candidate.configuration()});
-          choices.moe.back().configuration.m8Simdgroups =
-              expected == MoeExpertSimdgroups::Four ? MoeExpertSimdgroups::Eight
-                                                    : MoeExpertSimdgroups::Four;
-          plans.install(choices);
-          require(plans.moeDecode(shape, lanes).configuration() == candidate.configuration(),
-                  "installed MoE choice overrode the device tile policy");
-        }
-      }
-      for (uint32_t rows : {1U, 8U, 17U, 2048U}) {
-        require(plans.moePrefill(shape, rows).configuration().m8Simdgroups ==
-                        MoeExpertSimdgroups::Eight &&
-                    plans.moePrefill(shape, rows).configuration().kernel == kernel,
-                "MoE prefill plan left the shipped expert tile");
-        for (const auto &candidate : plans.moeCandidates({shape, rows, MoePhase::Prefill}))
-          require(candidate.configuration().m8Simdgroups == MoeExpertSimdgroups::Eight,
-                  "MoE prefill candidate left the shipped expert tile");
-      }
-    }
+// The int8-activation setting reaches every selection that reads it and
+// leaves the device's row as measured: on, Apple10 and Apple11 run an af4g64
+// projection's 2048-row chunk on the int8 prefill tile and score INT8 queries
+// in a 64-row chunk after 32K tokens (33 pages a split) and in a verify after
+// 128K; off, no family does. kernel-selection checks every plan.
+void int8ActivationsSetting() {
+  const Projection af4(5120, 17408,
+                       BlockWeights{{QuantizedSegment::planes(GGUF_FMT_AF4G64, 5120, 17408, {}, {}, {})}});
+  const kv::Layout layout{1, 2, 256};
+  const std::array<uint32_t, 1> history{131072};
+  const auto int8Queries = [](const std::string &pipeline) { return pipeline.find("q8q") != std::string::npos; };
+  for (uint32_t family : {9U, 10U, 11U}) {
+    const ExecutionPlans on(device(family), Int8Activations::On), off(device(family), Int8Activations::Off);
+    const ProjectionCalibration &row = on.calibration().projection, &offRow = off.calibration().projection;
+    require(on.linear().int8Activations() == Int8Activations::On &&
+                off.linear().int8Activations() == Int8Activations::Off && row.prefillInt8 == (family >= 10) &&
+                offRow.prefillInt8 == row.prefillInt8 && offRow.decodeInt8FromRows == row.decodeInt8FromRows &&
+                off.calibration().attention.int8QueriesFromPages == on.calibration().attention.int8QueriesFromPages,
+            "the int8-activation setting did not reach the plans' Linear, or moved the device's row");
+    const bool int8 = family >= 10;
+    const auto tile = [&](const ExecutionPlans &plans) {
+      return plans.linear().plan(af4, 2048, LinearEpilogue::Residual).configuration().tile;
+    };
+    require(tile(on) == (int8 ? LinearTile::GgufPrefillInt8 : LinearTile::GgufPrefill) &&
+                tile(off) == LinearTile::GgufPrefill,
+            "the int8 prefill tile does not follow the int8-activation setting");
+    const auto queries = [&](const ExecutionPlans &plans, kv::ChunkedPrefillParams sequence) {
+      const std::array sequences{sequence};
+      const auto plan = plans.attention(sequences, 16, layout,
+                                        plans.sequenceAttentionWorkspace(16, layout));
+      return int8Queries(plan.splitPipeline());
+    };
+    require(queries(on, sequenceOf(32768, 64)) == int8 && !queries(off, sequenceOf(32768, 64)) &&
+                queries(on, sequenceOf(history[0], 8)) == int8 && !queries(off, sequenceOf(history[0], 8)),
+            "INT8 attention queries do not follow the int8-activation setting");
   }
 }
 
-// Apple7/8 prefill and verify attention run the register tile over INT8 KV whatever
-// split configuration is installed; BF16 KV and newer families keep MPP.
-void attentionDeviceTiles() {
-  for (uint32_t family : {7U, 8U, 9U, 10U}) {
-    const auto expected = family < 9 ? AttentionTile::Register
-                                     : AttentionTile::Mpp;
-    ExecutionPlans plans(device(family));
-    for (auto shape : attentionShapes) {
-      const std::array<uint32_t, 4> histories{31, 2048, 131072, 0};
-      for (auto config : PagedAttention::verifyCandidates()) {
-        OperatorChoices choices;
-        choices.verifyAttention.push_back({{shape, 3}, config});
-        plans.install(choices);
-        const auto selected =
-            plans.verifyAttention(3, shape.queryHeads, layout(shape), histories);
-        auto resolved = config;
-        resolved.tile = expected;
-        require(selected.configuration == resolved,
-                "verify plan departed from the device attention tile");
-        require(selected.sameExecutionAs(PagedAttention::verifyPlan(
-                    3, shape.queryHeads, layout(shape), histories, resolved)),
-                "device verify tile changed the installed split partition");
-        const kv::Layout bf16{1, shape.kvHeads, 256, kv::Format::BFloat16};
-        require(plans.verifyAttention(3, shape.queryHeads, bf16, histories)
-                        .configuration.tile == AttentionTile::Mpp,
-                "BF16 KV left the MPP verify tile");
+// A DFlash2 draft's plans (draftLinear) keep bf16 activations, int8
+// activations on or off: the 27B draft's context projection, prepared af4g64,
+// prefills a full chunk on the bf16 prefill tile where the target's plans
+// would take the int8 one, its shorter chunks and its decode steps on the
+// target's plans.
+void draftPlans() {
+  const Projection context(5120, 25600,
+                           BlockWeights{{QuantizedSegment::planes(GGUF_FMT_AF4G64, 5120, 25600, {}, {}, {})}});
+  for (uint32_t family : {9U, 10U, 11U})
+    for (const Int8Activations setting : {Int8Activations::On, Int8Activations::Off}) {
+      const ExecutionPlans plans(device(family), setting);
+      const Linear &draft = plans.draftLinear(), &target = plans.linear();
+      require(draft.int8Activations() == Int8Activations::Off, "a draft's plans took int8 activations");
+      for (uint32_t rows : {1U, 64U, 2048U}) {
+        const LinearConfig own = draft.plan(context, rows, LinearEpilogue::None).configuration(),
+                           targets = target.plan(context, rows, LinearEpilogue::None).configuration();
+        const bool int8 = family >= 10 && setting == Int8Activations::On && rows == 2048;
+        require((targets.tile == LinearTile::GgufPrefillInt8) == int8 &&
+                    own == (int8 ? LinearConfig{.tile = LinearTile::GgufPrefill} : targets),
+                "a draft's prefill chunk took the int8 prefill tile or left the target's bf16 plan");
       }
-      for (auto config : PagedAttention::prefillCandidates()) {
-        OperatorChoices choices;
-        choices.prefillAttention.push_back({{shape, 2048}, config});
-        plans.install(choices);
-        const auto selected =
-            plans.prefillAttention(2048, shape.queryHeads, layout(shape), 131072);
-        auto resolved = config;
-        resolved.tile = expected;
-        require(selected.configuration == resolved,
-                "prefill plan departed from the device attention tile");
-        require(selected.sameExecutionAs(PagedAttention::prefillPlan(
-                    2048, shape.queryHeads, layout(shape), 131072, resolved)),
-                "device prefill tile changed the installed split partition");
-        const kv::Layout bf16{1, shape.kvHeads, 256, kv::Format::BFloat16};
-        require(plans.prefillAttention(2048, shape.queryHeads, bf16, 131072)
-                        .configuration.tile == AttentionTile::Mpp,
-                "BF16 KV left the MPP prefill tile");
-      }
+      for (uint32_t lanes = 1; lanes <= 4; ++lanes)
+        require(draft.plan(context, lanes * SPLASH_DRAFT_QUERY_ROWS).configuration() == target.plan(context, lanes * SPLASH_DRAFT_QUERY_ROWS).configuration(),
+                "a draft's decode plan departed from the target's");
     }
-  }
 }
 
-// GGUF MoE plans (Block32 weights) run the three expert passes: the
-// exact register tile on Apple9, with its Table16 row sums in the workspace
-// bounds, staged tiles everywhere else (32-row tiles for prefill chunks past
-// one route per expert), and no installed choices.
+// MoE plans run the three expert passes on staged tiles on every GPU, on the
+// MMA kernels below Apple9: 8-row tiles while a step's routes average at most
+// one row per expert, as a decode step's of up to four lanes do, 32-row tiles
+// past that.
 void ggufMoePlans() {
-  MoeShape shape = routedShape;
-  shape.weightLayout = WeightLayout::Block32;
-  for (uint32_t family : {0U, 7U, 9U, 10U, 11U}) {
-    ExecutionPlans plans(device(family));
-    // Below Apple9 the staged tiles' plans run on the MMA kernels.
-    const MoeGgufTile stagedTile = family < 9 ? MoeGgufTile::Mma : MoeGgufTile::Staged;
-    const MoeGgufTile expected = family == 9 ? MoeGgufTile::Register : stagedTile;
-    require(moeGgufTile(family, shape) == expected, "GGUF expert tile is not gated on GPU family 9");
-    // GGUF plans are not tuned: a table may not hold a choice for them.
-    OperatorChoices choices;
-    choices.moe.push_back({MoeWorkload{shape, 16, MoePhase::Decode}, MoeConfig{MoeExpertTile::M8}});
-    rejects([&] { plans.install(choices); });
+  const MoeShape shape = routedShape;
+  // A GPU family, the cores its device reports (none: kAssumedGpuCores) and its tile.
+  struct Device final {
+    uint32_t family, reportedCores;
+    MoeGgufTile expected;
+  };
+  for (const auto [family, reportedCores, expected] :
+       {Device{7, 0, MoeGgufTile::Mma}, Device{8, 0, MoeGgufTile::Mma}, Device{9, 0, MoeGgufTile::Staged},
+        Device{9, 11, MoeGgufTile::Staged}, Device{9, 10, MoeGgufTile::Staged}, Device{10, 0, MoeGgufTile::Staged},
+        Device{11, 0, MoeGgufTile::Staged}}) {
+    DeviceCapabilities capabilities = device(family);
+    capabilities.gpuCoreCount = reportedCores;
+    ExecutionPlans plans(capabilities, Int8Activations::On);
+    require(plans.moe(shape, kRouterFormat, 8).configuration().ggufTile == expected,
+            "GGUF expert tile is not the MMA tile below Apple9 and the staged tile from it");
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-      const MoePlan plan = plans.moeDecode(shape, lanes);
-      require(plan.configuration().ggufTile == expected && plan.tileRows() == 8 && plan.splitExperts() &&
-                  plan.configuration().ggufRouterTile == FloatTile::Simdgroup,
-              "GGUF MoE decode plan left its device tile");
-      for (const MoePlan &candidate : plans.moeCandidates({shape, lanes * 8, MoePhase::Decode}))
-        require(candidate.configuration() == plan.configuration(), "GGUF MoE decode candidate is not the device's plan");
-      // Sums of the widest input (hidden, 3 K / 4 fp32) per 8-row tile.
-      require(plan.workspace().groupedSumsBytes ==
-                  (expected == MoeGgufTile::Register ? uint64_t{plan.maximumTiles()} * 2048 * 3 : 0),
-              "GGUF register plan sums its Table16 tiles");
-      covers(plans.moeDecodeWorkspacePerLane(shape), plan.workspace(), lanes, kMoeWorkspaceFields);
-      require(plans.moeDecode(routedShape, lanes).configuration().ggufTile == MoeGgufTile::Staged &&
-                  plans.moeDecode(routedShape, lanes).workspace().groupedSumsBytes == 0,
-              "affine MoE plan took the GGUF register tile");
+      const MoePlan plan = plans.moe(shape, kRouterFormat, lanes * 8);
+      require(plan.tileRows() == 8 && plan.configuration().ggufRouterTile == FloatTile::Simdgroup,
+              "GGUF MoE decode plan left its 8-row tiles");
+      covers(plans.moeWorkspace(shape, kRouterFormat, kStepRows), plan.workspace(), 1, kMoeWorkspaceFields);
     }
-    // Apple9 stages experts mostly in a format it stages (IQ2_XS: UD-Q2_K_XL)
-    // and keeps the register tile for the others (Q4_K: UD-Q4_K_M).
-    MoeShape staged = shape, q4k = shape;
-    staged.expertFormat = GGUF_FMT_IQ2XS;
-    q4k.expertFormat = GGUF_FMT_Q4K;
-    require(moeGgufTile(family, staged) == stagedTile && moeGgufTile(family, q4k) == expected,
-            "GGUF expert tile does not follow the experts' format on GPU family 9");
-    for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-      const MoePlan plan = plans.moeDecode(staged, lanes);
-      require(plan.configuration().ggufTile == stagedTile && plan.workspace().groupedSumsBytes == 0,
-              "GGUF MoE plan of staged experts took the register tile");
-      covers(plans.moeDecodeWorkspacePerLane(staged), plan.workspace(), lanes, kMoeWorkspaceFields);
+    // Prefill: 8-row tiles while the routes average at most one row per
+    // expert (32 rows of 8 of 256 experts). The router's float tile follows
+    // selectFloatTile and the router's format (32 assumed cores: the neural
+    // accelerator from 321 rows of BF16 values, 449 of F32 values and 705 of
+    // a quantized format's rows, never on Apple9).
+    for (const auto [routerFormat, first] :
+         {std::pair{uint32_t{GGUF_FMT_BF16}, 321U}, std::pair{QuantizedSegment::kFloat32, 449U},
+          std::pair{uint32_t{GGUF_FMT_AF8G64}, 705U}}) {
+      const MoeWorkspace bound = plans.moeWorkspace(shape, routerFormat, 2048);
+      for (uint32_t rows : {1U, 8U, 17U, 32U, 33U, 100U, 256U, 257U, 320U, 321U, 448U, 449U, 704U, 705U, 2048U}) {
+        const MoePlan plan = plans.moe(shape, routerFormat, rows);
+        const FloatTile router = family >= 10 && rows >= first ? FloatTile::NeuralAccelerator : FloatTile::Simdgroup;
+        require(plan.tileRows() == (rows <= 32 ? 8U : 32U) && plan.configuration().ggufRouterTile == router &&
+                    plan.configuration().ggufTile == expected,
+                "GGUF MoE prefill plan left its tiles");
+        covers(bound, plan.workspace(), 1, kMoeWorkspaceFields);
+      }
     }
-    // Prefill: the register tile's 8 rows, or staged 8-row tiles while the
-    // routes average at most one row per expert (32 rows of 8 of 256
-    // experts). The router's float tile follows Linear::ggufFloatTile (32
-    // assumed cores: the neural accelerator from 321 rows, only from Apple10).
-    for (uint32_t rows : {1U, 8U, 17U, 32U, 33U, 100U, 256U, 257U, 320U, 321U, 2048U}) {
-      const MoePlan plan = plans.moePrefill(shape, rows);
-      const uint32_t tileRows = expected == MoeGgufTile::Register || rows <= 32 ? 8 : 32;
-      const FloatTile router = family >= 10 && rows > 320 ? FloatTile::NeuralAccelerator : FloatTile::Simdgroup;
-      require(plan.configuration().ggufTile == expected && plan.tileRows() == tileRows && plan.splitExperts() &&
-                  (plan.workspace().groupedSumsBytes > 0) == (expected == MoeGgufTile::Register) &&
-                  plan.configuration().ggufRouterTile == router,
-              "GGUF MoE prefill plan left the device's tile");
-      covers(plans.moePrefillWorkspace(shape, 2048), plan.workspace(), 1, kMoeWorkspaceFields);
-      for (const MoePlan &candidate : plans.moeCandidates({shape, rows, MoePhase::Prefill}))
-        require(candidate.configuration() == plan.configuration(), "GGUF MoE prefill candidate is not the device's plan");
-    }
-    // The prefill bound holds the device's plans and nothing else: on Apple9
-    // the register tile's 8-row tiles (20480 grouped rows at 2048 rows), not
-    // the staged 32-row tiles it never runs (26624).
+    // The prefill bound is the bound of the device's plans: from 33 rows
+    // their 32-row tiles (26624 grouped rows at 2048 rows).
     MoeWorkspace devicePlans;
     for (uint32_t rows = 1; rows <= 2048; ++rows) {
-      const MoeWorkspace workspace = plans.moePrefill(shape, rows).workspace();
+      const MoeWorkspace workspace = plans.moe(shape, kRouterFormat, rows).workspace();
       for (const auto field : kMoeWorkspaceFields) devicePlans.*field = std::max(devicePlans.*field, workspace.*field);
     }
-    require(plans.moePrefillWorkspace(shape, 2048) == devicePlans,
+    require(plans.moeWorkspace(shape, kRouterFormat, 2048) == devicePlans,
             "GGUF MoE prefill bound is not the bound of the device's plans");
   }
-  // The register tile reads GGUF 8-row tiles only.
-  rejects([&] { (void)MoE::decodePlan(routedShape, 1, {MoeExpertTile::M8, kMoeRouteWideRows,
-                                                       MoeExpertSimdgroups::Eight, MoeGgufTile::Register}); });
-  rejects([&] { (void)MoE::decodePlan(shape, 1, {MoeExpertTile::M32, kMoeRouteWideRows,
-                                                 MoeExpertSimdgroups::Eight, MoeGgufTile::Register}); });
-  // GGUF kernels exist for 8-row tiles and 32-row prefill tiles only.
-  rejects([&] { (void)MoE::decodePlan(shape, 1, {MoeExpertTile::M32}); });
 }
 
-void allCandidates() {
-  ExecutionPlans plans(device());
-  const ExecutionPlans shipped(device());
-  const Linear baseline(device());
-  for (auto matrix : matrices) {
-    for (uint32_t rows : {1U, 17U, 2048U, 8U, 16U, 24U, 32U}) {
-      const auto phase = rows == 1 || rows == 17 || rows == 2048
-                             ? LinearPhase::Prefill : LinearPhase::Decode;
-      for (auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual,
-                            phase == LinearPhase::Prefill
-                                ? LinearEpilogue::UpWithGate
-                                : LinearEpilogue::GateUp}) {
-        const LinearWorkload w{matrix, rows, phase, epilogue};
-        for (const auto &candidate : baseline.candidates(w)) {
-          OperatorChoices choices;
-          choices.linear.push_back({w, candidate.configuration()});
-          plans.install(choices);
-          const auto selected = plans.linear().plan(w);
-          require(selected.configuration() == candidate.configuration() &&
-                      selected.pipeline() == candidate.pipeline() &&
-                      selected.threadsPerThreadgroup() == candidate.threadsPerThreadgroup(),
-                  "linear candidate configuration/pipeline/scope not selected together");
-          if (candidate.configuration().simdgroups == LinearSimdgroups::Four) {
-            const auto original = shipped.linear().plan(w);
-            require(selected.storageRows() == original.storageRows() &&
-                        selected.sumsBytes() == original.sumsBytes() &&
-                        selected.gateScratchBytes() == original.gateScratchBytes() &&
-                        selected.downSumsBytes() == original.downSumsBytes() &&
-                        plans.gateUpWorkspace(affineGateUp(matrix)) == shipped.gateUpWorkspace(affineGateUp(matrix)),
-                    "four-SIMDgroup choice changed an external workspace requirement");
-          }
-          require(plans.gateUpWorkspace(affineGateUp(matrix)) >= candidate.gateScratchBytes() ||
-                      phase == LinearPhase::Prefill,
-                  "gate scratch omitted a selected decode width");
+// A dense tile of a sequence of more than one tile takes a history split per
+// the device's pages per split (KernelCalibration.hpp): one per 64 pages on
+// Apple9 GPUs of 10 cores or fewer, one per 32 elsewhere. Qwen3.6-35B-A3B's
+// attention: a 512-row chunk after 4K tokens (144 pages), at most 4 splits a
+// tile of its 64, and a 64-row chunk after 32K (1026 pages), at most 32.
+void prefillSplitsFollowTheDeviceRow() {
+  const kv::Layout layout{1, 2, 256};
+  struct Expected final {
+    uint32_t rows, history, small, other;
+  };
+  for (const auto [rows, history, small, other] : {Expected{512, 4096, 2, 4}, Expected{64, 32768, 16, 32}})
+    for (const auto [family, cores] : {std::pair{9U, 10U}, {9U, 1U}, {9U, 11U}, {9U, 40U}, {10U, 12U}, {10U, 32U}}) {
+      DeviceCapabilities capabilities = device(family);
+      capabilities.gpuCoreCount = cores;
+      const ExecutionPlans plans(capabilities, Int8Activations::On);
+      const std::array sequence{sequenceOf(history, rows)};
+      const uint32_t splits =
+          plans.attention(sequence, 16, layout, plans.sequenceAttentionWorkspace(16, layout))
+              .sequences()[0]
+              .splits;
+      require(splits == (family == 9 && cores <= 10 ? small : other),
+              "a prefill attention plan of family " + std::to_string(family) + ", " + std::to_string(cores) +
+                  " cores took " + std::to_string(splits) + " splits");
+    }
+}
+
+// A device that reports no core count gets the plans of kAssumedGpuCores
+// cores, Linear and MoE alike.
+void unknownCoreCount() {
+  for (uint32_t family : {9U, 10U}) {
+    DeviceCapabilities assumed = device(family);
+    assumed.gpuCoreCount = DeviceCapabilities::kAssumedGpuCores;
+    const ExecutionPlans unknown(device(family), Int8Activations::On), planned(assumed, Int8Activations::On);
+    for (auto matrix : matrices)
+      for (uint32_t lanes = 1; lanes <= 4; ++lanes)
+        for (auto epilogue : {LinearEpilogue::None, LinearEpilogue::Residual, LinearEpilogue::GateUp}) {
+          const LinearWorkload w{matrix, lanes * 8, epilogue};
+          require(unknown.linear().plan(w).configuration() == planned.linear().plan(w).configuration(),
+                  "an unknown core count planned a decode projection for other than the assumed cores");
         }
-      }
-    }
-  }
-  for (auto shape : attentionShapes) {
-    for (uint32_t rows : {1U, 9U, 17U, 2048U}) {
-      for (auto config : PagedAttention::prefillCandidates()) {
-        OperatorChoices choices;
-        choices.prefillAttention.push_back({{shape, rows}, config});
-        plans.install(choices);
-        const auto selected = plans.prefillAttention(rows, shape.queryHeads,
-                                                     layout(shape), 2049);
-        require(selected.configuration == config, "prefill candidate not selected");
-        covers(plans.prefillAttentionWorkspace(2048, shape.queryHeads, layout(shape)),
-               selected.workspace, 1, attentionFields);
-      }
-    }
-    for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-      std::array<uint32_t, 4> histories{};
-      for (uint32_t lane = 0; lane < lanes; ++lane) histories[lane] = 31 + lane;
-      for (auto config : PagedAttention::verifyCandidates()) {
-        OperatorChoices choices;
-        choices.verifyAttention.push_back({{shape, lanes}, config});
-        plans.install(choices);
-        const auto selected = plans.verifyAttention(lanes, shape.queryHeads,
-                                                    layout(shape), histories);
-        require(selected.configuration == config, "verify candidate not selected");
-        covers(plans.verifyAttentionWorkspacePerLane(shape.queryHeads, layout(shape)),
-               selected.workspace, lanes, attentionFields);
-      }
-    }
-  }
-  for (auto shape : draftShapes)
     for (uint32_t lanes = 1; lanes <= 4; ++lanes)
-      for (auto config : DraftAttention::candidates(shape)) {
-        OperatorChoices choices;
-        choices.draftAttention.push_back({{shape, lanes}, config});
-        plans.install(choices);
-        const auto selected = plans.draftAttention(shape, lanes);
-        require(selected.configuration() == config, "draft candidate not selected");
-        covers(plans.draftAttentionWorkspacePerLane(shape), selected.workspace(),
-               lanes, draftFields);
-      }
-  for (auto shape : moeShapes) {
-    for (uint32_t rows : {1U, 17U, 2048U})
-      for (const auto &candidate : plans.moeCandidates({shape, rows, MoePhase::Prefill})) {
-        OperatorChoices choices;
-        choices.moe.push_back({{shape, rows, MoePhase::Prefill}, candidate.configuration()});
-        plans.install(choices);
-        require(plans.moePrefill(shape, rows).configuration() == candidate.configuration(),
-                "MoE prefill candidate not selected");
-        covers(plans.moePrefillWorkspace(shape, 2048), candidate.workspace(), 1,
-               kMoeWorkspaceFields);
-      }
-    for (uint32_t lanes = 1; lanes <= 4; ++lanes)
-      for (const auto &candidate : plans.moeCandidates({shape, lanes * 8, MoePhase::Decode})) {
-        OperatorChoices choices;
-        choices.moe.push_back({{shape, lanes * 8, MoePhase::Decode}, candidate.configuration()});
-        plans.install(choices);
-        require(plans.moeDecode(shape, lanes).configuration() == candidate.configuration(),
-                "MoE decode candidate not selected");
-        covers(plans.moeDecodeWorkspacePerLane(shape), candidate.workspace(), lanes,
-               kMoeWorkspaceFields);
-      }
+      require(unknown.moe(routedShape, kRouterFormat, lanes * 8).configuration() ==
+                  planned.moe(routedShape, kRouterFormat, lanes * 8).configuration(),
+              "an unknown core count planned a MoE decode step for other than the assumed cores");
   }
 }
 
-OperatorChoices mixedChoices() {
-  OperatorChoices choices;
-  choices.linear.push_back({{matrices[0], 8, LinearPhase::Decode,
-                              LinearEpilogue::GateUp}, {LinearTile::N256, 60}});
-  choices.prefillAttention.push_back({{attentionShapes[0]},
-                                      {PrefillSplitMultiplier::Two}});
-  choices.verifyAttention.push_back({{attentionShapes[0], 3},
-                                     {VerifySplitCount::One}});
-  choices.draftAttention.push_back({{draftShapes[0], 3}, {32}});
-  choices.moe.push_back({{routedShape, 24, MoePhase::Decode}, {MoeExpertTile::M32}});
-  choices.moe.push_back({{routedShape, 9, MoePhase::Prefill}, {MoeExpertTile::M8}});
-  return choices;
+// Apple7/8 run the injecting hyper-connection norm on the staged kernel while
+// its rows fit in three quarters of the cores; other families never do.
+void hyperNormPlans() {
+  // A GPU family, the cores its device reports (none: kAssumedGpuCores) and
+  // the most rows it stages.
+  struct Device final {
+    uint32_t family, reportedCores, stagedRows;
+  };
+  for (const auto [family, reportedCores, stagedRows] :
+       {Device{7, 38, 28}, Device{8, 38, 28}, Device{8, 10, 7}, Device{8, 0, DeviceCapabilities::kAssumedGpuCores * 3 / 4},
+        Device{9, 38, 0}, Device{10, 38, 0}}) {
+    DeviceCapabilities capabilities = device(family);
+    capabilities.gpuCoreCount = reportedCores;
+    const ExecutionPlans plans(capabilities, Int8Activations::On);
+    for (uint32_t r = 1; r <= HYPER_CONNECTION_NORM_QUARTER_ROWS; ++r)
+      require(plans.hyperNormStaged(r) == (r <= stagedRows),
+              "the staged hyper norm is not gated on Apple7/8 and three quarters of the cores");
+  }
 }
 
-void requireMixed(const ExecutionPlans &plans) {
-  require(plans.linear().plan(mixedChoices().linear[0].workload).configuration() ==
-              LinearConfig{LinearTile::N256, 60}, "linear table was partially replaced");
-  require(plans.prefillAttention(2048, 24, layout(attentionShapes[0]), 2049).configuration.splitMultiplier ==
-              PrefillSplitMultiplier::Two,
-          "prefill table was partially replaced");
-  const std::array<uint32_t, 3> histories{31, 32, 2049};
-  const auto verify = plans.verifyAttention(3, 24, layout(attentionShapes[0]), histories);
-  require(verify.configuration.splitCount == VerifySplitCount::One &&
-              verify.laneSplits[0] == 1 &&
-              verify.laneSplits[2] == kv::q8VerifyAttentionSplits(1, 2049, 8),
-          "verify table was partially replaced");
-  require(plans.draftAttention(draftShapes[0], 3).configuration().groups == 32,
-          "draft table was partially replaced");
-  require(plans.moeDecode(routedShape, 3).tileRows() == 32 &&
-              plans.moePrefill(routedShape, 9).tileRows() == 8,
-          "MoE table was partially replaced");
-}
-
-void policyKeysAndBounds() {
-  ExecutionPlans plans(device());
-  auto choices = mixedChoices();
-  // Deliberately unsorted: each shape has an exact 2048-row selection.
-  choices.prefillAttention.push_back({{attentionShapes[1]},
-                                      {PrefillSplitMultiplier::Two}});
-  plans.install(choices);
-  requireMixed(plans);
-  const kv::Layout bf16{1, 4, 256, kv::Format::BFloat16};
-  const std::array<uint32_t, 3> bf16Histories{31, 32, 2049};
-  require(plans.prefillAttention(2048, 24, bf16, 2049).configuration ==
-              PrefillAttentionConfig{} &&
-              plans.verifyAttention(3, 24, bf16, bf16Histories).configuration ==
-              VerifyAttentionConfig{},
-          "INT8 calibration leaked into the BF16 policy");
-  require(!plans.prefillAttention(2048, 24, bf16, 2049).sameExecutionAs(
-              plans.prefillAttention(2048, 24, layout(attentionShapes[0]), 2049)),
-          "different cache formats aliased the same execution plan");
-  require(plans.prefillAttention(2048, 24, layout(attentionShapes[0], 64), 0).sameExecutionAs(
-              plans.prefillAttention(2048, 24, layout(attentionShapes[0]), 0)),
-          "layer count leaked into one-layer plan identity");
-  for (uint32_t history : {1U, 31U, 32U, 33U, 2047U, 2048U, 2050U, 131079U})
-    require(plans.prefillAttention(2048, 24, layout(attentionShapes[0]), history).configuration.splitMultiplier ==
-                PrefillSplitMultiplier::Two,
-            "prefill policy was restricted to sampled exact histories");
-  equalWorkspace(plans.prefillAttentionWorkspace(17, 24, layout(attentionShapes[0])),
-                 PagedAttention::prefillWorkspace(17, 24, layout(attentionShapes[0])),
-                 attentionFields);
-  for (const auto shape : attentionShapes)
-    for (uint32_t rows = 1; rows <= 2048; ++rows) {
-      const auto selected = plans.prefillAttention(rows, shape.queryHeads, layout(shape), 131079);
-      const auto bound = plans.prefillAttentionWorkspace(rows, shape.queryHeads, layout(shape));
-      covers(bound, selected.workspace, 1, attentionFields);
-      const auto baseline = PagedAttention::prefillPlan(rows, shape.queryHeads, layout(shape), 131079);
-      if (rows < 2048) {
-        require(selected.configuration == PrefillAttentionConfig{} &&
-                    selected.sameExecutionAs(baseline),
-                "fixed-chunk attention selection changed shorter or ragged rows");
-        equalWorkspace(bound, PagedAttention::prefillWorkspace(rows, shape.queryHeads, layout(shape)),
-                       attentionFields);
-      } else {
-        require(selected.configuration.splitMultiplier == PrefillSplitMultiplier::Two &&
-                    !selected.sameExecutionAs(baseline),
-                "fixed-chunk attention selection did not reach its exact row key");
-        equalWorkspace(bound, PagedAttention::prefillWorkspace(
-                                  rows, shape.queryHeads, layout(shape),
-                                  {PrefillSplitMultiplier::Two}),
-                       attentionFields);
-        require(bound.partialsBytes >= selected.workspace.partialsBytes &&
-                    bound.statisticsBytes >= selected.workspace.statisticsBytes,
-                "fixed-chunk arena omitted selected scratch or its baseline fallback");
-      }
-    }
-  std::array<uint32_t, 4> histories{31, 32, 2049, std::numeric_limits<uint32_t>::max()};
-  const auto padded = plans.verifyAttention(3, 24, layout(attentionShapes[0]), histories);
-  require(padded.configuration.splitCount == VerifySplitCount::One &&
-              padded.laneSplits[3] == 0 &&
-              padded.splits == kv::q8VerifyAttentionSplits(1, 2049, 8),
-          "padded inactive lookup history was not ignored");
-  std::swap(histories[0], histories[1]);
-  const auto swapped = plans.verifyAttention(3, 24, layout(attentionShapes[0]), histories);
-  require(swapped.configuration.splitCount == VerifySplitCount::One &&
-              swapped.splits == padded.splits,
-          "verify policy did not apply to a mixed lane order");
-  require(plans.verifyAttention(2, 24, layout(attentionShapes[0]), histories).splits == 32,
-          "choice extrapolated to another packed width");
-  require(plans.verifyAttention(3, 16, layout(attentionShapes[1]), histories).splits == 32,
-          "choice extrapolated to another GQA shape");
-  const auto verify = plans.verifyAttentionWorkspacePerLane(24, layout(attentionShapes[0]));
+void workspaceBounds() {
+  const ExecutionPlans plans(device(), Int8Activations::On);
+  const std::array<uint32_t, 3> histories{31, 32, 32769};
+  const auto verify = plans.laneAttentionWorkspace(24, attentionShapes[0].layout);
+  const auto exact = plans.attention(lanesAfter(histories), 24, attentionShapes[0].layout, workspaceOf(verify, 3));
+  require(exact.sequences().size() == 3 && exact.sequences()[1].splits == 32 && exact.sequences()[2].splits == 65,
+          "a decode step's plan did not resolve one history per lane");
   require(verify.partialsBytes ==
-                  uint64_t{8} * kv::kQ8VerifyMaximumSplits * 24 * 256 * 4 &&
+                  uint64_t{8} * kv::kAttentionMaximumSplits * 24 * 256 * 4 &&
               verify.statisticsBytes ==
-                  uint64_t{8} * kv::kQ8VerifyMaximumSplits * 24 * 2 * 4,
-          "verify workspace does not cover the maximum split count");
-  const auto moe = plans.moeDecodeWorkspacePerLane(routedShape);
-  require(moe.groupedInputBytes == 8432299 && moe.expertOutputBytes == 8432299 &&
-              moe.expertIntermediateBytes == 2108075 && moe.groupedRoutesBytes == 8235 &&
-              moe.tileDescriptorsBytes == 520 && moe.tileCountBytes == 4,
-          "B3 MoE workspace must use componentwise ceiling, including baseline");
-  require(plans.gateUpWorkspace(affineGateUp(matrices[0])) == 1114112 &&
-              plans.gateUpWorkspace(affineGateUp(matrices[1])) == 393216,
-          "B1 gate choice hid the B3/B4 baseline requirement");
+                  uint64_t{8} * kv::kAttentionMaximumSplits * 24 * 2 * 4,
+          "a decode lane's workspace does not cover the maximum split count");
+  // A decode step's, of up to 64 rows: from 33 rows its plans take 32-row
+  // tiles, 274 of them at 64 rows (16 full tiles' routes, a partial tile for
+  // each of 256 experts, and two of the shared expert's), whose grouped rows
+  // are the 576 routes' and, where the passes' matmuls read, the 31 rows a
+  // last tile's may read past its live rows.
+  const auto moe = plans.moeWorkspace(routedShape, kRouterFormat, kStepRows);
+  require(moe.groupedInputBytes == 607 * 2048 * 2 && moe.expertOutputBytes == 576 * 2048 * 2 &&
+              moe.expertIntermediateBytes == 607 * 512 * 2 && moe.groupedRoutesBytes == 576 * 4 &&
+              moe.tileDescriptorsBytes == 274 * 12 && moe.tileCountBytes == 80 && moe.expertSlotsBytes == 1024,
+          "MoE decode workspace changed");
+  // The gate pass of the decode tiles' most rows, 64 a gate/up pair runs in two passes.
+  require(plans.gateUpWorkspace(gateUp(matrices[0]), kMaximumDecodeTileRows) == 2228224 &&
+              plans.gateUpWorkspace(gateUp(matrices[1]), kMaximumDecodeTileRows) == 786432,
+          "gate/up workspace omitted the gate pass of the decode tiles' 64 rows");
   const auto draft = plans.draftAttentionWorkspacePerLane(draftShapes[0]);
   // Grouped queries per lane plus eight heads x four splits of 32 x 130 fp32
   // attention partials behind them.
@@ -563,109 +379,54 @@ void policyKeysAndBounds() {
               draft.groupedQueriesBytes == 65536 + 8 * 4 * 16640 &&
               draft.queryKeysBytes == 16384 && draft.queryValuesBytes == 16384,
           "draft workspace ABI changed");
-  require(plans.draftAttention(draftShapes[0], 2).configuration() == DraftAttentionConfiguration{} &&
-              plans.draftAttention(draftShapes[1], 3).configuration() == DraftAttentionConfiguration{},
-          "draft choice leaked across width or shape");
-  plans.install({});
-  require(plans.moeDecode(routedShape, 3).tileRows() == 8 &&
-              plans.draftAttention(draftShapes[0], 3).configuration() == DraftAttentionConfiguration{} &&
-              plans.prefillAttention(2048, 24, layout(attentionShapes[0]), 0).configuration == PrefillAttentionConfig{},
-          "empty install did not reset all tables");
-}
-
-void atomicInvalidChoices() {
-  ExecutionPlans plans(device());
-  plans.install(mixedChoices());
-  const auto invalid = [&](auto change) {
-    auto pending = mixedChoices();
-    pending.linear[0].configuration.groups = 32;
-    pending.draftAttention[0].configuration.groups = 80;
-    change(pending);
-    rejects([&] { plans.install(pending); });
-    requireMixed(plans);
-  };
-  invalid([](auto &c) { c.linear[0].configuration.groups = 0; });
-  invalid([](auto &c) { c.linear[0].configuration.simdgroups = LinearSimdgroups::Four; });
-  invalid([](auto &c) { c.linear[0].configuration.simdgroups = LinearSimdgroups(6); });
-  invalid([](auto &c) { c.linear[0].workload.rows = 9; });
-  invalid([](auto &c) { c.prefillAttention[0].configuration.splitMultiplier = PrefillSplitMultiplier(0); });
-  invalid([](auto &c) { c.prefillAttention[0].configuration.splitMultiplier = PrefillSplitMultiplier(3); });
-  invalid([](auto &c) { c.prefillAttention[0].configuration.scalePlacement = AttentionScalePlacement(2); });
-  invalid([](auto &c) { c.prefillAttention[0].workload.shape.queryHeads = 32; });
-  invalid([](auto &c) { c.prefillAttention[0].workload.rows = 0; });
-  invalid([](auto &c) { c.prefillAttention[0].workload.rows = 2049; });
-  invalid([](auto &c) { c.verifyAttention[0].configuration.splitCount = VerifySplitCount(0); });
-  invalid([](auto &c) { c.verifyAttention[0].configuration.scalePlacement = AttentionScalePlacement(2); });
-  invalid([](auto &c) { c.verifyAttention[0].workload.lanes = 5; });
-  invalid([](auto &c) { c.verifyAttention[0].workload.lanes = 0; });
-  invalid([](auto &c) { c.draftAttention[0].configuration.groups = 1; });
-  invalid([](auto &c) { c.draftAttention[0].workload.shape.dynamicSize = 256; });
-  invalid([](auto &c) { c.draftAttention[0].workload.lanes = 0; });
-  invalid([](auto &c) { c.moe[0].configuration.expertTile = MoeExpertTile(16); });
-  invalid([](auto &c) { c.moe[0].configuration.m8Simdgroups = MoeExpertSimdgroups(6); });
-  invalid([](auto &c) { c.moe[0].workload.rows = 9; });
-  invalid([](auto &c) { c.moe[0].workload.rows = 40; });
-  invalid([](auto &c) { c.moe[0].workload.phase = MoePhase(255); });
-  invalid([](auto &c) { c.moe[0].workload.shape.expertsPerToken = 257; });
-  invalid([](auto &c) { c.linear.push_back(c.linear[0]); });
-  invalid([](auto &c) { c.prefillAttention.push_back(c.prefillAttention[0]); });
-  invalid([](auto &c) { c.verifyAttention.push_back(c.verifyAttention[0]); });
-  invalid([](auto &c) { c.draftAttention.push_back(c.draftAttention[0]); });
-  invalid([](auto &c) { c.moe.push_back(c.moe[0]); });
 }
 
 void invalidLookupsAndContextEdges() {
-  ExecutionPlans plans(device());
-  const auto kvLayout = layout(attentionShapes[0]);
-  const std::array<uint32_t, 4> histories{0, 1, 2, 3};
-  rejects([&] { (void)plans.verifyAttention(0, 24, kvLayout, histories); });
-  rejects([&] { (void)plans.verifyAttention(UINT32_MAX, 24, kvLayout, histories); });
-  rejects([&] { (void)plans.verifyAttention(3, 24, kvLayout, std::span(histories).first(2)); });
-  rejects([&] { (void)plans.verifyAttention(1, 24, {}, histories); });
-  rejects([&] { (void)plans.prefillAttention(1, 24, kvLayout, UINT32_MAX); });
-  rejects([&] { (void)plans.prefillAttention(1, 24, {}, 0); });
-  rejects([&] { (void)plans.prefillAttentionWorkspace(0, 24, kvLayout); });
-  rejects([&] { (void)plans.prefillAttentionWorkspace(UINT32_MAX, 24, kvLayout); });
-  rejects([&] { (void)plans.moeDecode(routedShape, UINT32_MAX); });
-  rejects([&] { (void)plans.moeDecode(routedShape, 0); });
-  rejects([&] { (void)plans.moePrefillWorkspace(routedShape, 0); });
-  rejects([&] { (void)plans.gateUpWorkspace({256, 64}); });
-  rejects([&] { (void)plans.draftAttentionWorkspacePerLane({}); });
-  OperatorChoices choices;
-  choices.prefillAttention.push_back({{attentionShapes[0]},
-                                      {PrefillSplitMultiplier::Two}});
-  choices.verifyAttention.push_back({{attentionShapes[0], 1},
-                                     {VerifySplitCount::One}});
-  plans.install(choices);
-  const auto finalPrefill = plans.prefillAttention(
-      1, 24, kvLayout, kv::kMaximumPhysicalTokens - 1);
-  require(finalPrefill.rows == 1 &&
-              finalPrefill.historyTokens == kv::kMaximumPhysicalTokens - 1 &&
-              finalPrefill.splits == 32,
-          "valid final physical token was rejected");
+  const ExecutionPlans plans(device(), Int8Activations::On);
+  const auto kvLayout = attentionShapes[0].layout;
+  const auto workspace = workspaceOf(plans.laneAttentionWorkspace(24, kvLayout), 4);
+  const std::array<uint32_t, 5> histories{0, 1, 2, 3, 4};
+  for (const size_t lanes : {size_t{0}, histories.size()})
+    rejects([&] { (void)plans.attention(lanesAfter(std::span(histories).first(lanes)), 24, kvLayout, workspace); },
+            "invalid attention sequences", "an attention of no sequences or past a batch was accepted");
+  rejects([&] { (void)plans.attention(lanesAfter(std::span(histories).first(1)), 24, {}, workspace); },
+          "no KV store kernel for layout", "an attention plan of an empty KV layout was accepted");
+  rejects([&] { (void)plans.attention(lanesAfter(std::span(histories).first(1)), 24, kvLayout, {}); },
+          "the attention workspace holds no sequence's splits", "an attention plan without a workspace was accepted");
+  rejects([&] { (void)PagedAttention::workspace(0, 24, kvLayout); }, "invalid attention workspace slots",
+          "a workspace of no tile splits was accepted");
+  for (const uint32_t rows : {UINT32_MAX, 0U})
+    rejects([&] { (void)plans.moe(routedShape, kRouterFormat, rows); }, "invalid MoE rows",
+            "a MoE step of no rows or past the budget was accepted");
+  rejects([&] { (void)plans.moeWorkspace(routedShape, kRouterFormat, 0); }, "invalid MoE rows",
+          "a MoE workspace of no rows was accepted");
+  rejects([&] { (void)plans.gateUpWorkspace({256, 32}, kMaximumDecodeTileRows); }, "invalid linear matrix",
+          "a gate/up workspace of a partial 64-input span was accepted");
+  rejects([&] { (void)plans.draftAttentionWorkspacePerLane({}); },
+          "unsupported compiled draft attention shape", "a draft workspace of an empty shape was accepted");
   std::array<uint32_t, 1> edge{kv::kMaximumPhysicalTokens - 8};
-  const auto finalVerify = plans.verifyAttention(1, 24, kvLayout, edge);
-  require(finalVerify.configuration.splitCount == VerifySplitCount::One &&
-              finalVerify.splits == kv::kQ8VerifyMaximumSplits,
-          "valid final physical verify rows were rejected");
+  const auto finalVerify = plans.attention(lanesAfter(edge), 24, kvLayout, workspace);
+  require(finalVerify.sequences()[0].splits == kv::kAttentionMaximumSplits,
+          "valid final physical decode rows were rejected");
   ++edge[0];
-  rejects([&] { (void)plans.verifyAttention(1, 24, kvLayout, edge); });
+  rejects([&] { (void)lanesAfter(edge); }, "context_out_of_range",
+          "decode rows past the physical context were accepted");
 }
 } // namespace
 
 int main() {
   try {
     baselinePlans();
-    moeDeviceTiles();
-    attentionDeviceTiles();
+    int8ActivationsSetting();
+    draftPlans();
     ggufMoePlans();
-    allCandidates();
-    policyKeysAndBounds();
-    atomicInvalidChoices();
+    unknownCoreCount();
+    hyperNormPlans();
+    prefillSplitsFollowTheDeviceRow();
+    workspaceBounds();
     invalidLookupsAndContextEdges();
-    std::cout << "PASS execution plans: typed policies, device MoE tiles, atomic "
-                 "install, all candidates, B1-B4 and prefill workspace bounds "
-                 "(CPU only)\n";
+    std::cout << "PASS execution plans: device policies, int8 activations on and off, the draft's bf16 prefill, "
+                 "device MoE tiles, B1-B4 and prefill workspace bounds (CPU only)\n";
     return 0;
   } catch (const std::exception &error) {
     std::cerr << "FAIL execution plans: " << error.what() << '\n';

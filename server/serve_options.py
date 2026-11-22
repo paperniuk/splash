@@ -1,0 +1,1105 @@
+"""The options `splash serve` and the server share: each flag's check, help
+and default, and how the launcher passes a value on to the server.
+
+Standard library only, with the server modules that are too: the launcher
+parses these options before .venv exists.
+"""
+
+import argparse
+import copy
+import math
+import os
+import re
+from collections.abc import Callable
+from dataclasses import dataclass
+from decimal import Decimal
+from pathlib import Path
+
+from . import images, origins, unix_socket
+from .chat_format import REASONING_EFFORTS
+from .http_security import validate_api_key
+from .protocol import MAX_THINKING_END_TOKENS
+
+# serve-native's contended prefill floor is a power of two in
+# [64, ExecutionLimits::prefillTokenBudget]; mirrored so a bad value fails
+# before the model loads.
+MIN_CONTENDED_PREFILL_ROWS = 64
+MAX_CONTENDED_PREFILL_ROWS = 2048
+# The most context --max-context takes: the most any family serves
+# (QwenTargetDimensions::maximumContextTokens(), as the engine's families
+# command reports it), YaRN's window of the Qwen targets. The engine refuses
+# more than the model's own.
+MAX_YARN_CONTEXT_TOKENS = 1010000
+# The suffixes of a --max-context: K, 1024 tokens, and M, a million.
+_CONTEXT_UNITS = {"K": 1024, "M": 1000000}
+DEFAULT_MAX_REQUEST_BYTES = 128 * 1024 * 1024
+DEFAULT_QUEUE_SIZE = 32
+# The port both commands serve on unless --port names another, or for the
+# launcher SPLASH_PORT does.
+DEFAULT_PORT = 8000
+_SIZE_UNITS = {
+    unit + suffix: 1024**power
+    for power, unit in enumerate(("K", "M", "G"), 1)
+    for suffix in ("", "B", "IB")
+}
+# A size's number: whole, or with a fraction before a unit (2.5G).
+_SIZE_NUMBER = re.compile(r"\d+(\.\d+)?")
+# A model ID, as --model takes it: OWNER/REPO, a Hugging Face repository ID
+# by the Hub's rule, then optionally :VARIANT, which names the GGUF to serve,
+# such as UD-Q4_K_M.
+REPO_ID = re.compile(
+    r"[A-Za-z0-9_](?:[A-Za-z0-9._-]*[A-Za-z0-9_])?/"
+    r"[A-Za-z0-9_](?:[A-Za-z0-9._-]{0,94}[A-Za-z0-9_])?"
+)
+VARIANT_SEPARATOR = ":"
+VARIANT = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+
+
+def check_repo_id(value):
+    """`value`, if it is a full Hugging Face repository ID; ValueError
+    otherwise."""
+    if (
+        not isinstance(value, str)
+        or not REPO_ID.fullmatch(value)
+        or "--" in value
+        or ".." in value
+        or value.endswith(".git")
+    ):
+        raise ValueError("model must be a full Hugging Face repository ID (owner/repo)")
+    return value
+
+
+def split_model_id(value):
+    """A model ID's repository ID and variant, None without one; ValueError
+    for a value that is no model ID."""
+    if not isinstance(value, str):
+        raise ValueError("model must be a full Hugging Face repository ID (owner/repo)")
+    repo_id, separator, variant = value.partition(VARIANT_SEPARATOR)
+    check_repo_id(repo_id)
+    if not separator:
+        return repo_id, None
+    if not VARIANT.fullmatch(variant) or ".." in variant:
+        raise ValueError(
+            "model variant must be a short name such as UD-Q4_K_M "
+            f"(owner/repo{VARIANT_SEPARATOR}VARIANT)"
+        )
+    return repo_id, variant
+
+
+def parse_model_id(value):
+    try:
+        split_model_id(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
+    return value
+
+
+def parse_max_context(value):
+    """'auto' (None), or a token count with an optional _CONTEXT_UNITS suffix,
+    up to MAX_YARN_CONTEXT_TOKENS: the engine serves one past the native
+    window with YaRN."""
+    normalized = value.strip().upper()
+    if normalized == "AUTO":
+        return None
+    number, multiplier = normalized, 1
+    if normalized[-1:] in _CONTEXT_UNITS:
+        number, multiplier = normalized[:-1], _CONTEXT_UNITS[normalized[-1]]
+    try:
+        tokens = int(number) * multiplier
+    except ValueError:
+        tokens = 0
+    if not 1 <= tokens <= MAX_YARN_CONTEXT_TOKENS:
+        raise argparse.ArgumentTypeError(
+            "must be 'auto' or a token count up to 1010000, such as 100K or 1M "
+            "(K = 1024 tokens, M = 1000000 tokens)"
+        )
+    return tokens
+
+
+def parse_max_memory(value):
+    """'auto' (None), or a byte count with an optional K, M or G suffix; a
+    count with a suffix may have a fraction (2.5G), rounded down to whole
+    bytes."""
+    normalized = value.strip().upper()
+    if normalized == "AUTO":
+        return None
+    multiplier = 1
+    for suffix in sorted(_SIZE_UNITS, key=len, reverse=True):
+        if normalized.endswith(suffix):
+            normalized, multiplier = normalized[: -len(suffix)], _SIZE_UNITS[suffix]
+            break
+    number = _SIZE_NUMBER.fullmatch(normalized)
+    size = 0
+    if number and (multiplier > 1 or not number.group(1)):
+        size = int(Decimal(normalized) * multiplier)
+    if not 1 <= size <= 2**63 - 1:
+        raise argparse.ArgumentTypeError(
+            "must be 'auto' or a positive byte count such as 32G or 2.5G"
+        )
+    return size
+
+
+def parse_max_cache_disk(value):
+    """'auto' (None), 0 for no SSD cache, or a byte count with an optional K, M
+    or G suffix."""
+    if value.strip() == "0":
+        return 0
+    try:
+        return parse_max_memory(value)
+    except argparse.ArgumentTypeError:
+        raise argparse.ArgumentTypeError(
+            "use auto, 0 to disable, or a size such as 16G"
+        ) from None
+
+
+def parse_max_cache_disk_writes(value):
+    """0 for no write budget, or a byte count a day with an optional K, M or G
+    suffix."""
+    if value.strip() == "0":
+        return 0
+    try:
+        size = parse_max_memory(value)
+    except argparse.ArgumentTypeError:
+        size = None
+    if size is None:
+        raise argparse.ArgumentTypeError("use 0 for no limit, or a size such as 200G")
+    return size
+
+
+def _memory_size(value, example, choices):
+    """'auto' (None), one of `choices` as given in lowercase, or a byte count
+    with an optional K, M or G suffix: the memory of a store the engine plans
+    when it is auto. The engine refuses a size below the store's smallest."""
+    normalized = value.strip().lower()
+    if normalized == "auto":
+        return None
+    if normalized in choices:
+        return normalized
+    try:
+        return parse_max_memory(value)
+    except argparse.ArgumentTypeError:
+        options = ", ".join(("auto", *choices))
+        raise argparse.ArgumentTypeError(
+            f"use {options}, or a size such as {example}"
+        ) from None
+
+
+def parse_ple_memory(value):
+    return _memory_size(value, "2G", ("off",))
+
+
+def parse_expert_memory(value):
+    return _memory_size(value, "16G", ("off",))
+
+
+def parse_sparse_kv_memory(value):
+    return _memory_size(value, "1200M", ())
+
+
+def parse_cache_dir(value):
+    if not value.strip():
+        raise argparse.ArgumentTypeError("must name a directory")
+    return Path(value).expanduser().absolute()
+
+
+def parse_chat_template_file(value):
+    if not value.strip():
+        raise argparse.ArgumentTypeError("must name a Jinja chat template file")
+    return Path(value).expanduser().absolute()
+
+
+def parse_request_size(value):
+    try:
+        size = parse_max_memory(value)
+    except argparse.ArgumentTypeError:
+        size = None
+    if size is None:
+        raise argparse.ArgumentTypeError("must be a positive byte count such as 128M")
+    return size
+
+
+# The units a duration takes after its number; seconds without one.
+_DURATION_UNITS = {"s": 1, "m": 60, "h": 3600}
+
+
+def _duration_seconds(value):
+    """A duration in seconds, written as seconds or with an s, m or h suffix;
+    None unless positive and finite."""
+    text = value.strip().lower()
+    unit = _DURATION_UNITS.get(text[-1:])
+    try:
+        seconds = float(text[:-1]) * unit if unit else float(text)
+    except ValueError:
+        return None
+    return seconds if math.isfinite(seconds) and seconds > 0 else None
+
+
+def parse_request_timeout(value):
+    if (seconds := _duration_seconds(value)) is None:
+        raise argparse.ArgumentTypeError(
+            "must be a positive duration such as 30m, 2h or 3600"
+        )
+    return seconds
+
+
+# The longest bounded prefill GPU command buffer (runtime/engine/Scheduler.hpp).
+PREFILL_BOUND_DEFAULT_MS = 2000
+PREFILL_BOUND_MAX_MS = 600_000
+
+
+def parse_prefill_bound(value):
+    """Milliseconds from 1 to PREFILL_BOUND_MAX_MS."""
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        result = 0
+    if not 1 <= result <= PREFILL_BOUND_MAX_MS:
+        raise argparse.ArgumentTypeError(
+            f"must be milliseconds from 1 to {PREFILL_BOUND_MAX_MS}"
+        )
+    return result
+
+
+PREFILL_BOUND_SCOPES = ("buffer", "command")
+
+
+def parse_prefill_bound_scope(value):
+    """buffer or command."""
+    if value not in PREFILL_BOUND_SCOPES:
+        raise argparse.ArgumentTypeError("must be buffer or command")
+    return value
+
+
+def parse_idle_release(value):
+    """--idle-release in seconds, math.inf for off."""
+    if value.strip().lower() == "off":
+        return math.inf
+    if (seconds := _duration_seconds(value)) is None:
+        raise argparse.ArgumentTypeError(
+            "must be off or a positive duration such as 30m, 2h or 600"
+        )
+    return seconds
+
+
+def idle_release_text(seconds):
+    """--idle-release as the server's and the engine's command lines spell it."""
+    return "off" if math.isinf(seconds) else str(seconds)
+
+
+def parse_queue_size(value):
+    try:
+        size = int(value)
+    except ValueError:
+        size = 0
+    if size <= 0:
+        raise argparse.ArgumentTypeError(
+            "must be a positive number of requests such as 32"
+        )
+    return size
+
+
+def parse_decode_share(value):
+    try:
+        share = float(value)
+    except ValueError:
+        share = math.nan
+    if not math.isfinite(share) or share < 0:
+        raise argparse.ArgumentTypeError("must be a nonnegative number such as 0.5")
+    return share
+
+
+def parse_contended_prefill_rows(value):
+    try:
+        rows = int(value)
+    except ValueError:
+        rows = 0
+    is_in_range = MIN_CONTENDED_PREFILL_ROWS <= rows <= MAX_CONTENDED_PREFILL_ROWS
+    if not is_in_range or rows & (rows - 1):
+        raise argparse.ArgumentTypeError(
+            "must be a power of two in "
+            f"[{MIN_CONTENDED_PREFILL_ROWS}, {MAX_CONTENDED_PREFILL_ROWS}]"
+        )
+    return rows
+
+
+def parse_ane_ffn_share(value):
+    try:
+        share = float(value)
+    except ValueError:
+        share = math.nan
+    if not 0 <= share < 1:
+        raise argparse.ArgumentTypeError("must be a share in [0, 1) such as 0.35")
+    return share
+
+
+def parse_ane_ffn_minimum_rows(value):
+    try:
+        rows = int(value)
+    except ValueError:
+        rows = 0
+    if rows <= 0:
+        raise argparse.ArgumentTypeError(
+            "must be a positive number of rows such as 512"
+        )
+    return rows
+
+
+def parse_max_image_pixels(value):
+    try:
+        pixels = int(value)
+    except ValueError:
+        pixels = 0
+    if not images.MIN_PIXELS <= pixels <= images.MAX_PIXELS:
+        raise argparse.ArgumentTypeError(
+            f"must be between {images.MIN_PIXELS} and {images.MAX_PIXELS} pixels"
+        )
+    return pixels
+
+
+def parse_served_model_name(value):
+    if (
+        not isinstance(value, str)
+        or not value
+        or any(not c.isprintable() or c.isspace() or c in "\\%?#" for c in value)
+        or any(part in ("", ".", "..") for part in value.split("/"))
+    ):
+        raise argparse.ArgumentTypeError(
+            "model alias must be a non-empty name without whitespace or URL delimiters"
+        )
+    return value
+
+
+def parse_host(value):
+    """An address to bind, which the bind checks, or unix:PATH with the path
+    of a UNIX socket."""
+    if unix_socket.path(value) == "":
+        raise argparse.ArgumentTypeError(
+            "unix: needs the socket's path, such as unix:/tmp/splash.sock"
+        )
+    return value
+
+
+def parse_allowed_origin(value):
+    """An --allowed-origin value as the server compares Origin headers with it."""
+    try:
+        return origins.parse_allowed_origin(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
+
+
+def _origin_text(origin):
+    """A parsed --allowed-origin value as parse_allowed_origin reads it back."""
+    if origin == origins.ANY_ORIGIN:
+        return origin
+    scheme, host, port = origin
+    authority = f"[{host}]" if ":" in host else host
+    return f"{scheme}://{authority}" + ("" if port is None else f":{port}")
+
+
+def parse_api_key(value):
+    try:
+        return validate_api_key(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
+
+
+def parse_reasoning_effort(value):
+    if value not in REASONING_EFFORTS:
+        raise argparse.ArgumentTypeError(
+            f"must be one of {', '.join(REASONING_EFFORTS)}"
+        )
+    return value
+
+
+def parse_thinking_token_budget(value):
+    try:
+        tokens = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a nonnegative integer") from None
+    if tokens < 0:
+        raise argparse.ArgumentTypeError("must be a nonnegative integer")
+    return tokens
+
+
+# The help's option groups, in the order `splash serve --help` lists them:
+# each group's key and title. The launcher's own model options and --port
+# join "model" and "network".
+GROUPS = (
+    ("model", "model"),
+    ("network", "network and access"),
+    ("memory", "memory and context"),
+    ("cache", "SSD cache"),
+    ("api", "API"),
+    ("requests", "requests"),
+)
+
+
+@dataclass(frozen=True)
+class EngineArgument:
+    """How the server passes an option on to the engine's serve-native. The
+    server leaves out an optional one at the option's default, which must
+    equal the engine's own (native_arguments_test.cpp pins the KV and state
+    formats, verify rows, image patches and activations)."""
+
+    # The engine's flag, or the slot of its positional argument after
+    # MODEL_DIRECTORY. An optional positional comes after every required
+    # one, so leaving it out moves none.
+    at: str | int
+    # A parsed value as the engine's command line spells it.
+    text: Callable[[object], str] = str
+    # Written at the default too: the engine requires MAX_CONTEXT and
+    # MAX_MEMORY.
+    required: bool = False
+
+
+def _auto_text(value):
+    """A value whose default None the engine spells auto."""
+    return "auto" if value is None else str(value)
+
+
+def _spelled(text):
+    """The text of a switch, which the engine takes as a flag's value."""
+    return lambda _value: text
+
+
+@dataclass(frozen=True)
+class ServeOption:
+    """An option of both commands, how the launcher passes it on, and how
+    the server passes it on to the engine (None: the server keeps it)."""
+
+    flag: str
+    # The key of the help group that lists it (GROUPS).
+    group: str
+    # add_argument's keywords, help included.
+    options: dict
+    # The environment variable that gives the default.
+    environment: str | None = None
+    # A secret reaches the server in its environment variable, never on its
+    # command line, where other processes can read it.
+    secret: bool = False
+    # A parsed value as the server's command line spells it.
+    text: Callable[[object], str] = str
+    engine: EngineArgument | None = None
+    # What a model's family must have for the option to act on it, one of
+    # the facts install/families.py reports: a fact of its layout, as the
+    # engine gives it (experts, recurrent_state, ple_table, sparse_kv,
+    # dense_ffn), or of its release (vision, reasoning_switch). None: every
+    # model.
+    needs: str | None = None
+
+    @property
+    def dest(self):
+        return self.flag.removeprefix("--").replace("-", "_")
+
+    def default(self):
+        if self.environment is not None:
+            return os.environ.get(self.environment)
+        return self.options.get("default")
+
+
+SERVE_OPTIONS = (
+    ServeOption(
+        "--host",
+        "network",
+        dict(
+            type=parse_host,
+            default="127.0.0.1",
+            metavar="ADDRESS",
+            help="HTTP bind address (default: 127.0.0.1; 0.0.0.0 for all IPv4 "
+            "interfaces; unix:PATH for a UNIX socket); clients use an IP "
+            "address, localhost or a name given with --allowed-host",
+        ),
+    ),
+    ServeOption(
+        "--allowed-host",
+        "network",
+        dict(
+            action="append",
+            default=[],
+            metavar="HOST",
+            help="additional HTTP Host name to accept, e.g. mymac.local; does not "
+            "change the bind address (repeatable)",
+        ),
+    ),
+    ServeOption(
+        "--allowed-origin",
+        "network",
+        dict(
+            action="append",
+            default=[],
+            type=parse_allowed_origin,
+            metavar="ORIGIN",
+            help="origin whose pages may call the API from a browser or webview, "
+            "e.g. tauri://localhost; '*' for any (repeatable)",
+        ),
+        text=_origin_text,
+    ),
+    ServeOption(
+        "--api-key",
+        "network",
+        dict(
+            type=parse_api_key,
+            metavar="KEY",
+            help="require this key as a bearer token or x-api-key on every route "
+            "but the chat page, /health and /ready (default: SPLASH_API_KEY)",
+        ),
+        environment="SPLASH_API_KEY",
+        secret=True,
+    ),
+    ServeOption(
+        "--no-webui",
+        "network",
+        dict(action="store_true", default=False, help="disable the chat page"),
+    ),
+    ServeOption(
+        "--max-memory",
+        "memory",
+        dict(
+            type=parse_max_memory,
+            default=None,
+            metavar="SIZE",
+            help="Metal memory budget, e.g. 28G; it can only lower the automatic "
+            "budget (default: auto)",
+        ),
+        engine=EngineArgument(1, text=_auto_text, required=True),
+    ),
+    ServeOption(
+        "--max-context",
+        "memory",
+        dict(
+            type=parse_max_context,
+            default=None,
+            metavar="TOKENS",
+            help="context token limit, e.g. 100K or 1M (K = 1024 tokens, M = "
+            "1000000 tokens), up to the model's limit, at most 1010000; past its "
+            "native window a model with YaRN turns it on, which is static and "
+            "changes answers at every length, so pass more than the native "
+            "window only when a request needs it (default: auto, the native "
+            "window when memory holds it)",
+        ),
+        engine=EngineArgument(0, text=_auto_text, required=True),
+    ),
+    ServeOption(
+        "--ple-memory",
+        "memory",
+        dict(
+            type=parse_ple_memory,
+            default=None,
+            metavar="SIZE",
+            help="RAM row cache of the PLE n-gram table of a Qwen3.8-Flash-Next "
+            "GGUF, e.g. 2G, which streams the rest from the SSD; off loads the "
+            "whole table, tens of GB (default: auto, a cache of at most the "
+            "rows of a 128K-token prompt, less where memory is short)",
+        ),
+        engine=EngineArgument("--ple-memory"),
+        needs="ple_table",
+    ),
+    ServeOption(
+        "--expert-memory",
+        "memory",
+        dict(
+            type=parse_expert_memory,
+            default=None,
+            metavar="SIZE",
+            help="RAM for the routed experts of a MoE model, e.g. 16G: they "
+            "stream through a store of exactly this size, which neither grows "
+            "nor gives memory back, and read the other experts from the SSD "
+            "when a token routes them; a size that holds every expert, or "
+            "off, loads them all (default: auto, which loads them all where "
+            "memory holds them, and otherwise gives them what the context "
+            "leaves, giving back down to their floor while requests need it; "
+            "see streamed experts)",
+        ),
+        engine=EngineArgument("--expert-memory"),
+        needs="experts",
+    ),
+    ServeOption(
+        "--sparse-kv-memory",
+        "memory",
+        dict(
+            type=parse_sparse_kv_memory,
+            default=None,
+            metavar="SIZE",
+            help="RAM cache of the KV blocks a block-sparse model such as "
+            "Qwen3.8-Flash-Next reads of requests whose KV is on the SSD, e.g. "
+            "1200M; never below its floor (default: auto, its floor)",
+        ),
+        engine=EngineArgument("--sparse-kv-memory"),
+        needs="sparse_kv",
+    ),
+    ServeOption(
+        "--kv-format",
+        "memory",
+        dict(
+            choices=("int8", "bf16"),
+            default="int8",
+            help="target KV cache storage (default: int8); bf16 uses more memory",
+        ),
+        engine=EngineArgument("--kv-format"),
+    ),
+    ServeOption(
+        "--state-format",
+        "memory",
+        dict(
+            choices=("fp32", "bf16"),
+            default="fp32",
+            help="recurrent state storage of running requests (default: fp32); "
+            "bf16 halves each one's state, and cached states store int8 codes "
+            "in either format unless --cached-states exact",
+        ),
+        engine=EngineArgument("--state-format"),
+        needs="recurrent_state",
+    ),
+    ServeOption(
+        "--cached-states",
+        "memory",
+        dict(
+            choices=("int8", "exact"),
+            default="int8",
+            help="recurrent state storage of cached states (default: int8): int8 "
+            "codes take about a quarter of an fp32 state, and a restored state "
+            "can differ at near ties; exact keeps --state-format's, so a "
+            "restore is exact",
+        ),
+        engine=EngineArgument("--cached-states"),
+        needs="recurrent_state",
+    ),
+    ServeOption(
+        "--idle-release",
+        "memory",
+        dict(
+            type=parse_idle_release,
+            default=None,
+            metavar="DURATION",
+            help="time without a request before the engine unwires its memory and "
+            "frees the weights: seconds, or with an s, m or h suffix, e.g. 30m "
+            "(default: 10m); off keeps both, though POST /v1/memory/release "
+            "still frees the weights",
+        ),
+        text=idle_release_text,
+        engine=EngineArgument("--idle-release", text=idle_release_text),
+    ),
+    ServeOption(
+        "--max-cache-disk",
+        "cache",
+        dict(
+            type=parse_max_cache_disk,
+            default=None,
+            metavar="SIZE",
+            help="SSD quota for cached KV pages and states: auto follows the "
+            "volume, a quarter of its free space beyond a floor of 10G (5%% of "
+            "a volume under 200G), at most 32G; a size such as 16G is held as "
+            "given while the volume keeps that floor; 0 disables (default: auto)",
+        ),
+        engine=EngineArgument(2),
+    ),
+    ServeOption(
+        "--max-cache-disk-writes",
+        "cache",
+        dict(
+            type=parse_max_cache_disk_writes,
+            default=0,
+            metavar="SIZE",
+            help="the most the SSD cache writes a day, e.g. 200G; the state a "
+            "conversation resumes from and KV pages pass it (default: 0, no "
+            "limit)",
+        ),
+        engine=EngineArgument("--max-cache-disk-writes"),
+    ),
+    ServeOption(
+        "--persistent-cache",
+        "cache",
+        dict(
+            action="store_true",
+            default=False,
+            help="keep the SSD cache across restarts",
+        ),
+        engine=EngineArgument("--persistent-cache", text=_spelled("on")),
+    ),
+    ServeOption(
+        "--cache-dir",
+        "cache",
+        dict(
+            type=parse_cache_dir,
+            default=None,
+            metavar="DIRECTORY",
+            help="where --persistent-cache keeps its files; needs "
+            "--persistent-cache (default: ~/Library/Caches/Splash/prefix-cache)",
+        ),
+        engine=EngineArgument("--cache-dir"),
+    ),
+    ServeOption(
+        "--served-model-name",
+        "api",
+        dict(
+            action="append",
+            default=[],
+            type=parse_served_model_name,
+            metavar="NAME",
+            help="additional API model name (repeatable); responses report the "
+            "loaded model ID unless --announce-served-name",
+        ),
+    ),
+    ServeOption(
+        "--announce-served-name",
+        "api",
+        dict(
+            action="store_true",
+            default=False,
+            help="report the first --served-model-name in API responses and list "
+            "it first in /v1/models; /status keeps the loaded model ID (needs "
+            "--served-model-name)",
+        ),
+    ),
+    ServeOption(
+        "--reasoning-effort",
+        "api",
+        dict(
+            type=parse_reasoning_effort,
+            metavar="EFFORT",
+            help="effort of every Chat, Responses and Messages request, whatever "
+            "the request asks: "
+            + ", ".join(REASONING_EFFORTS[:-1])
+            + f" or {REASONING_EFFORTS[-1]}; none turns thinking off (default: "
+            "SPLASH_REASONING_EFFORT, else each request's own)",
+        ),
+        environment="SPLASH_REASONING_EFFORT",
+        needs="reasoning_switch",
+    ),
+    ServeOption(
+        "--default-reasoning-effort",
+        "api",
+        dict(
+            type=parse_reasoning_effort,
+            metavar="EFFORT",
+            help="effort of Chat and Responses requests that set none: "
+            + ", ".join(REASONING_EFFORTS[:-1])
+            + f" or {REASONING_EFFORTS[-1]} (default: "
+            "SPLASH_DEFAULT_REASONING_EFFORT, else the model template's)",
+        ),
+        environment="SPLASH_DEFAULT_REASONING_EFFORT",
+        needs="reasoning_switch",
+    ),
+    ServeOption(
+        "--thinking-token-budget",
+        "api",
+        dict(
+            type=parse_thinking_token_budget,
+            metavar="N",
+            help="thinking tokens of a thinking request that sets no "
+            "thinking_token_budget, after which its thinking closes (default: "
+            "SPLASH_THINKING_TOKEN_BUDGET, else no cap)",
+        ),
+        environment="SPLASH_THINKING_TOKEN_BUDGET",
+        needs="reasoning_switch",
+    ),
+    ServeOption(
+        "--thinking-end-text",
+        "api",
+        dict(
+            metavar="TEXT",
+            help="text that ends thinking where a thinking budget runs out, such "
+            "as a sentence that turns to the answer, then </think> as its last "
+            f"token; at most {MAX_THINKING_END_TOKENS} tokens (default: "
+            "SPLASH_THINKING_END_TEXT, else the close the chat template writes "
+            "after a reasoning)",
+        ),
+        environment="SPLASH_THINKING_END_TEXT",
+        needs="reasoning_switch",
+    ),
+    ServeOption(
+        "--chat-template-file",
+        "api",
+        dict(
+            type=parse_chat_template_file,
+            default=None,
+            metavar="FILE",
+            help="a Jinja chat template to render every request with, in place "
+            "of the model's own; read once at startup (default: the model's)",
+        ),
+    ),
+    ServeOption(
+        "--max-request-size",
+        "requests",
+        dict(
+            type=parse_request_size,
+            default=DEFAULT_MAX_REQUEST_BYTES,
+            metavar="SIZE",
+            help="maximum HTTP request body size, e.g. 128M (default: 128M); "
+            "shared input budget is max(512M, twice this limit)",
+        ),
+    ),
+    ServeOption(
+        "--max-image-pixels",
+        "requests",
+        dict(
+            type=parse_max_image_pixels,
+            default=images.MAX_PIXELS,
+            metavar="PIXELS",
+            help=f"maximum resized pixels per image, {images.MIN_PIXELS}–"
+            f"{images.MAX_PIXELS} (default: {images.MAX_PIXELS}); bounds the "
+            "vision scratch one image needs",
+        ),
+        engine=EngineArgument(
+            "--max-image-patches", text=lambda pixels: str(images.max_patches(pixels))
+        ),
+        needs="vision",
+    ),
+    ServeOption(
+        "--request-timeout",
+        "requests",
+        dict(
+            type=parse_request_timeout,
+            default=None,
+            metavar="DURATION",
+            help="time before a queued or in-flight request expires with 504: "
+            "seconds, or with an s, m or h suffix, e.g. 30m (default: none)",
+        ),
+    ),
+    ServeOption(
+        "--queue-size",
+        "requests",
+        dict(
+            type=parse_queue_size,
+            default=DEFAULT_QUEUE_SIZE,
+            metavar="REQUESTS",
+            help="requests admitted at once, running or waiting; more get 503 "
+            f"(default: {DEFAULT_QUEUE_SIZE})",
+        ),
+    ),
+    ServeOption(
+        "--decode-share",
+        "requests",
+        dict(
+            type=parse_decode_share,
+            default=None,
+            metavar="SHARE",
+            help="decode time owed per unit of prefill time while other requests "
+            "decode (default: 0.5; 0 alternates one command each)",
+        ),
+        engine=EngineArgument("--decode-share"),
+    ),
+    ServeOption(
+        "--contended-prefill-rows",
+        "requests",
+        dict(
+            type=parse_contended_prefill_rows,
+            default=None,
+            metavar="N",
+            help="smallest prefill command, in rows, while other requests "
+            "decode; a power of two in "
+            f"[{MIN_CONTENDED_PREFILL_ROWS}, {MAX_CONTENDED_PREFILL_ROWS}] "
+            "(default: 256 on Apple GPU family 7/8 (M1/M2), 512 otherwise)",
+        ),
+        engine=EngineArgument("--contended-prefill-rows"),
+    ),
+    ServeOption(
+        "--prefill-mode",
+        "requests",
+        dict(
+            choices=("bounded", "full"),
+            default="bounded",
+            help="bounded (default) keeps each prefill GPU command buffer, one "
+            "per layer, within a few seconds so macOS does not abort "
+            "long-context prefill; full sends whole 2048-token chunks",
+        ),
+    ),
+    ServeOption(
+        "--prefill-bound-ms",
+        "requests",
+        dict(
+            type=parse_prefill_bound,
+            default=None,
+            metavar="MILLISECONDS",
+            help="longest bounded prefill GPU command buffer in milliseconds (default: "
+            f"SPLASH_PREFILL_BOUND_MS or {PREFILL_BOUND_DEFAULT_MS}); halved after "
+            "each macOS display-stall abort once the bound holds whole commands",
+        ),
+        environment="SPLASH_PREFILL_BOUND_MS",
+    ),
+    ServeOption(
+        "--prefill-bound-scope",
+        "requests",
+        dict(
+            type=parse_prefill_bound_scope,
+            default=None,
+            metavar="buffer|command",
+            help="what the prefill bound holds: each GPU command buffer "
+            "(default: SPLASH_PREFILL_BOUND_SCOPE or buffer) or each whole "
+            "command, which some Macs need at long context; the first macOS "
+            "display-stall abort switches to command",
+        ),
+        environment="SPLASH_PREFILL_BOUND_SCOPE",
+    ),
+    ServeOption(
+        "--disable-ane",
+        "requests",
+        dict(
+            action="store_true",
+            default=False,
+            help="prefill on the GPU alone (default: a dense model's long "
+            "prompts also use the Neural Engine when that is faster)",
+        ),
+        engine=EngineArgument("--ane", text=_spelled("off")),
+        needs="dense_ffn",
+    ),
+    ServeOption(
+        "--ane-ffn-share",
+        "requests",
+        dict(
+            type=parse_ane_ffn_share,
+            default=None,
+            metavar="SHARE",
+            help="the Neural Engine's share of a dense model's prefill FFN, "
+            "instead of the one calibration finds, which also runs a prefill "
+            "command of 256 rows or more as two chunks, one's FFN on the "
+            "Neural Engine beside the other's mixer; that pays only at a "
+            "share above the calibrated one (default: calibrated, with a "
+            "higher share of its own for commands of 769 rows or more as two "
+            "chunks, which the first start times and later starts serve; 0 "
+            "prefills on the GPU alone, as --disable-ane does whatever this says)",
+        ),
+        needs="dense_ffn",
+    ),
+    ServeOption(
+        "--ane-ffn-minimum-rows",
+        "requests",
+        dict(
+            type=parse_ane_ffn_minimum_rows,
+            default=None,
+            metavar="ROWS",
+            help="the least rows of a prefill chunk that splits at "
+            "--ane-ffn-share (default: 256)",
+        ),
+        needs="dense_ffn",
+    ),
+    ServeOption(
+        "--activations",
+        "requests",
+        dict(
+            choices=("auto", "bf16"),
+            default="auto",
+            help="auto rounds activations to 8 bits where the GPU multiplies "
+            "them twice as fast (M5 and later) and leaves the others bf16: "
+            "long prompts through MLX 4- and 5-bit weights (about a quarter "
+            "less time to the first token), rotated PQ2_0 decode and attention "
+            "over the INT8 KV cache; bf16 keeps every activation bf16, for "
+            "evaluations and bf16 parity (default: auto)",
+        ),
+        engine=EngineArgument("--activations"),
+    ),
+    ServeOption(
+        "--verify-rows",
+        "requests",
+        dict(
+            choices=("auto", "all"),
+            default="auto",
+            help="rows each decode cycle verifies: all verifies every row of "
+            "a draft's block a lane, so greedy and seeded outputs repeat "
+            "(default: auto, where each cycle takes the step of the most "
+            "expected accepted tokens per cost, by the costs the Mac measured "
+            "at a start and the cost of a long history and the acceptance "
+            "learned from earlier cycles, or, on a model whose experts "
+            "stream, the rows worth their time by its cycles' cost line, "
+            "which is faster but lets those outputs differ from run to run)",
+        ),
+        engine=EngineArgument("--verify-rows"),
+    ),
+    ServeOption(
+        "--allow-idle-sleep",
+        "requests",
+        dict(
+            action="store_true",
+            default=False,
+            help="let the Mac sleep automatically while requests run (default: it "
+            "stays awake until they finish; the display may still sleep)",
+        ),
+        engine=EngineArgument("--idle-sleep", text=_spelled("allow")),
+    ),
+)
+
+
+def option_groups(parser):
+    """The help groups of `parser`, by key, created in GROUPS order. The
+    server's parser leaves "model" empty, and help omits an empty group."""
+    return {key: parser.add_argument_group(title) for key, title in GROUPS}
+
+
+def add_serve_arguments(parser, groups=None):
+    """Add every shared option to its group of `parser`, from
+    option_groups(parser) unless the caller made them. Defaults from the
+    environment are read now, and checked like a value given on the command
+    line; a list default is copied, so no parse returns the table's own
+    list."""
+    if groups is None:
+        groups = option_groups(parser)
+    for option in SERVE_OPTIONS:
+        groups[option.group].add_argument(
+            option.flag, **{**option.options, "default": copy.copy(option.default())}
+        )
+
+
+def check_serve_arguments(parser, args):
+    """The checks of the shared options that involve more than one."""
+    if args.announce_served_name and not args.served_model_name:
+        parser.error("--announce-served-name needs --served-model-name")
+    if args.persistent_cache and args.max_cache_disk == 0:
+        parser.error(
+            "--persistent-cache needs the SSD cache --max-cache-disk 0 turns off"
+        )
+    if args.max_cache_disk_writes and args.max_cache_disk == 0:
+        parser.error(
+            "--max-cache-disk-writes needs the SSD cache --max-cache-disk 0 turns off"
+        )
+    if args.cache_dir is not None and not args.persistent_cache:
+        parser.error("--cache-dir needs --persistent-cache")
+    if args.ane_ffn_minimum_rows is not None and args.ane_ffn_share is None:
+        parser.error("--ane-ffn-minimum-rows needs --ane-ffn-share")
+    if args.reasoning_effort is not None and args.default_reasoning_effort is not None:
+        parser.error(
+            "--default-reasoning-effort (SPLASH_DEFAULT_REASONING_EFFORT) sets "
+            "the effort of requests that set none, and --reasoning-effort "
+            "(SPLASH_REASONING_EFFORT) leaves none: it sets every request's"
+        )
+
+
+def serve_argv(args):
+    """The server's command line for the shared options `args` sets to other
+    than their defaults; the server reads the defaults itself."""
+    argv = []
+    for option in SERVE_OPTIONS:
+        value = getattr(args, option.dest)
+        if option.secret or value == option.default():
+            continue
+        if option.options.get("action") == "store_true":
+            argv.append(option.flag)
+        elif option.options.get("action") == "append":
+            argv.extend(f"{option.flag}={option.text(item)}" for item in value)
+        else:
+            argv.append(f"{option.flag}={option.text(value)}")
+    return argv
+
+
+def engine_argv(args):
+    """The engine's arguments after MODEL_DIRECTORY for the options `args`
+    sets: the positional ones, then the flags (EngineArgument)."""
+    positional, flags = {}, []
+    for option in SERVE_OPTIONS:
+        engine = option.engine
+        value = getattr(args, option.dest)
+        if engine is None or (value == option.default() and not engine.required):
+            continue
+        if isinstance(engine.at, int):
+            positional[engine.at] = engine.text(value)
+        else:
+            flags.extend((engine.at, engine.text(value)))
+    return [positional[position] for position in sorted(positional)] + flags
+
+
+def serve_environment(args):
+    """The environment the server reads the shared secrets from."""
+    return {
+        option.environment: getattr(args, option.dest)
+        for option in SERVE_OPTIONS
+        if option.secret and getattr(args, option.dest) is not None
+    }

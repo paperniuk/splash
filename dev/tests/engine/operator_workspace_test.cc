@@ -1,136 +1,182 @@
+#include "TestChecks.hpp"
+#include "TestFamilies.hpp"
 #include "metal/abi/MoE.h"
 #include "model/WeightLayout.hpp"
+#include "ops/DraftSelector.hpp"
 #include "ops/MoE.hpp"
 #include "ops/PagedAttention.hpp"
 #include "ops/Sampling.hpp"
+#include "ops/KernelCalibration.hpp"
 
 #include <algorithm>
+#include <array>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
 
 namespace {
 
-void require(bool condition, const char *message) {
-  if (!condition)
-    throw std::runtime_error(message);
-}
+using splash::test::attentionRow;
+using splash::test::rejects;
+using splash::test::require;
 
-template <class Function> void rejects(Function function) {
-  try {
-    (void)function();
-  } catch (const std::invalid_argument &) {
-    return;
-  }
-  throw std::runtime_error("invalid workspace request was accepted");
-}
-
+// A workspace holds tile splits of a geometry's tiles (ops::PagedAttention::
+// workspace): a prompt chunk's arena kAttentionSequenceSplits, which hold the
+// plan of any one sequence of up to the budget's rows after any history, a
+// decode lane's kAttentionMaximumSplits, a lane's one tile at the most
+// splits, so that every lane of a step attends in one dispatch.
 void attention() {
   using namespace splash;
   for (const uint32_t queryHeads : {16U, 24U}) {
     const kv::Layout layout{1, queryHeads == 16 ? 2U : 4U, 256};
-    for (const auto config : ops::PagedAttention::prefillCandidates()) {
-      uint32_t maximumSlots = 0;
-      for (uint32_t rows = 1; rows <= 2048; ++rows) {
-        // Split counts decrease as the M8 tile count grows, so a shorter
-        // request can need more scratch than the exact requested row count.
-        const uint32_t tiles = (rows + 7) / 8;
-        const uint32_t splits = std::min(
-            32U, static_cast<uint32_t>(config.splitMultiplier) *
-                     std::clamp(32U / tiles, 1U, 32U));
-        maximumSlots = std::max(maximumSlots, tiles * splits);
-        const auto workspace = ops::PagedAttention::prefillWorkspace(rows, queryHeads, layout, config);
-        require(workspace.partialsBytes == uint64_t{maximumSlots} * 8 * queryHeads * 256 * 4,
-                "prefill partial workspace differs from the maximum over actual row counts");
-        require(workspace.statisticsBytes == uint64_t{maximumSlots} * 8 * queryHeads * 2 * 4,
-                "prefill statistics workspace differs from the maximum over actual row counts");
-        for (uint32_t history : {0U, 4095U, 4096U, 131072U, kv::kMaximumPhysicalTokens - rows}) {
-          const auto plan = ops::PagedAttention::prefillPlan(rows, queryHeads, layout, history, config);
-          require(workspace.partialsBytes >= plan.workspace.partialsBytes &&
-                      workspace.statisticsBytes >= plan.workspace.statisticsBytes,
-                  "prefill workspace omitted actual rows at a valid context boundary");
-        }
+    const auto slots = [&](uint32_t count) { return ops::PagedAttention::workspace(count, queryHeads, layout); };
+    for (const uint32_t count : {1U, 128U, 256U, 512U})
+      require(slots(count).partialsBytes == uint64_t{count} * 8 * queryHeads * 256 * 4 &&
+                  slots(count).statisticsBytes == uint64_t{count} * 8 * queryHeads * 2 * 4,
+              "an attention workspace is not its tile splits' partials and statistics");
+    const ops::AttentionWorkspace chunk = slots(ops::kAttentionSequenceSplits);
+    require(chunk.partialsBytes == (queryHeads == 24 ? 48U : 32U) * uint64_t{1024 * 1024},
+            "a prompt chunk's attention workspace changed");
+    for (uint32_t rows = 1; rows <= 2048; ++rows)
+      for (const uint32_t history : {0U, 65536U, 1'000'000U}) {
+        const std::array sequence{ops::PagedAttention::chunkParams(history, rows, (rows + 31) / 32 * 32,
+                                                                   (history + rows + 31) / 32)};
+        const auto plan = ops::PagedAttention::plan(sequence, queryHeads, layout, ops::kApple10Attention,
+                                                    ops::Int8Activations::Off, chunk);
+        require(plan.dispatches().size() == 1 && plan.workspace().partialsBytes <= chunk.partialsBytes &&
+                    plan.workspace().statisticsBytes <= chunk.statisticsBytes,
+                "a prompt chunk's workspace omitted the plan of a sequence of its rows");
       }
-      const auto maximum = ops::PagedAttention::prefillWorkspace(2048, queryHeads, layout, config);
-      const uint64_t expectedMiB = (queryHeads == 24 ? 48U : 32U) *
-                                  static_cast<uint32_t>(config.splitMultiplier);
-      require(maximum.partialsBytes == expectedMiB * 1024 * 1024,
-              "2048-row prefill partial workspace changed");
+    std::array<kv::ChunkedPrefillParams, 4> lanes{};
+    for (uint32_t lane = 0; lane < 4; ++lane)
+      lanes[lane] = ops::PagedAttention::chunkParams(1'000'000 - lane, 8, 32, (1'000'008 + 31) / 32);
+    for (uint32_t count = 1; count <= 4; ++count) {
+      const auto plan = ops::PagedAttention::plan(std::span(lanes).first(count), queryHeads, layout,
+                                                  ops::kApple10Attention, ops::Int8Activations::Off,
+                                                  slots(count * kv::kAttentionMaximumSplits));
+      require(plan.dispatches().size() == 1 && plan.dispatches()[0].slots == count * kv::kAttentionMaximumSplits,
+              "a decode step's lanes at the most splits do not attend in one dispatch of their workspace");
     }
-    for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-      const auto workspace =
-          ops::PagedAttention::verifyWorkspace(lanes, queryHeads, layout);
-      const uint64_t values =
-          uint64_t{lanes} * 8 * kv::kQ8VerifyMaximumSplits * queryHeads;
-      require(workspace.partialsBytes == values * 256 * 4,
-              "verify partial workspace is not sized for the maximum split count");
-      require(workspace.statisticsBytes == values * 2 * 4,
-              "verify statistics workspace is not sized for the maximum split count");
-    }
-    rejects([&] { return ops::PagedAttention::prefillWorkspace(0, queryHeads, layout); });
-    rejects([&] { return ops::PagedAttention::prefillWorkspace(2049, queryHeads, layout); });
-    rejects([&] { return ops::PagedAttention::verifyWorkspace(0, queryHeads, layout); });
-    rejects([&] { return ops::PagedAttention::verifyWorkspace(5, queryHeads, layout); });
-    rejects([&] { return ops::PagedAttention::verifyWorkspace(1, 0, layout); });
+    rejects([&] { (void)slots(0); }, "invalid attention workspace slots", "a workspace of no tile splits was sized");
+    rejects([&] { (void)ops::PagedAttention::workspace(1, 0, layout); }, "no paged-attention kernel for layout",
+            "a workspace of no query heads was sized");
   }
 }
 
-// Expert ids, route rows and grouped routes are uint32, routing weights fp32
-// and activations bf16. The grouped input first holds the router's fp32
-// scores, one row of 256 per token. The split prefill plan parks its gate in
-// expertOutput, so that field spans the wider of the hidden and intermediate
-// widths.
+// The attention kernels follow how a layout reads its pages, not its value
+// order: Qwen3.8-Flash-Next's geometry read page by page has no kernel (its
+// sparse kernels read selected blocks), and a reader of selected blocks takes
+// token-major values, the only order whose blocks are contiguous.
+void attentionReads() {
+  using namespace splash;
+  const kv::Layout selected{.attentionLayers = 1, .kvHeads = 2, .headDimension = 256,
+                            .valuesTokenMajor = true, .reads = kv::Reads::SelectedBlocks};
+  constexpr ops::Int8Activations off = ops::Int8Activations::Off;
+  const std::array sequences{ops::PagedAttention::chunkParams(4096, 64, 64, 130),
+                             ops::PagedAttention::chunkParams(4096, 8, 32, 129)};
+  const auto plan = [&](kv::Layout layout) {
+    return ops::PagedAttention::plan(sequences, 24, layout, ops::kApple10Attention, off,
+                                     ops::PagedAttention::workspace(ops::kAttentionSequenceSplits, 24, selected));
+  };
+  require(plan(selected).sparse, "a reader of selected blocks did not plan the sparse kernels");
+  kv::Layout everyPage = selected;
+  everyPage.reads = kv::Reads::EveryPage;
+  require(everyPage.valid(), "a page loop over token-major values is not a layout");
+  rejects([&] { (void)plan(everyPage); }, "no paged-attention kernel for layout",
+          "the page loop planned the sparse kernels of token-major values");
+  kv::Layout dimensionMajor = selected;
+  dimensionMajor.valuesTokenMajor = false;
+  require(!dimensionMajor.valid(), "a reader of selected blocks took dimension-major values");
+}
+
+// Only a reader of selected blocks reads a block index, so only its layout
+// holds one and only its pages can leave memory while their index stays:
+// Qwen3.8-Flash-Next's pages read page by page are no layout, whose K/V
+// every row would read.
+void blockIndexReader() {
+  using namespace splash;
+  const kv::Layout selected{.attentionLayers = 12, .kvHeads = 2, .headDimension = 256, .indexDimension = 128,
+                            .valuesTokenMajor = true, .reads = kv::Reads::SelectedBlocks};
+  require(selected.valid() && selected.spillable(), "a reader of selected blocks cannot spill its pages");
+  kv::Layout everyPage = selected;
+  everyPage.reads = kv::Reads::EveryPage;
+  require(!everyPage.valid() && !everyPage.spillable(), "the page loop's layout holds a block index");
+}
+
+// Expert ids, route rows, grouped routes and the experts' slots are uint32,
+// routing weights fp32 and activations bf16; a row routes its top k and each
+// shared slice, which fills one tile per tileRows rows. A route takes a
+// grouped row, and the grouped input and intermediate hold the tileRows - 1
+// rows past them that a tile's matmul may read. The grouped input first holds
+// the router's fp32 scores, one row of 256 per token.
 void checkMoe(splash::ops::MoeWorkspace workspace,
-              splash::ops::MoeShape shape, uint32_t rows, uint32_t tileRows,
-              uint32_t outputWidth) {
+              splash::ops::MoeShape shape, uint32_t rows, uint32_t tileRows) {
   using splash::model::kBFloat16Bytes;
   constexpr uint64_t kRouterScores = 256;
-  const uint64_t routes = uint64_t{rows} * shape.routesPerToken();
-  const uint64_t tiles = splash::ops::moeMaximumTiles(rows, shape, tileRows);
-  const uint64_t grouped = tiles * tileRows;
+  const uint64_t routes = uint64_t{rows} * (shape.expertsPerToken + shape.sharedSlices);
+  const uint64_t routed = uint64_t{rows} * shape.expertsPerToken;
+  const uint64_t tiles = std::min(routed / tileRows + shape.experts, routed) +
+                         uint64_t{shape.sharedSlices} * ((rows + tileRows - 1) / tileRows);
+  require(tiles == splash::ops::moeMaximumTiles(rows, shape, tileRows), "MoE maximum tiles changed from baseline");
+  const uint64_t read = routes + tileRows - 1;
   require(workspace.selectedExpertsBytes == routes * sizeof(uint32_t) &&
               workspace.routingWeightsBytes == routes * sizeof(float) &&
               workspace.tileDescriptorsBytes == tiles * sizeof(MoeTileDescriptor) &&
-              workspace.tileCountBytes == sizeof(uint32_t) &&
-              workspace.groupedRoutesBytes == grouped * sizeof(uint32_t) &&
+              workspace.tileCountBytes == sizeof(MoeTileCount) &&
+              workspace.groupedRoutesBytes == routes * sizeof(uint32_t) &&
               workspace.routeRowsBytes == routes * sizeof(uint32_t) &&
-              workspace.groupedInputBytes == std::max(grouped * shape.hiddenSize * kBFloat16Bytes,
+              workspace.expertSlotsBytes == uint64_t{shape.experts} * sizeof(uint32_t) &&
+              workspace.groupedInputBytes == std::max(read * shape.hiddenSize * kBFloat16Bytes,
                                                       uint64_t{rows} * kRouterScores * sizeof(float)) &&
-              workspace.expertIntermediateBytes ==
-                  grouped * shape.expertIntermediateSize * kBFloat16Bytes &&
-              workspace.expertOutputBytes == grouped * outputWidth * kBFloat16Bytes &&
-              workspace.groupedSumsBytes == 0,
+              workspace.expertIntermediateBytes == read * shape.expertIntermediateSize * kBFloat16Bytes &&
+              workspace.expertOutputBytes == routes * shape.hiddenSize * kBFloat16Bytes,
           "MoE workspace changed from baseline");
 }
 
 void moe() {
   using namespace splash::ops;
-  for (const MoeShape shape : {MoeShape{256, 8, 2, 512},
-                               MoeShape{2048, 256, 8, 512}}) {
-    const uint32_t splitWidth =
-        std::max(shape.hiddenSize, shape.expertIntermediateSize);
+  // Flint's: two ungated shared slices behind a sigmoid router.
+  constexpr MoeShape kSlices{.hiddenSize = 2048,
+                             .experts = 256,
+                             .expertsPerToken = 6,
+                             .expertIntermediateSize = 512,
+                             .router = MoeRouter::SigmoidNormalized,
+                             .sharedSlices = 2,
+                             .sharedGate = false};
+  for (const MoeShape shape : {MoeShape{256, 8, 2, 512}, MoeShape{2048, 256, 8, 512}, kSlices}) {
     for (uint32_t rows = 1; rows <= 2048; ++rows)
-      checkMoe(MoE::prefillPlan(shape, rows, {MoeExpertTile::M32}).workspace(), shape, rows, 32, splitWidth);
-    const auto single = MoE::decodePlan(shape, 1, {MoeExpertTile::M8}).workspace();
+      checkMoe(MoE::plan(shape, rows, {MoeExpertTile::M32}).workspace(), shape, rows, 32);
+    const auto single = MoE::plan(shape, 8, {MoeExpertTile::M8}).workspace();
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-      const auto workspace = MoE::decodePlan(shape, lanes, {MoeExpertTile::M8}).workspace();
-      checkMoe(workspace, shape, lanes * 8, 8, shape.hiddenSize);
+      const auto workspace = MoE::plan(shape, lanes * 8, {MoeExpertTile::M8}).workspace();
+      checkMoe(workspace, shape, lanes * 8, 8);
       require(workspace.groupedInputBytes <= lanes * single.groupedInputBytes &&
                   workspace.tileDescriptorsBytes <=
                       lanes * single.tileDescriptorsBytes,
-              "packed decode workspace exceeds per-lane allocation bound");
+              "batched decode workspace exceeds per-lane allocation bound");
     }
-    rejects([&] { return MoE::prefillPlan(shape, 0, {MoeExpertTile::M32}); });
-    rejects([&] { return MoE::prefillPlan(shape, 2049, {MoeExpertTile::M32}); });
-    rejects([&] { return MoE::decodePlan(shape, 0, {MoeExpertTile::M8}); });
-    rejects([&] { return MoE::decodePlan(shape, 5, {MoeExpertTile::M8}); });
+    for (const uint32_t rows : {0U, 2049U})
+      rejects([&] { (void)MoE::plan(shape, rows, {MoeExpertTile::M32}); }, "invalid MoE rows",
+              "a MoE step of no rows or past the budget was planned");
   }
-  rejects([] { return MoE::prefillPlan({}, 1, {MoeExpertTile::M32}); });
+  rejects([] { (void)MoE::plan({}, 1, {MoeExpertTile::M32}); },
+          "invalid MoE workspace shape", "a MoE plan of an empty shape was sized");
+  // No kernel routes a softmax router's two shared slices.
+  MoeShape uncompiled = kSlices;
+  uncompiled.router = MoeRouter::Softmax;
+  rejects([&] { (void)MoE::plan(uncompiled, 1, {MoeExpertTile::M32}); }, "invalid MoE workspace shape",
+          "a MoE plan of a routing no kernel compiles was sized");
+  // Nor a sigmoid router past the experts its kernels route.
+  uncompiled = kSlices;
+  uncompiled.experts = SPLASH_MOE_EXPERT_SLOTS + 1;
+  rejects([&] { (void)MoE::plan(uncompiled, 1, {MoeExpertTile::M32}); }, "invalid MoE workspace shape",
+          "a MoE plan of more experts than its routing's kernels route was sized");
 }
 
 void sampling() {
+  using splash::ops::DraftSelector;
   using splash::ops::Sampling;
-  // Independent ABI formulas, including one lane and B1-B4 packed
+  // Independent ABI formulas, including one lane and B1-B4 batch
   // extents. No backend, allocation or GPU graph is needed to size buffers.
   for (uint32_t rows : {1U, 8U, 16U, 24U, 32U,
                         std::numeric_limits<uint32_t>::max()}) {
@@ -138,27 +184,42 @@ void sampling() {
     const uint64_t count = rows;
     require(workspace.argmaxValuesBytes == count * 16 * 4 &&
                 workspace.argmaxIndicesBytes == count * 16 * 4 &&
-                workspace.partialIdsBytes == count * 16 * 32 * 4 &&
-                workspace.partialValuesBytes == count * 16 * 32 * 4 &&
-                workspace.topIdsBytes == count * 32 * 4 &&
-                workspace.topProbabilitiesBytes == count * 32 * 4,
+                workspace.partialMassesBytes == count * 16 * 12 &&
+                workspace.vocabularyRowsBytes == count * 12 &&
+                workspace.vocabularyRangesBytes == count * 256 * 8 &&
+                workspace.vocabularyArrivalsBytes == count * 4,
             "target sampling workspace changed from the shipped 16-shard ABI");
   }
   for (uint32_t positions : {1U, 7U, 14U, 21U, 28U,
                              std::numeric_limits<uint32_t>::max()}) {
-    const auto workspace = Sampling::draftWorkspace(positions);
+    const auto workspace = DraftSelector::workspace(positions);
     const uint64_t count = positions;
     // Partial values carry the 16 x 16 edge table of every position behind
     // the eight shard partials.
     require(workspace.partialIdsBytes == count * 8 * 16 * 4 &&
                 workspace.partialValuesBytes == count * (8 + 16) * 16 * 4 &&
                 workspace.candidatesBytes == count * 16 * 4 &&
-                workspace.unaryBytes == count * 16 * 4 &&
-                workspace.proposalProbabilitiesBytes == count * 16 * 4,
+                workspace.unaryBytes == count * 16 * 4,
             "draft sampling workspace changed from the shipped 8-shard ABI");
   }
-  rejects([] { return Sampling::workspace(0); });
-  rejects([] { return Sampling::draftWorkspace(0); });
+  rejects([] { (void)Sampling::workspace(0); }, "invalid sampling workspace row count",
+          "a sampling workspace of no rows was sized");
+  rejects([] { (void)DraftSelector::workspace(0); },
+          "invalid draft selector workspace position count",
+          "a draft selector workspace of no positions was sized");
+  // A family's stop tokens fill the places the kernels compare, those past
+  // its list with SPLASH_NO_TOKEN, which is no stop token.
+  using splash::ops::StopTokens;
+  constexpr StopTokens two{248044, 248046};
+  static_assert(std::ranges::equal(two.ids, std::array{248044U, 248046U, SPLASH_NO_TOKEN, SPLASH_NO_TOKEN}) &&
+                std::ranges::equal(two.tokens(), std::array{248044U, 248046U}) && two.contains(248046) &&
+                !two.contains(SPLASH_NO_TOKEN) && StopTokens{}.tokens().empty());
+  constexpr StopTokens four{150001, 150003, 150005, 150018};
+  static_assert(four.tokens().size() == SPLASH_STOP_TOKENS && four.contains(150018) && !four.contains(150002));
+  rejects([] { (void)StopTokens{1, 2, 3, 4, 5}; }, "more stop tokens than the sampling kernels compare",
+          "five stop tokens were taken");
+  rejects([] { (void)StopTokens{1, SPLASH_NO_TOKEN}; }, "SPLASH_NO_TOKEN",
+          "SPLASH_NO_TOKEN was taken as a stop token");
 }
 
 } // namespace
@@ -166,6 +227,8 @@ void sampling() {
 int main() {
   try {
     attention();
+    attentionReads();
+    blockIndexReader();
     moe();
     sampling();
     std::cout << "operator workspace: PASS\n";

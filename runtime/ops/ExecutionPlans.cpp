@@ -1,278 +1,126 @@
 #include "ops/ExecutionPlans.hpp"
 
-#include "ops/ChoiceTable.hpp"
+#include "metal/abi/Gguf.h"
 
 #include <algorithm>
 #include <stdexcept>
+#include <tuple>
 #include <utility>
 
 namespace splash::ops {
-namespace {
 
-constexpr uint32_t kMaximumLanes = SPLASH_MAXIMUM_BATCH_WIDTH;
-constexpr uint32_t kDecodeRows = SPLASH_TARGET_VERIFY_ROWS;
-static_assert(kMaximumLanes == 4);
+ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device, Int8Activations int8Activations)
+    : linear_(device, int8Activations), draftLinear_(device, Int8Activations::Off),
+      attentionTile_(linear_.calibration().simdgroupMma ? AttentionTile::Register : AttentionTile::Mpp) {}
 
-AttentionShape attentionShape(uint32_t queryHeads, kv::Layout layout) {
-  return {queryHeads, layout.kvHeads, layout.headDimension, layout.format};
-}
-kv::Layout attentionLayout(AttentionShape shape) {
-  // Layer count affects the persistent cache, not one layer's execution key.
-  return {1, shape.kvHeads, shape.headDimension, shape.format};
-}
-
-void validateHistory(uint32_t history, uint32_t rows) {
-  if (uint64_t{history} + rows > kv::kMaximumPhysicalTokens)
-    throw std::invalid_argument("attention choice history exceeds context");
-}
-VerifyAttentionPolicy verifyKey(uint32_t lanes, uint32_t queryHeads,
-                                 kv::Layout layout,
-                                 std::span<const uint32_t> histories) {
-  if (!lanes || lanes > kMaximumLanes ||
-      (histories.size() != lanes && histories.size() != kMaximumLanes))
-    throw std::invalid_argument("invalid verify attention history vector");
-  for (uint32_t lane = 0; lane < lanes; ++lane)
-    validateHistory(histories[lane], kDecodeRows);
-  return {attentionShape(queryHeads, layout), lanes};
+bool ExecutionPlans::hyperNormStaged(uint32_t rows) const noexcept {
+  // Apple7/8 only, and only while the rows' threadgroups have the cores to
+  // themselves: past that the staged kernel runs a second wave where the
+  // quarters kernel doesn't slow down. Its 96 norms of a Flash-Next Q2_0 step
+  // on an M2 Max (38 cores), quarters -> staged ms: 16 rows 2.73 -> 2.10,
+  // 32 rows 2.80 -> 2.27, 33 rows 2.82 -> 2.24, 34 rows 2.80 -> 3.01, 64 rows
+  // 2.90 -> 3.13. Three quarters of the cores keeps a margin below that edge.
+  return calibration().simdgroupMma && rows * 4 <= calibration().cores * 3;
 }
 
-constexpr std::array attentionFields{
-    &AttentionWorkspace::partialsBytes, &AttentionWorkspace::statisticsBytes};
-constexpr std::array draftFields{
-    &DraftAttentionWorkspace::convolutionBytes,
-    &DraftAttentionWorkspace::qkvBytes,
-    &DraftAttentionWorkspace::groupedQueriesBytes,
-    &DraftAttentionWorkspace::queryKeysBytes,
-    &DraftAttentionWorkspace::queryValuesBytes};
-
-// The shipped configuration of a MoE workload's phase, the first candidate.
-MoeConfig baselineMoeConfig(MoePhase phase) noexcept {
-  return (phase == MoePhase::Prefill ? MoE::prefillCandidates() : MoE::decodeCandidates()).front();
-}
-
-// The operator plan of `config` for a MoE workload's phase and physical rows.
-MoePlan phasePlan(const MoeWorkload &workload, const MoeConfig &config) {
-  if (workload.phase == MoePhase::Prefill) return MoE::prefillPlan(workload.shape, workload.rows, config);
-  if (workload.phase != MoePhase::Decode || !workload.rows || workload.rows % kDecodeRows)
-    throw std::invalid_argument("invalid MoE phase or physical rows");
-  return MoE::decodePlan(workload.shape, workload.rows / kDecodeRows, config);
-}
-
-template <typename Workspace, size_t N>
-void include(Workspace &bound, const Workspace &required,
-             const std::array<uint64_t Workspace::*, N> &fields,
-             uint32_t lanes = 1) {
-  for (auto field : fields) {
-    const uint64_t bytes = required.*field;
-    bound.*field = std::max(bound.*field,
-                           bytes / lanes + uint64_t{bytes % lanes != 0});
+// A chunk's rows pick its projections' tile, and a tile's height names its
+// kernels (gguf_decode_<format>_m<rows>_*, the register tile's _l<tiles>), so
+// each tile and height a chunk takes is a class, and the prefill tile one
+// more. Every other kernel a chunk's rows pick today changes once along them
+// (selectFloatTile, selectMoe, the staged norm, the hyper-connection norm's
+// quarters, and the Neural Engine split, which takes no class's first chunk:
+// AneFfn::kMinimumRows), so a chunk of one row and one of the most take both
+// sides. A class no warmup ran created its kernels while its request waited:
+// 19 s for the 27B's cold 17-row chunk on a 16-core Apple9 plan.
+std::vector<uint32_t> ExecutionPlans::prefillRowClasses() const {
+  std::vector<uint32_t> first;
+  std::pair<LinearTile, uint32_t> last{};
+  for (uint32_t rows = 1; rows <= SPLASH_PREFILL_TOKEN_BUDGET; ++rows) {
+    const LinearPlan plan = linear_.plan({{GGUF_TILE_COLUMNS, GGUF_TILE_COLUMNS}, rows});
+    const LinearTile tile = plan.configuration().tile;
+    // Only the staged and register tiles' kernels are named by their height.
+    const bool named = tile == LinearTile::GgufStaged || tile == LinearTile::GgufRegister;
+    const std::pair key{tile, named ? plan.storageRows() : 0};
+    if (first.empty() || key != last) first.push_back(rows);
+    last = key;
   }
+  return first;
 }
 
-} // namespace
-
-ExecutionPlans::ExecutionPlans(const DeviceCapabilities &device)
-    : linear_(device), baselineLinear_(device),
-      moeRouteWideRows_(moeRouteWideRows(device.gpuCoreCount)),
-      moeDecodeSimdgroups_(moeDecodeSimdgroups(device.appleGpuFamily)),
-      appleGpuFamily_(device.appleGpuFamily),
-      // Apple7/8 have no bfloat arithmetic; their prefill and verify attention
-      // use the register tile whatever split configuration was measured or
-      // installed.
-      attentionTile_(device.appleGpuFamily < 9 ? AttentionTile::Register
-                                            : AttentionTile::Mpp),
-      // Apple7/8 run the register affine expert tiles in both phases.
-      moeExpertKernel_(device.appleGpuFamily < 9 ? MoeExpertKernel::Register
-                                                 : MoeExpertKernel::Mpp) {}
-
-void ExecutionPlans::install(const OperatorChoices &choices) {
-  OperatorChoices pending = choices;
-  Linear nextLinear = baselineLinear_;
-  nextLinear.setChoices(pending.linear);
-  for (const auto &choice : pending.prefillAttention) {
-    const auto &w = choice.workload;
-    (void)PagedAttention::prefillPlan(w.rows, w.shape.queryHeads,
-                                    attentionLayout(w.shape), 0,
-                                    choice.configuration);
+// A step's rows pick its projections' tile and height as a chunk's do
+// (prefillRowClasses); a float projection's tile, which a step's rows move
+// only at the accelerator tile's fewest rows, as they fill one 64-row tile
+// (selectFloatTile); and a MoE target's expert tile (32-row tiles once its
+// rows' routes outnumber its experts). Its router's tile changes with them
+// on no device.
+std::vector<uint32_t> ExecutionPlans::decodeRowClasses(uint32_t mostRows,
+                                                       std::optional<std::pair<MoeShape, uint32_t>> moe) const {
+  if (mostRows > SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS)
+    throw std::invalid_argument("a decode step holds at most a verify block a lane");
+  const FloatTileCalibration &floats = calibration().floatTile;
+  std::vector<uint32_t> first;
+  std::tuple<LinearTile, uint32_t, bool, uint32_t> last{};
+  for (uint32_t rows = 1; rows <= mostRows; ++rows) {
+    const LinearPlan plan = linear_.plan({{GGUF_TILE_COLUMNS, GGUF_TILE_COLUMNS}, rows});
+    const LinearTile tile = plan.configuration().tile;
+    const bool named = tile == LinearTile::GgufStaged || tile == LinearTile::GgufRegister;
+    MoeConfig config{};
+    if (moe) config = selectMoe(calibration(), moe->first, moe->second, rows);
+    const std::tuple key{tile, named ? plan.storageRows() : 0, floats.neuralAccelerator && rows >= floats.minimumRows,
+                         uint32_t(config.expertTile)};
+    if (first.empty() || key != last) first.push_back(rows);
+    last = key;
   }
-  for (const auto &choice : pending.verifyAttention) {
-    const auto &w = choice.workload;
-    const std::array<uint32_t, kMaximumLanes> histories{};
-    (void)PagedAttention::verifyPlan(w.lanes, w.shape.queryHeads,
-                                   attentionLayout(w.shape), histories,
-                                   choice.configuration);
-  }
-  for (const auto &choice : pending.draftAttention)
-    (void)DraftAttention::plan(choice.workload.shape, choice.workload.lanes,
-                               choice.configuration);
-  for (const auto &choice : pending.moe) {
-    const auto &w = choice.workload;
-    if (w.shape.weightLayout == WeightLayout::Block32)
-      throw std::invalid_argument("block MoE plans are not tuned");
-    // The choice's own configuration: an invalid device field fails install
-    // although moePlan replaces it.
-    (void)phasePlan(w, choice.configuration);
-  }
-  sortUniqueChoices(pending.prefillAttention);
-  sortUniqueChoices(pending.verifyAttention);
-  sortUniqueChoices(pending.draftAttention);
-  sortUniqueChoices(pending.moe);
-  // All potentially throwing work is above. No partial table install can
-  // affect a production lookup if validation or allocation fails.
-  std::swap(linear_, nextLinear);
-  std::swap(choices_, pending);
+  return first;
 }
 
-PrefillAttentionPlan ExecutionPlans::prefillAttention(
-    uint32_t rows, uint32_t queryHeads, kv::Layout layout,
-    uint32_t historyTokens) const {
-  validateHistory(historyTokens, rows);
-  const PrefillAttentionPolicy workload{attentionShape(queryHeads, layout), rows};
-  PrefillAttentionConfig config =
-      chosenConfiguration(choices_.prefillAttention, workload, PrefillAttentionConfig{});
-  config.tile = attentionTile_;
-  return PagedAttention::prefillPlan(rows, queryHeads, layout, historyTokens, config);
-}
-
-VerifyAttentionPlan ExecutionPlans::verifyAttention(
-    uint32_t lanes, uint32_t queryHeads, kv::Layout layout,
-    std::span<const uint32_t> historyTokens) const {
-  const auto workload = verifyKey(lanes, queryHeads, layout, historyTokens);
-  VerifyAttentionConfig config =
-      chosenConfiguration(choices_.verifyAttention, workload, VerifyAttentionConfig{});
-  config.tile = attentionTile_;
-  return PagedAttention::verifyPlan(lanes, queryHeads, layout, historyTokens, config);
+AttentionPlan ExecutionPlans::attention(std::span<const kv::ChunkedPrefillParams> sequences, uint32_t queryHeads,
+                                        kv::Layout layout, AttentionWorkspace capacity,
+                                        AttentionVariant variant) const {
+  return PagedAttention::plan(sequences, queryHeads, layout, calibration().attention, linear_.int8Activations(),
+                              capacity, variant, attentionTile_, calibration().cores);
 }
 
 DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,
                                                  uint32_t lanes) const {
-  return DraftAttention::plan(
-      shape, lanes,
-      chosenConfiguration(choices_.draftAttention,
-                       DraftAttentionWorkload{shape, lanes},
-                       DraftAttentionConfiguration{}));
+  return DraftAttention::plan(shape, lanes);
 }
 
-// The device's fields of a MoE plan: the router threshold, the 8-row tile
-// simdgroups and, for a GGUF plan, which is not tuned, its tiles.
-MoePlan ExecutionPlans::moePlan(const MoeWorkload &workload, MoeConfig config) const {
-  const MoeShape shape = workload.shape;
-  const bool prefill = workload.phase == MoePhase::Prefill;
-  config.routeWideRows = moeRouteWideRows_;
-  // The four-simdgroup 8-row tiles are measured at decode occupancy only; a
-  // prefill chunk's much larger expert grid keeps the shipped tile.
-  config.m8Simdgroups = prefill ? MoeExpertSimdgroups::Eight : moeDecodeSimdgroups_;
-  if (shape.weightLayout == WeightLayout::Affine64) config.kernel = moeExpertKernel_;
-  if (shape.weightLayout == WeightLayout::Block32) {
-    const MoeGgufTile tile = moeGgufTile(appleGpuFamily_, shape);
-    config.expertTile = prefill ? moeGgufPrefillTile(shape, workload.rows, tile) : MoeExpertTile::M8;
-    config.ggufTile = tile;
-    config.ggufRouterTile = linear_.ggufFloatTile(workload.rows, shape.experts);
-  }
-  return phasePlan(workload, config);
+MoePlan ExecutionPlans::moe(MoeShape shape, uint32_t routerFormat, uint32_t rows) const {
+  return MoE::plan(shape, rows, selectMoe(calibration(), shape, routerFormat, rows));
 }
 
-MoePlan ExecutionPlans::moePrefill(MoeShape shape, uint32_t rows) const {
-  const MoeWorkload workload{shape, rows, MoePhase::Prefill};
-  return moePlan(workload, chosenConfiguration(choices_.moe, workload, baselineMoeConfig(MoePhase::Prefill)));
+AttentionWorkspace ExecutionPlans::sequenceAttentionWorkspace(uint32_t queryHeads, kv::Layout layout) const {
+  return PagedAttention::workspace(kAttentionSequenceSplits, queryHeads, layout);
 }
 
-MoePlan ExecutionPlans::moeDecode(MoeShape shape, uint32_t lanes) const {
-  // Validate before multiplying an untrusted width into a physical-row key.
-  if (!lanes || lanes > kMaximumLanes)
-    throw std::invalid_argument("invalid MoE decode width");
-  const MoeWorkload workload{shape, lanes * kDecodeRows, MoePhase::Decode};
-  return moePlan(workload, chosenConfiguration(choices_.moe, workload, baselineMoeConfig(MoePhase::Decode)));
+AttentionWorkspace ExecutionPlans::laneAttentionWorkspace(uint32_t queryHeads, kv::Layout layout) const {
+  return PagedAttention::workspace(kv::kAttentionMaximumSplits, queryHeads, layout);
 }
 
-std::array<MoePlan, 2> ExecutionPlans::moeCandidates(const MoeWorkload &workload) const {
-  // GGUF plans are not tuned: both candidates are the device's plan.
-  if (workload.shape.weightLayout == WeightLayout::Block32) {
-    const MoePlan plan = moePlan(workload, {});
-    return {plan, plan};
-  }
-  const std::array<MoeConfig, 2> configs =
-      workload.phase == MoePhase::Prefill ? MoE::prefillCandidates() : MoE::decodeCandidates();
-  return {moePlan(workload, configs[0]), moePlan(workload, configs[1])};
-}
-
-AttentionWorkspace ExecutionPlans::prefillAttentionWorkspace(
-    uint32_t maximumRows, uint32_t queryHeads, kv::Layout layout) const {
-  auto bound = PagedAttention::prefillWorkspace(maximumRows, queryHeads, layout);
-  const auto shape = attentionShape(queryHeads, layout);
-  for (const auto &choice : choices_.prefillAttention) {
-    const auto &w = choice.workload;
-    if (w.shape == shape && w.rows <= maximumRows)
-      include(bound, PagedAttention::prefillWorkspace(
-                         w.rows, queryHeads, layout, choice.configuration),
-              attentionFields);
-  }
-  return bound;
-}
-
-AttentionWorkspace ExecutionPlans::verifyAttentionWorkspacePerLane(
-    uint32_t queryHeads, kv::Layout layout) const {
-  AttentionWorkspace bound;
-  for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes)
-    include(bound, PagedAttention::verifyWorkspace(lanes, queryHeads, layout),
-            attentionFields, lanes);
-  const auto shape = attentionShape(queryHeads, layout);
-  for (const auto &choice : choices_.verifyAttention) {
-    const auto &w = choice.workload;
-    if (w.shape == shape)
-      include(bound, PagedAttention::verifyWorkspace(
-                         w.lanes, queryHeads, layout, choice.configuration),
-              attentionFields, w.lanes);
-  }
-  return bound;
-}
-
+// The draft workspace is linear in the lanes: one lane's is every width's
+// share.
 DraftAttentionWorkspace ExecutionPlans::draftAttentionWorkspacePerLane(
     DraftAttentionShape shape) const {
-  DraftAttentionWorkspace bound;
-  for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes)
-    include(bound, DraftAttention::plan(shape, lanes).workspace(), draftFields,
-            lanes);
-  for (const auto &choice : choices_.draftAttention) {
-    const auto &w = choice.workload;
-    if (w.shape == shape)
-      include(bound, DraftAttention::plan(shape, w.lanes,
-                                          choice.configuration).workspace(),
-              draftFields, w.lanes);
-  }
-  return bound;
+  return DraftAttention::plan(shape, 1).workspace();
 }
 
-MoeWorkspace ExecutionPlans::moePrefillWorkspace(MoeShape shape,
-                                               uint32_t maximumRows) const {
+MoeWorkspace ExecutionPlans::moeWorkspace(MoeShape shape, uint32_t routerFormat, uint32_t maximumRows) const {
   // Validate the bound before iterating; every row is included even if a
   // future grouped layout's largest field is not monotone in row count.
-  auto bound = moePrefill(shape, maximumRows).workspace();
+  MoeWorkspace bound = moe(shape, routerFormat, maximumRows).workspace();
   for (uint32_t rows = 1; rows <= maximumRows; ++rows) {
-    include(bound, moePlan({shape, rows, MoePhase::Prefill}, baselineMoeConfig(MoePhase::Prefill)).workspace(),
-            kMoeWorkspaceFields);
-    include(bound, moePrefill(shape, rows).workspace(), kMoeWorkspaceFields);
+    const MoeWorkspace required = moe(shape, routerFormat, rows).workspace();
+    for (const auto field : kMoeWorkspaceFields) bound.*field = std::max(bound.*field, required.*field);
   }
   return bound;
 }
 
-MoeWorkspace ExecutionPlans::moeDecodeWorkspacePerLane(MoeShape shape) const {
-  MoeWorkspace bound;
-  for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) {
-    const MoeWorkload workload{shape, lanes * kDecodeRows, MoePhase::Decode};
-    include(bound, moePlan(workload, baselineMoeConfig(MoePhase::Decode)).workspace(), kMoeWorkspaceFields, lanes);
-    include(bound, moeDecode(shape, lanes).workspace(), kMoeWorkspaceFields, lanes);
-  }
-  return bound;
-}
-
-uint64_t ExecutionPlans::gateUpWorkspace(ProjectionShape shape) const {
+uint64_t ExecutionPlans::gateUpWorkspace(ProjectionShape shape, uint32_t maximumRows) const {
   uint64_t bound = 0;
-  for (uint32_t lanes = 1; lanes <= kMaximumLanes; ++lanes) {
-    const LinearWorkload workload{{shape.outputSize, shape.inputSize}, lanes * kDecodeRows,
-                                  LinearPhase::Decode, LinearEpilogue::GateUp, shape.layout};
-    bound = std::max({bound, baselineLinear_.plan(workload).gateScratchBytes(),
-                      linear_.plan(workload).gateScratchBytes()});
+  for (uint32_t rows = 1; rows <= maximumRows; ++rows) {
+    const LinearWorkload workload{{shape.outputSize, shape.inputSize}, rows, LinearEpilogue::GateUp};
+    bound = std::max(bound, linear_.plan(workload).gateScratchBytes());
   }
   return bound;
 }

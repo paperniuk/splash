@@ -1,0 +1,1219 @@
+#pragma once
+
+// The model the engine, native loop and transport tests run their engines
+// on, and the states and tickets it hands them.
+
+#include "FakeElasticPool.hpp"
+#include "FakeMemory.hpp"
+#include "TestImmediateTicket.hpp"
+#include "TestKvPool.hpp"
+#include "TimingProfile.hpp"
+#include "engine/KvCache.hpp"
+#include "model/Model.hpp"
+
+#include <algorithm>
+#include <atomic>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <optional>
+#include <random>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+namespace splash::test {
+
+class State final : public CompositeState {
+public:
+  State() = default;
+  // A state a prefill command captured: once the cache lets go of it, its
+  // buffers return to the model's pool, as QwenStateStorage's do.
+  explicit State(std::shared_ptr<uint64_t> pool) : pool_(std::move(pool)) {}
+  ~State() override {
+    if (pool_)
+      *pool_ += bytes();
+  }
+  uint64_t bytes() const noexcept override { return 64; }
+
+private:
+  std::shared_ptr<uint64_t> pool_;
+};
+
+class DiskState final : public CompositeState {
+public:
+  uint64_t bytes() const noexcept override { return 64; }
+  uint64_t residentBytes() const noexcept override { return 0; }
+};
+
+// The buffers of a state a prefill command captures (Executor::reserveState):
+// the command seals them into the state, and dropped unsealed they return to
+// the model's pool.
+class Reservation final : public StateReservation {
+public:
+  explicit Reservation(std::shared_ptr<uint64_t> pool) : pool_(std::move(pool)) {}
+  ~Reservation() override {
+    if (pool_)
+      *pool_ += State().bytes();
+  }
+  // The pool the sealed state's buffers return to.
+  std::shared_ptr<uint64_t> seal() noexcept { return std::exchange(pool_, nullptr); }
+
+private:
+  std::shared_ptr<uint64_t> pool_;
+};
+
+struct OffloadControl {
+  bool ready = false;
+  bool released = false;
+};
+
+// A state write in flight; its disk copy is a DiskState.
+class OffloadTicket final : public StateOffload {
+public:
+  explicit OffloadTicket(std::shared_ptr<OffloadControl> control)
+      : control_(std::move(control)) {}
+  bool ready() const noexcept override { return control_->ready; }
+  bool finish() override { return true; }
+  const std::shared_ptr<const CompositeState> &state() const noexcept override {
+    return disk_;
+  }
+private:
+  std::shared_ptr<OffloadControl> control_;
+  std::shared_ptr<const CompositeState> disk_ = std::make_shared<DiskState>();
+};
+
+// With a pool, it is a captured state whose buffers return to the model's
+// pool once the cache lets go of them, like State's. A persistent tier also
+// writes its copy while it stays in RAM (persist).
+class OffloadState final : public CompositeState {
+public:
+  explicit OffloadState(std::shared_ptr<OffloadControl> control,
+                        std::shared_ptr<uint64_t> pool = nullptr)
+      : control_(std::move(control)), pool_(std::move(pool)) {}
+  ~OffloadState() override {
+    control_->released = true;
+    if (pool_)
+      *pool_ += bytes();
+  }
+  uint64_t bytes() const noexcept override { return 64; }
+  bool writable() const noexcept override { return true; }
+  bool canOffload(bool) const noexcept override { return true; }
+  std::unique_ptr<StateOffload> offload(std::function<void()>) const override {
+    return std::make_unique<OffloadTicket>(control_);
+  }
+  std::unique_ptr<StateOffload> persist(std::function<void()>) const override {
+    return std::make_unique<OffloadTicket>(control_);
+  }
+private:
+  std::shared_ptr<OffloadControl> control_;
+  std::shared_ptr<uint64_t> pool_;
+};
+
+// A captured state whose copy a persistent tier writes while it stays in
+// RAM (persist), and a reclaim writes as it leaves RAM through a staging
+// copy (offload), as the model's states are written; the copy is a
+// DiskState.
+class KeptState final : public CompositeState {
+public:
+  explicit KeptState(std::shared_ptr<OffloadControl> control) : control_(std::move(control)) {}
+  uint64_t bytes() const noexcept override { return 64; }
+  bool writable() const noexcept override { return true; }
+  bool canOffload(bool) const noexcept override { return true; }
+  std::unique_ptr<StateOffload> offload(std::function<void()>) const override {
+    return std::make_unique<OffloadTicket>(control_);
+  }
+  std::unique_ptr<StateOffload> persist(std::function<void()>) const override {
+    return std::make_unique<OffloadTicket>(control_);
+  }
+
+private:
+  std::shared_ptr<OffloadControl> control_;
+};
+
+struct RestoreControl {
+  bool ready = false;
+  bool success = true;
+  bool cancelled = false;
+  // No cache slot for the restored state's RAM copy.
+  bool promotionDenied = false;
+};
+
+class RestoreTicket final : public StateRestore {
+public:
+  std::shared_ptr<RestoreControl> control;
+  std::function<void()> commit;
+  // With the model's memory, the RAM copy in buffers it takes as its
+  // reserveState() does (Executor::restoredCopy).
+  std::function<std::shared_ptr<const CompositeState>()> copy;
+  bool ready() const noexcept override { return control->ready; }
+  bool finish() override {
+    if (!control->success || control->cancelled) return false;
+    commit();
+    return true;
+  }
+  void cancel() noexcept override { control->cancelled = true; }
+  std::shared_ptr<const CompositeState> snapshot() override {
+    if (control->promotionDenied)
+      return nullptr;
+    return copy ? copy() : std::make_shared<State>();
+  }
+};
+
+struct MaskOverlapState final {
+  uint64_t requestId = 0;
+  bool emitted = false;
+  bool provided = false;
+  bool abandoned = false;
+  // Keeps the command running after its mask wait ended.
+  bool held = false;
+};
+
+// A decode command that waits for the verify mask of its one constrained
+// lane; `results` are its lanes', in order.
+class MaskOverlapTicket final : public ModelBatchTicket {
+public:
+  MaskOverlapTicket(std::shared_ptr<MaskOverlapState> state, std::vector<ModelStepResult> results)
+      : state_(std::move(state)), results_(std::move(results)) {}
+
+  std::vector<ModelMaskRequest> takeMaskRequests() override {
+    if (state_->emitted)
+      return {};
+    state_->emitted = true;
+    return {{state_->requestId, {10, 11, 12, 13, 14, 15, 16, 17}, {kNoMaskParent, 0, 1, 2, 3, 4, 5, 6}}};
+  }
+  bool ownsMaskWait(uint64_t id) const noexcept override {
+    return state_->emitted && id == state_->requestId;
+  }
+  void abandonMask(uint64_t id) noexcept override {
+    if (id == state_->requestId)
+      state_->abandoned = true;
+  }
+  bool ready() const noexcept override {
+    return !state_->held && (state_->provided || state_->abandoned);
+  }
+  std::vector<ModelStepResult> wait() override {
+    if (!ready())
+      throw std::logic_error("mask-overlap ticket completed without input");
+    return std::move(results_);
+  }
+  model::CommandSample sample() const noexcept override { return {.wallMilliseconds = 1.0}; }
+
+private:
+  std::shared_ptr<MaskOverlapState> state_;
+  std::vector<ModelStepResult> results_;
+};
+
+// A model that runs no kernels, behaving as model::Runtime does where the
+// engine, loop and transport tests rely on it: lanes, captured states in
+// their reserved buffers, constrained lanes' masks (the verify mask inside
+// the command, MaskOverlapTicket), score logits, and no decode of a lane
+// left only its emitted anchor. Its other members are the tests' knobs and
+// records.
+class Executor final : public model::Model {
+public:
+  explicit Executor(
+      uint32_t maximumLanes = model::ExecutionLimits::maximumBatchWidth)
+      : maximumLanes(maximumLanes) {}
+
+  void checkHealth() override {
+    if (healthCheck)
+      healthCheck();
+  }
+
+  StateAdmission begin(const ModelRequest &request) override {
+    ++beginAttempts;
+    lastBeginId = request.id;
+    lastRestoredTokens = request.restoredTokens;
+    if (beginObserver) beginObserver();
+    beganFlags[request.id] = request.flags;
+    beganSampling[request.id] = request.sampling;
+    outputLimits[request.id] = request.maxNewTokens;
+    if (beginGrowthBlocked && beginGrowthBlocked())
+      return {{}, StateFailure::MemoryPressure, beginAllocationFailure};
+    if (deniedBegins) {
+      --deniedBegins;
+      return {{}, StateFailure::MemoryPressure, metal::AllocationFailure::EngineBudget};
+    }
+    for (uint32_t lane = 0; lane < maximumLanes; ++lane) {
+      const bool used = std::any_of(
+          requests.begin(), requests.end(), [lane](const auto &entry) {
+            return entry.second.resident && entry.second.lane == lane;
+          });
+      if (!used) {
+        if (const metal::AllocationFailure refused = takeLaneState(); refused != metal::AllocationFailure::None)
+          return {{}, StateFailure::MemoryPressure, refused};
+        requests.emplace(
+            request.id,
+            Request{.lane = lane,
+                    .resident = true,
+                    .constrained =
+                        request.constraint == ConstraintMode::TokenMask,
+                    .scoreTokens = {request.scoreTokens.begin(),
+                                    request.scoreTokens.end()}});
+        prompts[request.id].assign(request.prompt.begin(), request.prompt.end());
+        return {lane, StateFailure::None};
+      }
+    }
+    return {{}, StateFailure::ConcurrencyLimit};
+  }
+  void suspend(uint64_t id) override {
+    Request &entry = requests.at(id);
+    if (!entry.resident)
+      throw std::logic_error("request is already suspended");
+    pageTables.erase(id);
+    spilledReadFloors.erase(id);
+    historyStaging.erase(id);
+    releaseLane(id);
+    entry.resident = false;
+    entry.position = 0;
+    ++suspensions;
+    suspendedIds.push_back(id);
+    if (laneReleased)
+      laneReleased();
+    if (kvGrowthBlocked && unblockGrowthOnSuspend)
+      *kvGrowthBlocked = false;
+  }
+  StateAdmission resume(const ModelRequest &request) override {
+    ++resumeAttempts;
+    lastRestoredTokens = request.restoredTokens;
+    outputLimits[request.id] = request.maxNewTokens;
+    if (resumeDenied)
+      return {{}, StateFailure::MemoryPressure, metal::AllocationFailure::HostPressure};
+    const uint64_t id = request.id;
+    Request &entry = requests.at(id);
+    for (uint32_t lane = 0; lane < maximumLanes; ++lane) {
+      const bool used = std::any_of(
+          requests.begin(), requests.end(), [&](const auto &candidate) {
+            return candidate.first != id && candidate.second.resident &&
+                   candidate.second.lane == lane;
+          });
+      if (!used) {
+        if (const metal::AllocationFailure refused = takeLaneState(); refused != metal::AllocationFailure::None)
+          return {{}, StateFailure::MemoryPressure, refused};
+        entry.lane = lane;
+        entry.resident = true;
+        entry.position = 0;
+        entry.replaying = true;
+        resumedPrompts.emplace_back(request.prompt.begin(), request.prompt.end());
+        ++resumptions;
+        return {lane, StateFailure::None};
+      }
+    }
+    return {{}, StateFailure::ConcurrencyLimit};
+  }
+  std::unique_ptr<StateRestore> beginRestore(
+      uint64_t id, uint32_t length, std::shared_ptr<const CompositeState> state,
+      bool restoreDraft, std::function<void()>) override {
+    if (state->residentBytes()) {
+      applyRestore(id, length, std::move(state), restoreDraft);
+      return {};
+    }
+    ++diskReads;
+    auto ticket = std::make_unique<RestoreTicket>();
+    ticket->control = restoreControl;
+    ticket->commit = [this, id, length, state, restoreDraft] {
+      applyRestore(id, length, state, restoreDraft);
+    };
+    if (memory)
+      ticket->copy = [this] { return restoredCopy(); };
+    return ticket;
+  }
+  void setDraftContextPlan(uint64_t id, DraftContextPlan plan) override {
+    plans[id] = std::move(plan);
+  }
+  std::vector<ModelStepResult> prefill(const BatchPlan &,
+                                       std::span<const ModelBatchItem> items) {
+    prefillWidths.push_back(static_cast<uint32_t>(items.size()));
+    std::vector<ModelStepResult> result;
+    for (const auto &item : items) {
+      requireRows(item, item.logicalPosition);
+      if (kv) {
+        const uint64_t end = item.logicalPosition + item.tokenCount;
+        for (uint64_t row = (item.logicalPosition + engine::KvCache::pageTokens - 1) /
+                            engine::KvCache::pageTokens * engine::KvCache::pageTokens;
+             row < end; row += engine::KvCache::pageTokens) {
+          kv->content.at(item.pageTable[row / engine::KvCache::pageTokens]) =
+              rows(row / engine::KvCache::pageTokens, item.inputTokens[row - item.logicalPosition]);
+        }
+      }
+      Request &state = requests.at(item.requestId);
+      if (nonFinitePrefills.contains(item.requestId)) {
+        // The chunk commits nothing; the engine ends the request.
+        result.push_back({.requestId = item.requestId,
+                          .consumedPromptTokens = item.tokenCount,
+                          .failure = "target prefill row is not finite"});
+        continue;
+      }
+      state.position += item.tokenCount;
+      prefillRows += item.tokenCount;
+      ++prefillChunks[item.requestId];
+      const uint64_t end = item.logicalPosition + item.tokenCount;
+      std::vector<std::shared_ptr<const CompositeState>> captured;
+      uint64_t after = item.logicalPosition;
+      // The production runtime refuses a capture its draft plan leaves no
+      // whole draft window for, and the plan has one for its boundaries.
+      const std::vector<DraftBoundaryPlan> &planned = plans.at(item.requestId).boundaries;
+      for (const StateCapture &capture : item.stateCaptures) {
+        if (capture.tokens <= after || capture.tokens > end || !capture.reservation)
+          throw std::logic_error("a state capture lies outside its step or out of order");
+        if (std::none_of(planned.begin(), planned.end(), [&](const DraftBoundaryPlan &boundary) {
+              return boundary.boundary == capture.tokens;
+            }))
+          throw std::logic_error("a state capture is not a boundary of the request's draft plan");
+        after = capture.tokens;
+        captures.push_back({item.requestId, capture.tokens, end});
+        captured.push_back(seal(static_cast<Reservation &>(*capture.reservation)));
+      }
+      // The step that completes the prompt selects its first token; a replay
+      // never does again. A constrained prompt's end waits for the first
+      // mask instead, and a score request's returns its option logits.
+      const bool last = !state.replaying &&
+                        state.position == prompts.at(item.requestId).size();
+      const bool awaitsMask = state.constrained && last;
+      // The wait outlives a suspension, as the host continuation keeps it.
+      state.awaitingMask = state.awaitingMask || awaitsMask;
+      if (last && !awaitsMask)
+        state.anchorLimit = outputLimits.at(item.requestId);
+      ModelStepResult step{item.requestId, item.tokenCount, {}, false,
+                           awaitsMask ? DecodeStage::ApplyInitialMask
+                                      : DecodeStage::Regular,
+                           0, 0};
+      if (last && !state.scoreTokens.empty()) {
+        step.finished = true;
+        if (invalidScores.contains(item.requestId))
+          step.failure = "score logit is not finite";
+        for (size_t index = 0; step.failure.empty() && index < state.scoreTokens.size();
+             ++index)
+          step.scoreLogits.push_back(static_cast<float>(index) + 0.5f);
+      } else if (last && prefillAnchor) {
+        // Prefill selected a stop token or the last budgeted token: emitted
+        // now, without a KV row, and the request never decodes.
+        step.outputTokens = {42};
+        step.outputTokensWithoutKv = 1;
+        step.finished = *prefillAnchor;
+      } else if (last && firstTokens && !state.constrained) {
+        step.firstToken = 42;
+      }
+      // A step that fails commits nothing.
+      if (step.failure.empty())
+        step.capturedStates = std::move(captured);
+      step.unreadableKvBlocks = takeUnreadable(item.requestId);
+      result.push_back(std::move(step));
+    }
+    return result;
+  }
+  std::vector<ModelStepResult> decode(const BatchPlan &plan,
+                                      std::span<const ModelBatchItem> items) {
+    std::vector<ModelStepResult> result;
+    for (const auto &item : items) {
+      requireRows(item, item.logicalPosition);
+      // The production runtime stores a decode lane's rows, up to its verify
+      // block's most, from the lane's position; the engine must have covered
+      // them with page-table entries.
+      if (uint64_t{item.pageTable.size()} * engine::KvCache::pageTokens <
+          item.logicalPosition + model::ExecutionLimits::targetVerifyRows) {
+        throw std::invalid_argument("page_table_too_short");
+      }
+      Request &state = requests.at(item.requestId);
+      const uint32_t limit = outputLimits.at(item.requestId);
+      if (plan.decodeStage == DecodeStage::ApplyInitialMask) {
+        // Selects the first token under its mask and drafts nothing.
+        state.anchorLimit = limit;
+        result.push_back({item.requestId, 0, {}, false, DecodeStage::Regular,
+                          0, 0});
+      } else {
+        // The fake's step at the last budgeted token stands for the
+        // runtime's emission of that anchor as it selects it, under the
+        // same limit; an anchor selected under a higher limit was not
+        // emitted, and the runtime decodes no lane left only that anchor.
+        if (limit < state.anchorLimit && limit < state.generated + 2)
+          throw std::logic_error("terminal anchor was not emitted on selection");
+        const auto speculative = speculativeCounts.find(item.requestId);
+        const uint32_t emitted = speculative == speculativeCounts.end()
+            ? decodeTokens : speculative->second.second + 1;
+        const std::vector<uint32_t> tokens =
+            item.requestId == poisonRequest && poisonToken
+                ? std::vector<uint32_t>{*poisonToken}
+                : std::vector<uint32_t>(emitted, 42);
+        ModelStepResult step{item.requestId, 0, tokens, decodeFinishes,
+                             DecodeStage::Regular, 0, 0};
+        step.outputTokensWithoutKv = decodeTokensWithoutKv;
+        // A cycle seals the state it captures once the tokens it stores, all
+        // it emits but a terminal anchor, reach its boundary.
+        const uint64_t stored = item.logicalPosition + tokens.size() - decodeTokensWithoutKv;
+        if (item.stateCaptures.size() > 1)
+          throw std::logic_error("a decode cycle captures one state at most");
+        for (const StateCapture &capture : item.stateCaptures) {
+          if (!decodeStateCaptures || !capture.reservation || capture.tokens % engine::KvCache::pageTokens ||
+              capture.tokens <= item.logicalPosition ||
+              capture.tokens > item.logicalPosition + std::min(model::ExecutionLimits::targetVerifyRows,
+                                                               limit - state.generated))
+            throw std::logic_error("a decode capture lies past the rows its cycle may retain");
+          if (capture.tokens > stored)
+            continue;
+          captures.push_back({item.requestId, capture.tokens, stored});
+          step.capturedStates.push_back(seal(static_cast<Reservation &>(*capture.reservation)));
+        }
+        if (speculative != speculativeCounts.end()) {
+          step.draftedTokens = speculative->second.first;
+          step.acceptedDraftTokens = speculative->second.second;
+        }
+        step.unreadableKvBlocks = takeUnreadable(item.requestId);
+        state.generated += static_cast<uint32_t>(tokens.size());
+        state.anchorLimit = limit;
+        result.push_back(std::move(step));
+      }
+    }
+    return result;
+  }
+  // What the runtime's GPU page tables rely on: a revision names one page
+  // list, starts at one and only moves forward, and the list at the next
+  // revision keeps the pages below its first changed one. The cache starts
+  // a request's revisions again once the engine suspends or ends it.
+  void checkPageTables(std::span<const ModelBatchItem> items) {
+    for (const ModelBatchItem &item : items) {
+      if (!item.pageTableRevision)
+        throw std::logic_error("a page table has no revision");
+      const auto [found, inserted] = pageTables.try_emplace(item.requestId);
+      PageTableShadow &shadow = found->second;
+      const auto unchangedBelow = [&](size_t first) {
+        return first <= shadow.pages.size() && first <= item.pageTable.size() &&
+               std::equal(shadow.pages.begin(), shadow.pages.begin() + first,
+                          item.pageTable.begin());
+      };
+      if (!inserted &&
+          (item.pageTableRevision < shadow.revision ||
+           (item.pageTableRevision == shadow.revision &&
+            !std::ranges::equal(shadow.pages, item.pageTable)) ||
+           (item.pageTableRevision == shadow.revision + 1 &&
+            !unchangedBelow(item.pageTableFirstChanged))))
+        throw std::logic_error("a page table revision does not describe its pages");
+      shadow = {item.pageTableRevision, {item.pageTable.begin(), item.pageTable.end()}};
+    }
+  }
+  std::unique_ptr<ModelBatchTicket>
+  submit(const BatchPlan &plan, std::span<const ModelBatchItem> items,
+         std::function<void()> completion) override {
+    checkPageTables(items);
+    // A command keeps within the model's limits, as the production runtime
+    // runs no other.
+    if (const auto broken = model::commandViolation(commandLimits(), plan, items))
+      throw std::invalid_argument(std::string(*broken));
+    // A lane reads the K/V only a copy holds through memory reserved for it
+    // before its command, as the production runtime's readers require: a
+    // decoding lane's floor of the hot block cache, a prefill's staging of
+    // the pages its command reads.
+    for (const ModelBatchItem &item : items) {
+      if (!item.pageSources || !item.pageSources->indexPages())
+        continue;
+      const auto staged = historyStaging.find(item.requestId);
+      const bool reserved =
+          plan.kind == WorkKind::Decode
+              ? spilledReadFloors.contains(item.requestId)
+              : staged != historyStaging.end() &&
+                    uint64_t{staged->second} * engine::KvCache::pageTokens >=
+                        item.logicalPosition + item.tokenCount;
+      if (!reserved)
+        throw std::logic_error("a lane reads spilled K/V without memory reserved for its reads");
+    }
+    std::unique_ptr<ModelBatchTicket> ticket;
+    const auto constrained = [&](const ModelBatchItem &item) { return requests.at(item.requestId).constrained; };
+    if (plan.kind == WorkKind::Decode && plan.decodeStage == DecodeStage::Regular &&
+        std::ranges::any_of(items, constrained)) {
+      // A cycle with a constrained lane after its first token waits for that
+      // lane's mask inside the ticket, as the production constrained ticket
+      // does, and its other lanes decode as they do in a command of their
+      // own.
+      if (std::ranges::count_if(items, constrained) > 1)
+        throw std::logic_error("the test model takes the verify mask of one lane per command");
+      overlap = std::make_shared<MaskOverlapState>();
+      std::vector<ModelStepResult> results;
+      for (const ModelBatchItem &item : items) {
+        if (constrained(item)) {
+          overlap->requestId = item.requestId;
+          results.push_back({item.requestId, 0, {42}, decodeFinishes, DecodeStage::Regular, 7, 0});
+        } else {
+          results.push_back(std::move(decode(plan, std::span(&item, 1)).front()));
+        }
+      }
+      ticket = std::make_unique<MaskOverlapTicket>(overlap, std::move(results));
+    } else if (plan.kind == WorkKind::Decode && holdDecodeUntil) {
+      heldCompletion = std::move(completion);
+      ticket = std::make_unique<HeldTicket>(decode(plan, items), holdDecodeUntil,
+                                            1.0);
+    } else if (plan.kind == WorkKind::Prefill && stagePrefillUntil) {
+      ticket = std::make_unique<StagedTicket>(prefill(plan, items), stagePrefillUntil);
+    } else if (plan.kind == WorkKind::Prefill && holdPrefillUntil) {
+      heldCompletion = std::move(completion);
+      ticket = std::make_unique<HeldTicket>(prefill(plan, items),
+                                            holdPrefillUntil, 1.0);
+    } else if (plan.kind == WorkKind::Prefill && plan.pass + 1 < plan.passes) {
+      // A pass before a command's last commits nothing, as the production
+      // runtime's returns.
+      std::vector<ModelStepResult> results(items.size());
+      for (size_t lane = 0; lane < items.size(); ++lane) results[lane].requestId = items[lane].requestId;
+      ticket = timedTicket(std::move(results), plan, items, completion);
+    } else {
+      ticket = timedTicket(plan.kind == WorkKind::Prefill ? prefill(plan, items) : decode(plan, items), plan,
+                           items, completion);
+    }
+    if (submitObserver)
+      submitObserver();
+    return ticket;
+  }
+  // A command holds groupRows rows in up to `passes` passes over as many
+  // layers, the rows of one lane at most past a chunk, and streams the
+  // history of one lane at most.
+  model::CommandLimits commandLimits() const noexcept override {
+    return {.commandRows = groupRows,
+            .layers = passes,
+            .maximumPasses = passes,
+            .lanesPastChunk = 1,
+            .indexPageLanes = 1,
+            .streamsWeights = streamedExperts};
+  }
+  bool capturesInDecode() const noexcept override { return decodeStateCaptures; }
+  // With timing, the profile's work (TimedWork); otherwise the default.
+  model::CommandWork prefillWork(std::span<const model::PrefillLane> lanes, uint32_t first,
+                                 uint32_t passesLeft) const override {
+    return timing ? timing->prefillWork(lanes, first, passesLeft)
+                  : model::Model::prefillWork(lanes, first, passesLeft);
+  }
+  std::span<model::ElasticPool *const> pools() noexcept override {
+    pools_[0] = experts;
+    return experts ? std::span<model::ElasticPool *const>(pools_) : std::span<model::ElasticPool *const>();
+  }
+  // A prefill's staging beyond what it holds.
+  uint64_t stagingShortfall(uint64_t id, uint32_t pages) const override {
+    const auto staged = historyStaging.find(id);
+    const uint32_t held = staged == historyStaging.end() ? 0 : staged->second;
+    return pages > held ? uint64_t{pages - held} * stagingPageBytes : 0;
+  }
+  // Each lane's floor is spilledReadFloorBytes, linear where the real cache
+  // rounds to whole extents (model::KvBlockCache::lanesShortfallBytes); the
+  // lanes waiting for theirs count no stale extents, which a Start may take.
+  uint64_t hotFloorBytes(uint32_t lanes) const override { return uint64_t{lanes} * spilledReadFloorBytes; }
+  uint64_t hotFloorShortfall(std::span<const uint64_t> ids) const override {
+    return static_cast<uint64_t>(std::ranges::count_if(ids, [&](uint64_t id) { return !spilledReadFloors.contains(id); })) *
+           spilledReadFloorBytes;
+  }
+  // Runs the model's commands on `profile`: they report its work and take
+  // its time, the experts pool's residency pricing their reads.
+  void time(const TimingProfile &profile) {
+    timing.emplace(profile,
+                   [this, &profile] { return experts ? experts->residentShare() : profile.measuredResidentShare; });
+    noise_.seed(profile.seed);
+  }
+  // With a clock: when the timed command in flight ends, and its completion,
+  // run once the clock has reached it.
+  [[nodiscard]] std::optional<double> commandEnd() const noexcept { return commandEnd_; }
+  void land(double nowMilliseconds) {
+    if (!commandEnd_ || *commandEnd_ > nowMilliseconds)
+      return;
+    commandEnd_.reset();
+    if (const std::function<void()> completion = std::exchange(timedCompletion_, {}))
+      completion();
+  }
+  // A state's buffers for a resident lane's page boundary, or nullptr with the
+  // cause: refused for the next `deniedReservations` calls, at
+  // `denyReservationAt`, and while `reservationRoom` reports no memory.
+  std::shared_ptr<StateReservation> reserveState(uint64_t id, uint32_t tokens,
+                                                 metal::AllocationFailure &refusal) override {
+    if (!requests.at(id).resident || !tokens || tokens % engine::KvCache::pageTokens)
+      throw std::logic_error("a state was reserved off a resident lane's page boundary");
+    ++reservationAttempts;
+    if (reservationObserver)
+      reservationObserver();
+    if (deniedReservations) {
+      --deniedReservations;
+      refusal = reservationFailure;
+      return nullptr;
+    }
+    if (denyReservationAt == tokens || (reservationRoom && !reservationRoom())) {
+      refusal = reservationFailure;
+      return nullptr;
+    }
+    if (memory) {
+      if (const metal::AllocationResult result = takeStateBuffers(); !result) {
+        refusal = result.failure;
+        return nullptr;
+      }
+    }
+    refusal = metal::AllocationFailure::None;
+    ++reservations;
+    return std::make_shared<Reservation>(evictedStateBytes);
+  }
+  // The production model copies the lane's state at its position into
+  // buffers it takes as reserveState() does; so does the fake, refusing as
+  // reserveState() refuses.
+  std::shared_ptr<const CompositeState> snapshot(uint64_t id) override {
+    metal::AllocationFailure refusal;
+    const std::shared_ptr<StateReservation> buffers =
+        reserveState(id, requests.at(id).position, refusal);
+    if (!buffers)
+      return nullptr;
+    ++snapshots;
+    return seal(static_cast<Reservation &>(*buffers));
+  }
+  // Without a cache slot the production model writes the lane's state to
+  // the disk tier; the fake has one when `stateTier` is set, with quota for
+  // every state.
+  bool canSnapshotToDisk(bool) const noexcept override { return stateTier != nullptr; }
+  std::unique_ptr<StateOffload> snapshotToDisk(uint64_t, std::function<void()>) override {
+    ++diskSnapshots;
+    return std::make_unique<OffloadTicket>(stateTier);
+  }
+  std::optional<uint32_t> statesToActivate() const noexcept override {
+    return statesLacked ? statesLacked() : std::optional<uint32_t>{0};
+  }
+  // What a lane's start allocates (takeLaneState). Nothing without `memory`.
+  uint64_t startStateBytes() const noexcept override { return memory ? laneTake().allocated : 0; }
+  // The production model's pool releases the buffers beyond a lane's with
+  // keepLane, else all of them (QwenStateStorage::idleBytes); the fake's are
+  // those of the states the cache let go of and of `evictedStates` more (none
+  // under KeptState), of the pool a start leaves with `afterStart`, less what
+  // refills a lane's footprint with keepLane, else with the footprint pooled.
+  // Nothing without `memory`.
+  uint64_t idleBufferBytes(uint32_t evictedStates, bool afterStart, bool keepLane) const noexcept override {
+    if (!memory)
+      return 0;
+    const LaneTake lane = afterStart ? laneTake() : LaneTake{};
+    const uint64_t pooled = pooledLaneBytes - lane.pooled;
+    const uint64_t each = keptTier ? 0 : State().bytes();
+    const uint64_t returned = *evictedStateBytes + uint64_t{evictedStates} * each;
+    if (!keepLane)
+      return reclaimableIdleStateBytes - lane.idle + pooled + returned;
+    const uint64_t refill = std::min(returned, laneFootprintBytes - std::min(laneFootprintBytes, pooled));
+    return reclaimableIdleStateBytes - lane.idle + returned - refill;
+  }
+  // A decoding lane's floor of the hot block cache, held until the lane is
+  // suspended or ends, or a prefill's staging of the pages it reads; refused
+  // as refusedSpilledReads, spilledReadsRoom and refusedStaging say.
+  model::ModelMemoryAdmission reserveSpilledReads(uint64_t id, model::SpilledReadNeed need) override {
+    if (need.kind == WorkKind::Decode) {
+      if (refusedSpilledReads.contains(id) || (spilledReadsRoom && !spilledReadsRoom(id)))
+        return {.allocationFailure = spilledReadsRefusal};
+      if (!spilledReadFloors.contains(id)) {
+        const uint64_t stale = std::min(spilledReadFloorBytes, staleHotBytes);
+        if (const metal::AllocationResult result = allocateReads(id, spilledReadFloorBytes - stale); !result)
+          return {.allocationFailure = result.failure};
+        staleHotBytes -= stale;
+      }
+      spilledReadFloors.insert(id);
+      return {.ok = true};
+    }
+    if (refusedStaging.contains(id))
+      return {.allocationFailure = metal::AllocationFailure::EngineBudget};
+    const auto found = historyStaging.find(id);
+    if (const uint32_t held = found == historyStaging.end() ? 0 : found->second; need.pages > held)
+      if (const metal::AllocationResult result = allocateReads(id, uint64_t{need.pages - held} * stagingPageBytes);
+          !result)
+        return {.allocationFailure = result.failure};
+    uint32_t &staged = historyStaging[id];
+    staged = std::max(staged, need.pages);
+    return {.ok = true};
+  }
+  uint64_t releaseIdleBuffer(bool keepLane) noexcept override {
+    keptLane = keepLane;
+    poolStates(std::exchange(*evictedStateBytes, 0));
+    if (!keepLane && pooledLaneBytes)
+      return giveBackStates(std::exchange(pooledLaneBytes, 0));
+    const uint64_t released = giveBackStates(reclaimableIdleStateBytes);
+    reclaimableIdleStateBytes = 0;
+    reclaimedIdleStateBytes += released;
+    if (released && kvGrowthBlocked)
+      *kvGrowthBlocked = false;
+    return released;
+  }
+  std::optional<std::string> provideMask(uint64_t id, std::span<const uint32_t> words,
+                                         std::span<const uint32_t>) override {
+    Request &entry = requests.at(id);
+    const bool verify = overlap && overlap->emitted && overlap->requestId == id &&
+                        !overlap->provided && !overlap->abandoned;
+    if (!verify && !entry.awaitingMask)
+      throw std::logic_error("request is not waiting for a token mask");
+    if (std::none_of(words.begin(), words.end(), [](uint32_t word) { return word != 0; }))
+      return "token mask row permits no vocabulary token";
+    if (verify)
+      overlap->provided = true;
+    else
+      entry.awaitingMask = false;
+    ++providedMasks;
+    return std::nullopt;
+  }
+  void end(uint64_t id) override {
+    ++ends;
+    if (const auto found = requests.find(id); found != requests.end() && found->second.resident) {
+      releaseLane(id);
+      if (laneReleased)
+        laneReleased();
+    }
+    requests.erase(id);
+    pageTables.erase(id);
+    spilledReadFloors.erase(id);
+    historyStaging.erase(id);
+  }
+
+  // What a page holds once prefill has written a block's first row to it.
+  static uint64_t rows(uint32_t block, uint32_t firstToken) {
+    return (uint64_t{block} << 32) | firstToken;
+  }
+  // With `kv`, a step's page table names allocated extents only and finds
+  // every prompt block before `position`; with windowPages, the window's
+  // pages hold every layer (kv::PageForm::Full), and windowDigest folds in
+  // what the step read there.
+  void requireRows(const ModelBatchItem &item, uint64_t position) {
+    if (!kv)
+      return;
+    for (uint32_t page : item.pageTable)
+      if (!kv->allocated(page / kv->extentPages()))
+        throw std::logic_error("a page table names a page of a released extent");
+    const std::vector<uint32_t> &prompt = prompts.at(item.requestId);
+    const uint64_t blocks =
+        std::min<uint64_t>(position, prompt.size()) / engine::KvCache::pageTokens;
+    for (uint32_t block = 0; block < blocks; ++block) {
+      if (kv->content.at(item.pageTable[block]) !=
+          rows(block, prompt[block * engine::KvCache::pageTokens]))
+        throw std::logic_error("a page does not hold its block's rows");
+    }
+    if (!windowPages)
+      return;
+    const auto fold = [&](uint64_t value) { windowDigest = (windowDigest ^ value) * 0x100000001b3ULL; };
+    fold(item.requestId);
+    fold(position);
+    fold(item.tokenCount);
+    const uint64_t first = position / engine::KvCache::pageTokens;
+    const uint64_t marked = (std::min<uint64_t>(position, prompt.size()) + engine::KvCache::pageTokens - 1) /
+                            engine::KvCache::pageTokens;
+    for (uint64_t page = first - std::min<uint64_t>(first, windowPages); page < item.pageTable.size(); ++page) {
+      if (kv->form(item.pageTable[page]) != kv::PageForm::Full)
+        throw std::logic_error("a page a step's window reads does not hold every layer");
+      if (page < marked)
+        fold(kv->content.at(item.pageTable[page]));
+    }
+  }
+
+  struct Request {
+    uint32_t lane = 0;
+    uint32_t position = 0;
+    bool resident = false;
+    bool replaying = false;
+    bool constrained = false;
+    std::vector<uint32_t> scoreTokens;
+    // Waits for its first token's mask.
+    bool awaitingMask = false;
+    // The tokens its decode steps emitted, and the output limit under which
+    // its anchor was selected: by the step that completed its prompt, its
+    // first mask's or its latest decode step.
+    uint32_t generated = 0;
+    uint32_t anchorLimit = 0;
+  };
+  std::unordered_map<uint64_t, Request> requests;
+  // The page list each request's last item named, at its revision.
+  struct PageTableShadow {
+    uint64_t revision = 0;
+    std::vector<uint32_t> pages;
+  };
+  std::unordered_map<uint64_t, PageTableShadow> pageTables;
+  // The storage whose pages the fake writes and checks: prefill marks the
+  // page of every block it starts, as the production model writes its rows
+  // there, and each later step requires the marks of the blocks before it.
+  TestKvStorage *kv = nullptr;
+  // A windowed target's window, in pages, and the digest of what each step
+  // read in its windows (requireRows).
+  uint32_t windowPages = 0;
+  uint64_t windowDigest = 0xcbf29ce484222325ULL;
+  std::unordered_map<uint64_t, std::vector<uint32_t>> prompts;
+  std::unordered_map<uint64_t, DraftContextPlan> plans;
+  std::shared_ptr<RestoreControl> restoreControl = std::make_shared<RestoreControl>();
+  uint32_t diskReads = 0;
+  uint32_t prefillRows = 0;
+  uint32_t restored = 0;
+  // State reservations granted, and asked for.
+  uint32_t reservations = 0;
+  uint32_t reservationAttempts = 0;
+  // Each state a step captured: its request, its boundary and the step's
+  // end, past the boundary for one inside the step (a decode cycle's: the
+  // tokens it stores).
+  struct Capture {
+    uint64_t requestId = 0;
+    uint32_t tokens = 0;
+    uint64_t end = 0;
+  };
+  std::vector<Capture> captures;
+  // States taken from a lane after its command (snapshot).
+  uint32_t snapshots = 0;
+  uint32_t diskSnapshots = 0;
+  std::shared_ptr<OffloadControl> stateTier;
+  // With it, captured states are KeptStates whose copies land when it says
+  // so.
+  std::shared_ptr<OffloadControl> keptTier;
+  // With it, captured states are OffloadStates, written as the cache lets
+  // them leave RAM, their copies landing when it says so.
+  std::shared_ptr<OffloadControl> offloadTier;
+  // Its decode cycles capture states (Model::capturesInDecode), as every
+  // target but one with auxiliary state bytes does.
+  bool decodeStateCaptures = true;
+  uint32_t deniedReservations = 0;
+  std::optional<uint32_t> denyReservationAt;
+  uint32_t beginAttempts = 0;
+  // The request of the latest begin(), for hooks that refuse only some.
+  uint64_t lastBeginId = 0;
+  // The restored prefix the latest begin() or resume() activated with.
+  uint32_t lastRestoredTokens = 0;
+  // Begins the budget refuses, and resumes the host refuses.
+  uint32_t deniedBegins = 0;
+  uint32_t suspensions = 0;
+  // The request of each suspension, in order.
+  std::vector<uint64_t> suspendedIds;
+  uint32_t resumptions = 0;
+  uint32_t resumeAttempts = 0;
+  // Requests the engine ended (end()).
+  uint32_t ends = 0;
+  bool resumeDenied = false;
+  uint32_t maximumLanes = model::ExecutionLimits::maximumBatchWidth;
+  std::function<void()> beginObserver;
+  std::function<void()> reservationObserver;
+  std::function<bool()> reservationRoom;
+  metal::AllocationFailure reservationFailure = metal::AllocationFailure::EngineBudget;
+  std::function<bool()> beginGrowthBlocked;
+  std::vector<std::vector<uint32_t>> resumedPrompts;
+  std::vector<uint32_t> prefillWidths;
+  bool restoredDraft = false;
+  metal::AllocationFailure beginAllocationFailure =
+      metal::AllocationFailure::EngineBudget;
+  uint64_t reclaimableIdleStateBytes = 0;
+  // The pooled buffers a lane starts from, up to laneFootprintBytes (one
+  // lane's state buffers); only a reclaim that does not keep the lane
+  // releases them. The buffers of states the cache let go of (at a reclaim)
+  // and of a lane that leaves (with memory) refill them, and the rest are
+  // idle (reclaimableIdleStateBytes).
+  uint64_t pooledLaneBytes = 0;
+  uint64_t laneFootprintBytes = 0;
+  // The buffers of states the cache has let go of, and of reservations no
+  // step sealed, until releaseIdleBuffer takes them into the pool.
+  std::shared_ptr<uint64_t> evictedStateBytes = std::make_shared<uint64_t>(0);
+  // The cached states whose buffers the pool lacks for one activation (Model::statesToActivate).
+  std::function<std::optional<uint32_t>()> statesLacked;
+  uint64_t reclaimedIdleStateBytes = 0;
+  bool keptLane = false;
+  // Called when a resident request gives its lane back.
+  std::function<void()> laneReleased;
+  bool *kvGrowthBlocked = nullptr;
+  bool unblockGrowthOnSuspend = true;
+  bool decodeFinishes = true;
+  std::unordered_map<uint64_t, std::pair<uint32_t, uint32_t>> speculativeCounts;
+  uint32_t decodeTokensWithoutKv = 0;
+  // When set, the decode step emits poisonToken (instead of 42) for
+  // poisonRequest, exercising the engine's output validation.
+  uint64_t poisonRequest = 0;
+  std::optional<uint32_t> poisonToken;
+  // Set when prefill itself ends the request: the value is `finished` (stop).
+  std::optional<bool> prefillAnchor;
+  // Whether the step that completes an unconstrained request's prompt reports
+  // its first token (ModelStepResult::firstToken), as the runtime does. It is
+  // 42, which the first decode step's tokens start with.
+  bool firstTokens = false;
+  std::shared_ptr<std::atomic<bool>> holdDecodeUntil;
+  std::shared_ptr<std::atomic<bool>> holdPrefillUntil;
+  // Set, each prefill command is two: the first runs until the flag is
+  // true, and the engine's advance() then runs the second (StagedTicket).
+  std::shared_ptr<std::atomic<bool>> stagePrefillUntil;
+  // The completion of the latest held command, for the test to call as
+  // Metal's completion handler would.
+  std::function<void()> heldCompletion;
+  std::shared_ptr<MaskOverlapState> overlap;
+  std::function<void()> healthCheck;
+  // Runs once each command is submitted, a held one's completion stored.
+  std::function<void()> submitObserver;
+  // The times each command that completes at once reports, from its plan
+  // and items, before a profile's (time()); none without either.
+  std::function<CommandTimes(const BatchPlan &, std::span<const ModelBatchItem>)> commandTimes;
+  // Score requests whose final prompt step reports a non-finite logit.
+  std::unordered_set<uint64_t> invalidScores;
+  // Requests whose prefill steps report a row that is not finite.
+  std::unordered_set<uint64_t> nonFinitePrefills;
+  // The flags and sampling each request began with, and the output limit
+  // (ModelRequest::maxNewTokens) its latest begin() or resume() was given.
+  std::unordered_map<uint64_t, uint32_t> beganFlags;
+  std::unordered_map<uint64_t, SamplingParameters> beganSampling;
+  std::unordered_map<uint64_t, uint32_t> outputLimits;
+  // The prefill steps each request took.
+  std::unordered_map<uint64_t, uint32_t> prefillChunks;
+  // The most rows of a prefill command (CommandLimits::commandRows): a
+  // chunk's, or a prefill group's, as where experts stream.
+  uint32_t groupRows = model::ExecutionLimits::prefillTokenBudget;
+  // The target's layers, over which a prefill command runs in as many passes
+  // at most (CommandLimits::layers, maximumPasses).
+  uint32_t passes = 1;
+  // Whether its experts stream (CommandLimits::streamsWeights).
+  bool streamedExperts = false;
+  // The tokens a decode step emits.
+  uint32_t decodeTokens = 1;
+  // The masks the model took.
+  uint32_t providedMasks = 0;
+  // Requests whose floor of the hot block cache is refused, and those whose
+  // history's staging is (reserveSpilledReads).
+  std::unordered_set<uint64_t> refusedSpilledReads;
+  std::function<bool(uint64_t)> spilledReadsRoom;
+  metal::AllocationFailure spilledReadsRefusal = metal::AllocationFailure::EngineBudget;
+  std::unordered_set<uint64_t> refusedStaging;
+  // The requests that hold their floor of the hot block cache, and the
+  // pages of history staged for each.
+  std::unordered_set<uint64_t> spilledReadFloors;
+  std::unordered_map<uint64_t, uint32_t> historyStaging;
+  // Blocks of KV the SSD cache holds that each request's next step reports
+  // it could not read (ModelStepResult::unreadableKvBlocks).
+  std::unordered_map<uint64_t, std::vector<uint64_t>> unreadableBlocks;
+
+  // With `memory`, the model allocates under `admission`: lane and state
+  // buffers as "states" (heldStateBytes), hot block floors
+  // (spilledReadFloorBytes) and staging (stagingPageBytes a page) as
+  // "spilled_reads".
+  FakeMemory *memory = nullptr;
+  metal::AllocationAdmission admission;
+  uint64_t spilledReadFloorBytes = 0, stagingPageBytes = 0;
+  // The hot block cache's extents past the floors that no lane reads (a
+  // Spill lane that ended left them): a lane's floor takes them before it
+  // allocates, and no shortfall counts them, as a Start may take them.
+  uint64_t staleHotBytes = 0;
+  uint64_t heldStateBytes = 0;
+  std::unordered_map<uint64_t, uint64_t> spilledReadBytes;
+  // The expert store as an elastic pool (pools()), whose residency prices
+  // the timed commands' reads and which their routing serves.
+  FakeElasticPool *experts = nullptr;
+  // With it (time()), the model reports the profile's work and its commands
+  // take the profile's time and sample its work; with a clock too, each
+  // completes once the clock reaches its end (TimedTicket).
+  std::optional<TimedWork> timing;
+  std::function<double()> clock;
+  // Runs as each command that takes those times (or commandTimes') is
+  // submitted.
+  std::function<void(const BatchPlan &, const CommandTimes &)> commandTimed;
+
+  // Holds every command until the flag it returns is set.
+  std::shared_ptr<std::atomic<bool>> holdCommands() {
+    holdPrefillUntil = holdDecodeUntil = std::make_shared<std::atomic<bool>>(false);
+    return holdDecodeUntil;
+  }
+
+private:
+  metal::AllocationResult allocateStates(uint64_t bytes) {
+    if (!bytes)
+      return {};
+    const metal::AllocationResult result = memory->allocate(admission, "states", bytes);
+    if (result)
+      heldStateBytes += bytes;
+    return result;
+  }
+  // One state's buffers: those the cache let go of first, else booked.
+  bool stateReused() const noexcept { return *evictedStateBytes >= State().bytes(); }
+  metal::AllocationResult takeStateBuffers() {
+    const uint64_t bytes = State().bytes();
+    if (stateReused()) {
+      *evictedStateBytes -= bytes;
+      return {};
+    }
+    return allocateStates(bytes);
+  }
+  // A restored state's RAM copy, in one state's buffers: nullptr when they
+  // are refused, as the production snapshot of a restore is.
+  std::shared_ptr<const CompositeState> restoredCopy() {
+    if (!takeStateBuffers())
+      return nullptr;
+    return std::make_shared<State>(evictedStateBytes);
+  }
+  // State buffers a reclaim gives back.
+  uint64_t giveBackStates(uint64_t bytes) noexcept {
+    if (memory && bytes) {
+      memory->release("states", bytes);
+      heldStateBytes -= bytes;
+    }
+    return bytes;
+  }
+  // Buffers back in the pool refill those a lane starts from; the rest are
+  // idle.
+  void poolStates(uint64_t bytes) noexcept {
+    const uint64_t refill = std::min(bytes, laneFootprintBytes - std::min(laneFootprintBytes, pooledLaneBytes));
+    pooledLaneBytes += refill;
+    reclaimableIdleStateBytes += bytes - refill;
+  }
+  // A lane's state buffers, from the idle pooled ones first, then those a
+  // lane starts from, and what it allocates.
+  struct LaneTake final {
+    uint64_t idle = 0, pooled = 0, allocated = 0;
+  };
+  LaneTake laneTake() const noexcept {
+    const uint64_t idle = std::min(reclaimableIdleStateBytes, laneFootprintBytes);
+    const uint64_t pooled = std::min(pooledLaneBytes, laneFootprintBytes - idle);
+    return {idle, pooled, laneFootprintBytes - idle - pooled};
+  }
+  // Takes them: the cause of a refusal, or None.
+  metal::AllocationFailure takeLaneState() {
+    if (!memory || !laneFootprintBytes)
+      return metal::AllocationFailure::None;
+    const LaneTake take = laneTake();
+    if (const metal::AllocationResult result = allocateStates(take.allocated); !result)
+      return result.failure;
+    reclaimableIdleStateBytes -= take.idle;
+    pooledLaneBytes -= take.pooled;
+    return metal::AllocationFailure::None;
+  }
+  metal::AllocationResult allocateReads(uint64_t id, uint64_t bytes) {
+    if (!memory || !bytes)
+      return {};
+    const metal::AllocationResult result = memory->allocate(admission, "spilled_reads", bytes);
+    if (result)
+      spilledReadBytes[id] += bytes;
+    return result;
+  }
+  // A resident lane leaves: its state buffers go back to the pool and its
+  // reads' memory to the host.
+  void releaseLane(uint64_t id) {
+    if (memory)
+      poolStates(laneFootprintBytes);
+    if (const auto found = spilledReadBytes.find(id); found != spilledReadBytes.end()) {
+      memory->release("spilled_reads", found->second);
+      spilledReadBytes.erase(found);
+    }
+  }
+  // A command that completes at once, or with a clock once it reaches its
+  // end, taking the times a test gives it (commandTimes), or its work's time
+  // on the profile.
+  std::unique_ptr<ModelBatchTicket> timedTicket(std::vector<ModelStepResult> results, const BatchPlan &plan,
+                                                std::span<const ModelBatchItem> items,
+                                                const std::function<void()> &completion) {
+    const CommandTimes times =
+        commandTimes ? commandTimes(plan, items) : timing ? timedTimes(plan, items) : CommandTimes{};
+    if (commandTimed)
+      commandTimed(plan, times);
+    if (!clock)
+      return immediateTicket(std::move(results), completion, times);
+    commandEnd_ = clock() + times.wallMilliseconds;
+    timedCompletion_ = completion;
+    return std::make_unique<TimedTicket>(std::move(results), times, clock, *commandEnd_);
+  }
+  // A command's time and work on the profile at the experts' residency now: a
+  // decode reads its misses (decodeBytesPerToken a row) of its rows' topK
+  // experts a layer.
+  CommandTimes timedTimes(const BatchPlan &plan, std::span<const ModelBatchItem> items) {
+    const TimingProfile &profile = timing->profile();
+    const double share = timing->residentShare();
+    CommandTimes times;
+    if (plan.kind == WorkKind::Prefill) {
+      std::vector<model::PrefillLane> lanes;
+      for (const ModelBatchItem &item : items)
+        lanes.push_back({.position = static_cast<uint32_t>(item.logicalPosition),
+                         .rows = item.tokenCount,
+                         .indexPages = item.pageSources ? item.pageSources->indexPages() : 0});
+      times = timing->times(lanes, plan.layer, plan.passes - plan.pass);
+    } else {
+      const auto width = static_cast<uint32_t>(items.size());
+      const uint32_t rows = width * model::ExecutionLimits::draftQueryRows;
+      const auto spilling = static_cast<uint32_t>(std::ranges::count_if(
+          items, [](const ModelBatchItem &item) { return item.pageSources && item.pageSources->indexPages(); }));
+      times = decodeTimes(profile, width, rows, share, spilling);
+      const uint64_t routed = uint64_t{rows} * profile.experts.topK * profile.layers;
+      const uint64_t misses =
+          profile.experts.expertBytes
+              ? std::min(routed, static_cast<uint64_t>(decodeBytesPerToken(profile, share) * rows /
+                                                       double(profile.experts.expertBytes)))
+              : 0;
+      times.sample.work = {.weightReadBytes = misses * profile.experts.expertBytes};
+    }
+    if (profile.noise)
+      times.wallMilliseconds *= std::max(0.0, 1.0 + profile.noise * std::normal_distribution<double>()(noise_));
+    return times;
+  }
+  // The blocks the request's step reports it could not read, once.
+  std::vector<uint64_t> takeUnreadable(uint64_t id) {
+    const auto found = unreadableBlocks.find(id);
+    if (found == unreadableBlocks.end())
+      return {};
+    std::vector<uint64_t> blocks = std::move(found->second);
+    unreadableBlocks.erase(found);
+    return blocks;
+  }
+  // The state the step that captured it keeps in the reserved buffers.
+  std::shared_ptr<const CompositeState> seal(Reservation &reservation) {
+    std::shared_ptr<uint64_t> pool = reservation.seal();
+    if (keptTier)
+      return std::make_shared<KeptState>(keptTier);
+    if (offloadTier)
+      return std::make_shared<OffloadState>(offloadTier, std::move(pool));
+    return std::make_shared<State>(std::move(pool));
+  }
+  void applyRestore(uint64_t id, uint32_t length,
+                    std::shared_ptr<const CompositeState> state,
+                    bool restoreDraftState) {
+    if (!state)
+      throw std::runtime_error("empty restore state");
+    requests.at(id).position = length;
+    restored += length;
+    restoredDraft = restoreDraftState;
+  }
+
+  model::ElasticPool *pools_[1] = {};
+  std::mt19937_64 noise_;
+  std::optional<double> commandEnd_;
+  std::function<void()> timedCompletion_;
+};
+
+// A streamed target whose expert reads are small beside its chunks' work
+// (the M6's Flash-Next with an 85 GB/s SSD), so that every command runs in
+// the most passes the engine tests' model allows.
+inline const TimingProfile &passingTarget() {
+  static const TimingProfile profile = [] {
+    TimingProfile result = kM6FlashNextQ2;
+    result.name = "passing-target";
+    result.chunkMilliseconds = 2220.0;
+    result.rowMilliseconds = 0.3;
+    result.weightBytesPerMillisecond = 85e6;
+    result.hostFloorMilliseconds = 0.0;
+    result.hiddenShare = 0.0;
+    return result;
+  }();
+  return profile;
+}
+
+// A target with every expert resident whose spilled history costs a command
+// 80 ms a page to read: a lane holding Index pages runs groups, others chunks.
+inline const TimingProfile &heavyHistoryTarget() {
+  static const TimingProfile profile = [] {
+    TimingProfile result = kStoreLessSpillFlashNext;
+    result.name = "heavy-history-target";
+    result.spilledPageBytes = 1'000'000'000;
+    return result;
+  }();
+  return profile;
+}
+
+// A dense target whose prefill takes 4 ms a row and nothing else, and whose
+// decode commands take 10 ms: beside a decoding lane a command is cut to the
+// floor of 512 rows, as G holds only 125 of them.
+inline const TimingProfile &fourMillisecondRows() {
+  static const TimingProfile profile{
+      .name = "four-millisecond-rows",
+      .rowMilliseconds = 4.0,
+      .decodeMilliseconds = {10.0, 10.0, 10.0, 10.0},
+  };
+  return profile;
+}
+
+// The fake model's command limits (Executor::groupRows, passes,
+// streamedExperts), for a fixture to set before it builds the engine.
+inline std::function<void(Executor &)> commandShape(uint32_t groupRows, uint32_t passes = 1,
+                                                    bool streamsExperts = false) {
+  return [=](Executor &model) {
+    model.groupRows = groupRows;
+    model.passes = passes;
+    model.streamedExperts = streamsExperts;
+  };
+}
+
+} // namespace splash::test

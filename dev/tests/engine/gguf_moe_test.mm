@@ -4,33 +4,82 @@
 // - Float projection, both tiles (fp32 simdgroup MMA, and the neural
 //   accelerator on three exact bf16 parts per weight): every row count a
 //   decode or prefill dispatch takes (with ragged tile tails), the router and
-//   alpha/beta widths, bf16 and fp32 destinations at a column offset of a
-//   wider row; neighbours stay untouched.
+//   alpha/beta widths at K of whole and partial 64-input steps, bf16 and fp32
+//   destinations at a column offset of a wider row; neighbours stay
+//   untouched. BF16 weights (a router a GGUF stores so) give the outputs of
+//   the F32 tensor of their values bit for bit, and so do the native rows of
+//   every quantized format (an MLX checkpoint's quantized router) those of
+//   the F32 values the gather decodes from them, as load-time widening wrote
+//   them; their bf16 destination is refused. Two projections of one input
+//   (the QSA indexer's query and key) share a dispatch when they share a tile
+//   and each gives the outputs of its own dispatch bit for bit.
 // - Float segments of a fused GGUF projection (Linear), the 35B's and the
-//   27B's F32 alpha/beta widths, on either float tile: the quantized
+//   27B's F32 alpha/beta widths, at the device's own GPU family and the
+//   forced Apple9/10 families (and their register and neural accelerator
+//   tiles) only where the device's family supports them: the quantized
 //   segments' outputs unchanged, the padding past the segments unwritten.
-// - MoE: every GGUF plan (the staged 8- and 32-row tiles and the Apple9
-//   register tile, whatever GPU runs the test; decode steps and prefill
-//   chunks) for every format, gate, up and down in three formats and the
-//   shared expert in three more; routes and weights against the fp64 router,
-//   each pass inside the fp64 interval its numerics allow, the block's output,
-//   and a row's output bitwise equal at every lane count and chunk of one
-//   tile.
+// - MoE: every GGUF plan (the staged 8- and 32-row tiles, Apple7/8's MMA
+//   tiles in their place; decode steps and prefill chunks) for every format, gate, up and down in three formats and
+//   the shared expert in three more, also with up in the gate's formats (gate
+//   and up run in one pass); routes and weights against the fp64 router, each
+//   pass inside the fp64 interval its numerics allow, the block's output, a
+//   row's output bitwise equal at every lane count and chunk of one tile where
+//   its routes run the same tile kinds (the staged expert passes run an
+//   expert's only tile of at most GGUF_COLUMN_ROWS live rows on the column
+//   tile; the rows so compared are counted) and at every repeat of a run (a
+//   set's first plan also on fresh scratch, where every row must compare), the
+//   output of the live tiles' grids bitwise that of every tile's with the gate
+//   and up passes apart (gguf_moe_test.metal, on the down pass's expert tile),
+//   and the grouping: tiles as each expert's routes fill them, their rows
+//   packed in tile order, every route's grouped row naming it back in a tile
+//   of its expert, and the rows past the tiles' unwritten, though a last
+//   tile's matmul reads them. Concentrated and skewed router loads on
+//   the staged 32-row tiles of one format, at ragged row counts. A decode
+//   step that routes its lanes' rows alone, no row of no lane, whether its
+//   rows of no lane follow the lanes' or lie around them, every lane's row
+//   bitwise the all-rows step's.
+// - The router and the shared expert's slices are the build's
+//   (ops::kCompiledMoeRoutings): softmax weights and one gated shared slice by
+//   default; gguf-moe-sigmoid builds Flint's, sigmoid weights over the sum of
+//   the top 6 and two ungated 512-wide slices of a 1024-wide shared expert,
+//   each slice's passes against the fp64 products of its rows and column
+//   window of the whole expert.
+// Streamed experts (model::ExpertStore) run in expert_store_test.mm.
+// `gguf-moe METALLIB float-stress N` runs the native rows' check alone N
+// times, on fresh rows each time, for a failure one run may not show. Run it
+// as test-engine-metal runs the test, under shader validation, beside a
+// second, unvalidated float-stress as load:
+//   gguf-moe production-and-test.metallib float-stress 1000 &
+//   MTL_SHADER_VALIDATION=1 gguf-moe production-and-test.metallib float-stress 20
+//   kill %1
+// With the simdgroup tile's fragment loop ended by a break (MMAs under a loop
+// exit the compiler cannot prove uniform, kernels/shared/gguf_float.metal),
+// one of a simdgroup's sums for the last fragment of native rows came out
+// zero or another fragment's: 16 of 20 iterations failed so on an Apple11 GPU
+// under macOS 27.0 beside the load (alone, far fewer or none), none of 20 on
+// an Apple9 under macOS 26.6. With the fragment skipped instead, none failed.
+#include "MoeStep.hpp"
 #include "../../../runtime/metal/CommandGraph.hpp"
 #include "../../../runtime/metal/MetalBackend.hpp"
 #include "../../../runtime/ops/Linear.hpp"
 #include "../../../runtime/ops/MoE.hpp"
 #include "GgufFormatReference.hpp"
+#include "MoeExtents.hpp"
+#include "MoeFixture.hpp"
 #include "metal/abi/Gguf.h"
 #include "metal/abi/MoE.h"
+#include "ops/LaneRows.hpp"
 
 #import <Foundation/Foundation.h>
 
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <functional>
 #include <iostream>
 #include <map>
@@ -38,6 +87,8 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -45,46 +96,73 @@ namespace {
 using splash::DeviceCapabilities;
 using splash::metal::BufferStorage;
 using splash::metal::CommandGraph;
+using splash::metal::ComputeDispatch;
 using splash::metal::MetalBackend;
 using splash::metal::MetalBuffer;
 using splash::ops::FloatOutput;
+using splash::ops::FloatProjection;
 using splash::ops::FloatTile;
 using splash::ops::BlockExpertProjection;
 using splash::ops::BlockMoeWeights;
+using splash::ops::ExpertChunks;
 using splash::ops::QuantizedSegment;
 using splash::ops::MoE;
-using splash::ops::MoeBuffers;
 using splash::ops::MoeConfig;
-using splash::ops::MoeScratchField;
-using splash::ops::kMoeScratchFields;
-using splash::ops::MoeExpertSimdgroups;
-using splash::ops::MoeExpertTile;
 using splash::ops::MoeGgufTile;
+using splash::ops::MoeScratch;
+using splash::ops::MoeExpertTile;
 using splash::ops::MoePlan;
 using splash::ops::MoeShape;
-using splash::ops::MoeWeights;
 using splash::ops::LinearEpilogue;
 using splash::ops::LinearMatrix;
-using splash::ops::LinearPhase;
 using splash::ops::LinearPlan;
 using splash::ops::LinearScratch;
 using splash::ops::LinearScratchSize;
 using splash::ops::Linear;
 using splash::ops::PreparedInput;
 using splash::ops::Projection;
-using splash::ops::WeightLayout;
 using namespace gguf_reference;
+using namespace moe_fixture;
 
 // K = 1024 on the hidden side (16 spans, four 256-input coefficient units)
 // and 512 on the intermediate side, as the 35B's experts.
-constexpr uint32_t kHidden = 1024;
-constexpr uint32_t kIntermediate = 512;
-constexpr uint32_t kExperts = 16;
-constexpr uint32_t kTopK = 4;
-constexpr uint32_t kRoutes = kTopK + 1;
-constexpr uint32_t kMaximumRows = 263;
-
-std::mt19937 rng(0x35);
+// gguf-moe-e512 builds the test at Qwen3.8-Flash-Next's routing: 512
+// experts, top 10, a 640-wide intermediate; gguf-moe-sigmoid at Flint's:
+// 256 experts, top 6 by a sigmoid router, a 512-wide intermediate and a
+// shared expert of two ungated slices, at hidden 256.
+#ifndef GGUF_MOE_HIDDEN
+#define GGUF_MOE_HIDDEN 1024
+#define GGUF_MOE_INTERMEDIATE 512
+#define GGUF_MOE_EXPERTS 16
+#define GGUF_MOE_TOP_K 4
+#endif
+#ifndef GGUF_MOE_ROUTER
+#define GGUF_MOE_ROUTER Softmax
+#define GGUF_MOE_SHARED_SLICES 1
+#define GGUF_MOE_SHARED_GATE true
+#endif
+constexpr uint32_t kHidden = GGUF_MOE_HIDDEN;
+constexpr uint32_t kIntermediate = GGUF_MOE_INTERMEDIATE;
+constexpr uint32_t kExperts = GGUF_MOE_EXPERTS;
+constexpr uint32_t kTopK = GGUF_MOE_TOP_K;
+constexpr uint32_t kSharedSlices = GGUF_MOE_SHARED_SLICES;
+constexpr uint32_t kRoutes = kTopK + kSharedSlices;
+constexpr MoeShape kShape{.hiddenSize = kHidden,
+                          .experts = kExperts,
+                          .expertsPerToken = kTopK,
+                          .expertIntermediateSize = kIntermediate,
+                          .router = splash::ops::MoeRouter::GGUF_MOE_ROUTER,
+                          .sharedSlices = kSharedSlices,
+                          .sharedGate = GGUF_MOE_SHARED_GATE};
+static_assert(kShape.valid(), "the test's routing is compiled");
+// The floor chunk's slots and each elastic chunk's but the last in the tests
+// of chunked experts: neither a power of two, the floor of other slots than
+// an elastic chunk, two elastic chunks or more, and the last holds fewer.
+constexpr uint32_t kMultiChunkFloorSlots = kExperts / 3 + 1;
+constexpr uint32_t kMultiChunkSlots = kExperts / 6 + 1;
+static_assert(kMultiChunkFloorSlots != kMultiChunkSlots && (kExperts - kMultiChunkFloorSlots) % kMultiChunkSlots &&
+                  (kExperts - kMultiChunkFloorSlots) / kMultiChunkSlots >= 2,
+              "the floor differs from an elastic chunk, and the elastic chunks end in a partial one");
 
 [[noreturn]] void fail(const std::string &message) {
   std::cerr << "FAIL: " << message << '\n';
@@ -95,78 +173,9 @@ void require(bool condition, const std::string &message) {
   if (!condition) fail(message);
 }
 
-float bf16(double value) { return float(__bf16(float(value))); }
 double silu(double value) { return value / (1.0 + std::exp(-value)); }
 // Where silu has its minimum (silu' = 0).
 constexpr double kSiluArgmin = -1.2784645427610738;
-
-MetalBuffer upload(MetalBackend &backend, const void *data, uint64_t bytes, const char *label) {
-  MetalBuffer buffer = backend.allocateBuffer(bytes, BufferStorage::Shared, label);
-  std::memcpy(buffer.contents(), data, bytes);
-  return buffer;
-}
-
-MetalBuffer zeros(MetalBackend &backend, uint64_t bytes, const char *label) {
-  if (!bytes) return {};
-  MetalBuffer buffer = backend.allocateBuffer(bytes, BufferStorage::Shared, label);
-  std::memset(buffer.contents(), 0, bytes);
-  return buffer;
-}
-
-// The segments of a repacked [rows, K] tensor in format f and of [rows, K] floats.
-QuantizedSegment planeSegment(MetalBackend &backend, Fmt f, const Packed &planes, uint32_t rows, uint32_t K) {
-  return QuantizedSegment::planes(
-      f, rows, K, upload(backend, planes.w0.data(), planes.w0.size(), "gguf-plane0"),
-      kQuantFormats[f].plane1_bytes ? upload(backend, planes.w1.data(), planes.w1.size(), "gguf-plane1")
-                                    : MetalBuffer{},
-      upload(backend, planes.meta.data(), planes.meta.size(), "gguf-meta"));
-}
-QuantizedSegment floatSegment(MetalBackend &backend, const std::vector<float> &values, uint32_t rows,
-                              uint32_t K) {
-  return QuantizedSegment::floats(rows, K, upload(backend, values.data(), values.size() * sizeof(float),
-                                                  "gguf-floats"));
-}
-
-// A GGUF tensor [rows, K]: its segment and GGML's fp32 values of it.
-struct Tensor {
-  QuantizedSegment segment;
-  std::vector<float> values;
-  uint32_t rows = 0, columns = 0;
-  [[nodiscard]] const float *row(uint64_t n) const { return values.data() + n * columns; }
-};
-
-Tensor quantized(MetalBackend &backend, Fmt f, uint32_t rows, uint32_t K) {
-  const std::vector<uint8_t> native = makeNative(f, rows, K, rng);
-  Tensor t;
-  t.rows = rows;
-  t.columns = K;
-  t.segment = planeSegment(backend, f, repack(f, native, rows, K, &t.values), rows, K);
-  return t;
-}
-
-Tensor floating(MetalBackend &backend, uint32_t rows, uint32_t K, float scale) {
-  std::normal_distribution<float> normal(0.0f, scale);
-  Tensor t;
-  t.rows = rows;
-  t.columns = K;
-  t.values.resize(uint64_t{rows} * K);
-  for (float &v : t.values) v = normal(rng);
-  t.segment = floatSegment(backend, t.values, rows, K);
-  return t;
-}
-
-// bf16 rows in [-1, 1].
-std::vector<float> activations(uint64_t elements) {
-  std::uniform_real_distribution<float> unit(-1.0f, 1.0f);
-  std::vector<float> values(elements);
-  for (float &v : values) v = bf16(unit(rng));
-  return values;
-}
-
-MetalBuffer bfloatBuffer(MetalBackend &backend, const std::vector<float> &values, const char *label) {
-  std::vector<__bf16> bits(values.begin(), values.end());
-  return upload(backend, bits.data(), bits.size() * 2, label);
-}
 
 // fp32 accumulation of n exact products: at most n u sum |x w| (u = 2^-24).
 // The simdgroup float tile adds K products, the neural accelerator tile the
@@ -179,18 +188,31 @@ bool inside(float got, double exact, double bound) {
   return got >= bf16(exact - bound) && got <= bf16(exact + bound);
 }
 
+// Apple7/8 run the staged MoE plans on their MMA kernels (MoeGgufTile::Mma,
+// kernels/shared/moe_gguf_mma.metal), and neither the register nor the neural
+// accelerator tiles, whose MPP matmuls run far below their MMA rate.
+bool mmaTiles(const MetalBackend &backend) { return backend.capabilities().appleGpuFamily < 9; }
+MoeGgufTile moeTile(const MetalBackend &backend) { return mmaTiles(backend) ? MoeGgufTile::Mma : MoeGgufTile::Staged; }
+MoeConfig moeConfig(const MetalBackend &backend, MoeExpertTile tile) {
+  return MoeConfig{.expertTile = tile, .ggufTile = moeTile(backend)};
+}
+std::vector<FloatTile> floatTiles(const MetalBackend &backend) {
+  return mmaTiles(backend) ? std::vector<FloatTile>{FloatTile::Simdgroup}
+                           : std::vector<FloatTile>{FloatTile::Simdgroup, FloatTile::NeuralAccelerator};
+}
+
 // ---------------------------------------------------------------- float projection
 // The input holds exactly the dispatch's rows, so a tile reading past them
-// would fail shader validation.
+// would fail shader validation. The simdgroup tile reads K in steps of 64
+// inputs, zeros past a row's end: K = 96 and 2080 end in part of a step, and
+// K = 96 leaves six of its eight K parts without one.
 int floatProjection(MetalBackend &backend) {
   int failures = 0;
-  for (const uint32_t K : {512u, 2048u})
+  for (const uint32_t K : {96u, 512u, 2048u, 2080u})
     for (const uint32_t N : {16u, 64u, 256u}) {
       const Tensor w = floating(backend, N, K, 0.05f);
-      for (const FloatTile tile : {FloatTile::Simdgroup, FloatTile::NeuralAccelerator}) {
+      for (const FloatTile tile : floatTiles(backend)) {
         const bool accelerator = tile == FloatTile::NeuralAccelerator;
-        // Apple7/8 never plan the accelerator tile (Linear::ggufFloatTile).
-        if (accelerator && backend.capabilities().appleGpuFamily < 9) continue;
         double worst = 0, sum = 0;
         size_t outputs = 0;
         int tileFailures = 0;
@@ -209,7 +231,7 @@ int floatProjection(MetalBackend &backend) {
             std::memset(output.contents(), 0x7F, output.sizeBytes());
             CommandGraph graph;
             splash::ops::addGgufFloat(graph, input, w.segment, output, rows, stride, offset, type, tile);
-            static_cast<void>(backend.submitCommand(graph.dispatches()));
+            static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
             size_t outside = 0, touched = 0;
             for (uint32_t r = 0; r <= rows; ++r)
               for (uint32_t c = 0; c < stride; ++c) {
@@ -254,14 +276,265 @@ int floatProjection(MetalBackend &backend) {
   return failures;
 }
 
+// BF16 weights, as some GGUFs store the MoE router: on both tiles, at every
+// row count and destination floatProjection takes, the outputs of the F32
+// tensor of their values bit for bit, the bytes outside the tile untouched.
+int bfloat16Weights(MetalBackend &backend) {
+  int failures = 0;
+  for (const uint32_t K : {512u, 2048u})
+    for (const uint32_t N : {16u, 256u}) {
+      std::normal_distribution<float> normal(0.0f, 0.05f);
+      std::vector<float> values(uint64_t{N} * K);
+      for (float &v : values) v = bf16(normal(rng));
+      const std::vector<__bf16> bits(values.begin(), values.end());
+      const QuantizedSegment f32 = floatSegment(backend, values, N, K);
+      const QuantizedSegment b16 = QuantizedSegment::rows(
+          GGUF_FMT_BF16, N, K, upload(backend, bits.data(), bits.size() * 2, "gguf-bf16"));
+      for (const FloatTile tile : floatTiles(backend)) {
+        const bool accelerator = tile == FloatTile::NeuralAccelerator;
+        int tileFailures = 0;
+        for (const uint32_t rows : {1u, 7u, 16u, 33u, 263u, 2048u}) {
+          if (rows == 2048 && (K != 2048 || N != 256)) continue;
+          if (accelerator && rows < 16) continue;
+          const MetalBuffer input = bfloatBuffer(backend, activations(uint64_t{rows} * K), "float-input");
+          for (const FloatOutput type : {FloatOutput::BFloat16, FloatOutput::Float32}) {
+            const uint32_t stride = N + 96, offset = 32;
+            const uint64_t bytes = uint64_t{rows + 1} * stride * (type == FloatOutput::Float32 ? 4 : 2);
+            const auto run = [&](const QuantizedSegment &weights) {
+              MetalBuffer output = backend.allocateBuffer(bytes, BufferStorage::Shared, "float-output");
+              std::memset(output.contents(), 0x7F, bytes);
+              CommandGraph graph;
+              splash::ops::addGgufFloat(graph, input, weights, output, rows, stride, offset, type, tile);
+              static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+              return output;
+            };
+            const MetalBuffer want = run(f32), got = run(b16);
+            if (std::memcmp(want.contents(), got.contents(), bytes)) {
+              printf("  float %s K=%u N=%u rows=%u %s: BF16 weights' outputs differ from the F32 tensor's FAIL\n",
+                     accelerator ? "accelerator" : "simdgroup", K, N, rows,
+                     type == FloatOutput::Float32 ? "f32" : "bf16");
+              ++tileFailures;
+            }
+          }
+        }
+        printf("float %-11s K=%u N=%3u: BF16 weights give the F32 tensor's outputs bit for bit, bf16/f32 %s\n",
+               accelerator ? "accelerator" : "simdgroup", K, N, tileFailures ? "FAIL" : "ok");
+        failures += tileFailures;
+      }
+    }
+  return failures;
+}
+
+// The F32 values of rows of quantized format f, as the token gather decodes
+// them (gguf_embed_f32_<format>, which load-time widening runs).
+QuantizedSegment gatheredValues(MetalBackend &backend, Fmt f, uint32_t N, uint32_t K, const MetalBuffer &rows) {
+  std::vector<uint32_t> ids(N);
+  std::iota(ids.begin(), ids.end(), 0u);
+  const MetalBuffer idBuffer = upload(backend, ids.data(), ids.size() * 4, "gguf-native-ids");
+  const MetalBuffer values = backend.allocateBuffer(uint64_t{N} * K * 4, BufferStorage::Shared, "gguf-floats");
+  CommandGraph graph;
+  graph.add(std::string("gguf_embed_f32_") + kQuantFormats[f].name, {idBuffer, rows, values},
+            GgufEmbedParams{N, N, K}, {(N * K + 255) / 256, 1, 1}, {256, 1, 1});
+  static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+  return QuantizedSegment::floats(N, K, values);
+}
+
+// The native rows of every quantized format, as an MLX checkpoint's quantized
+// router loads: on both tiles, at the row counts and fp32 destination
+// bfloat16Weights takes and at K of whole blocks of 96 and 160 (the
+// simdgroup tile's last step half full) to 2048, the outputs of the F32
+// values the token gather decodes from the rows bit for bit, the bytes
+// outside the tile untouched; a bf16 destination is refused.
+int nativeRowWeights(MetalBackend &backend) {
+  int failures = 0;
+  for (uint32_t f = 0; f < GGUF_FMT_COUNT; ++f) {
+    if (float16(Fmt(f))) continue;
+    int formatFailures = 0;
+    std::string ks;
+    for (const uint32_t K : {96u, 160u, 512u, 2048u}) {
+      if (K % kQuantFormats[f].block_elements) continue;
+      ks += (ks.empty() ? "" : ",") + std::to_string(K);
+      for (const uint32_t N : {16u, 256u}) {
+        const std::vector<uint8_t> native = makeNative(Fmt(f), N, K, rng);
+        const MetalBuffer rows = upload(backend, native.data(), native.size(), "gguf-native-rows");
+        const QuantizedSegment f32 = gatheredValues(backend, Fmt(f), N, K, rows);
+        const QuantizedSegment quantized = QuantizedSegment::rows(f, N, K, rows);
+        for (const FloatTile tile : floatTiles(backend)) {
+          const bool accelerator = tile == FloatTile::NeuralAccelerator;
+          for (const uint32_t count : {1u, 7u, 16u, 33u, 263u, 2048u}) {
+            if (count == 2048 && (K != 2048 || N != 256)) continue;
+            if (accelerator && count < 16) continue;
+            const MetalBuffer input = bfloatBuffer(backend, activations(uint64_t{count} * K), "float-input");
+            const uint32_t stride = N + 96, offset = 32;
+            const uint64_t bytes = uint64_t{count + 1} * stride * 4;
+            const auto run = [&](const QuantizedSegment &weights) {
+              MetalBuffer output = backend.allocateBuffer(bytes, BufferStorage::Shared, "float-output");
+              std::memset(output.contents(), 0x7F, bytes);
+              CommandGraph graph;
+              splash::ops::addGgufFloat(graph, input, weights, output, count, stride, offset, FloatOutput::Float32,
+                                        tile);
+              static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+              return output;
+            };
+            const MetalBuffer want = run(f32), got = run(quantized);
+            if (std::memcmp(want.contents(), got.contents(), bytes)) {
+              printf("  float %s %s K=%u N=%u rows=%u: native rows' outputs differ from the F32 values' FAIL\n",
+                     accelerator ? "accelerator" : "simdgroup", kQuantFormats[f].name, K, N, count);
+              ++formatFailures;
+            }
+          }
+          bool refused = false;
+          try {
+            CommandGraph graph;
+            splash::ops::addGgufFloat(graph, bfloatBuffer(backend, activations(uint64_t{16} * K), "float-input"),
+                                      quantized, f32.plane0, 16, N, 0, FloatOutput::BFloat16, tile);
+          } catch (const std::invalid_argument &) {
+            refused = true;
+          }
+          if (!refused) {
+            printf("  float %s %s: a bf16 destination of native rows was accepted FAIL\n",
+                   accelerator ? "accelerator" : "simdgroup", kQuantFormats[f].name);
+            ++formatFailures;
+          }
+        }
+      }
+    }
+    printf("float native %-7s K=%s N=16,256: the F32 values' outputs bit for bit, both tiles %s\n",
+           kQuantFormats[f].name, ks.c_str(), formatFailures ? "FAIL" : "ok");
+    failures += formatFailures;
+  }
+  return failures;
+}
+
+// Two projections of one quantized format's native rows of one input in one
+// dispatch, and one beside the F32 values of another in two: each
+// projection's fp32 outputs and the bytes around them those of its own
+// dispatch bit for bit, at decode and prefill row counts on either tile, at
+// K = 160 (a half-full last simdgroup step) and 2048.
+int nativePairs(MetalBackend &backend) {
+  constexpr uint32_t kQueryStride = 96, kKeyStride = 40;
+  const std::vector<FloatTile> kTiles = floatTiles(backend);
+  int failures = 0;
+  for (const auto &[f, K] : {std::pair{Fmt(GGUF_FMT_AF4G32), 160u}, std::pair{Fmt(GGUF_FMT_AF8G64), 2048u},
+                             std::pair{Q80, 160u}}) {
+    const std::vector<uint8_t> queryRows = makeNative(f, 64, K, rng), keyRows = makeNative(f, 24, K, rng);
+    const QuantizedSegment query =
+        QuantizedSegment::rows(f, 64, K, upload(backend, queryRows.data(), queryRows.size(), "pair-query"));
+    const QuantizedSegment key =
+        QuantizedSegment::rows(f, 24, K, upload(backend, keyRows.data(), keyRows.size(), "pair-key"));
+    const QuantizedSegment floatKey = gatheredValues(backend, f, 24, K, key.plane0);
+    for (const uint32_t rows : {1u, 16u, 33u, 263u}) {
+      const MetalBuffer input = bfloatBuffer(backend, activations(uint64_t{rows} * K), "pair-input");
+      for (const FloatTile tile : kTiles) {
+        if (rows < 16 && tile != FloatTile::Simdgroup) continue;
+        for (const QuantizedSegment *second : {&key, &floatKey}) {
+          const auto destination = [&](uint32_t stride) {
+            MetalBuffer output =
+                backend.allocateBuffer(uint64_t{rows + 1} * stride * 4, BufferStorage::Shared, "pair-output");
+            std::memset(output.contents(), 0x7F, output.sizeBytes());
+            return output;
+          };
+          const std::array<MetalBuffer, 4> outputs{destination(kQueryStride), destination(kKeyStride),
+                                                   destination(kQueryStride), destination(kKeyStride)};
+          const std::array<FloatProjection, 2> pair{FloatProjection{&query, outputs[0], kQueryStride, 32, tile},
+                                                    FloatProjection{second, outputs[1], kKeyStride, 8, tile}};
+          CommandGraph together, apart;
+          splash::ops::addGgufFloat(together, input, pair, rows, FloatOutput::Float32);
+          splash::ops::addGgufFloat(apart, input, query, outputs[2], rows, kQueryStride, 32, FloatOutput::Float32,
+                                    tile);
+          splash::ops::addGgufFloat(apart, input, *second, outputs[3], rows, kKeyStride, 8, FloatOutput::Float32,
+                                    tile);
+          const size_t dispatches = together.dispatches().size();
+          for (const CommandGraph *graph : {&together, &apart})
+            static_cast<void>(backend.submitCommandAsync(graph->dispatches()).wait());
+          if (dispatches != (second == &key ? 1u : 2u) ||
+              std::memcmp(outputs[0].contents(), outputs[2].contents(), outputs[0].sizeBytes()) ||
+              std::memcmp(outputs[1].contents(), outputs[3].contents(), outputs[1].sizeBytes())) {
+            printf("  native pair %s K=%u rows=%u %s, %s key: %zu dispatches, outputs differ from each projection's "
+                   "own dispatch FAIL\n",
+                   kQuantFormats[f].name, K, rows, tile == FloatTile::NeuralAccelerator ? "accelerator" : "simdgroup",
+                   second == &key ? "native" : "F32", dispatches);
+            ++failures;
+          }
+        }
+      }
+    }
+  }
+  printf("native pairs: one dispatch of one format and tile, two beside F32, each projection's outputs as alone %s\n",
+         failures ? "FAIL" : "ok");
+  return failures;
+}
+
+// Two float projections of one input, each into a destination of its own
+// stride and offset and on a tile of its own, as the QSA indexer projects its
+// query and key: at decode and prefill row counts and bf16 and fp32
+// destinations, one dispatch when they share a value type and a tile and two
+// otherwise, each projection's outputs and the bytes around them those of its
+// own dispatch bit for bit.
+int floatPairs(MetalBackend &backend) {
+  constexpr uint32_t K = 512, kQueryStride = 96, kKeyStride = 40;
+  const std::vector<FloatTile> kTiles = floatTiles(backend);
+  const auto name = [](FloatTile tile) { return tile == FloatTile::NeuralAccelerator ? "accelerator" : "simdgroup"; };
+  const Tensor query = floating(backend, 64, K, 0.05f), key = floating(backend, 24, K, 0.05f);
+  const std::vector<__bf16> bits(key.values.begin(), key.values.end());
+  const QuantizedSegment bfloatKey = QuantizedSegment::rows(
+      GGUF_FMT_BF16, 24, K, upload(backend, bits.data(), bits.size() * 2, "gguf-bf16"));
+  int failures = 0;
+  for (const uint32_t rows : {1u, 16u, 33u, 263u}) {
+    const MetalBuffer input = bfloatBuffer(backend, activations(uint64_t{rows} * K), "pair-input");
+    for (const FloatTile queryTile : kTiles)
+      for (const FloatTile keyTile : kTiles) {
+        if (rows < 16 && (queryTile != FloatTile::Simdgroup || keyTile != FloatTile::Simdgroup)) continue;
+        for (const FloatOutput type : {FloatOutput::BFloat16, FloatOutput::Float32})
+          for (const QuantizedSegment *second : {&key.segment, &bfloatKey}) {
+            // One row more than the dispatch writes, whose sentinel must survive.
+            const auto destination = [&](uint32_t stride) {
+              MetalBuffer output = backend.allocateBuffer(
+                  uint64_t{rows + 1} * stride * (type == FloatOutput::Float32 ? 4 : 2), BufferStorage::Shared,
+                  "pair-output");
+              std::memset(output.contents(), 0x7F, output.sizeBytes());
+              return output;
+            };
+            const std::array<MetalBuffer, 4> outputs{destination(kQueryStride), destination(kKeyStride),
+                                                     destination(kQueryStride), destination(kKeyStride)};
+            const std::array<FloatProjection, 2> pair{
+                FloatProjection{&query.segment, outputs[0], kQueryStride, 32, queryTile},
+                FloatProjection{second, outputs[1], kKeyStride, 8, keyTile}};
+            CommandGraph together, apart;
+            splash::ops::addGgufFloat(together, input, pair, rows, type);
+            splash::ops::addGgufFloat(apart, input, query.segment, outputs[2], rows, kQueryStride, 32, type,
+                                      queryTile);
+            splash::ops::addGgufFloat(apart, input, *second, outputs[3], rows, kKeyStride, 8, type, keyTile);
+            const size_t dispatches = together.dispatches().size();
+            for (const CommandGraph *graph : {&together, &apart})
+              static_cast<void>(backend.submitCommandAsync(graph->dispatches()).wait());
+            if (dispatches != (second == &key.segment && queryTile == keyTile ? 1u : 2u) ||
+                std::memcmp(outputs[0].contents(), outputs[2].contents(), outputs[0].sizeBytes()) ||
+                std::memcmp(outputs[1].contents(), outputs[3].contents(), outputs[1].sizeBytes())) {
+              printf("  float pair rows=%u %s, query %s, %s key %s: %zu dispatches, outputs %s FAIL\n", rows,
+                     type == FloatOutput::Float32 ? "f32" : "bf16", name(queryTile),
+                     second == &key.segment ? "F32" : "BF16", name(keyTile), dispatches,
+                     "differ from each projection's own dispatch");
+              ++failures;
+            }
+          }
+      }
+  }
+  printf("float pairs: one dispatch of one value type and tile, two otherwise, each projection's outputs as alone %s\n",
+         failures ? "FAIL" : "ok");
+  return failures;
+}
+
 // A fused projection with a float segment of `floatColumns` columns, as the
 // GDN input (qkv | z | alpha-beta) of a GGUF storing alpha/beta as F32 (64
 // columns on the 35B, 96 on the 27B): the float projection writes the float
 // segment's columns, the quantized kernels the others bit for bit as without
-// it, and the padding past the last segment stays unwritten; decode through
-// both GGUF decode families (register, staged) at one to four lanes, and
-// prefill, where a one-core device takes the neural accelerator float tile
-// from 16 rows.
+// it, and the padding past the last segment stays unwritten; decode at one to
+// four lanes, and prefill. The device's own family runs on Apple7/8 (their
+// MMA plans); Apple9 and Apple10 are forced only where the device's family
+// supports them (a forced family the device lacks can hang its kernels):
+// both GGUF decode families (register, staged), and a one-core device taking
+// the neural accelerator float tile from 16 rows.
 int floatSegments(MetalBackend &backend, uint32_t floatColumns) {
   constexpr uint32_t K = 1024, N = 768, kFloatColumn = 512;
   const uint32_t covered = kFloatColumn + floatColumns;
@@ -271,12 +544,20 @@ int floatSegments(MetalBackend &backend, uint32_t floatColumns) {
   Projection full(N, K, splash::ops::BlockWeights{{at(q80.segment, 0),
       at(q4k.segment, 256), at(gates.segment, kFloatColumn)}});
   Projection quantizedOnly(N, K, splash::ops::BlockWeights{{at(q80.segment, 0), at(q4k.segment, 256)}});
+  const uint32_t own = backend.capabilities().appleGpuFamily;
+  std::vector<std::pair<uint32_t, uint32_t>> cases;
+  if (own < 9) cases.emplace_back(own, 0u);
+  for (const auto forced : {std::pair{9u, 0u}, std::pair{10u, 0u}, std::pair{10u, 1u}})
+    if (forced.first <= own) cases.push_back(forced);
+  std::string families;
+  for (const auto &[family, cores] : cases)
+    families += (families.empty() ? "" : ", ") + std::to_string(family) + (cores ? " one-core" : "");
   int failures = 0;
-  for (const auto [family, cores] : {std::pair{9u, 0u}, std::pair{10u, 0u}, std::pair{10u, 1u}}) {
+  for (const auto &[family, cores] : cases) {
     DeviceCapabilities device = backend.capabilities();
     device.appleGpuFamily = family;
     if (cores) device.gpuCoreCount = cores;
-    const Linear linear(device);
+    const Linear linear(device, splash::ops::Int8Activations::On);
     const auto check = [&](uint32_t rows, uint32_t storage, const std::string &label,
                            const std::function<void(CommandGraph &, MetalBuffer, const Projection &, MetalBuffer)> &add) {
       const std::vector<float> x = activations(uint64_t{storage} * K);
@@ -288,7 +569,7 @@ int floatSegments(MetalBackend &backend, uint32_t floatColumns) {
       CommandGraph graph;
       add(graph, input, full, y);
       add(graph, input, quantizedOnly, reference);
-      static_cast<void>(backend.submitCommand(graph.dispatches()));
+      static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
       const auto *got = static_cast<const uint16_t *>(y.contents()), *want = static_cast<const uint16_t *>(reference.contents());
       size_t differ = 0, outside = 0, written = 0;
       for (uint32_t r = 0; r < rows; ++r)
@@ -300,7 +581,8 @@ int floatSegments(MetalBackend &backend, uint32_t floatColumns) {
             const Dot d = dot(x.data() + uint64_t{r} * K, gates.row(c - kFloatColumn), K);
             __bf16 value;
             std::memcpy(&value, got + i, 2);
-            outside += !inside(float(value), d.value, floatBound(d, K, linear.ggufFloatTile(rows, floatColumns)));
+            const FloatTile tile = linear.ggufFloatTile(rows, floatColumns, QuantizedSegment::kFloat32);
+            outside += !inside(float(value), d.value, floatBound(d, K, tile));
           }
         }
       if (differ || outside || written) {
@@ -320,111 +602,75 @@ int floatSegments(MetalBackend &backend, uint32_t floatColumns) {
     };
     const LinearMatrix matrix{N, K};
     for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
-      const LinearPlan plan = linear.plan({matrix, lanes * 8, LinearPhase::Decode, LinearEpilogue::None, WeightLayout::Block32},
-                                          full);
+      const LinearPlan plan = linear.plan({matrix, lanes * 8, LinearEpilogue::None}, full);
       const LinearScratch scratch = scratchFor(plan);
       check(lanes * 8, plan.storageRows(), "decode B" + std::to_string(lanes),
             [&](CommandGraph &graph, MetalBuffer input, const Projection &p, MetalBuffer output) {
-              splash::ops::LinearDispatchStats stats;
-              static_cast<void>(linear.addDecodeBatch(graph, input, p, output, lanes, stats, scratch));
+              static_cast<void>(linear.add(graph, {.input = input, .output = output, .scratch = scratch}, p,
+                                           linear.plan(p, lanes * SPLASH_DRAFT_QUERY_ROWS)));
             });
     }
     for (const uint32_t rows : {1u, 24u, 33u, 263u}) {
-      const LinearPlan plan =
-          linear.plan({matrix, rows, LinearPhase::Prefill, LinearEpilogue::None, WeightLayout::Block32}, full);
+      const LinearPlan plan = linear.plan({matrix, rows, LinearEpilogue::None}, full);
       const LinearScratch scratch = scratchFor(plan);
       check(rows, plan.storageRows(), "prefill rows=" + std::to_string(rows),
             [&](CommandGraph &graph, MetalBuffer input, const Projection &p, MetalBuffer output) {
-              linear.addPrefill(graph, input, p, output, {}, rows, scratch);
+              linear.addProjection(graph, input, p, output, rows, scratch);
             });
     }
   }
-  printf("float segment: fused Q8_0|Q4_K|F32 (%u float columns) decode B1-4 (register, staged) and prefill "
-         "1/24/33/263 rows, both float tiles %s\n", floatColumns, failures ? "FAIL" : "ok");
+  printf("float segment: fused Q8_0|Q4_K|F32 (%u float columns) decode B1-4 and prefill 1/24/33/263 rows at Apple "
+         "family %s (register and neural accelerator tiles only where the family has them) %s\n", floatColumns,
+         families.c_str(), failures ? "FAIL" : "ok");
   return failures;
 }
 
 // A projection of float segments alone runs no quantized kernel, so it leaves
-// the scratch table as it found it: an Apple9 register plan chained after it
-// on the same input (as the draft chains its head and selector) prepares its
-// own table and writes what it writes alone, bit for bit.
+// the scratch table as it found it: a plan chained after it on the same input
+// (as the draft chains its head and selector) prepares its own table and
+// writes what it writes alone, bit for bit. The plan is an Apple9 register
+// plan only where the device's family supports Apple9; Apple7/8 chain their
+// own family's plan (a forced family the device lacks can hang its kernels).
 int floatOnlyChain(MetalBackend &backend) {
   constexpr uint32_t K = 1024, N = 256;
   const Tensor gates = floating(backend, N, K, 0.05f), q4k = quantized(backend, Q4K, N, K);
   const Projection floats(N, K, splash::ops::BlockWeights{{gates.segment}});
   const Projection blocks(N, K, splash::ops::BlockWeights{{q4k.segment}});
   DeviceCapabilities device = backend.capabilities();
-  device.appleGpuFamily = 9;
-  const Linear linear(device);
+  const bool registers = device.appleGpuFamily >= 9;
+  if (registers) device.appleGpuFamily = 9;
+  const Linear linear(device, splash::ops::Int8Activations::On);
   int failures = 0;
   for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
     const uint64_t rows = lanes * 8, bytes = rows * N * 2;
-    const LinearScratchSize size = linear.decodePlan(blocks, lanes).scratchSize();
+    const LinearPlan plan = linear.plan(blocks, lanes * SPLASH_DRAFT_QUERY_ROWS);
+    const LinearScratchSize size = plan.scratchSize();
     const LinearScratch scratch{zeros(backend, size.input, "chain-table"), zeros(backend, size.sums, "chain-sums"),
                                 zeros(backend, size.partials, "chain-partials"),
                                 zeros(backend, size.counters, "chain-counters")};
     const MetalBuffer input = bfloatBuffer(backend, activations(rows * K), "chain-input");
     const MetalBuffer scores = zeros(backend, bytes, "chain-scores"), chained = zeros(backend, bytes, "chain-output"),
                       alone = zeros(backend, bytes, "chain-reference");
-    splash::ops::LinearDispatchStats stats;
     CommandGraph graph, reference;
-    const PreparedInput prepared = linear.addDecodeBatch(graph, input, floats, scores, lanes, stats, scratch);
-    static_cast<void>(linear.addDecodeBatch(graph, input, blocks, chained, lanes, stats, scratch, prepared));
-    static_cast<void>(backend.submitCommand(graph.dispatches()));
-    static_cast<void>(linear.addDecodeBatch(reference, input, blocks, alone, lanes, stats, scratch));
-    static_cast<void>(backend.submitCommand(reference.dispatches()));
+    const PreparedInput prepared =
+        linear.add(graph, {.input = input, .output = scores, .scratch = scratch}, floats, linear.plan(floats, lanes * SPLASH_DRAFT_QUERY_ROWS));
+    static_cast<void>(
+        linear.add(graph, {.input = input, .output = chained, .scratch = scratch, .prepared = prepared}, blocks, plan));
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+    static_cast<void>(linear.add(reference, {.input = input, .output = alone, .scratch = scratch}, blocks, plan));
+    static_cast<void>(backend.submitCommandAsync(reference.dispatches()).wait());
     if (std::memcmp(chained.contents(), alone.contents(), bytes)) {
-      printf("  float-only projection B%u: a register plan chained after it read another table FAIL\n", lanes);
+      printf("  float-only projection B%u: a %s plan chained after it read another table FAIL\n", lanes,
+             registers ? "register" : "device-family");
       ++failures;
     }
   }
-  printf("float-only projection: a register plan chained after it prepares its own table, B1-4 %s\n",
-         failures ? "FAIL" : "ok");
+  printf("float-only projection: a %s plan chained after it prepares its own table, B1-4 %s\n",
+         registers ? "register" : "device-family", failures ? "FAIL" : "ok");
   return failures;
 }
 
 // ---------------------------------------------------------------- MoE
-struct Model {
-  Tensor router, sharedGate;
-  std::array<Tensor, 3> routed;   // gate, up, down: experts * N rows
-  std::array<Tensor, 3> shared;
-  MoeWeights weights;
-  std::array<Fmt, 6> formats{};
-};
-
-// Gate, up and down in formats f, f + 1, f + 2 and the shared expert's in
-// f + 3, f + 4, f + 5.
-Model makeModel(MetalBackend &backend, int f) {
-  Model m;
-  for (int i = 0; i < 6; ++i) m.formats[i] = Fmt((f + i) % FMT_COUNT);
-  m.router = floating(backend, kExperts, kHidden, 0.05f);
-  m.sharedGate = floating(backend, 1, kHidden, 0.05f);
-  const uint32_t n[3] = {kIntermediate, kIntermediate, kHidden}, k[3] = {kHidden, kHidden, kIntermediate};
-  for (int p = 0; p < 3; ++p) {
-    m.routed[p] = quantized(backend, m.formats[p], kExperts * n[p], k[p]);
-    m.shared[p] = quantized(backend, m.formats[3 + p], n[p], k[p]);
-  }
-  BlockMoeWeights gguf;
-  gguf.router = m.router.segment;
-  gguf.sharedScalarGate = m.sharedGate.segment;
-  gguf.gate = {m.routed[0].segment, m.shared[0].segment};
-  gguf.up = {m.routed[1].segment, m.shared[1].segment};
-  gguf.down = {m.routed[2].segment, m.shared[2].segment};
-  m.weights = gguf;
-  return m;
-}
-
-struct Buffers {
-  MoeBuffers moe;
-  std::vector<float> input, residual;
-};
-
-void allocate(MetalBackend &backend, Buffers &b, const MoePlan &plan) {
-  const auto &w = plan.workspace();
-  for (const MoeScratchField &field : kMoeScratchFields)
-    b.moe.scratch.*field.buffer = zeros(backend, w.*field.bytes, "moe-scratch");
-}
-
 // The fp64 gate and up products of (row, expert), shared by every plan.
 struct GateUp {
   std::vector<Dot> gate, up;
@@ -436,24 +682,251 @@ struct Stats {
   double gateUpWorst = 0, downWorst = 0;
 };
 
-// One plan's run checked against the fp64 model; returns its output rows.
-std::vector<uint16_t> runPlan(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan &plan, bool staged,
-                              std::map<std::pair<uint32_t, uint32_t>, GateUp> &products, Stats &stats,
-                              const std::string &label) {
+// A pipeline's name without the slices suffix of the test's routing
+// (ops::CompiledMoeRouting).
+std::string_view withoutSlices(std::string_view name) {
+  const std::string_view suffix = kShape.compiledRouting()->slicesSuffix;
+  return name.ends_with(suffix) ? name.substr(0, name.size() - suffix.size()) : name;
+}
+
+// The dispatches of `graph` on the grids of their bounds, every tile a step
+// could fill, with a gate/up pass split into the gate and up passes
+// (gguf_moe_test.metal's gguf_moe_test_m<rows>_gate and _up, on the down
+// pass's expert tile), the gate parked in `gate`, of the intermediate's size;
+// the passes' parameters live in `passes`. Apple7/8's MMA gate/up pass
+// (moe_expert_gguf_mma_m<rows>_gate_up), whose numerics the reference's
+// staged tile does not share, runs merged on its full grid.
+std::vector<ComputeDispatch> fullGridsTwoPasses(const CommandGraph &graph, const MetalBuffer &gate,
+                                                std::deque<MoeGgufExpertParams> &passes) {
+  constexpr std::string_view kMerged = "moe_expert_gguf_m";
+  std::vector<ComputeDispatch> dispatches;
+  for (ComputeDispatch dispatch : graph.dispatches()) {
+    dispatch.indirectThreadgroups = {};
+    const size_t merged = dispatch.pipelineName.rfind("_gate_up");
+    if (merged == std::string::npos || dispatch.pipelineName.starts_with("moe_expert_gguf_mma_m")) {
+      dispatches.push_back(std::move(dispatch));
+      continue;
+    }
+    // Input, tiles, tile count, gate's and up's shared planes, output, slot
+    // table, parameters and the routed experts' chunks (an address table); a
+    // pass binds one projection's shared planes, its output, the gate and the
+    // slot table, and reaches the same chunks for its projection.
+    require(dispatch.pipelineName.starts_with(kMerged), "a gate/up pass is not the GGUF experts'");
+    const std::string rows = dispatch.pipelineName.substr(kMerged.size(), merged - kMerged.size());
+    for (const bool up : {false, true}) {
+      ComputeDispatch pass = dispatch;
+      pass.pipelineName = "gguf_moe_test_m" + rows + (up ? "_up" : "_gate") +
+                          std::string(kShape.compiledRouting()->slicesSuffix);
+      // The reference decodes every format, of no function constants.
+      pass.constants.clear();
+      pass.buffers.resize(3);
+      for (uint32_t plane = 0; plane < 3; ++plane)
+        pass.buffers.push_back({3 + plane, dispatch.buffers[(up ? 6 : 3) + plane].buffer});
+      pass.buffers.push_back({6, up ? dispatch.buffers[9].buffer : gate});
+      pass.buffers.push_back({7, gate});
+      pass.buffers.push_back({8, dispatch.buffers[10].buffer});
+      // The pass's own parameters: the passes' sizes, floor and chunk slots, and
+      // this pass's formats (its projection is its kernel's).
+      MoeGgufGateUpParams both;
+      std::memcpy(&both, dispatch.bytes[0].data, sizeof(both));
+      const MoeGgufExpertParams &params = passes.emplace_back(MoeGgufExpertParams{
+          both.input_size, both.output_size, both.experts, up ? both.up_routed_format : both.gate_routed_format,
+          up ? both.up_shared_format : both.gate_shared_format, both.floor_slots, both.chunk_slots, both.tiles});
+      pass.bytes[0] = {9, &params, sizeof(params)};
+      pass.addresses.index = 10;
+      pass.threadgroups.x = dispatch.threadgroups.x * GGUF_STAGED_COLUMNS / GGUF_TILE_COLUMNS;
+      dispatches.push_back(std::move(pass));
+    }
+  }
+  return dispatches;
+}
+
+// The byte every grouped route and grouped input holds before a run.
+constexpr uint8_t kCanary = 0xa5;
+
+bool untouched(const void *data, uint64_t bytes) {
+  const auto *begin = static_cast<const uint8_t *>(data);
+  return std::all_of(begin, begin + bytes, [](uint8_t byte) { return byte == kCanary; });
+}
+
+// Each grouped row's tile by the tiles' first rows, UINT32_MAX where none
+// holds it: a step's routes' rows, which no tile's rows pass or share.
+std::vector<uint32_t> rowTiles(const MoeScratch &scratch, const MoePlan &plan, const std::string &label) {
+  const auto *tiles = static_cast<const MoeTileDescriptor *>(scratch.tileDescriptors.contents());
+  const uint32_t tileCount = *static_cast<const uint32_t *>(scratch.tileCount.contents());
+  std::vector<uint32_t> tileOf(uint64_t{plan.rows()} * kRoutes, UINT32_MAX);
+  for (uint32_t tile = 0; tile < tileCount; ++tile)
+    for (uint32_t row = 0; row < tiles[tile].rows; ++row) {
+      const uint64_t grouped = uint64_t{tiles[tile].first_row} + row;
+      require(grouped < tileOf.size() && tileOf[grouped] == UINT32_MAX,
+              label + ": a tile's rows pass the routes' or another tile's");
+      tileOf[grouped] = tile;
+    }
+  return tileOf;
+}
+
+// The grouping of a run whose grouped routes and input held kCanary: as many
+// tiles as each expert's routes fill, their live rows packed in tile order (a
+// tile's first row where the tile before it's end), every route at a grouped
+// row that names it back in a tile of its expert, and the rows past the
+// tiles' written neither by the grouping nor by the gather (the passes'
+// matmuls read up to tileRows - 1 of them past a last tile's live rows), but
+// where the router's scores, which come first in the grouped input, overwrote
+// them.
+void checkGrouping(const MoeScratch &scratch, const MoePlan &plan, const std::string &label) {
+  const uint32_t rows = plan.rows(), tileRows = plan.tileRows();
+  const auto *selected = static_cast<const uint32_t *>(scratch.selectedExperts.contents());
+  const auto *routeRows = static_cast<const uint32_t *>(scratch.routeRows.contents());
+  const auto *groupedRoutes = static_cast<const uint32_t *>(scratch.groupedRoutes.contents());
+  const auto *groupedInput = static_cast<const uint8_t *>(scratch.groupedInput.contents());
+  const auto *tiles = static_cast<const MoeTileDescriptor *>(scratch.tileDescriptors.contents());
+  const uint32_t tileCount = *static_cast<const uint32_t *>(scratch.tileCount.contents());
+  uint32_t packed = 0;
+  for (uint32_t tile = 0; tile < tileCount; ++tile) {
+    require(tiles[tile].rows > 0 && tiles[tile].rows <= tileRows, label + ": invalid tile live row count");
+    require(tiles[tile].first_row == packed, label + ": a tile's rows do not follow the tile before it's");
+    packed += tiles[tile].rows;
+  }
+  const std::vector<uint32_t> tileOf = rowTiles(scratch, plan, label);
+  std::array<uint32_t, kExperts + kSharedSlices> routes{};
+  for (uint32_t route = 0; route < rows * kRoutes; ++route) {
+    require(selected[route] < routes.size(), label + ": invalid selected expert");
+    ++routes[selected[route]];
+    const uint32_t grouped = routeRows[route];
+    require(grouped < packed && groupedRoutes[grouped] == route && tiles[tileOf[grouped]].expert == selected[route],
+            label + ": grouped route mapping does not round-trip");
+  }
+  uint32_t occupied = 0;
+  for (const uint32_t count : routes) occupied += (count + tileRows - 1) / tileRows;
+  require(tileCount == occupied, label + ": tile count differs from per-expert occupancy");
+  require(untouched(groupedRoutes + packed, scratch.groupedRoutes.sizeBytes() - uint64_t{packed} * sizeof(uint32_t)),
+          label + ": the grouping wrote past the tiles' rows");
+  const uint64_t rowBytes = uint64_t{kHidden} * 2,
+                 scoreBytes = uint64_t{rows} * kShape.routerWidth() * 4;
+  for (uint64_t grouped = packed; grouped < scratch.groupedInput.sizeBytes() / rowBytes; ++grouped)
+    require(grouped * rowBytes < scoreBytes || untouched(groupedInput + grouped * rowBytes, rowBytes),
+            label + ": the gather wrote past the tiles' rows");
+}
+
+// Whether tile t of a grouping ran the column tile on `tile`'s expert passes: on the staged passes every tile
+// moe_column_tile names, and on the MMA passes (Apple7/8, kernels/shared/moe_gguf_mma.metal) those of them whose
+// expert, routed or shared, has a projection in a format they run there apart from their MMA tiles
+// (moe_mma_column_format).
+bool columnTile(const MoeTileDescriptor *tiles, uint32_t t, uint32_t tileRows, MoeGgufTile tile, const Model &m) {
+  if (!moe_column_tile(tiles, t)) return false;
+  if (tile == MoeGgufTile::Staged) return true;
+  const auto first = m.formats.begin() + (tiles[t].expert == kExperts ? 3 : 0);
+  return std::any_of(first, first + 3, [&](gguf_reference::Fmt f) { return moe_mma_column_format(f, tileRows); });
+}
+
+// A run's output rows and, per route, whether its expert tile ran the column tile (columnTile).
+struct MoeRun {
+  std::vector<uint16_t> output;
+  std::vector<bool> column;
+};
+std::vector<bool> columnRoutes(const MoeScratch &scratch, const MoePlan &plan, const std::string &label,
+                               const Model &m) {
+  const uint32_t routes = plan.rows() * kRoutes, tileRows = plan.tileRows();
+  const auto *routeRows = static_cast<const uint32_t *>(scratch.routeRows.contents());
+  const auto *tiles = static_cast<const MoeTileDescriptor *>(scratch.tileDescriptors.contents());
+  const std::vector<uint32_t> tileOf = rowTiles(scratch, plan, label);
+  std::vector<bool> column(routes);
+  for (uint32_t route = 0; route < routes; ++route)
+    column[route] = columnTile(tiles, tileOf[routeRows[route]], tileRows, plan.configuration().ggufTile, m);
+  return column;
+}
+// The first `rows` rows of two runs: rows whose routes ran the same tile kinds are bitwise equal, as a row's output
+// depends on its own routes only and a route's on its tile kind only (the rows of one expert tile are independent);
+// of the `compared` rows that ran them, `differ` counts the rows that are not. Rows whose routes ran other tile kinds,
+// which lie within fp64 in both runs (runPlan), are counted in `acrossKinds`.
+struct RowComparison {
+  uint32_t compared = 0, differ = 0, acrossKinds = 0;
+};
+RowComparison compareRows(const MoeRun &a, const MoeRun &b, uint32_t rows) {
+  RowComparison c;
+  for (uint32_t r = 0; r < rows; ++r) {
+    const auto routes = [&](const MoeRun &run) { return run.column.begin() + uint64_t{r} * kRoutes; };
+    if (!std::equal(routes(a), routes(a) + kRoutes, routes(b))) {
+      ++c.acrossKinds;
+      continue;
+    }
+    const auto row = [&](const MoeRun &run) { return run.output.begin() + uint64_t{r} * kHidden; };
+    ++c.compared;
+    c.differ += !std::equal(row(a), row(a) + kHidden, row(b));
+  }
+  return c;
+}
+// The first `rows` rows of a prefill chunk against the widest chunk and against the chunk before it, which holds more
+// rows than it but whose routes run more of its own tile kinds than the widest's do (a lone row's routes run the
+// column tile, a wide chunk's mostly the staged tile, so the widest chunk can compare none of a narrow chunk's rows).
+RowComparison compareChunks(const MoeRun &run, const MoeRun &widest, const MoeRun &previous, uint32_t rows,
+                            const std::string &label) {
+  RowComparison sum;
+  for (const MoeRun *other : {&widest, &previous}) {
+    if (other == &previous && previous.output.size() == widest.output.size()) continue;
+    const RowComparison c = compareRows(run, *other, rows);
+    if (c.differ)
+      printf("  %s: %u rows differ from the %u-row chunk FAIL\n", label.c_str(), c.differ,
+             uint32_t(other->output.size() / kHidden));
+    sum.compared += c.compared;
+    sum.differ += c.differ;
+    sum.acrossKinds += c.acrossKinds;
+  }
+  return sum;
+}
+// A set's first run against its partner of the same tile kinds by construction: the same plan run again on fresh
+// scratch, whose grouping orders each expert's routes anew but routes every row as before, so each route runs the
+// tile kind it ran and every row must compare bitwise. The set's runs of other rows compare only the rows whose
+// routes happen to run the same kinds, which a shape need not have (a 512-expert block's narrow chunks run the column
+// tile where its widest runs staged); this pair keeps the comparison from testing nothing. Returns the failures.
+int compareRepeat(const MoeRun &first, const MoeRun &again, const std::string &label) {
+  const uint32_t rows = uint32_t(first.output.size() / kHidden);
+  const RowComparison c =
+      again.output.size() == first.output.size() ? compareRows(again, first, rows) : RowComparison{};
+  if (c.compared == rows && !c.differ) return 0;
+  printf("  %s: a repeat of the run compared %u of its %u rows bitwise, %u differ FAIL\n", label.c_str(), c.compared,
+         rows, c.differ);
+  return 1;
+}
+
+// One plan's run checked against the fp64 model, gate and up in one pass on the staged tiles; returns its output rows
+// and the tile kinds of its routes.
+MoeRun runPlan(MetalBackend &backend, const Model &m, Buffers &b, const MoePlan &plan,
+               std::map<std::pair<uint32_t, uint32_t>, GateUp> &products, Stats &stats, const std::string &label) {
   const uint32_t rows = plan.rows();
   allocate(backend, b, plan);
   std::memset(b.moe.output.contents(), 0, b.moe.output.sizeBytes());
+  for (const MetalBuffer *buffer : {&b.moe.scratch.groupedRoutes, &b.moe.scratch.groupedInput})
+    std::memset(buffer->contents(), kCanary, buffer->sizeBytes());
   CommandGraph graph;
-  MoE::add(graph, b.moe, m.weights, plan);
-  static_cast<void>(backend.submitCommand(graph.dispatches()));
+  splash::test::addMoeStep(graph, b.moe, m.weights, plan);
+  static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
   const auto *selected = static_cast<const uint32_t *>(b.moe.scratch.selectedExperts.contents());
   const auto *routing = static_cast<const float *>(b.moe.scratch.routingWeights.contents());
   const auto *routeRows = static_cast<const uint32_t *>(b.moe.scratch.routeRows.contents());
   const auto *intermediate = static_cast<const __bf16 *>(b.moe.scratch.expertIntermediate.contents());
   const auto *down = static_cast<const __bf16 *>(b.moe.scratch.expertOutput.contents());
   const auto *output = static_cast<const __bf16 *>(b.moe.output.contents());
-  const uint32_t tileRows = plan.tileRows(), tiles = *static_cast<const uint32_t *>(b.moe.scratch.tileCount.contents());
+  const uint32_t tiles = *static_cast<const uint32_t *>(b.moe.scratch.tileCount.contents());
   require(tiles <= plan.maximumTiles(), label + ": tile count exceeds its bound");
+  checkGrouping(b.moe.scratch, plan, label);
+  // Each expert pass runs the live tiles of its column tiles; gate and up run
+  // in one pass (_gate_up, _gate_up_mixed where their formats differ), then
+  // down.
+  uint32_t gateUpPasses = 0, downPasses = 0;
+  for (const ComputeDispatch &dispatch : graph.dispatches()) {
+    const uint32_t *grid = nullptr;
+    if (const MetalBuffer &buffer = dispatch.indirectThreadgroups.buffer)
+      grid = static_cast<const uint32_t *>(buffer.contents()) + dispatch.indirectThreadgroups.offsetBytes / 4;
+    require(dispatch.pipelineName.starts_with("moe_expert_gguf") == (grid != nullptr) &&
+                (!grid || (grid[0] == dispatch.threadgroups.x && grid[1] == tiles && grid[2] == 1 &&
+                           dispatch.threadgroups.y == plan.maximumTiles())),
+            label + ": " + dispatch.pipelineName + " runs another grid than its live tiles");
+    const std::string_view pass = withoutSlices(dispatch.pipelineName);
+    gateUpPasses += pass.ends_with("_gate_up") || pass.ends_with("_gate_up_mixed");
+    downPasses += pass.ends_with("_down");
+  }
+  require(gateUpPasses == 1 && downPasses == 1, label + ": gate and up do not run in one pass before down");
   for (uint32_t r = 0; r < rows; ++r) {
     const float *x = b.input.data() + uint64_t{r} * kHidden;
     // Routes: the fp64 top-k by descending score, ascending id; the GPU's fp32
@@ -476,43 +949,58 @@ std::vector<uint16_t> runPlan(MetalBackend &backend, const Model &m, Buffers &b,
                   std::to_string(rank) + ", fp64 ranks " + std::to_string(want));
     }
     // fp32 weights: a softmax weight moves by at most twice the largest score
-    // error of the routes (relative), a sigmoid by its argument's error.
+    // error of the routes (relative), a sigmoid by its argument's error, and
+    // a sigmoid over the sum of the top k's sigmoids by twice it.
+    const auto sigmoid = [](double value) { return 1.0 / (1.0 + std::exp(-value)); };
+    const auto weight = [&](uint32_t rank) {
+      return kShape.router == splash::ops::MoeRouter::Softmax ? std::exp(score[order[rank]] - score[order[0]])
+                                                              : sigmoid(score[order[rank]]);
+    };
     double denominator = 0, scoreError = 0;
     for (uint32_t rank = 0; rank < kTopK; ++rank) {
-      denominator += std::exp(score[order[rank]] - score[order[0]]);
+      denominator += weight(rank);
       scoreError = std::max(scoreError, bound[order[rank]]);
     }
     for (uint32_t rank = 0; rank < kTopK; ++rank) {
-      const double want = std::exp(score[order[rank]] - score[order[0]]) / denominator;
+      const double want = weight(rank) / denominator;
       require(std::fabs(routing[r * kRoutes + rank] - want) <= want * (2 * scoreError + std::ldexp(1.0, -18)),
-              label + ": routing weight of row " + std::to_string(r) + " differs from the fp64 softmax");
+              label + ": routing weight of row " + std::to_string(r) + " differs from the fp64 router's");
     }
-    const Dot gate = dot(x, m.sharedGate.row(0), kHidden);
-    const double sharedWeight = 1.0 / (1.0 + std::exp(-gate.value));
-    require(selected[r * kRoutes + kTopK] == kExperts &&
-                std::fabs(routing[r * kRoutes + kTopK] - sharedWeight) <=
-                    sharedWeight * (floatBound(gate, kHidden) + std::ldexp(1.0, -18)),
-            label + ": shared expert route of row " + std::to_string(r) + " is wrong");
+    // Every shared slice weighs the sigmoid of the scalar gate, or exactly 1.
+    double sharedWeight = 1, sharedError = 0;
+    if (kShape.sharedGate) {
+      const Dot gate = dot(x, m.sharedGate.row(0), kHidden);
+      sharedWeight = sigmoid(gate.value);
+      sharedError = sharedWeight * (floatBound(gate, kHidden) + std::ldexp(1.0, -18));
+    }
+    for (uint32_t slice = 0; slice < kSharedSlices; ++slice)
+      require(selected[r * kRoutes + kTopK + slice] == kExperts + slice &&
+                  std::fabs(routing[r * kRoutes + kTopK + slice] - sharedWeight) <= sharedError,
+              label + ": shared slice " + std::to_string(slice) + " route of row " + std::to_string(r) +
+                  " is wrong");
 
     // Each route: silu(gate) * up from the fp64 products, then down over the
-    // GPU's own intermediate, then the weighted sum over the GPU's outputs.
+    // GPU's own intermediate, then the weighted sum over the GPU's outputs. A
+    // shared slice's rows are its slice of the shared expert's (and of its
+    // down projection, the rows of its column window).
     std::vector<double> expected(kHidden), magnitude(kHidden);
     for (uint32_t c = 0; c < kHidden; ++c) expected[c] = b.residual[uint64_t{r} * kHidden + c];
     for (uint32_t slot = 0; slot < kRoutes; ++slot) {
       const uint32_t route = r * kRoutes + slot, expert = selected[route], grouped = routeRows[route];
-      require(grouped < tiles * tileRows, label + ": grouped row out of range");
-      const bool isShared = expert == kExperts;
+      const bool isShared = expert >= kExperts;
+      // The expert's place among the routed experts or the shared slices.
+      const uint64_t place = isShared ? expert - kExperts : expert;
       GateUp &gu = products[{r, expert}];
       if (gu.gate.empty())
         for (uint32_t n = 0; n < kIntermediate; ++n) {
-          const uint64_t row = isShared ? n : uint64_t{expert} * kIntermediate + n;
+          const uint64_t row = place * kIntermediate + n;
           gu.gate.push_back(dot(x, (isShared ? m.shared[0] : m.routed[0]).row(row), kHidden));
           gu.up.push_back(dot(x, (isShared ? m.shared[1] : m.routed[1]).row(row), kHidden));
         }
       std::vector<float> h(kIntermediate);
       for (uint32_t n = 0; n < kIntermediate; ++n) {
         const Dot &g = gu.gate[n], &u = gu.up[n];
-        const double eg = projectionBound(g, staged), eu = projectionBound(u, staged);
+        const double eg = projectionBound(g, true), eu = projectionBound(u, true);
         // bf16(u) * silu(bf16(g)) rounded to bf16: silu over the gate's
         // interval (its minimum inside if the interval holds it) times the up
         // interval.
@@ -541,9 +1029,9 @@ std::vector<uint16_t> runPlan(MetalBackend &backend, const Model &m, Buffers &b,
         stats.gateUpWorst = std::max(stats.gateUpWorst, std::fabs(got - exact) / scale);
       }
       for (uint32_t n = 0; n < kHidden; ++n) {
-        const uint64_t row = isShared ? n : uint64_t{expert} * kHidden + n;
+        const uint64_t row = place * kHidden + n;
         const Dot y = dot(h.data(), (isShared ? m.shared[2] : m.routed[2]).row(row), kIntermediate);
-        const double e = projectionBound(y, staged);
+        const double e = projectionBound(y, true);
         const float got = float(down[uint64_t{grouped} * kHidden + n]);
         if (!inside(got, y.value, e))
           fail(label + ": down of row " + std::to_string(r) + " expert " + std::to_string(expert) + " column " +
@@ -564,9 +1052,153 @@ std::vector<uint16_t> runPlan(MetalBackend &backend, const Model &m, Buffers &b,
                                                std::to_string(c) + " differs from the weighted expert sum");
     }
   }
-  std::vector<uint16_t> result(uint64_t{rows} * kHidden);
-  std::memcpy(result.data(), output, result.size() * 2);
+  MoeRun result{std::vector<uint16_t>(uint64_t{rows} * kHidden), columnRoutes(b.moe.scratch, plan, label, m)};
+  std::memcpy(result.output.data(), output, result.output.size() * 2);
+  // Bitwise the output of the same dispatches again, whose grouping orders each expert's routes anew (its atomics),
+  // and of every tile's threadgroups and two gate/up passes.
+  for (int repeat = 0; repeat < 2; ++repeat) {
+    std::memset(b.moe.output.contents(), 0, b.moe.output.sizeBytes());
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+    require(!std::memcmp(result.output.data(), output, result.output.size() * 2),
+            label + ": the output differs from a repeat of the run");
+  }
+  std::deque<MoeGgufExpertParams> passes;
+  const MetalBuffer gate = zeros(backend, b.moe.scratch.expertIntermediate.sizeBytes(), "moe-two-pass-gate");
+  const std::vector<ComputeDispatch> reference = fullGridsTwoPasses(graph, gate, passes);
+  std::memset(b.moe.output.contents(), 0, b.moe.output.sizeBytes());
+  static_cast<void>(backend.submitCommandAsync(reference).wait());
+  require(!std::memcmp(result.output.data(), output, result.output.size() * 2),
+          label + ": the output differs from the full grids' and two gate/up passes'");
   return result;
+}
+
+// Each buffer a decode plan and a 32-row prefill plan reach,
+// at its extent and one element short, and each weight: the planes of every
+// shared expert tensor and each region of every chunk of the routed experts
+// (a floor chunk and elastic chunks of other slots, the last holding fewer),
+// whose rows fill whole tiles, in units of a row's group of 32 inputs or meta
+// unit (metal/abi/QuantFormat.h), also of routed formats with a second plane
+// (Q5_K, Q6_K and Q3_K), and a gated shared expert's scalar gate's fp32
+// weights. A region of the floor chunk or of an elastic chunk one element
+// short, chunks that hold fewer slots than the block, a floor or elastic
+// chunks of more slots than their views hold and a malformed list of them
+// are refused where the chunks are made (ExpertChunks::of); a block
+// without chunks, or with chunks made for another block, is refused by its
+// MoE.
+void bufferExtents(MetalBackend &backend) {
+  const MoeShape shape = kShape;
+  const Model m = makeModel(backend, shape, 0, false);
+  Buffers b;
+  b.moe.input = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-input");
+  b.moe.residual = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-residual");
+  b.moe.output = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-output");
+  for (const MoePlan &plan : {MoE::plan(shape, SPLASH_DRAFT_QUERY_ROWS, moeConfig(backend, MoeExpertTile::M8)),
+                              MoE::plan(shape, 33, moeConfig(backend, MoeExpertTile::M32))}) {
+    allocate(backend, b, plan);
+    splash::test::requireMoeExtents(backend, b.moe, m.weights, plan);
+  }
+  const MoePlan plan = MoE::plan(shape, 33, moeConfig(backend, MoeExpertTile::M32));
+  allocate(backend, b, plan);
+  const BlockMoeWeights &blocks = m.weights;
+  const uint32_t floorSlots = kMultiChunkFloorSlots, chunkSlots = kMultiChunkSlots;
+  const BlockMoeWeights chunked = chunkedWeights(backend, m, floorSlots, chunkSlots);
+  const BlockMoeWeights chunkedPlane1 =
+      chunkedWeights(backend, makeModel(backend, shape, Q5K, false), floorSlots, chunkSlots);
+  // The chunks `planes`, a floor of `floor` slots and elastic chunks of
+  // `elastic` slots each, for the routed experts of `weights`
+  // (ExpertChunks::of).
+  const auto chunksOf = [](const BlockMoeWeights &weights, std::vector<MetalBuffer> planes, uint32_t floor,
+                           uint32_t elastic) {
+    return ExpertChunks::of(std::move(planes), floor, elastic, weights.slots, weights.gate.routed, weights.up.routed,
+                            weights.down.routed);
+  };
+  // A weight buffer of the block `base` that `with` puts in its place.
+  const auto requireWeightExtent = [&](const BlockMoeWeights &base, const MetalBuffer &buffer, uint64_t bytes,
+                                       uint64_t element, const std::string &name, const auto &with) {
+    splash::test::requireExtent(backend, buffer, bytes, element, name, [&](CommandGraph &graph, const MetalBuffer &view) {
+      BlockMoeWeights changed = base;
+      with(changed, view);
+      splash::test::addMoeStep(graph, b.moe, changed, plan);
+    });
+  };
+  for (const auto &[member, name, z] : {std::tuple{&BlockMoeWeights::gate, "gate", 0u},
+                                        std::tuple{&BlockMoeWeights::up, "up", 1u},
+                                        std::tuple{&BlockMoeWeights::down, "down", 2u}}) {
+    const QuantizedSegment &tensor = (blocks.*member).shared;
+    const QuantFormat &format = kQuantFormats[tensor.formatId];
+    const uint64_t groups = uint64_t{tensor.outputSize} * (tensor.inputSize / 32);
+    for (const auto &[plane, planeName, unitBytes, units] :
+         {std::tuple{&QuantizedSegment::plane0, " plane0", format.plane0_bytes, groups},
+          std::tuple{&QuantizedSegment::plane1, " plane1", format.plane1_bytes, groups},
+          std::tuple{&QuantizedSegment::meta, " meta", format.meta_bytes, groups / format.meta_groups}}) {
+      if (!unitBytes) continue;
+      requireWeightExtent(blocks, tensor.*plane, units * unitBytes, unitBytes,
+                          std::string("MoE shared ") + name + planeName,
+                          [&](BlockMoeWeights &changed, const MetalBuffer &view) {
+                            (changed.*member).shared.*plane = view;
+                          });
+    }
+    // Each region of each chunk of the routed experts, of its slots' rows.
+    for (const BlockMoeWeights *weights : {&chunked, &chunkedPlane1}) {
+      const QuantizedSegment &routed = (weights->*member).routed;
+      const QuantFormat &routedFormat = kQuantFormats[routed.formatId];
+      const uint64_t slotGroups = uint64_t{routed.outputSize / weights->slots} * (routed.inputSize / 32);
+      const std::vector<MetalBuffer> &planes = *weights->chunks.planes();
+      for (uint32_t chunk = 0, first = 0; first < weights->slots; first += chunk++ ? chunkSlots : floorSlots) {
+        const uint64_t held = std::min(chunk ? chunkSlots : floorSlots, weights->slots - first);
+        for (const auto &[plane, planeName, unitBytes, units] :
+             {std::tuple{0u, " plane0", routedFormat.plane0_bytes, slotGroups},
+              std::tuple{1u, " plane1", routedFormat.plane1_bytes, slotGroups},
+              std::tuple{2u, " meta", routedFormat.meta_bytes, slotGroups / routedFormat.meta_groups}}) {
+          if (!unitBytes) continue;
+          const size_t entry = size_t{chunk} * MOE_EXPERT_CHUNK_ADDRESSES + z * 3 + plane;
+          requireWeightExtent(*weights, planes[entry], held * units * unitBytes, unitBytes,
+                              std::string("MoE expert ") + name + " chunk " + std::to_string(chunk) + planeName,
+                              [&](BlockMoeWeights &changed, const MetalBuffer &view) {
+                                std::vector<MetalBuffer> replaced = planes;
+                                replaced[entry] = view;
+                                changed.chunks = chunksOf(changed, std::move(replaced), floorSlots, chunkSlots);
+                              });
+        }
+      }
+    }
+  }
+  // Chunks without the last, a floor or elastic chunks of no slots or of
+  // more slots than their views hold, or a list that ends inside a chunk.
+  const std::vector<MetalBuffer> &planes = *chunked.chunks.planes();
+  const auto refused = [&](std::vector<MetalBuffer> changed, uint32_t floor, uint32_t elastic,
+                           std::string_view expected, const std::string &what) {
+    splash::test::rejects([&] { static_cast<void>(chunksOf(chunked, std::move(changed), floor, elastic)); },
+                          expected, "MoE expert chunks that " + what + " were made");
+  };
+  refused({planes.begin(), planes.end() - MOE_EXPERT_CHUNK_ADDRESSES}, floorSlots, chunkSlots,
+          "MoE expert chunks hold", "hold fewer slots than the block");
+  refused(planes, 0, chunkSlots, "MoE expert chunks hold", "have a floor of no slots");
+  refused(planes, floorSlots, 0, "MoE expert chunks hold", "have elastic chunks of no slots");
+  refused(planes, floorSlots + 1, chunkSlots, "MoE expert gate chunk 0 plane0 buffer holds",
+          "have a floor of more slots than the floor chunk's views");
+  refused(planes, floorSlots, chunkSlots + 1, "MoE expert gate chunk 1 plane0 buffer holds",
+          "have elastic chunks of more slots than their views");
+  refused({planes.begin(), planes.end() - 1}, floorSlots, chunkSlots, "MoE expert chunks take",
+          "end inside a chunk");
+  // A block without chunks, or with the chunks made for another block's
+  // routed formats.
+  for (const auto &[chunks, expected, what] :
+       {std::tuple{ExpertChunks{}, "MoE routed experts have no chunks", "no chunks"},
+        std::tuple{chunkedPlane1.chunks, "MoE expert chunks were checked for another block",
+                   "chunks checked for another block"}}) {
+    BlockMoeWeights changed = chunked;
+    changed.chunks = chunks;
+    CommandGraph graph;
+    splash::test::rejects([&] { splash::test::addMoeStep(graph, b.moe, changed, plan); }, expected,
+                          std::string("a block's MoE with ") + what + " was accepted");
+    require(graph.empty(), std::string("a block's MoE with ") + what + " encoded a dispatch");
+  }
+  if (shape.sharedGate)
+    requireWeightExtent(blocks, blocks.sharedScalarGate.plane0, uint64_t{kHidden} * 4, 4,
+                        "MoE shared scalar gate weight", [](BlockMoeWeights &changed, const MetalBuffer &view) {
+                          changed.sharedScalarGate.plane0 = view;
+                        });
 }
 
 int moe(MetalBackend &backend) {
@@ -578,102 +1210,528 @@ int moe(MetalBackend &backend) {
   b.moe.input = bfloatBuffer(backend, b.input, "moe-input");
   b.moe.residual = bfloatBuffer(backend, b.residual, "moe-residual");
   b.moe.output = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-output");
-  const MoeShape shape{kHidden, kExperts, kTopK, kIntermediate, WeightLayout::Block32};
-  // Apple7/8 run the staged plans on their MMA kernels (MoeGgufTile::Mma), and neither the Apple9 register tile nor
-  // the neural accelerator router, whose MPP matmuls run far below their MMA rate.
-  const bool mma = backend.capabilities().appleGpuFamily < 9;
-  const std::vector<MoeGgufTile> tiles = mma ? std::vector<MoeGgufTile>{MoeGgufTile::Mma}
-                                             : std::vector<MoeGgufTile>{MoeGgufTile::Staged, MoeGgufTile::Register};
-  const std::vector<FloatTile> routers = mma ? std::vector<FloatTile>{FloatTile::Simdgroup}
-                                             : std::vector<FloatTile>{FloatTile::Simdgroup, FloatTile::NeuralAccelerator};
-  const auto tileName = [](MoeGgufTile tile) {
-    return tile == MoeGgufTile::Register ? "register" : tile == MoeGgufTile::Mma ? "mma     " : "staged  ";
-  };
-  for (int f = 0; f < FMT_COUNT; ++f) {
-    const Model m = makeModel(backend, f);
-    std::map<std::pair<uint32_t, uint32_t>, GateUp> products;
-    std::string formats;
-    for (Fmt format : m.formats) formats += std::string(formats.empty() ? "" : "/") + fmtName(format);
-    for (const MoeGgufTile tile : tiles) {
+  const MoeShape shape = kShape;
+  // A model's prefill on the staged 32-row tiles, whose live-row matmuls
+  // (moe_live_rows) differ by chunk, with the router on each float tile: a
+  // row's result is the same in every chunk on one tile (either tile's scores
+  // of a row depend on that row alone).
+  const auto prefill32 = [&](const Model &m, std::map<std::pair<uint32_t, uint32_t>, GateUp> &products,
+                             const std::string &formats) {
+    for (const FloatTile router : floatTiles(backend)) {
       const int before = failures;
       Stats stats;
-      std::vector<uint16_t> widest;
-      for (uint32_t lanes = 4; lanes >= 1; --lanes) {
-        const MoePlan plan = MoE::decodePlan(
-            shape, lanes, MoeConfig{MoeExpertTile::M8, splash::ops::kMoeRouteWideRows, MoeExpertSimdgroups::Eight, tile});
-        const std::string label = formats + " " + tileName(tile) + " decode B" +
-                                  std::to_string(lanes);
-        const std::vector<uint16_t> rows = runPlan(backend, m, b, plan, tile != MoeGgufTile::Register, products, stats, label);
-        // A row's result depends on its own routes only, not on the lanes it
-        // is batched with (the tile rows of one expert are independent).
-        if (widest.empty()) widest = rows;
-        else if (!std::equal(rows.begin(), rows.end(), widest.begin())) {
-          printf("  %s: rows differ from the four-lane dispatch FAIL\n", label.c_str());
-          ++failures;
-        }
-      }
-      // Prefill chunks on the same 8-row tiles (ExecutionPlans::moePrefill).
-      for (const uint32_t chunk : {kMaximumRows, 27u, 9u}) {
-        const MoePlan plan = MoE::prefillPlan(
-            shape, chunk, MoeConfig{MoeExpertTile::M8, splash::ops::kMoeRouteWideRows, MoeExpertSimdgroups::Eight, tile});
-        const std::string label = formats + " " + tileName(tile) + " prefill rows=" +
-                                  std::to_string(chunk);
-        const std::vector<uint16_t> rows = runPlan(backend, m, b, plan, tile != MoeGgufTile::Register, products, stats, label);
-        if (!std::equal(rows.begin(), rows.begin() + std::min(rows.size(), widest.size()), widest.begin())) {
-          printf("  %s: rows differ from the four-lane dispatch FAIL\n", label.c_str());
-          ++failures;
-        }
-      }
-      printf("%-20s %s decode B1-4, prefill 263/27/9: gate/up %.2f%% and down %.2f%% of outputs differ from bf16(fp64), "
-             "errors at most %.1e/%.1e of sum|x w| %s\n",
-             formats.c_str(), tileName(tile),
-             100.0 * stats.gateUpFlips / (stats.outputs / 2), 100.0 * stats.downFlips / stats.outputs,
-             stats.gateUpWorst, stats.downWorst, failures > before ? "FAIL" : "ok");
-    }
-    // The 32-row tiles, whose 16- and 32-row matmuls both run at 263 rows,
-    // with the router on each float tile: a row's result is the same in every
-    // chunk on one tile (either tile's scores of a row depend on that row
-    // alone).
-    for (const FloatTile router : routers) {
-      const int before = failures;
-      Stats stats;
-      std::vector<uint16_t> widest;
+      MoeRun widest, previous;
+      uint32_t compared = 0, acrossKinds = 0;
       for (const uint32_t rows : {kMaximumRows, 33u, 16u}) {
-        MoeConfig config{MoeExpertTile::M32};
+        MoeConfig config = moeConfig(backend, MoeExpertTile::M32);
         config.ggufRouterTile = router;
-        if (mma) config.ggufTile = MoeGgufTile::Mma;
-        const MoePlan plan = MoE::prefillPlan(shape, rows, config);
+        const MoePlan plan = MoE::plan(shape, rows, config);
         const std::string label = formats + " prefill rows=" + std::to_string(rows) +
                                   (router == FloatTile::NeuralAccelerator ? " (accelerator router)" : "");
-        const std::vector<uint16_t> result = runPlan(backend, m, b, plan, true, products, stats, label);
-        if (widest.empty()) widest = result;
-        else if (!std::equal(result.begin(), result.end(), widest.begin())) {
-          printf("  %s: rows differ from the %u-row chunk FAIL\n", label.c_str(), kMaximumRows);
+        const MoeRun result = runPlan(backend, m, b, plan, products, stats, label);
+        if (widest.output.empty()) {
+          Stats repeat;
+          failures += compareRepeat(result, runPlan(backend, m, b, plan, products, repeat, label + " repeat"),
+                                    label);
+          widest = previous = result;
+          continue;
+        }
+        const RowComparison c = compareChunks(result, widest, previous, rows, label);
+        compared += c.compared;
+        acrossKinds += c.acrossKinds;
+        failures += c.differ > 0;
+        previous = result;
+      }
+      printf("%-20s staged   prefill 263/33/16 (32-row tiles, %s router): gate/up %.2f%% and down %.2f%% of outputs "
+             "differ from bf16(fp64), errors at most %.1e/%.1e of sum|x w|, %u rows compared bitwise, %u across tile "
+             "kinds %s\n",
+             formats.c_str(), router == FloatTile::NeuralAccelerator ? "accelerator" : "simdgroup",
+             100.0 * stats.gateUpFlips / (stats.outputs / 2), 100.0 * stats.downFlips / stats.outputs, stats.gateUpWorst,
+             stats.downWorst, compared, acrossKinds, failures > before ? "FAIL" : "ok");
+    }
+  };
+  // The models of every format (makeModel).
+  for (int f = 0; f < FMT_COUNT; ++f)
+    for (const bool upInGateFormats : {false, true}) {
+      const Model m = makeModel(backend, shape, f, upInGateFormats);
+      std::map<std::pair<uint32_t, uint32_t>, GateUp> products;
+      const std::string formats = formatNames(m);
+      const int before = failures;
+      Stats stats;
+      MoeRun widest;
+      uint32_t compared = 0, acrossKinds = 0;
+      // The rows of a run that differ from the four-lane dispatch's where their routes ran the same tile kinds.
+      const auto compareWidest = [&](const MoeRun &run, const std::string &label) {
+        const RowComparison c =
+            compareRows(run, widest, uint32_t(std::min(run.output.size(), widest.output.size()) / kHidden));
+        compared += c.compared;
+        acrossKinds += c.acrossKinds;
+        if (c.differ) {
+          printf("  %s: %u rows differ from the four-lane dispatch FAIL\n", label.c_str(), c.differ);
           ++failures;
         }
+      };
+      for (uint32_t lanes = 4; lanes >= 1; --lanes) {
+        const MoePlan plan = MoE::plan(shape, lanes * SPLASH_DRAFT_QUERY_ROWS, moeConfig(backend, MoeExpertTile::M8));
+        const std::string label = formats + " staged decode B" + std::to_string(lanes);
+        const MoeRun run = runPlan(backend, m, b, plan, products, stats, label);
+        // A row's result depends on its own routes and the tile kinds they
+        // run only, not on the rows it is batched with (the tile rows of one
+        // expert are independent).
+        if (widest.output.empty()) {
+          Stats repeat;
+          failures += compareRepeat(run, runPlan(backend, m, b, plan, products, repeat, label + " repeat"), label);
+          widest = run;
+        } else {
+          compareWidest(run, label);
+        }
       }
-      printf("%-20s %s prefill 263/33/16 (32-row tiles, %s router): gate/up %.2f%% and down %.2f%% of outputs "
-             "differ from bf16(fp64), errors at most %.1e/%.1e of sum|x w| %s\n",
-             formats.c_str(), tileName(mma ? MoeGgufTile::Mma : MoeGgufTile::Staged), router == FloatTile::NeuralAccelerator ? "accelerator" : "simdgroup",
-             100.0 * stats.gateUpFlips / (stats.outputs / 2), 100.0 * stats.downFlips / stats.outputs, stats.gateUpWorst,
-             stats.downWorst, failures > before ? "FAIL" : "ok");
+      // Prefill chunks on the same 8-row tiles.
+      for (const uint32_t chunk : {kMaximumRows, 27u, 9u, 8u}) {
+        const MoePlan plan = MoE::plan(shape, chunk, moeConfig(backend, MoeExpertTile::M8));
+        const std::string label = formats + " staged prefill rows=" + std::to_string(chunk);
+        compareWidest(runPlan(backend, m, b, plan, products, stats, label), label);
+      }
+      printf("%-20s staged   decode B1-4, prefill 263/27/9/8: gate/up %.2f%% and down %.2f%% of outputs differ from "
+             "bf16(fp64), errors at most %.1e/%.1e of sum|x w|, %u rows compared bitwise, %u across tile kinds %s\n",
+             formats.c_str(), 100.0 * stats.gateUpFlips / (stats.outputs / 2), 100.0 * stats.downFlips / stats.outputs,
+             stats.gateUpWorst, stats.downWorst, compared, acrossKinds, failures > before ? "FAIL" : "ok");
+      prefill32(m, products, formats);
     }
+  return failures;
+}
+
+// Concentrated and skewed loads: a router whose expert e scores 4 x[e], and
+// rows whose first kExperts inputs rank the experts, the first at 1, the next
+// expert at 0.5. When experts outnumber hidden columns, paired experts read
+// the same column with opposite signs; the remaining inputs stay below 0.5.
+// Every row (Concentrated) or
+// six of every eight (Skewed) route to experts 0 and 1 first, the others to
+// expert row % kExperts and the next. On the staged 32-row tiles of the
+// Q4_K gate/up model, 1, 12 and 48 rows leave ragged tiles of 8- and 16-row
+// matmuls; at 256 rows the concentrated load fills whole tiles and the skewed
+// one leaves 16-row tails. A row's result is the same at every row count.
+int routingLoads(MetalBackend &backend) {
+  enum class Load { Concentrated, Skewed };
+  const MoeShape shape = kShape;
+  Model m = makeModel(backend, shape, Q4K, true);
+  m.router.values.assign(uint64_t{kExperts} * kHidden, 0.0f);
+  static_assert(kExperts <= 2 * kHidden, "the routing fixture holds two experts per input column");
+  const auto column = [](uint32_t expert) { return expert % kHidden; };
+  const auto sign = [](uint32_t expert) { return expert < kHidden ? 1.0f : -1.0f; };
+  for (uint32_t e = 0; e < kExperts; ++e)
+    m.router.values[uint64_t{e} * kHidden + column(e)] = 4.0f * sign(e);
+  m.router.segment = floatSegment(backend, m.router.values, kExperts, kHidden);
+  m.weights.router = m.router.segment;
+  const std::string formats = formatNames(m);
+  int failures = 0;
+  for (const Load load : {Load::Concentrated, Load::Skewed}) {
+    const std::string name = load == Load::Concentrated ? "concentrated" : "skewed";
+    Buffers b;
+    b.input = activations(uint64_t{kMaximumRows} * kHidden);
+    b.residual = activations(uint64_t{kMaximumRows} * kHidden);
+    for (float &v : b.residual) v = bf16(0.1f * v);
+    for (uint32_t r = 0; r < kMaximumRows; ++r) {
+      const uint32_t first = load == Load::Concentrated || r % 8 < 6 ? 0 : r % kExperts;
+      const uint32_t next = (first + 1) % kExperts;
+      for (uint32_t c = 0; c < std::min(kExperts, kHidden); ++c)
+        b.input[uint64_t{r} * kHidden + c] = bf16(0.01 * c * std::min(1.0, 16.0 / kExperts));
+      b.input[uint64_t{r} * kHidden + column(first)] = sign(first);
+      b.input[uint64_t{r} * kHidden + column(next)] = bf16(0.5f * sign(next));
+    }
+    b.moe.input = bfloatBuffer(backend, b.input, "moe-input");
+    b.moe.residual = bfloatBuffer(backend, b.residual, "moe-residual");
+    b.moe.output = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-output");
+    std::map<std::pair<uint32_t, uint32_t>, GateUp> products;
+    Stats stats;
+    MoeRun widest, previous;
+    uint32_t compared = 0, acrossKinds = 0;
+    const int before = failures;
+    for (const uint32_t rows : {256u, 48u, 12u, 1u}) {
+      const MoePlan plan = MoE::plan(shape, rows, moeConfig(backend, MoeExpertTile::M32));
+      const std::string label = formats + " " + name + " prefill rows=" + std::to_string(rows);
+      const MoeRun result = runPlan(backend, m, b, plan, products, stats, label);
+      const auto *selected = static_cast<const uint32_t *>(b.moe.scratch.selectedExperts.contents());
+      for (uint32_t r = 0; r < rows; ++r) {
+        const uint32_t first = load == Load::Concentrated || r % 8 < 6 ? 0 : r % kExperts;
+        require(selected[r * kRoutes] == first && selected[r * kRoutes + 1] == (first + 1) % kExperts,
+                label + ": fixture routes to its intended first two experts");
+      }
+      if (widest.output.empty()) {
+        Stats repeat;
+        failures +=
+            compareRepeat(result, runPlan(backend, m, b, plan, products, repeat, label + " repeat"), label);
+        widest = previous = result;
+        continue;
+      }
+      const RowComparison c = compareChunks(result, widest, previous, rows, label);
+      compared += c.compared;
+      acrossKinds += c.acrossKinds;
+      failures += c.differ > 0;
+      previous = result;
+    }
+    printf("%-20s staged   prefill 256/48/12/1 (32-row tiles, %s routing): gate/up %.2f%% and down %.2f%% of "
+           "outputs differ from bf16(fp64), errors at most %.1e/%.1e of sum|x w|, %u rows compared bitwise, %u across "
+           "tile kinds %s\n",
+           formats.c_str(), name.c_str(), 100.0 * stats.gateUpFlips / (stats.outputs / 2),
+           100.0 * stats.downFlips / stats.outputs, stats.gateUpWorst, stats.downWorst, compared, acrossKinds,
+           failures > before ? "FAIL" : "ok");
+  }
+  return failures;
+}
+
+// A router of a quantized format's native rows, as an MLX checkpoint's
+// quantized router loads, routes as the F32 values the token gather decodes
+// from them: the same experts, routing weights and outputs bit for bit, in
+// decode at one to four lanes and in prefill with the router on each float
+// tile.
+int nativeRouter(MetalBackend &backend) {
+  const MoeShape shape = kShape;
+  Model m = makeModel(backend, shape, Q4K, true);
+  Buffers b;
+  b.input = activations(uint64_t{kMaximumRows} * kHidden);
+  b.residual = activations(uint64_t{kMaximumRows} * kHidden);
+  for (float &v : b.residual) v = bf16(0.1f * v);
+  b.moe.input = bfloatBuffer(backend, b.input, "moe-input");
+  b.moe.residual = bfloatBuffer(backend, b.residual, "moe-residual");
+  b.moe.output = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-output");
+  // A plan's routes, routing weights and output rows.
+  const auto run = [&](const MoePlan &plan, const QuantizedSegment &router) {
+    allocate(backend, b, plan);
+    m.weights.router = router;
+    CommandGraph graph;
+    splash::test::addMoeStep(graph, b.moe, m.weights, plan);
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+    const uint64_t routes = uint64_t{plan.rows()} * kRoutes * 4, output = uint64_t{plan.rows()} * kHidden * 2;
+    std::vector<uint8_t> bytes(2 * routes + output);
+    std::memcpy(bytes.data(), b.moe.scratch.selectedExperts.contents(), routes);
+    std::memcpy(bytes.data() + routes, b.moe.scratch.routingWeights.contents(), routes);
+    std::memcpy(bytes.data() + 2 * routes, b.moe.output.contents(), output);
+    return bytes;
+  };
+  int failures = 0;
+  for (const Fmt f : {Fmt(GGUF_FMT_AF8G64), Q80}) {
+    const std::vector<uint8_t> native = makeNative(f, kExperts, kHidden, rng);
+    const QuantizedSegment rows =
+        QuantizedSegment::rows(f, kExperts, kHidden, upload(backend, native.data(), native.size(), "router-rows"));
+    const QuantizedSegment values = gatheredValues(backend, f, kExperts, kHidden, rows.plane0);
+    std::vector<std::pair<std::string, MoePlan>> plans;
+    for (uint32_t lanes = 1; lanes <= 4; ++lanes)
+      plans.emplace_back("decode B" + std::to_string(lanes),
+                         MoE::plan(shape, lanes * SPLASH_DRAFT_QUERY_ROWS, moeConfig(backend, MoeConfig{}.expertTile)));
+    for (const FloatTile tile : floatTiles(backend))
+      for (const uint32_t count : {kMaximumRows, 33u, 16u}) {
+        MoeConfig config = moeConfig(backend, MoeExpertTile::M32);
+        config.ggufRouterTile = tile;
+        plans.emplace_back("prefill rows=" + std::to_string(count) +
+                               (tile == FloatTile::NeuralAccelerator ? " (accelerator router)" : ""),
+                           MoE::plan(shape, count, config));
+      }
+    int formatFailures = 0;
+    for (const auto &[label, plan] : plans)
+      if (run(plan, values) != run(plan, rows)) {
+        printf("  %s router %s: routes, weights or outputs differ from its F32 values' FAIL\n",
+               kQuantFormats[f].name, label.c_str());
+        ++formatFailures;
+      }
+    printf("%-20s %s router: decode B1-4, prefill 263/33/16 on both float tiles route and output as its F32 "
+           "values bit for bit %s\n",
+           formatNames(m).c_str(), kQuantFormats[f].name, formatFailures ? "FAIL" : "ok");
+    failures += formatFailures;
   }
   return failures;
 }
 
 } // namespace
 
+// The kernels read each routed expert from the slot its table names: the
+// experts in slots permuted by sigma, with each expert's router row moved to
+// match (expert e routes as e' did where sigma(e) = e'), give the identity
+// table's output bit for bit, in decode and in prefill.
+int permutedSlots(MetalBackend &backend) {
+  const MoeShape shape = kShape;
+  const auto sigma = [](uint32_t expert) { return (expert * 7 + 3) % kExperts; };
+  const Model m = makeModel(backend, shape, 0, false);
+  Model permuted = m;
+  MetalBuffer table = backend.allocateBuffer(uint64_t{kExperts} * sizeof(uint32_t), BufferStorage::Shared,
+                                             "permuted-slots");
+  std::vector<float> router(m.router.values.size());
+  for (uint32_t expert = 0; expert < kExperts; ++expert) {
+    static_cast<uint32_t *>(table.contents())[expert] = sigma(expert);
+    std::copy_n(m.router.row(sigma(expert)), kHidden, router.begin() + uint64_t{expert} * kHidden);
+  }
+  permuted.weights.slotTable = table;
+  permuted.weights.router = floatSegment(backend, router, kExperts, kHidden);
+  Buffers b;
+  b.input = activations(uint64_t{kMaximumRows} * kHidden);
+  b.residual = activations(uint64_t{kMaximumRows} * kHidden);
+  b.moe.input = bfloatBuffer(backend, b.input, "moe-input");
+  b.moe.residual = bfloatBuffer(backend, b.residual, "moe-residual");
+  b.moe.output = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-output");
+  const auto run = [&](const Model &model, const MoePlan &plan) {
+    allocate(backend, b, plan);
+    std::memset(b.moe.output.contents(), 0, b.moe.output.sizeBytes());
+    CommandGraph graph;
+    splash::test::addMoeStep(graph, b.moe, model.weights, plan);
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+    const auto *output = static_cast<const uint16_t *>(b.moe.output.contents());
+    return std::vector<uint16_t>(output, output + uint64_t{plan.rows()} * kHidden);
+  };
+  int failures = 0;
+  for (const MoePlan &plan : {MoE::plan(shape, 4 * SPLASH_DRAFT_QUERY_ROWS, moeConfig(backend, MoeExpertTile::M8)),
+                              MoE::plan(shape, kMaximumRows, moeConfig(backend, MoeExpertTile::M32))})
+    if (run(m, plan) != run(permuted, plan)) {
+      printf("  permuted slots, %u rows: the output differs from the identity table's FAIL\n", plan.rows());
+      ++failures;
+    }
+  printf("%-20s staged   permuted slot table, decode B4 and prefill %u: %s\n", formatNames(m).c_str(), kMaximumRows,
+         failures ? "FAIL" : "ok");
+  return failures;
+}
+
+// The kernels find a slot in its chunk (moe_expert_chunk): the experts copied
+// into a floor chunk of kMultiChunkFloorSlots slots and elastic chunks of
+// kMultiChunkSlots, the last of fewer, in slots permuted by sigma across the
+// floor and elastic chunks as permutedSlots permutes them, give the
+// output of the one chunk and identity table bit for bit, in decode B1-B4
+// and prefill 33 and 263 (column tiles in decode, and gate and up in one pass
+// in their own formats and in the gate's), each in the first formats and in
+// Q5_K's, whose formats have a second plane, so every chunk's plane1 regions
+// are read.
+int chunkedSlots(MetalBackend &backend) {
+  const MoeShape shape = kShape;
+  const auto sigma = [](uint32_t expert) { return (expert * 7 + 3) % kExperts; };
+  Buffers b;
+  b.input = activations(uint64_t{kMaximumRows} * kHidden);
+  b.residual = activations(uint64_t{kMaximumRows} * kHidden);
+  b.moe.input = bfloatBuffer(backend, b.input, "moe-input");
+  b.moe.residual = bfloatBuffer(backend, b.residual, "moe-residual");
+  b.moe.output = zeros(backend, uint64_t{kMaximumRows} * kHidden * 2, "moe-output");
+  const auto run = [&](const BlockMoeWeights &weights, const MoePlan &plan) {
+    allocate(backend, b, plan);
+    std::memset(b.moe.output.contents(), 0, b.moe.output.sizeBytes());
+    CommandGraph graph;
+    splash::test::addMoeStep(graph, b.moe, weights, plan);
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+    const auto *output = static_cast<const uint16_t *>(b.moe.output.contents());
+    return std::vector<uint16_t>(output, output + uint64_t{plan.rows()} * kHidden);
+  };
+  int failures = 0;
+  for (const bool upInGateFormats : {false, true}) {
+    for (const int format : {0, int(Q5K)}) {
+      const Model m = makeModel(backend, shape, format, upInGateFormats);
+      BlockMoeWeights chunked = chunkedWeights(backend, m, kMultiChunkFloorSlots, kMultiChunkSlots);
+      MetalBuffer table = backend.allocateBuffer(uint64_t{kExperts} * sizeof(uint32_t), BufferStorage::Shared,
+                                                 "chunked-slots");
+      std::vector<float> router(m.router.values.size());
+      for (uint32_t expert = 0; expert < kExperts; ++expert) {
+        static_cast<uint32_t *>(table.contents())[expert] = sigma(expert);
+        std::copy_n(m.router.row(sigma(expert)), kHidden, router.begin() + uint64_t{expert} * kHidden);
+      }
+      chunked.slotTable = table;
+      chunked.router = floatSegment(backend, router, kExperts, kHidden);
+      std::vector<MoePlan> plans;
+      for (uint32_t lanes = 1; lanes <= 4; ++lanes)
+        plans.push_back(MoE::plan(shape, lanes * SPLASH_DRAFT_QUERY_ROWS, moeConfig(backend, MoeExpertTile::M8)));
+      for (const uint32_t rows : {33u, kMaximumRows})
+        plans.push_back(MoE::plan(shape, rows, moeConfig(backend, MoeExpertTile::M32)));
+      int tileFailures = 0;
+      for (const MoePlan &plan : plans)
+        if (run(m.weights, plan) != run(chunked, plan)) {
+          printf("  chunked slots, %u rows: the output differs from one chunk's FAIL\n", plan.rows());
+          ++tileFailures;
+        }
+      printf("%-20s staged   a floor of %u slots and chunks of %u, permuted slots, decode B1-4 and prefill 33/%u: %s\n",
+             formatNames(m).c_str(), kMultiChunkFloorSlots, kMultiChunkSlots, kMaximumRows,
+             tileFailures ? "FAIL" : "ok");
+      failures += tileFailures;
+    }
+  }
+  return failures;
+}
+
+// A decode step whose lanes hold fewer rows than the step routes its lanes'
+// rows alone (MoeBuffers::laneRows): a routed route of a row of no lane
+// stays out of every tile with the route row ~0u, every other route
+// round-trips and the tiles hold exactly those routes, a row of no lane stays
+// finite (its residual and shared expert), and every lane's row's output is
+// bitwise the all-rows run's, where its routes run the same tile kinds (a
+// row's output depends on its own routes and their tile kinds only). Lanes
+// that hold every row of the step route as the all-rows grouping, bitwise.
+// The rows and the router are the case's own, so those kinds are: every row
+// routes experts 0 to kTopK - 2 and, but for each lane's first row, which
+// takes expert kTopK + lane alone (the column tile in both runs), expert
+// kTopK - 1, whose tiles stay staged in both runs. The steps: four lanes of
+// 8, 5, 2 and 1 rows packed from row 0 of a step of 32, its last 16 rows of no
+// lane; and lanes of 6, 2, 3 and 1 rows at rows 2, 10, 18 and 21 of a step of
+// 26, the rows around them of no lane.
+int laneRowsRoute(MetalBackend &backend, const std::string &name, uint32_t rows,
+                  const std::vector<SplashLaneRows> &lanes) {
+  const MoeShape shape = kShape;
+  static_assert(kTopK + SPLASH_MAXIMUM_BATCH_WIDTH <= std::min(kExperts, kHidden) && kExperts <= 2 * kHidden,
+                "each lane's first row has an expert of its own, each expert a router column");
+  int failures = 0;
+  Model m = makeModel(backend, shape, 0, false);
+  // Expert e scores 4 x[e % kHidden], negated past kHidden (routingLoads).
+  m.router.values.assign(uint64_t{kExperts} * kHidden, 0.0f);
+  for (uint32_t e = 0; e < kExperts; ++e)
+    m.router.values[uint64_t{e} * kHidden + e % kHidden] = e < kHidden ? 4.0f : -4.0f;
+  m.router.segment = floatSegment(backend, m.router.values, kExperts, kHidden);
+  m.weights.router = m.router.segment;
+  const MoePlan plan = MoE::plan(shape, rows, moeConfig(backend, MoeExpertTile::M8));
+  const uint32_t tileRows = plan.tileRows();
+  // Each row's lane, or none.
+  constexpr uint32_t kNoLane = UINT32_MAX;
+  std::vector<uint32_t> laneOf(rows, kNoLane);
+  for (uint32_t lane = 0; lane < lanes.size(); ++lane)
+    std::fill_n(laneOf.begin() + lanes[lane].first, lanes[lane].rows, lane);
+  const auto own = [&](uint32_t row) { return laneOf[row] != kNoLane && row == lanes[laneOf[row]].first; };
+  // Lanes of eight rows, the last of the rest, that hold every row of the
+  // step.
+  std::vector<SplashLaneRows> every;
+  for (uint32_t first = 0; first < rows; first += 8) every.push_back({first, std::min(8u, rows - first)});
+  if (every.size() > SPLASH_MAXIMUM_BATCH_WIDTH) throw std::logic_error("a step of more rows than four lanes of 8");
+  // Inputs within 0.25 of zero, which score an expert at most 1, and a row's
+  // route k at 1 - k / (2 kTopK), which scores its expert above 2.
+  std::mt19937 generator(0x5e1);
+  std::uniform_real_distribution<float> near(-0.25f, 0.25f);
+  Buffers b;
+  b.input.resize(uint64_t{rows} * kHidden);
+  b.residual.resize(uint64_t{rows} * kHidden);
+  for (std::vector<float> *values : {&b.input, &b.residual})
+    for (float &v : *values) v = bf16(near(generator));
+  const auto routeInput = [](uint32_t k) { return bf16(1.0 - k / (2.0 * kTopK)); };
+  for (uint32_t row = 0; row < rows; ++row) {
+    float *x = b.input.data() + uint64_t{row} * kHidden;
+    for (uint32_t k = 0; k + 1 < kTopK; ++k) x[k] = routeInput(k);
+    x[kTopK - 1] = own(row) ? 0.0f : routeInput(kTopK - 1);
+    if (own(row)) x[kTopK + laneOf[row]] = routeInput(kTopK - 1);
+  }
+  b.moe.input = bfloatBuffer(backend, b.input, "moe-input");
+  b.moe.residual = bfloatBuffer(backend, b.residual, "moe-residual");
+  b.moe.output = zeros(backend, uint64_t{rows} * kHidden * 2, "moe-output");
+  // A run's output rows and, per route, its tile kind: column or not,
+  // UINT32_MAX where the run left it out. Without lanes every row routes.
+  const auto run = [&](const std::vector<SplashLaneRows> &layout) {
+    allocate(backend, b, plan);
+    std::memset(b.moe.output.contents(), 0, b.moe.output.sizeBytes());
+    b.moe.lanes = uint32_t(layout.size());
+    b.moe.laneRows = layout.empty() ? MetalBuffer{}
+                                    : upload(backend, layout.data(), layout.size() * sizeof(SplashLaneRows), "lanes");
+    CommandGraph graph;
+    splash::test::addMoeStep(graph, b.moe, m.weights, plan);
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+    const auto *output = static_cast<const uint16_t *>(b.moe.output.contents());
+    const auto *routeRows = static_cast<const uint32_t *>(b.moe.scratch.routeRows.contents());
+    const auto *tiles = static_cast<const MoeTileDescriptor *>(b.moe.scratch.tileDescriptors.contents());
+    const std::vector<uint32_t> tileOf = rowTiles(b.moe.scratch, plan, name);
+    std::vector<uint32_t> kinds(uint64_t{rows} * kRoutes);
+    for (uint32_t route = 0; route < kinds.size(); ++route)
+      kinds[route] = routeRows[route] == UINT32_MAX ? UINT32_MAX
+                                                    : uint32_t(columnTile(tiles, tileOf[routeRows[route]], tileRows,
+                                                                          plan.configuration().ggufTile, m));
+    return std::pair{std::vector<uint16_t>(output, output + uint64_t{rows} * kHidden), kinds};
+  };
+  const auto [allOutput, allKinds] = run({});
+  const auto [fullOutput, fullKinds] = run(every);
+  const auto [output, kinds] = run(lanes);
+  const auto fail = [&](const std::string &what) {
+    printf("  %s: %s FAIL\n", name.c_str(), what.c_str());
+    ++failures;
+  };
+  const bool fullBitwise = fullOutput == allOutput && fullKinds == allKinds;
+  if (!fullBitwise) fail("lanes that hold every row are not bitwise the all-rows run");
+
+  const MoeScratch &scratch = b.moe.scratch;
+  const auto *selected = static_cast<const uint32_t *>(scratch.selectedExperts.contents());
+  const auto *routeRows = static_cast<const uint32_t *>(scratch.routeRows.contents());
+  const auto *groupedRoutes = static_cast<const uint32_t *>(scratch.groupedRoutes.contents());
+  const auto *tiles = static_cast<const MoeTileDescriptor *>(scratch.tileDescriptors.contents());
+  const uint32_t tileCount = *static_cast<const uint32_t *>(scratch.tileCount.contents());
+  for (uint32_t tile = 0, packed = 0; tile < tileCount; packed += tiles[tile++].rows)
+    if (tiles[tile].first_row != packed) fail("a tile's rows do not follow the tile before it's");
+  const std::vector<uint32_t> tileOf = rowTiles(scratch, plan, name);
+  std::array<uint32_t, kExperts + kSharedSlices> routes{};
+  for (uint32_t route = 0; route < rows * kRoutes; ++route) {
+    const uint32_t row = route / kRoutes, slot = route % kRoutes;
+    if (slot < kTopK) {
+      const uint32_t ranked = slot + 1 < kTopK ? slot : own(row) ? kTopK + laneOf[row] : kTopK - 1;
+      if (selected[route] != ranked) fail("row " + std::to_string(row) + " left the experts its inputs rank");
+    }
+    if (slot < kTopK && laneOf[row] == kNoLane) {
+      if (routeRows[route] != UINT32_MAX) fail("a route of row " + std::to_string(row) + " of no lane was grouped");
+      continue;
+    }
+    ++routes[selected[route]];
+    const uint32_t grouped = routeRows[route];
+    if (grouped >= tileOf.size() || tileOf[grouped] == UINT32_MAX || groupedRoutes[grouped] != route ||
+        tiles[tileOf[grouped]].expert != selected[route])
+      fail("a routed route's grouped row does not round-trip");
+  }
+  uint32_t occupied = 0;
+  for (const uint32_t count : routes) occupied += (count + tileRows - 1) / tileRows;
+  if (tileCount != occupied) fail("the tiles hold other routes than the lanes' rows'");
+
+  // Every lane's row compares, those whose routes ran the column tile too.
+  uint32_t compared = 0, column = 0, expected = 0;
+  for (uint32_t row = 0; row < rows; ++row) {
+    const auto at = [&](const std::vector<uint16_t> &values) { return values.begin() + uint64_t{row} * kHidden; };
+    if (laneOf[row] == kNoLane) {
+      if (!std::all_of(at(output), at(output) + kHidden, [](uint16_t v) { return (v & 0x7F80) != 0x7F80; }))
+        fail("row " + std::to_string(row) + " of no lane is not finite");
+      continue;
+    }
+    ++expected;
+    const auto routeKinds = kinds.begin() + uint64_t{row} * kRoutes;
+    if (!std::equal(routeKinds, routeKinds + kRoutes, allKinds.begin() + uint64_t{row} * kRoutes)) continue;
+    ++compared;
+    column += std::find(routeKinds, routeKinds + kRoutes, 1u) != routeKinds + kRoutes;
+    if (!std::equal(at(output), at(output) + kHidden, at(allOutput)))
+      fail("lane row " + std::to_string(row) + " differs from the all-rows run");
+  }
+  // Each lane's first row has an expert of its own, whose tile is a
+  // column tile; Apple7/8's MMA passes run one only for an expert of a
+  // moe_mma_column_format projection (columnTile), which this model has none
+  // of.
+  const bool columnKinds = moeTile(backend) == MoeGgufTile::Staged ||
+                           std::any_of(m.formats.begin(), m.formats.end(),
+                                       [&](gguf_reference::Fmt f) { return moe_mma_column_format(f, tileRows); });
+  const size_t columnRows = columnKinds ? lanes.size() : 0;
+  if (compared != expected || column != columnRows)
+    fail(std::to_string(compared) + " of " + std::to_string(expected) + " lane rows kept their tile kinds, " +
+         std::to_string(column) + " of them on the column tile, not every one and " + std::to_string(columnRows));
+  printf("%-20s staged   %s, lanes of every row: %s; %u lane rows bitwise, %u with a column-tile route: %s\n",
+         formatNames(m).c_str(), name.c_str(), fullBitwise ? "bitwise" : "differs", compared, column,
+         failures ? "FAIL" : "ok");
+  return failures;
+}
+
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
-    if (argc != 2) {
-      std::cerr << "usage: gguf_moe_test <metallib>\n";
+    const bool stress = argc == 4 && std::string(argv[2]) == "float-stress";
+    if (argc != 2 && !stress) {
+      std::cerr << "usage: gguf-moe <production-and-test.metallib> [float-stress <iterations>]\n";
       return 2;
     }
     try {
       MetalBackend backend(argv[1]);
-      const int failures = floatProjection(backend) + floatSegments(backend, 64) + floatSegments(backend, 96) +
-                           floatOnlyChain(backend) + moe(backend);
+      if (stress) {
+        const int iterations = std::atoi(argv[3]);
+        int failed = 0;
+        for (int iteration = 0; iteration < iterations; ++iteration) failed += nativeRowWeights(backend) != 0;
+        printf("float-stress: %d of %d iterations failed\n", failed, iterations);
+        return failed ? 1 : 0;
+      }
+      bufferExtents(backend);
+      const int failures = floatProjection(backend) + bfloat16Weights(backend) + nativeRowWeights(backend) +
+                           nativePairs(backend) + floatPairs(backend) +
+                           floatSegments(backend, 64) + floatSegments(backend, 96) + floatOnlyChain(backend) +
+                           moe(backend) + routingLoads(backend) + nativeRouter(backend) + permutedSlots(backend) +
+                           laneRowsRoute(backend, "lanes of 8/5/2/1 rows, 16 of no lane", 32,
+                                         {{0, 8}, {8, 5}, {13, 2}, {15, 1}}) +
+                           laneRowsRoute(backend, "rows of no lane around lanes of 6/2/3/1", 26,
+                                         {{2, 6}, {10, 2}, {18, 3}, {21, 1}}) +
+                           chunkedSlots(backend);
       if (failures) {
         std::cerr << "gguf_moe_test: " << failures << " failures\n";
         return 1;
