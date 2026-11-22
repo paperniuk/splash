@@ -17,8 +17,8 @@
 
 namespace splash::ops {
 
-// The instance of kernel `name` that writes `destination`: a plain decode
-// kernel's fp32 instance is "<name>_f32".
+// The instance of kernel `name` that writes `destination`: the plain decode
+// and MMA prefill kernels' fp32 instances are "<name>_f32".
 [[nodiscard]] inline std::string kernelInstance(std::string_view name, FloatOutput destination) {
   return std::string(name) + (destination == FloatOutput::Float32 ? "_f32" : "");
 }

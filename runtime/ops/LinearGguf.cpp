@@ -500,7 +500,8 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
     const uint32_t colTiles = s.outputSize / GGUF_TILE_COLUMNS;
     if (splits > 1) {
       bindings.insert(bindings.end(), {partials, counters, epilogueInput(b, w.epilogue)});
-      graph.add("gguf_prefill_mma_split_" + std::string(s.name()) + "_" + epilogue, std::move(bindings),
+      graph.add(kernelInstance("gguf_prefill_mma_split_" + std::string(s.name()) + "_" + epilogue,
+                               plan.destination()), std::move(bindings),
                 GgufPrefillSplitParams{params, splits}, {rowTiles, colTiles, splits}, {kMmaPrefillThreads, 1, 1});
       continue;
     }
@@ -512,7 +513,7 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
       graph.add(leadingInputsInstance(kernel), std::move(bindings),
                 GgufPrefillLeadingParams{params, p.planeInputs()}, groups, {threads, 1, 1});
     } else
-      graph.add(kernel, std::move(bindings), params, groups, {threads, 1, 1});
+      graph.add(kernelInstance(kernel, plan.destination()), std::move(bindings), params, groups, {threads, 1, 1});
   }
 }
 

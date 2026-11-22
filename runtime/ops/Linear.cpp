@@ -150,11 +150,13 @@ uint64_t LinearPlan::gateScratchBytes() const noexcept {
 LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destination)
     : workload_(w), config_(config), destination_(destination) {
   validate(w);
-  // Only the decode tiles have fp32 instances, of their plain projection.
+  // The decode tiles and Apple7/8's MMA prefill tile have fp32 instances
+  // for plain projections. Apple7/8 use that tile for heads past 32 rows.
   if (destination == FloatOutput::Float32 &&
-      (config.tile == LinearTile::GgufPrefill || config.tile == LinearTile::GgufPrefillInt8 ||
+      ((config.tile == LinearTile::GgufPrefill && !config.mmaPrefill) || config.tile == LinearTile::GgufPrefillInt8 ||
        w.epilogue != LinearEpilogue::None))
-    throw std::invalid_argument("an fp32 destination takes a plain projection on the decode tiles");
+    throw std::invalid_argument(config.mmaPrefill ? "an fp32 destination takes a plain projection on the MMA prefill tile"
+                                                  : "an fp32 destination takes a plain projection on the decode tiles");
   // Kernel names follow the segment formats (LinearGguf.cpp).
   requireConfiguration();
 }
