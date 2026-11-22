@@ -262,7 +262,8 @@ void Linear::addGguf(metal::CommandGraph &graph, const LinearBuffers &b,
   const std::vector<QuantizedSegment> &segments = p.blocks().segments;
   if (std::any_of(segments.begin(), segments.end(), [](const QuantizedSegment &s) { return s.isFloat(); })) {
     // The quantized segments, which precede the float ones, run the plan's tiles.
-    addGgufFloatSegments(graph, b, p, plan);
+    for (const QuantizedSegment &s : segments)
+      if (s.isFloat()) addGgufFloatSegment(graph, b, s, plan);
     BlockWeights weights{segments};
     std::erase_if(weights.segments, [](const QuantizedSegment &s) { return s.isFloat(); });
     if (!weights.segments.empty()) {
@@ -489,6 +490,11 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
   }
   const auto [partials, counters] = splitScratch(b, splits);
   for (const QuantizedSegment &s : p.blocks().segments) {
+    // The MMA gate pass comes directly here with its own segments and no epilogue.
+    if (s.isFloat()) {
+      addGgufFloatSegment(graph, b, s, plan);
+      continue;
+    }
     std::vector<metal::MetalBuffer> bindings{b.input, s.plane0, s.plane1Slot(), s.meta, b.output};
     const GgufPrefillParams params{k, w.rows, n, s.columnOffset};
     const uint32_t colTiles = s.outputSize / GGUF_TILE_COLUMNS;
@@ -657,16 +663,13 @@ void Linear::addGgufColumn(metal::CommandGraph &graph, const LinearBuffers &b, c
   }
 }
 
-// Float segments of a projection (QuantizedSegment::isFloat): a float projection
-// over the step's rows, whatever the rows of the plan's tiles.
-void Linear::addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffers &b,
-                                    const Projection &p, const LinearPlan &plan) const {
+// A float projection over the step's rows, whatever the rows of the plan's tiles.
+void Linear::addGgufFloatSegment(metal::CommandGraph &graph, const LinearBuffers &b,
+                                 const QuantizedSegment &s, const LinearPlan &plan) const {
   const LinearWorkload w = plan.workload();
   if (w.epilogue != LinearEpilogue::None) throw std::invalid_argument("float segments take no epilogue");
-  for (const QuantizedSegment &s : p.blocks().segments)
-    if (s.isFloat())
-      addGgufFloat(graph, b.input, s, b.output, w.rows, w.matrix.outputSize, s.columnOffset, plan.destination(),
-                   ggufFloatTile(w.rows, s.outputSize, s.formatId));
+  addGgufFloat(graph, b.input, s, b.output, w.rows, w.matrix.outputSize, s.columnOffset, plan.destination(),
+               ggufFloatTile(w.rows, s.outputSize, s.formatId));
 }
 
 FloatTile Linear::ggufFloatTile(uint32_t rows, uint32_t outputSize, uint32_t formatId) const noexcept {

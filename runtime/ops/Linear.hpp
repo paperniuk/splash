@@ -461,8 +461,8 @@ private:
                        const Projection *gate) const;
   void addGgufColumn(metal::CommandGraph &graph, const LinearBuffers &buffers, const Projection &projection,
                      const LinearPlan &plan, const Projection *gate) const;
-  void addGgufFloatSegments(metal::CommandGraph &graph, const LinearBuffers &buffers,
-                            const Projection &projection, const LinearPlan &plan) const;
+  void addGgufFloatSegment(metal::CommandGraph &graph, const LinearBuffers &buffers,
+                           const QuantizedSegment &segment, const LinearPlan &plan) const;
   // Apple7/8's MMA kernels (KernelCalibration::simdgroupMma).
   [[nodiscard]] bool mma() const noexcept { return calibration_.simdgroupMma; }
   KernelCalibration calibration_;
