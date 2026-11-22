@@ -1269,7 +1269,7 @@ int int8Experts(MetalBackend &backend) {
       MoeRun widest;
       uint32_t compared = 0;
       for (const uint32_t rows : {kMaximumRows, 33u, 16u, 1u}) {
-        MoeConfig config{MoeExpertTile::M32};
+        MoeConfig config = moeConfig(backend, MoeExpertTile::M32);
         config.int8Passes = on && runs && takes;
         const MoePlan plan = MoE::plan(kShape, rows, config);
         const std::string label = std::string(fmtName(f)) + (on ? " int8" : " staged") + " prefill rows=" +
@@ -1828,6 +1828,10 @@ int laneRowsRoute(MetalBackend &backend, const std::string &name, uint32_t rows,
 // that changed, are counted. The staged backend's run is held to its repeats
 // alone: the two-pass reference (gguf_moe_test.metal) takes the column tile.
 int stagedTiles(MetalBackend &backend, const char *metallib) {
+  if (mmaTiles(backend)) {
+    printf("staged-only function constant: skipped on the Apple7/8 MMA expert kernels\n");
+    return 0;
+  }
   constexpr uint32_t rows = 8, copies = 3;
   const MoeShape shape = kShape;
   MetalBackend staged(metallib);

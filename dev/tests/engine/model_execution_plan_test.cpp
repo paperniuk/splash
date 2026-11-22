@@ -122,7 +122,7 @@ void checkAneFfnSplitScratch() {
       bool split = false;
       for (uint32_t aneUnits = 1; aneUnits < units; ++aneUnits) {
         const uint32_t gpu = intermediate - aneUnits * (intermediate / units);
-        for (uint32_t rows = ops::AneFfn::kMinimumRows; rows <= ops::AneFfn::kMaximumRows; rows += 64)
+        for (uint32_t rows = ops::AneFfn::kMmaMinimumRows; rows <= ops::AneFfn::kMaximumRows; rows += 64)
           for (const auto epilogue : {ops::LinearEpilogue::None, ops::LinearEpilogue::UpWithGate}) {
             const auto plan = plans.linear().plan({{gpu, hidden}, rows, epilogue});
             const auto required = plan.scratchSize();

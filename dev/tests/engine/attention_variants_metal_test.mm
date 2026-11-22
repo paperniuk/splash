@@ -116,6 +116,7 @@ struct Case final {
   // INT8 pages score against INT8 queries in every split (the q8q entries),
   // which the reference quantizes as the kernel does.
   bool int8Queries;
+  bool registerTile;
   uint32_t lanes;
   uint32_t rows;
   std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> histories;
@@ -173,7 +174,7 @@ Case makeCase(metal::MetalBackend &backend, kv::Format format, bool int8Queries,
   }
   const auto spread = HostKvExtents::spread(allPages + 2);
   const std::vector<uint32_t> ids = HostKvExtents::mixedPages(spread, allPages, histories[0] + rows + lanes);
-  Case data{layoutOf(format), variant, int8Queries, lanes, rows, histories,
+  Case data{layoutOf(format), variant, int8Queries, backend.capabilities().appleGpuFamily < 9, lanes, rows, histories,
             HostKvExtents(backend, layoutOf(format, kLayer + 1), spread.extentPages, spread.extents),
             {}, {}, {}, 0, zeroed(backend, kQueryHeads * sizeof(float))};
   data.layer = data.pool.layer(kLayer);
@@ -443,7 +444,7 @@ ops::AttentionPlan planOf(const Case &data, const Staging &staging) {
   return ops::PagedAttention::plan(
       sequencesOf(data, staging), kQueryHeads, data.layout, data.attention(), ops::Int8Activations::On,
       ops::PagedAttention::workspace(data.lanes * ops::kAttentionSequenceSplits, kQueryHeads, data.layout),
-      data.variant);
+      data.variant, data.registerTile ? ops::AttentionTile::Register : ops::AttentionTile::Mpp);
 }
 
 // The encoding of a case's staged rows: their K/V into the pages (the test
@@ -481,7 +482,8 @@ void checkPlan(const Case &data, const Staging &staging, const ops::AttentionPla
   const std::string format = data.layout.format == kv::Format::Int8 ? "q8" : "bf16";
   require(plan.sinks &&
               plan.splitPipeline() ==
-                  "attention_" + (data.int8Queries ? std::string("q8q") : format) + "_split_kv4_g8_d128" + window &&
+                  "attention_" + (data.int8Queries ? std::string("q8q") : format) + (data.registerTile ? "_split_sgf" : "_split") +
+                      "_kv4_g8_d128" + window &&
               plan.reducePipeline() == "attention_reduce_kv4_g8_d128" + window + "_sinks",
           "the plan names another variant's kernels");
   const auto &dispatches = graph.dispatches();
@@ -1174,6 +1176,7 @@ int main(int argc, char **argv) {
     // split (the q8q entries); BF16 pages against bf16 queries.
     for (const auto &[format, int8Queries] : {std::pair{kv::Format::Int8, false}, std::pair{kv::Format::Int8, true},
                                               std::pair{kv::Format::BFloat16, false}}) {
+      if (int8Queries && backend.capabilities().appleGpuFamily < 9) continue;
       // Prefill tiles whose rows straddle their window's start: from the
       // history's start, after a cached prefix on either side of a window
       // and of a page, and long chunks after a long prefix, whose first tiles
@@ -1205,7 +1208,8 @@ int main(int argc, char **argv) {
       checkSplitCounts(backend, format, int8Queries);
       checkWindowWithinHistory(backend, format, int8Queries);
     }
-    for (const bool int8Queries : {false, true}) checkNonFiniteQueries(backend, int8Queries);
+    for (const bool int8Queries : {false, true})
+      if (!int8Queries || backend.capabilities().appleGpuFamily >= 9) checkNonFiniteQueries(backend, int8Queries);
     std::cout << "attention variants: PASS\n";
   } catch (const std::exception &error) {
     std::cerr << "attention variants: FAIL: " << error.what() << '\n';
