@@ -327,31 +327,24 @@ void invalidInputs() {
   }
 }
 
-// The most expected tokens past the anchors of any assignment of at most e
-// rows to the lanes, for every e, each lane's a prefix of its curve and at
-// most cap - 1 rows, by brute force.
+// The most expected tokens past the anchors for each extra-row budget.
+// Enumerate each lane's prefixes, keeping the best sum for each exact total
+// after that lane. Assignments with the same total have the same choices on
+// the remaining lanes.
 std::vector<double> bestAssignments(const std::vector<std::vector<float>> &curves, uint32_t cap) {
-  const size_t lanes = curves.size();
-  std::vector<uint32_t> taken(lanes, 0);
-  std::vector<double> best(lanes * cap + 1, 0.0);
-  for (bool more = true; more;) {
-    uint32_t total = 0;
-    double expected = 0.0;
-    for (size_t lane = 0; lane < lanes; ++lane) {
-      total += taken[lane];
-      for (uint32_t row = 0; row < taken[lane]; ++row)
-        expected += curves[lane][row];
+  std::vector<double> best(curves.size() * cap + 1, 0.0);
+  size_t reachable = 0;
+  for (const auto &curve : curves) {
+    const size_t limit = std::min<size_t>(curve.size(), cap - 1);
+    std::vector<double> next(best.size(), 0.0);
+    double prefix = 0.0;
+    for (size_t take = 0; take <= limit; ++take) {
+      if (take) prefix += curve[take - 1];
+      for (size_t previous = 0; previous <= reachable; ++previous)
+        next[previous + take] = std::max(next[previous + take], best[previous] + prefix);
     }
-    best[total] = std::max(best[total], expected);
-    more = false;
-    for (size_t lane = 0; lane < lanes && !more; ++lane) {
-      if (taken[lane] < std::min<size_t>(curves[lane].size(), cap - 1)) {
-        ++taken[lane];
-        more = true;
-      } else {
-        taken[lane] = 0;
-      }
-    }
+    reachable += limit;
+    best = std::move(next);
   }
   for (size_t extra = 1; extra < best.size(); ++extra)
     best[extra] = std::max(best[extra], best[extra - 1]);
