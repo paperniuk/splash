@@ -63,7 +63,8 @@ inline void load_inputs(device const bfloat *x, uint input_size, uint k0, sgmatr
       v[r][e] = *reinterpret_cast<device const uint2 *>(x + ulong(8 * r + l.fn + e) * input_size + k);
 }
 
-// load_inputs over `live` rows: the rows past them read as zeros, so that a tile reads no row past a chunk's.
+// load_inputs over `live` rows: the rows past them read row live - 1, so that a tile reads no row past a chunk's.
+// Their sums are not stored (prefill_store). A clamped row costs less than a predicated load on Apple7/8.
 template <uint FM>
 inline void load_live_inputs(device const bfloat *x, uint input_size, uint k0, sgmatrix::Lane l, uint live,
                              thread uint2 (&v)[FM][2]) {
@@ -71,10 +72,8 @@ inline void load_live_inputs(device const bfloat *x, uint input_size, uint k0, s
 #pragma unroll
   for (uint r = 0; r < FM; ++r)
 #pragma unroll
-    for (uint e = 0; e < 2; ++e) {
-      const uint row = 8 * r + l.fn + e;
-      v[r][e] = row < live ? *reinterpret_cast<device const uint2 *>(x + ulong(row) * input_size + k) : uint2(0);
-    }
+    for (uint e = 0; e < 2; ++e)
+      v[r][e] = *reinterpret_cast<device const uint2 *>(x + ulong(min(8 * r + l.fn + e, live - 1)) * input_size + k);
 }
 
 // acc += one group of FN column fragments, a(i, j) giving the lane's A elements of fragment i at step j, times the
@@ -212,14 +211,14 @@ inline void prefill_store(thread float2 (&acc)[FN][kPrefillSimdgroupRows / 8], s
   });
 }
 
-// Accumulates K steps [step_begin, step_end) of a prefill tile (rows [first, first + 64) and columns
-// [origin, origin + 64)) into `acc`. Returns whether this simdgroup holds chunk rows (`half_m * 32 < rows`);
-// simdgroups past them only stage weights.
-template <class F>
-inline bool prefill_accumulate(device const bfloat *x, device uchar *w0, device uchar *w1, device uchar *meta,
-                               uint input_size, uint origin, uint rows, uint step_begin, uint step_end,
-                               threadgroup half *stage, threadgroup half2 *tl, uint lane, uint simd_group,
-                               thread float2 (&acc)[FN][kPrefillSimdgroupRows / 8]) {
+// prefill_accumulate's K loop. With Live, a simdgroup with fewer than 32 live rows reads them alone
+// (load_live_inputs); without it every simdgroup reads its 32 rows whole, which only a tile whose chunk holds all 64
+// rows may do.
+template <class F, bool Live>
+inline bool prefill_accumulate_rows(device const bfloat *x, device uchar *w0, device uchar *w1, device uchar *meta,
+                                    uint input_size, uint origin, uint rows, uint step_begin, uint step_end,
+                                    threadgroup half *stage, threadgroup half2 *tl, uint lane, uint simd_group,
+                                    thread float2 (&acc)[FN][kPrefillSimdgroupRows / 8]) {
   constexpr uint FM = kPrefillSimdgroupRows / 8;
   const sgmatrix::Lane l = sgmatrix::lane_map(lane);
   const uint thread_index = simd_group * 32 + lane, column = thread_index % GGUF_TILE_COLUMNS;
@@ -260,7 +259,7 @@ inline bool prefill_accumulate(device const bfloat *x, device uchar *w0, device 
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (owns) {
       uint2 v[FM][2];
-      if (full)
+      if (!Live || full)
         load_inputs<FM>(x, input_size, step * kStep, l, v);
       else
         load_live_inputs<FM>(x, input_size, step * kStep, l, live, v);
@@ -271,6 +270,23 @@ inline bool prefill_accumulate(device const bfloat *x, device uchar *w0, device 
     }
   }
   return owns;
+}
+
+// Accumulates K steps [step_begin, step_end) of a prefill tile (rows [first, first + 64) and columns
+// [origin, origin + 64)) into `acc`. Returns whether this simdgroup holds chunk rows (`half_m * 32 < rows`);
+// simdgroups past them only stage weights. The tile picks its loop once, uniformly for the threadgroup so that both
+// copies' barriers match: a chunk's last tile reads its live rows alone, every other tile reads whole halves without
+// a choice per step (the choice in the loop cost the 27B Q4_0's 2048-row prefill 3.7% on an M2 Max).
+template <class F>
+inline bool prefill_accumulate(device const bfloat *x, device uchar *w0, device uchar *w1, device uchar *meta,
+                               uint input_size, uint origin, uint rows, uint step_begin, uint step_end,
+                               threadgroup half *stage, threadgroup half2 *tl, uint lane, uint simd_group,
+                               thread float2 (&acc)[FN][kPrefillSimdgroupRows / 8]) {
+  if (rows >= kPrefillRows)
+    return prefill_accumulate_rows<F, false>(x, w0, w1, meta, input_size, origin, rows, step_begin, step_end, stage,
+                                             tl, lane, simd_group, acc);
+  return prefill_accumulate_rows<F, true>(x, w0, w1, meta, input_size, origin, rows, step_begin, step_end, stage, tl,
+                                          lane, simd_group, acc);
 }
 
 // The prefill tile of chunk rows [first, first + 64) and columns [origin, origin + 64) of one segment: threads 0-63
