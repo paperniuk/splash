@@ -752,6 +752,29 @@ void gateUpPairs(MetalBackend &backend, const Linear &linear, LinearTile tile) {
           " gate and up format pairs at N 256 and 4 at N 1024, 1-4 lanes, within fp64");
 }
 
+// Gate/up of 33 to 64 rows on the tile the policy picks (Linear::plan), as a short prefill or three or four lanes'
+// 16-row trees run it: on Apple7/8 the 64-row MMA prefill tile, whose up pass reads the gate its own pass writes
+// first, not a stale gate scratch (here NaN).
+void policyGateUp(MetalBackend &backend, const Linear &linear) {
+  constexpr uint32_t K = 1024, N = 256;
+  const uint32_t columns = N + kPadding;
+  const Tensor g = tensor(backend, Q4K, N, K), u = tensor(backend, Q5K, N, K);
+  const Projection gate = projection({&g}, columns), up = projection({&u}, columns);
+  for (const uint32_t rows : {33u, 48u, 52u, 61u, 64u}) {
+    const LinearWorkload wl{{columns, K}, rows, LinearEpilogue::GateUp};
+    const LinearPlan plan = linear.plan(wl, up, &gate);
+    const std::vector<float> x = activations(Inputs::Dense, rows, K);
+    const LinearTile tile = plan.configuration().tile;
+    const std::string label = "policy gate/up " + std::to_string(rows) + " rows on the " +
+                              (tile == LinearTile::GgufPrefill ? "prefill" : tileName(tile)) + " tile";
+    const Outcome out = run(backend, linear, plan, up, &gate, storageRows(x, K, rows, plan.storageRows()), {},
+                            kPoisonNaN, N, label);
+    checkValues(out, within(products({&u}, columns, x, rows), true), within(products({&g}, columns, x, rows), true),
+                {}, wl, rows, N, label);
+  }
+  section("gate/up of 33-64 rows on the policy's tile, within fp64");
+}
+
 // Gate/up in one pass (LinearConfig::oneGateUpPass) on the staged tile, gate and up in each format ([768, K]), and in
 // Q4_K and MLX 4-bit at the 27B's [17408, 5120]: at every lane count, K split the tile takes and walk, and for one
 // lane on the 16-row tile too, bitwise the output of the gate and up passes, whatever the partials held before.
@@ -2013,6 +2036,7 @@ int main(int argc, char **argv) {
       else
         registerOneGateUpPass(backend, linear);
       prefill(backend, linear, 1024, tileFormats(LinearTile::GgufStaged));
+      policyGateUp(backend, linear);
       if (backend.capabilities().appleGpuFamily < 9) prefillSplit(backend, linear);
       decodeInt8(backend, linear);
       prefillInt8(backend, linear);
