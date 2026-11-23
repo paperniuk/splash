@@ -516,7 +516,7 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
       graph.add(leadingInputsInstance(kernel), std::move(bindings),
                 GgufPrefillLeadingParams{params, p.planeInputs()}, groups, {threads, 1, 1});
     } else
-      graph.add(kernelInstance(kernel, plan.destination()), std::move(bindings), params, groups, {threads, 1, 1});
+      graph.add(kernel, std::move(bindings), params, groups, {threads, 1, 1});
   }
 }
 
