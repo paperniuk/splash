@@ -7,7 +7,7 @@ An unofficial port of [Inco's Splash](https://github.com/incoai/splash) to
 Macs with an M1 or M2 chip. Splash is a local inference engine that serves
 Qwen3.8-27B, Qwen3.6-35B-A3B, Qwen3.8-Flash-Next and Flint to coding agents and to
 any OpenAI or Anthropic compatible client. Official Splash needs an M3 or
-newer; this fork runs the same engine, version 1.7.0, on M1 and M2.
+newer; this fork runs the same engine, version 1.7.1, on M1 and M2.
 
 **On an M3 or newer, use official Splash:** `brew install incoai/tap/splash`.
 Nothing here is faster there.
@@ -163,7 +163,7 @@ twice the memory, and in a 128K agent session on an M1 Max it read prompts
 The API is upstream's: OpenAI Chat Completions, OpenAI Responses and
 Anthropic Messages on `127.0.0.1:8000`, with streaming, tool calls, images
 and PDFs. `splash-m1 serve --help` lists the options. For the rest, read
-[the README of the 1.7 branch](https://github.com/paperniuk/splash/blob/apple7-m1-1.7/README.md)
+[the README of the 1.7.1 branch](https://github.com/paperniuk/splash/blob/apple7-m1-1.7.1/README.md)
 with `splash-m1` in place of `splash`. Since 1.4, `--max-context` can go past
 a model's native window with YaRN (`--yarn-factor`).
 
@@ -174,19 +174,19 @@ Reasoning is turned off per request with `"reasoning_effort": "none"`.
 Needs Xcode with the Metal Toolchain.
 
 ```bash
-git clone -b apple7-m1-1.7 https://github.com/paperniuk/splash.git
+git clone -b apple7-m1-1.7.1 https://github.com/paperniuk/splash.git
 cd splash
 make -j4
 ./splash serve --model mlx-community/Qwen3.8-27B-4bit
 ```
 
-Branch `apple7-m1-1.7` is upstream 1.7.0 plus the M1/M2 commits. `main`
+Branch `apple7-m1-1.7.1` is upstream 1.7.1 plus the M1/M2 commits. `main`
 follows upstream and does not run on M1/M2.
 
 ## Status
 
-- Stable: [1.7.0-m1.1](https://github.com/paperniuk/splash/releases/latest),
-  upstream 1.7.0 plus the M1/M2 work.
+- Stable: [1.7.1-m1](https://github.com/paperniuk/splash/releases/latest),
+  upstream 1.7.1 plus the M1/M2 work.
 - Known gaps: the 35B MoE's expert kernels are not tuned for M1/M2 yet;
   Macs below 64 GB are covered by the kernel tests, not run end to end on
   this release.
