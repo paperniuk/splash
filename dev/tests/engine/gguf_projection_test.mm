@@ -778,6 +778,40 @@ void policyGateUp(MetalBackend &backend, const Linear &linear) {
   section("gate/up of 33-64 rows on the policy's tile, within fp64");
 }
 
+// Plain fp32 destination (the logits head) of 33 to 64 rows on the tile the policy picks (Linear::plan), as three or
+// four lanes' 16-row decode steps run it: on Apple7/8 the 64-row MMA prefill tile, both split (narrow grid) and
+// unsplit (wide grid, as the 248320-column vocabulary head runs).
+void policyFloatOutput(MetalBackend &backend, const Linear &linear) {
+  const auto check = [&](Fmt f, uint32_t N, uint32_t K, std::span<const uint32_t> rowCounts, bool expectUnsplit) {
+    const uint32_t columns = N + kPadding;
+    const Tensor w = tensor(backend, f, N, K);
+    Projection p = projection({&w}, columns);
+    p.destination = FloatOutput::Float32;
+    for (const uint32_t rows : rowCounts) {
+      const LinearPlan f32Plan = linear.plan(p, rows);
+      if (expectUnsplit && f32Plan.configuration().splits != 1)
+        fail("policy fp32 " + std::string(fmtName(f)) + " " + std::to_string(N) + "x" + std::to_string(K) +
+             " unexpectedly split");
+      const LinearPlan bf16Plan = Linear::plan(f32Plan.workload(), f32Plan.configuration(), FloatOutput::BFloat16);
+      const std::vector<float> x = activations(Inputs::Dense, rows, K);
+      const std::vector<uint16_t> stored = storageRows(x, K, rows, bf16Plan.storageRows());
+      const std::string label = "policy fp32 " + std::string(fmtName(f)) + " " + std::to_string(N) + "x" +
+                                std::to_string(K) + " " + std::to_string(rows) + " rows S=" +
+                                std::to_string(f32Plan.configuration().splits);
+      const Outcome bf16 = run(backend, linear, bf16Plan, p, nullptr, stored, {}, kPoisonNaN, N, label + " bf16");
+      floatOutput(backend, linear, f32Plan, p, stored, bf16, within(products({&w}, columns, x, rows), true), N, label);
+    }
+  };
+  constexpr uint32_t rows[] = {33u, 48u, 64u};
+  // Narrow grid (splits > 1 on Apple7/8) in both head formats (27B Q6_K, Flash-Next Q5_K).
+  check(Q6K, 256, 1024, rows, false);
+  check(Q5K, 256, 1024, rows, false);
+  // Wide grid (splits == 1 on Apple7/8, as the vocabulary head runs).
+  check(Q6K, 20480, 256, rows, true);
+  check(Q5K, 20480, 256, rows, true);
+  section("fp32 destination of 33-64 rows on the policy's tile (split and unsplit), within fp64");
+}
+
 // Gate/up in one pass (LinearConfig::oneGateUpPass) on the staged tile, gate and up in each format ([768, K]), and in
 // Q4_K and MLX 4-bit at the 27B's [17408, 5120]: at every lane count, K split the tile takes and walk, and for one
 // lane on the 16-row tile too, bitwise the output of the gate and up passes, whatever the partials held before.
@@ -2083,6 +2117,7 @@ int main(int argc, char **argv) {
         registerOneGateUpPass(backend, linear);
       prefill(backend, linear, 1024, tileFormats(LinearTile::GgufStaged));
       policyGateUp(backend, linear);
+      policyFloatOutput(backend, linear);
       if (backend.capabilities().appleGpuFamily < 9) {
         prefillSplit(backend, linear);
         mmaFloatOutput(backend);

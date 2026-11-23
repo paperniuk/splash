@@ -450,6 +450,9 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
   const bool useMma = mma();
   if (plan.configuration().mmaPrefill && !useMma)
     throw std::invalid_argument("Apple7/8's 64-row MMA prefill tiles run on Apple7/8 alone");
+  if (plan.destination() == FloatOutput::Float32 &&
+      (!useMma || w.epilogue != LinearEpilogue::None || p.planeInputs()))
+    throw std::invalid_argument("an fp32 prefill projection requires Apple7/8's plain MMA tile");
   const uint32_t splits = plan.configuration().splits;
   if (splits > 1 && (!useMma || p.planeInputs()))
     throw std::invalid_argument("split block prefill requires the MMA tile");
@@ -500,14 +503,14 @@ void Linear::addGgufPrefill(metal::CommandGraph &graph, const LinearBuffers &b,
     const uint32_t colTiles = s.outputSize / GGUF_TILE_COLUMNS;
     if (splits > 1) {
       bindings.insert(bindings.end(), {partials, counters, epilogueInput(b, w.epilogue)});
-      graph.add(kernelInstance("gguf_prefill_mma_split_" + std::string(s.name()) + "_" + epilogue,
-                               plan.destination()), std::move(bindings),
-                GgufPrefillSplitParams{params, splits}, {rowTiles, colTiles, splits}, {kMmaPrefillThreads, 1, 1});
+      graph.add(kernelInstance("gguf_prefill_mma_split_" + std::string(s.name()) + "_" + epilogue, plan.destination()),
+                std::move(bindings), GgufPrefillSplitParams{params, splits}, {rowTiles, colTiles, splits},
+                {kMmaPrefillThreads, 1, 1});
       continue;
     }
     if (w.epilogue != LinearEpilogue::None) bindings.push_back(epilogueInput(b, w.epilogue));
     const metal::DispatchSize groups{rowTiles, colTiles, 1};
-    const std::string kernel = prefillKernel(s.name(), epilogue, useMma);
+    const std::string kernel = kernelInstance(prefillKernel(s.name(), epilogue, useMma), plan.destination());
     const uint32_t threads = useMma ? kMmaPrefillThreads : GGUF_PREFILL_THREADS;
     if (p.planeInputs()) {
       graph.add(leadingInputsInstance(kernel), std::move(bindings),
