@@ -1,7 +1,9 @@
 #pragma once
 
 #include "DFlashDraft.hpp"
+#include "DSparkDraft.hpp"
 #include "Flint.hpp"
+#include "Inkling.hpp"
 #include "Model.hpp"
 #include "Qwen3_6Moe.hpp"
 #include "Qwen3_8.hpp"
@@ -20,14 +22,35 @@
 
 namespace splash::model {
 
-using TargetLayout = std::variant<Qwen3_8Layout, Qwen3_6MoeLayout, Qwen4ExpLayout, FlintLayout>;
+using TargetLayout = std::variant<Qwen3_8Layout, Qwen3_6MoeLayout, Qwen4ExpLayout, FlintLayout, InklingLayout>;
+using DraftLayout = std::variant<DFlashDraftLayout, DSparkDraftLayout>;
+
+[[nodiscard]] inline std::span<const uint32_t> draftTargetLayerIds(const DraftLayout &draft) {
+  return std::visit([](const auto &layout) { return layout.targetLayerIds(); }, draft);
+}
+
+[[nodiscard]] inline DraftStateLayout draftStateLayout(const DraftLayout &draft) {
+  return std::visit([](const auto &layout) { return layout.stateLayout(); }, draft);
+}
+
+[[nodiscard]] inline uint32_t draftHiddenSize(const DraftLayout &draft) {
+  return std::visit([](const auto &layout) { return layout.hiddenSize; }, draft);
+}
+
+[[nodiscard]] inline uint32_t draftVocabularySize(const DraftLayout &draft) {
+  return std::visit([](const auto &layout) { return layout.vocabularySize; }, draft);
+}
+
+[[nodiscard]] inline uint32_t draftTargetHiddenSize(const DraftLayout &draft) {
+  return std::visit([](const auto &layout) { return layout.targetHiddenSize(); }, draft);
+}
 
 // The families Splash serves, values of the layout types TargetLayout holds,
 // one type for each architecture's code. A family of an architecture is one
 // more value here. Refusals name them in this order, and a config's model type
 // finds its family among those of its type in it (describeSourceModel).
 inline constexpr std::tuple kFamilies{Qwen3_8Layout{}, Qwen3_6MoeLayout{}, kQwen3_5_122BLayout, Qwen4ExpLayout{},
-                                      FlintLayout{}};
+                                      FlintLayout{}, InklingLayout{}};
 
 // Calls `use` with each family's layout, in kFamilies' order.
 template <class Use> constexpr void forEachFamily(Use use) {
@@ -47,7 +70,7 @@ enum class VisionSource : uint8_t { Safetensors = 1, Gguf, None };
 struct ModelDescriptor final {
   std::string name;
   TargetLayout target;
-  DFlashDraftLayout draft;
+  DraftLayout draft;
   ops::VisionLayout vision;
   ModelCapabilities capabilities;
   kv::Layout targetKvLayout;
@@ -79,7 +102,7 @@ struct ModelDescriptor final {
 // concrete target and draft layouts.
 [[nodiscard]] ModelDescriptor makeModelDescriptor(std::string name,
                                                   TargetLayout target,
-                                                  DFlashDraftLayout draft,
+                                                  DraftLayout draft,
                                                   ops::VisionLayout vision,
                                                   TargetSource targetSource,
                                                   VisionSource visionSource);

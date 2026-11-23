@@ -12,9 +12,10 @@ namespace splash::ops {
 namespace {
 
 // The target table kernel `name` of a target of `pairs` rotary pairs a row
-// (kernels/shared/rope.metal).
+// (kernels/shared/rope.metal). A NoPE target (zero pairs) builds no target
+// rows, and its tables are the draft's alone.
 std::string tableKernel(std::string name, uint32_t pairs) {
-  if (pairs == SPLASH_TARGET_ROPE_PAIRS) return name;
+  if (pairs == SPLASH_TARGET_ROPE_PAIRS || !pairs) return name;
   if (pairs == 64) return name + "_p64";
   throw std::invalid_argument("no RoPE table kernel for the target's rotary pairs");
 }
@@ -30,6 +31,11 @@ void RoPE::addTables(
     metal::MetalBuffer draftCosine, metal::MetalBuffer draftSine,
     RopeTableParams rows, uint32_t maximumRows, uint32_t targetPairs) {
   const std::string kernel = tableKernel("rope_build_tables", targetPairs);
+  // A NoPE target's chunk whose rows the draft does not read builds nothing.
+  if (!targetPairs) {
+    rows.target_rows = 0;
+    if (!rows.draft_rows) return;
+  }
   if ((!rows.target_rows && !rows.draft_rows) || rows.target_rows > maximumRows ||
       rows.draft_rows > maximumRows) {
     throw std::invalid_argument("invalid RoPE table row count");
@@ -73,6 +79,7 @@ void RoPE::addTreeTables(metal::CommandGraph &graph, metal::MetalBuffer layout, 
                          std::span<const uint32_t> anchors, metal::MetalBuffer targetInverseFrequencies,
                          metal::MetalBuffer targetCosine, metal::MetalBuffer targetSine, const StepRows &step,
                          float scale, uint32_t targetPairs) {
+  if (!targetPairs) return;
   const std::string kernel = tableKernel("rope_build_tree_tables", targetPairs);
   requireStepRows(step);
   if (anchors.size() != step.lanes)

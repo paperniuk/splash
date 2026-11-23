@@ -18,10 +18,10 @@
 // (ops::MoeRouter) then weights the top_k experts by the softmax of their
 // scores, or by each one's sigmoid over the sum of theirs
 // (SigmoidNormalized), summed in rank order.
-enum class MoeRouter : uint { Softmax, SigmoidNormalized };
+enum class MoeRouter : uint { Softmax, SigmoidNormalized, SigmoidCorrected };
 template <uint Slots, MoeRouter Router, uint Shared, bool SharedGate>
 inline void moe_route_select(device const float *scores, device bfloat *input,
-                             device const float *shared_gate, device uint *selected,
+                             device const float *shared_gate, device const float *bias, device uint *selected,
                              device float *routing_weights,
                              constant MoeRouteParams &params, uint group,
                              uint thread_index, uint simd_lane,
@@ -34,10 +34,11 @@ inline void moe_route_select(device const float *scores, device bfloat *input,
   const uint row = group;
   if (row >= params.rows)
     return;
-  row_scores[thread_index] =
-      thread_index < params.experts
-          ? scores[ulong(row) * Slots + thread_index]
-          : -numeric_limits<float>::infinity();
+  float score = thread_index < params.experts ? scores[ulong(row) * Slots + thread_index]
+                                               : -numeric_limits<float>::infinity();
+  if constexpr (Router == MoeRouter::SigmoidCorrected)
+    if (thread_index < params.experts) score = splash_sigmoid(score) + bias[thread_index];
+  row_scores[thread_index] = score;
 
   if constexpr (SharedGate) {
     device bfloat *row_input = input + ulong(row) * params.input_size;
@@ -86,7 +87,8 @@ inline void moe_route_select(device const float *scores, device bfloat *input,
     if (candidate == winner)
       lane_scores[best_slot] = -numeric_limits<float>::infinity();
     if (simd_lane == 0) {
-      ordered[rank] = row_best;
+      ordered[rank] = Router == MoeRouter::SigmoidCorrected
+                          ? splash_sigmoid(scores[ulong(row) * Slots + winner]) : row_best;
       selected[row_routes + rank] = winner;
     }
   }
@@ -101,6 +103,9 @@ inline void moe_route_select(device const float *scores, device bfloat *input,
       routing_weights[row_routes + rank] =
           fast::exp2((ordered[rank] - ordered[0]) * 1.44269504089f) /
           denominator;
+    } else if constexpr (Router == MoeRouter::SigmoidCorrected) {
+      for (uint other = 0; other < params.top_k; ++other) denominator += ordered[other];
+      routing_weights[row_routes + rank] = ordered[rank] / (denominator + 1e-20f) * params.route_scale;
     } else {
       for (uint other = 0; other < params.top_k; ++other)
         denominator += splash_sigmoid(ordered[other]);
@@ -121,7 +126,7 @@ inline void moe_route_select(device const float *scores, device bfloat *input,
     threadgroup float ordered[Slots];                                          \
     threadgroup float scalar_partials[Slots / 32];                             \
     moe_route_select<Slots, Router, Shared, SharedGate>(                       \
-        scores, input, shared_gate, selected, routing_weights, params, group,  \
+        scores, input, shared_gate, nullptr, selected, routing_weights, params, group,  \
         thread_index, simd_lane, simd_group, row_scores, ordered,              \
         scalar_partials);
 #define MOE_ROUTE_SELECT_ENTRY(Name, Slots, Router, Shared)                    \
@@ -155,6 +160,18 @@ MOE_ROUTE_SELECT_ENTRY(moe_route_select_f32, SPLASH_MOE_EXPERT_SLOTS, MoeRouter:
 MOE_ROUTE_SELECT_ENTRY(moe_route_select_f32_e512, SPLASH_MOE_WIDE_EXPERT_SLOTS, MoeRouter::Softmax, 1)
 MOE_ROUTE_SELECT_UNGATED_ENTRY(moe_route_select_f32_sigmoid_s2, SPLASH_MOE_EXPERT_SLOTS,
                                MoeRouter::SigmoidNormalized, 2)
+kernel void moe_route_select_f32_corrected_s0(
+    device const float *scores [[buffer(0)]], device const float *bias [[buffer(1)]],
+    device uint *selected [[buffer(2)]], device float *routing_weights [[buffer(3)]],
+    constant MoeRouteParams &params [[buffer(4)]], uint group [[threadgroup_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]], uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float row_scores[SPLASH_MOE_EXPERT_SLOTS], ordered[SPLASH_MOE_EXPERT_SLOTS];
+  threadgroup float scalar_partials[SPLASH_MOE_EXPERT_SLOTS / 32];
+  moe_route_select<SPLASH_MOE_EXPERT_SLOTS, MoeRouter::SigmoidCorrected, 0, false>(
+      scores, nullptr, nullptr, bias, selected, routing_weights, params, group, thread_index,
+      simd_lane, simd_group, row_scores, ordered, scalar_partials);
+}
 #undef MOE_ROUTE_SELECT_UNGATED_ENTRY
 #undef MOE_ROUTE_SELECT_ENTRY
 #undef MOE_ROUTE_SELECT_BODY
@@ -336,6 +353,8 @@ MOE_GROUP_ROUTES_VERIFIED_ENTRY(moe_group_routes_verified, SPLASH_MOE_EXPERT_SLO
 MOE_GROUP_ROUTES_VERIFIED_ENTRY(moe_group_routes_verified_e512, SPLASH_MOE_WIDE_EXPERT_SLOTS, 1)
 MOE_GROUP_ROUTES_ENTRY(moe_group_routes_s2, SPLASH_MOE_EXPERT_SLOTS, 2)
 MOE_GROUP_ROUTES_VERIFIED_ENTRY(moe_group_routes_verified_s2, SPLASH_MOE_EXPERT_SLOTS, 2)
+MOE_GROUP_ROUTES_ENTRY(moe_group_routes_s0, SPLASH_MOE_EXPERT_SLOTS, 0)
+MOE_GROUP_ROUTES_VERIFIED_ENTRY(moe_group_routes_verified_s0, SPLASH_MOE_EXPERT_SLOTS, 0)
 #undef MOE_GROUP_ROUTES_VERIFIED_ENTRY
 #undef MOE_GROUP_ROUTES_ENTRY
 #undef MOE_GROUP_ROUTES_BODY
@@ -364,6 +383,7 @@ kernel void moe_gather_rows(device const bfloat *input [[buffer(0)]],
   }
 }
 
+constant uint kMoeCombineSlots = 8;
 kernel void moe_combine(
     device const bfloat *expert_output [[buffer(0)]],
     device const uint *route_rows [[buffer(1)]],
@@ -379,14 +399,25 @@ kernel void moe_combine(
     return;
   float value = float(residual[ulong(row) * params.hidden_size + dimension]);
   ulong route = ulong(row) * params.routes_per_row;
-  for (uint slot = 0; slot < params.routes_per_row; ++slot) {
-    // A route a verified grouping left out (MoeGroupParams) adds nothing.
-    const uint grouped = route_rows[route + slot];
-    if (grouped == ~0u)
-      continue;
-    value += routing_weights[route + slot] *
-             float(expert_output[ulong(grouped) * params.hidden_size +
-                                 dimension]);
+  // A row's routes kMoeCombineSlots at a time, each run's rows and weights, then its outputs, loading together
+  // at clamped places: one route a step waited for its row's load and then its output's (Inkling 2 Mini's 8
+  // routes: 9.7 us a call on an M1 Max).
+  for (uint first = 0; first < params.routes_per_row; first += kMoeCombineSlots) {
+    uint grouped[kMoeCombineSlots];
+    float weight[kMoeCombineSlots], expert[kMoeCombineSlots];
+#pragma unroll
+    for (uint i = 0; i < kMoeCombineSlots; ++i) {
+      const ulong at = route + min(first + i, params.routes_per_row - 1);
+      grouped[i] = route_rows[at];
+      weight[i] = routing_weights[at];
+    }
+#pragma unroll
+    for (uint i = 0; i < kMoeCombineSlots; ++i)
+      expert[i] = float(expert_output[ulong(grouped[i] == ~0u ? 0u : grouped[i]) * params.hidden_size + dimension]);
+    // A route a verified grouping left out (MoeGroupParams) adds nothing, nor does a slot past the row's routes.
+#pragma unroll
+    for (uint i = 0; i < kMoeCombineSlots; ++i)
+      if (first + i < params.routes_per_row && grouped[i] != ~0u) value += weight[i] * expert[i];
   }
   output[ulong(row) * params.hidden_size + dimension] = bfloat(value);
 }

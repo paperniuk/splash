@@ -6,6 +6,8 @@
 
 #include <cstdint>
 #include <span>
+#include <memory>
+#include <vector>
 
 namespace splash::ops {
 
@@ -81,6 +83,33 @@ struct DraftDecodeAttentionBuffers final {
   metal::MetalBuffer queryValues;
 };
 
+// DSpark's global layer K/V as segments (metal/abi/DraftAttention.h), reached
+// through the table of their GPU addresses: every key segment's, then every
+// value segment's. Segment s holds the rows from s * segmentTokens, the last
+// of them fewer; together they hold `rows` rows of 8 KV heads x 128 bfloat16.
+struct DraftSegmentedContext final {
+  std::shared_ptr<const std::vector<metal::MetalBuffer>> table;
+  uint32_t segmentTokens = 0;
+  uint32_t rows = 0;
+
+  // Builds the table of `keys` and `values`, which hold `rows` rows in
+  // segments of `segmentTokens`; std::invalid_argument for segments that do not.
+  [[nodiscard]] static DraftSegmentedContext make(std::span<const metal::MetalBuffer> keys,
+                                                  std::span<const metal::MetalBuffer> values,
+                                                  uint32_t segmentTokens, uint32_t rows);
+  // Segments of each of keys and values.
+  [[nodiscard]] uint32_t segments() const noexcept {
+    return table ? static_cast<uint32_t>(table->size() / 2) : 0;
+  }
+  // The segment count `rows` rows take at `segmentTokens` a segment.
+  [[nodiscard]] static constexpr uint32_t segmentCount(uint32_t rows, uint32_t segmentTokens) noexcept {
+    return segmentTokens ? static_cast<uint32_t>((uint64_t{rows} + segmentTokens - 1) / segmentTokens) : 0;
+  }
+  // Throws std::invalid_argument unless the table holds a buffer of the
+  // bytes of each segment's rows, key segments then value segments.
+  void validate() const;
+};
+
 class DraftAttention final {
 public:
   [[nodiscard]] static DraftAttentionPlan plan(DraftAttentionShape shape,
@@ -97,6 +126,54 @@ public:
                         DraftDecodeAttentionBuffers buffers,
                         std::span<const uint32_t> cacheLengths,
                         const DraftAttentionPlan &plan);
+  static void addDSparkFusion(metal::CommandGraph &graph, metal::MetalBuffer captured,
+                              metal::MetalBuffer fuse, metal::MetalBuffer norm, metal::MetalBuffer output,
+                              uint32_t rows, uint32_t consumer);
+  static void addDSparkHeadPrepare(metal::CommandGraph &graph, metal::MetalBuffer input,
+                                   metal::MetalBuffer norm, metal::MetalBuffer output, uint32_t rows,
+                                   uint32_t heads, uint32_t startPosition);
+  // The bytes of the workspace a DSpark block attention's split partials take (DSPARK_ATTENTION_MAX_SPLITS).
+  [[nodiscard]] static uint64_t dsparkAttentionWorkspaceBytes();
+  static void addDSparkAttention(metal::CommandGraph &graph, metal::MetalBuffer queries,
+                                  metal::MetalBuffer contextKeys, metal::MetalBuffer contextValues,
+                                  metal::MetalBuffer blockKeys, metal::MetalBuffer blockValues,
+                                  metal::MetalBuffer output, metal::MetalBuffer workspace, uint32_t contextRows,
+                                  uint32_t contextFirst, uint32_t contextCapacity);
+  static void addDSparkBlockInput(metal::CommandGraph &graph, metal::MetalBuffer anchor,
+                                   metal::MetalBuffer mask, metal::MetalBuffer hidden, metal::MetalBuffer residual);
+  static void addDSparkResidualNorm(metal::CommandGraph &graph, metal::MetalBuffer input,
+                                    metal::MetalBuffer residual, metal::MetalBuffer norm,
+                                    metal::MetalBuffer output);
+  static void addDSparkSwiGlu(metal::CommandGraph &graph, metal::MetalBuffer gate,
+                              metal::MetalBuffer up, metal::MetalBuffer output);
+  static void addDSparkContextStore(metal::CommandGraph &graph, metal::MetalBuffer keys,
+                                    metal::MetalBuffer values, metal::MetalBuffer persistentKeys,
+                                    metal::MetalBuffer persistentValues, uint32_t rows,
+                                    uint32_t startPosition, uint32_t basePosition, uint32_t capacity);
+  static void addDSparkCommitGather(metal::CommandGraph &graph, metal::MetalBuffer captured,
+                                     metal::MetalBuffer retained, metal::MetalBuffer laneRows,
+                                     metal::MetalBuffer output, uint32_t packedRows, uint32_t laneCap);
+  static void addDSparkCommitStore(metal::CommandGraph &graph, metal::MetalBuffer keys,
+                                    metal::MetalBuffer values, metal::MetalBuffer retained,
+                                    metal::MetalBuffer persistentKeys, metal::MetalBuffer persistentValues,
+                                    uint32_t laneCap, uint32_t startPosition, uint32_t basePosition,
+                                    uint32_t capacity);
+  // The segmented global layer of DSpark (SPLASH_DRAFT_GLOBAL_SEGMENT_TOKENS,
+  // metal/abi/DraftAttention.h): the same operations as the ring's above, over
+  // rows of positions counted from `basePosition` that cross segments,
+  // reaching every segment through its address table. Rows read or written
+  // stay below context.rows.
+  static void addDSparkSegmentedAttention(metal::CommandGraph &graph, metal::MetalBuffer queries,
+                                          const DraftSegmentedContext &context, metal::MetalBuffer blockKeys,
+                                          metal::MetalBuffer blockValues, metal::MetalBuffer output,
+                                          metal::MetalBuffer workspace, uint32_t contextRows, uint32_t contextFirst);
+  static void addDSparkSegmentedContextStore(metal::CommandGraph &graph, metal::MetalBuffer keys,
+                                             metal::MetalBuffer values, const DraftSegmentedContext &context,
+                                             uint32_t rows, uint32_t startPosition, uint32_t basePosition);
+  static void addDSparkSegmentedCommitStore(metal::CommandGraph &graph, metal::MetalBuffer keys,
+                                            metal::MetalBuffer values, metal::MetalBuffer retained,
+                                            const DraftSegmentedContext &context, uint32_t laneCap,
+                                            uint32_t startPosition, uint32_t basePosition);
   // The context writers. A row of contextKv holds its keys, then its values
   // (kvHeads * headDimension each); its normalized, rotated keys and its
   // values go to its position's slot of the ring.

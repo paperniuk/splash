@@ -338,6 +338,12 @@ QwenStateStorage::draft(uint32_t index) const {
   return assigned.cells.draft->layers();
 }
 
+const MetalBuffer &QwenStateStorage::draftFeature(uint32_t index) const {
+  const Lane &assigned = lane(index);
+  requireAssigned(assigned);
+  return assigned.cells.draft->feature();
+}
+
 const MetalBuffer &QwenStateStorage::window(uint32_t index) const {
   const Lane &assigned = lane(index);
   requireAssigned(assigned);
@@ -394,6 +400,8 @@ void QwenStateStorage::clearDraftRings(uint32_t index) {
   for (const DFlashDraftRingLayer &layer : target.cells.draft->layers()) {
     clear(layer.keys, "draft ring keys");
     clear(layer.values, "draft ring values");
+    if (layer.segmented())
+      for (const MetalBuffer &segment : *layer.segments.table) clear(segment, "draft ring segment");
   }
 }
 

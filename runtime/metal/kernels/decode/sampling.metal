@@ -2089,3 +2089,271 @@ kernel void decode_accept_tree(
   retained[batch] = kept;
   retained_rows[batch] = nodes[path[kept - 1]].ancestors;
 }
+
+kernel void dspark_markov_init(device bfloat *state [[buffer(0)]], uint tid [[thread_index_in_threadgroup]]) {
+  state[tid] = bfloat(0.0f);
+}
+
+kernel void dspark_markov_context(
+    device const bfloat *hidden [[buffer(0)]],
+    device const bfloat *feature [[buffer(1)]],
+    device const bfloat *weights [[buffer(2)]],
+    device const bfloat *bias [[buffer(3)]],
+    device float *context [[buffer(4)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  const uint row = group / 768, output = group % 768;
+  float sum = 0.0f;
+  for (uint i = tid; i < 4608; i += 256) {
+    const float x = i < 2304 ? float(hidden[(row + 1) * 2304 + i]) : float(feature[i - 2304]);
+    sum += x * float(weights[ulong(output) * 5120 + 512 + i]);
+  }
+  threadgroup float parts[8];
+  const float subtotal = simd_sum(sum);
+  if (lane == 0) parts[simd_group] = subtotal;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0) {
+    float total = float(bias[output]);
+    for (uint i = 0; i < 8; ++i) total += parts[i];
+    context[group] = total;
+  }
+}
+
+kernel void dspark_markov_linear(
+    device const bfloat *state [[buffer(0)]],
+    device const bfloat *embedding [[buffer(1)]],
+    device const bfloat *weights [[buffer(2)]],
+    device const float *context [[buffer(3)]],
+    device const uint *tokens [[buffer(4)]],
+    device bfloat *raw [[buffer(5)]],
+    constant DSparkMarkovParams &params [[buffer(6)]],
+    uint output [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  const uint previous = params.position ? tokens[params.position - 1] : params.anchor;
+  const ulong base = ulong(output) * 5120;
+  float sum = float(state[tid]) * float(weights[base + tid]);
+  sum += float(embedding[ulong(previous) * 256 + tid]) * float(weights[base + 256 + tid]);
+  threadgroup float parts[8];
+  const float subtotal = simd_sum(sum);
+  if (lane == 0) parts[simd_group] = subtotal;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0) {
+    float total = context[params.position * 768 + output];
+    for (uint i = 0; i < 8; ++i) total += parts[i];
+    raw[output] = bfloat(total);
+  }
+}
+
+kernel void dspark_markov_update(
+    device const bfloat *raw [[buffer(0)]],
+    device bfloat *state [[buffer(1)]],
+    device bfloat *latent [[buffer(2)]],
+    uint tid [[thread_index_in_threadgroup]]) {
+  const bfloat gate = bfloat(1.0f / (1.0f + exp(-float(raw[tid]))));
+  const bfloat candidate = bfloat(tanh(float(raw[256 + tid])));
+  const bfloat a = bfloat(float(gate) * float(state[tid]));
+  const bfloat inverse = bfloat(1.0f - float(gate));
+  const bfloat b = bfloat(float(inverse) * float(candidate));
+  state[tid] = bfloat(float(a) + float(b));
+  latent[tid] = bfloat(tanh(float(raw[512 + tid])));
+}
+
+inline float dspark_capped(float base, float correction) {
+  const float sum = float(bfloat(float(bfloat(base)) + float(bfloat(correction))));
+  return float(bfloat(30.0f * tanh(sum / 30.0f)));
+}
+
+// The fold's inputs, SPLASH_DSPARK_RANK + 1 rows of 2304: row r the hidden output's column r (inputs[r][k] =
+// hiddenOut[k][r], hiddenOut being [2304][SPLASH_DSPARK_RANK]), the last its bias, which the head projects into the
+// fold weight's columns and the fold bias.
+kernel void dspark_fold_inputs(
+    device const bfloat *hiddenOut [[buffer(0)]],
+    device const bfloat *bias [[buffer(1)]],
+    device bfloat *inputs [[buffer(2)]],
+    uint index [[thread_position_in_grid]]) {
+  const uint r = index / 2304, k = index % 2304;
+  inputs[index] = r < SPLASH_DSPARK_RANK ? hiddenOut[k * SPLASH_DSPARK_RANK + r] : bias[k];
+}
+
+// The head's products of fold inputs start..start+rows (fp32 [rows][vocabulary]) into the fold weight
+// (bf16 [vocabulary][SPLASH_DSPARK_RANK]) or, for the bias input, the fold bias (fp32 [vocabulary]). A thread a token.
+kernel void dspark_fold_store(
+    device const float *product [[buffer(0)]],
+    device bfloat *weight [[buffer(1)]],
+    device float *foldBias [[buffer(2)]],
+    constant DSparkFoldParams &params [[buffer(3)]],
+    uint token [[thread_position_in_grid]]) {
+  if (token >= params.vocabulary) return;
+  for (uint r = 0; r < params.rows; ++r) {
+    const float value = product[ulong(r) * params.vocabulary + token];
+    const uint column = params.start + r;
+    if (column < SPLASH_DSPARK_RANK)
+      weight[ulong(token) * SPLASH_DSPARK_RANK + column] = bfloat(value);
+    else
+      foldBias[token] = value;
+  }
+}
+
+// A proposal step's scan: the corrected logit of every legal token, the fold bias and the fold weight's row times
+// the latent (fp32 accumulation, a simdgroup a row, each lane eight of the rank) added to the base logit as
+// dspark_capped rounds them, and each group of SPLASH_DSPARK_GROUP_ROWS tokens' largest (the lowest token on a tie),
+// with the group's softmax mass relative to it: partialValues[group] its logit and mass, partialIds[group] its
+// token. One threadgroup a group.
+kernel void dspark_fold_scan(
+    device const bfloat *weight [[buffer(0)]],
+    device const float *foldBias [[buffer(1)]],
+    device const bfloat *latent [[buffer(2)]],
+    device const float *base [[buffer(3)]],
+    device float *partialValues [[buffer(4)]],
+    device uint *partialIds [[buffer(5)]],
+    constant DSparkFoldScanParams &params [[buffer(6)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint kSimdgroups = SPLASH_DSPARK_GROUP_THREADS / 32;
+  threadgroup float groupBest[kSimdgroups];
+  threadgroup float groupSum[kSimdgroups];
+  threadgroup uint groupToken[kSimdgroups];
+  float x[8];
+  for (uint i = 0; i < 8; ++i) x[i] = float(latent[lane * 8 + i]);
+  const uint first = group * SPLASH_DSPARK_GROUP_ROWS;
+  const uint last = min(first + SPLASH_DSPARK_GROUP_ROWS, params.legal);
+  device const float *scores = base + ulong(params.position) * params.stride;
+  float best = -INFINITY, sum = 0.0f;
+  uint token = SPLASH_NO_TOKEN;
+  for (uint row = first + simd_group; row < last; row += kSimdgroups) {
+    const uint4 packed =
+        *reinterpret_cast<device const uint4 *>(weight + ulong(row) * SPLASH_DSPARK_RANK + lane * 8);
+    float dot = 0.0f;
+    for (uint w = 0; w < 4; ++w) {
+      const bfloat2 pair = as_type<bfloat2>(packed[w]);
+      dot += float(pair[0]) * x[2 * w] + float(pair[1]) * x[2 * w + 1];
+    }
+    dot = simd_sum(dot);
+    const float value = dspark_capped(scores[row], dot + foldBias[row]);
+    if (value > best) {
+      sum = sum * exp(best - value) + 1.0f;
+      best = value;
+      token = row;
+    } else {
+      sum += exp(value - best);
+    }
+  }
+  if (lane == 0) {
+    groupBest[simd_group] = best;
+    groupSum[simd_group] = sum;
+    groupToken[simd_group] = token;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0) {
+    float top = groupBest[0];
+    uint winner = groupToken[0];
+    for (uint s = 1; s < kSimdgroups; ++s) {
+      if (groupBest[s] > top || (groupBest[s] == top && groupToken[s] < winner)) {
+        top = groupBest[s];
+        winner = groupToken[s];
+      }
+    }
+    float total = 0.0f;
+    for (uint s = 0; s < kSimdgroups; ++s)
+      if (groupToken[s] != SPLASH_NO_TOKEN) total += groupSum[s] * exp(groupBest[s] - top);
+    partialValues[2 * group] = top;
+    partialValues[2 * group + 1] = total;
+    partialIds[group] = winner;
+  }
+}
+
+// The groups' bests merged: the proposal of the position is the largest (the lowest token on a tie), and its
+// probability the reciprocal of the softmax mass over every legal token relative to it.
+kernel void dspark_fold_reduce(
+    device const float *partialValues [[buffer(0)]],
+    device const uint *partialIds [[buffer(1)]],
+    device uint *tokens [[buffer(2)]],
+    device float *probabilities [[buffer(3)]],
+    constant DSparkFoldScanParams &params [[buffer(4)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  constexpr uint kThreads = SPLASH_DSPARK_GROUP_THREADS, kSimdgroups = kThreads / 32;
+  threadgroup float simdValue[kSimdgroups];
+  threadgroup uint simdId[kSimdgroups];
+  threadgroup float simdMass[kSimdgroups];
+  const uint groups = (params.legal + SPLASH_DSPARK_GROUP_ROWS - 1) / SPLASH_DSPARK_GROUP_ROWS;
+  float best = -INFINITY;
+  uint token = SPLASH_NO_TOKEN;
+  for (uint g = tid; g < groups; g += kThreads) {
+    const float value = partialValues[2 * g];
+    const uint id = partialIds[g];
+    if (value > best || (value == best && id < token)) {
+      best = value;
+      token = id;
+    }
+  }
+  const float laneBest = simd_max(best);
+  const uint laneToken = simd_min(best == laneBest ? token : SPLASH_NO_TOKEN);
+  if (lane == 0) {
+    simdValue[simd_group] = laneBest;
+    simdId[simd_group] = laneToken;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float top = simdValue[0];
+  uint winner = simdId[0];
+  for (uint s = 1; s < kSimdgroups; ++s) {
+    if (simdValue[s] > top || (simdValue[s] == top && simdId[s] < winner)) {
+      top = simdValue[s];
+      winner = simdId[s];
+    }
+  }
+  float sum = 0.0f;
+  for (uint g = tid; g < groups; g += kThreads) sum += partialValues[2 * g + 1] * exp(partialValues[2 * g] - top);
+  const float laneSum = simd_sum(sum);
+  if (lane == 0) simdMass[simd_group] = laneSum;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0) {
+    float total = 0.0f;
+    for (uint s = 0; s < kSimdgroups; ++s) total += simdMass[s];
+    tokens[params.position] = winner;
+    probabilities[params.position] = 1.0f / total;
+  }
+}
+
+kernel void dspark_chain_tree(
+    device const uint *chain [[buffer(0)]],
+    device uint *tokens [[buffer(1)]],
+    device SplashTreeRow *tree [[buffer(2)]],
+    device float2 *scores [[buffer(3)]],
+    device uint *sizes [[buffer(4)]],
+    device uchar *draws [[buffer(5)]],
+    device float *next [[buffer(6)]],
+    device float *caps [[buffer(7)]],
+    device const float *probabilities [[buffer(8)]],
+    constant DSparkChainParams &params [[buffer(9)]],
+    uint lane [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+  const uint length = params.length[lane];
+  if (tid == 0) sizes[lane] = length + 1;
+  if (tid > length) return;
+  const ulong row = ulong(lane) * SPLASH_TARGET_VERIFY_ROWS + tid;
+  tokens[row] = tid ? chain[ulong(lane) * SPLASH_TREE_CHAIN_TOKENS + tid - 1] : params.anchor[lane];
+  tree[row] = {(1u << (tid + 1)) - 1u, ushort(tid ? tid - 1 : SPLASH_TREE_ROOT), ushort(tid)};
+  float chance = 1.0f;
+  if (!params.forced[lane]) {
+    for (uint i = 0; i < tid; ++i) {
+      const float q = clamp(probabilities[ulong(lane) * SPLASH_DRAFT_PROPOSAL_TOKENS + i], 1.0e-6f, 1.0f - 1.0e-6f);
+      const float z = params.slope[lane] * log(q / (1.0f - q)) + params.intercept[lane][i];
+      chance *= 1.0f / (1.0f + exp(-z));
+    }
+  }
+  const float q = tid && !params.forced[lane] ? probabilities[ulong(lane) * SPLASH_DRAFT_PROPOSAL_TOKENS + tid - 1] : (tid ? -1.0f : 1.0f);
+  scores[row] = float2(q, chance);
+  caps[row] = 1.0f;
+  for (uint child = 0; child < SPLASH_TREE_CHILDREN; ++child)
+    draws[row * SPLASH_TREE_CHILDREN + child] = 0xff;
+  for (uint i = 0; i < SPLASH_DRAFT_CANDIDATES; ++i)
+    next[row * SPLASH_DRAFT_CANDIDATES + i] = 0.0f;
+}

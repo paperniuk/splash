@@ -36,6 +36,12 @@ struct StreamedMemoryInputs final {
   // arenaBytes'. A plan that spills takes them.
   std::array<std::array<uint64_t, 2>, 2> spillArenaBytes{};
   uint64_t laneStateBytes = 0;
+  // A draft's global K/V a token of context takes in each lane, which
+  // laneStateBytes leaves out (model::ModelMemoryPlan::draftContextTokenBytes):
+  // the floors charge a lane the least capacity, warmup's, and the KV
+  // allowance and the spill floors the capacity of the context they hold
+  // (model::draftContextCapacity). Zero for a draft without it.
+  uint64_t draftContextTokenBytes = 0;
   kv::Layout kvLayout;
   // The model's window (servedContextTokens), the context --max-context
   // asks for, zero for auto, and the one a relaunch keeps

@@ -80,23 +80,63 @@ DFlashDraftLayout draftLayout(uint32_t hiddenSize, uint32_t vocabularySize, uint
   return layout;
 }
 
+uint32_t draftGlobalSegmentTokens(const DraftStateLayout &layout, uint64_t maxBufferLengthBytes,
+                                  uint32_t maximumSegmentTokens) {
+  if (!layout.globalTokens || layout.globalLayer >= layout.layers) return 0;
+  const uint64_t rowBytes = uint64_t{layout.kvHeads} * layout.headDimension * DraftStateLayout::bfloat16Bytes;
+  const uint32_t tokens = static_cast<uint32_t>(
+      std::min<uint64_t>(maximumSegmentTokens, maxBufferLengthBytes / rowBytes));
+  if (!tokens) throw std::invalid_argument("a Metal buffer holds no row of the draft's global context");
+  const uint32_t segments = ops::DraftSegmentedContext::segmentCount(layout.globalTokens, tokens);
+  if (segments > SPLASH_DRAFT_MAX_GLOBAL_SEGMENTS)
+    throw std::invalid_argument("the draft's global context takes " + std::to_string(segments) +
+                                " segments, more than the " + std::to_string(SPLASH_DRAFT_MAX_GLOBAL_SEGMENTS) +
+                                " an address table holds");
+  return tokens;
+}
+
 DFlashDraftRing::DFlashDraftRing(
     metal::MetalBackend &backend, std::shared_ptr<StateAllocationTracker> tracker,
-    DraftStateLayout layout, std::string_view label)
+    DraftStateLayout layout, std::string_view label, uint32_t maximumSegmentTokens)
     : tracker_(std::move(tracker)), layers_(layout.layers) {
   if (!tracker_)
     throw std::invalid_argument("draft state allocation tracker is empty");
+  const uint32_t segmentTokens =
+      draftGlobalSegmentTokens(layout, backend.capabilities().maxBufferLengthBytes, maximumSegmentTokens);
   const uint64_t before = backend.memoryStats().allocatedBytes;
+  const uint64_t globalBytes = layout.globalLayer < layout.layers
+                                   ? layout.tensorBytes(layout.globalLayer)
+                                   : 0;
   const metal::MetalBuffer base = backend.allocateBuffer(
-      layout.ringBytes(), metal::BufferStorage::Shared, label);
+      layout.ringBytes() - 2 * globalBytes, metal::BufferStorage::Shared, label);
   uint64_t cursor = 0;
-  for (DFlashDraftRingLayer &layer : layers_) {
-    layer.keys = backend.view(base, cursor, layout.tensorBytes());
-    cursor += layout.tensorBytes();
-    layer.values = backend.view(base, cursor, layout.tensorBytes());
-    cursor += layout.tensorBytes();
+  for (uint32_t index = 0; index < layers_.size(); ++index) {
+    DFlashDraftRingLayer &layer = layers_[index];
+    const uint64_t bytes = layout.tensorBytes(index);
+    if (index == layout.globalLayer) {
+      // Segments of segmentTokens rows, the last of the rest, which together
+      // hold the bytes of the layer as one buffer would.
+      const uint64_t rowBytes = bytes / layout.globalTokens;
+      std::vector<metal::MetalBuffer> keys, values;
+      for (uint64_t first = 0; first < layout.globalTokens; first += segmentTokens) {
+        const uint64_t segmentBytes = std::min<uint64_t>(segmentTokens, layout.globalTokens - first) * rowBytes;
+        keys.push_back(backend.allocateBuffer(segmentBytes, metal::BufferStorage::Shared, label));
+        values.push_back(backend.allocateBuffer(segmentBytes, metal::BufferStorage::Shared, label));
+      }
+      layer.segments = ops::DraftSegmentedContext::make(keys, values, segmentTokens, layout.globalTokens);
+      continue;
+    }
+    layer.keys = backend.view(base, cursor, bytes);
+    cursor += bytes;
+    layer.values = backend.view(base, cursor, bytes);
+    cursor += bytes;
   }
-  if (cursor != layout.ringBytes())
+  if (layout.featureWidth) {
+    const uint64_t bytes = uint64_t{layout.featureWidth} * DraftStateLayout::bfloat16Bytes;
+    feature_ = backend.view(base, cursor, bytes);
+    cursor += bytes;
+  }
+  if (cursor != layout.ringBytes() - 2 * globalBytes)
     throw std::logic_error("draft ring accounting mismatch");
   actualAllocatedBytes_ =
       metal::allocationDelta(before, backend.memoryStats().allocatedBytes);

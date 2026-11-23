@@ -299,6 +299,68 @@ void testRestoresDraftStateFlag() {
     require(!plan.restoresDraftState, "cold plan claimed a restored draft ring");
 }
 
+// A DSpark replay captures every row of it, where a DFlash plan keeps the
+// last window: the global layer attends to all of them. The span resets the
+// draft ring exactly where the restore skipped it, and the boundaries' rows
+// tile the replay.
+void testDSparkPlanCapturesTheWholeReplay() {
+  constexpr uint32_t window = model::ExecutionLimits::draftContextTokens;
+  const auto cold = dsparkDraftContextPlan(activePlan(0, 10000));
+  require(cold.captureSpans.size() == 1 && cold.captureSpans[0].begin == 0 && cold.captureSpans[0].end == 10000 &&
+              cold.captureSpans[0].resetDraftState,
+          "a cold DSpark replay did not capture every row as one new window");
+  require(draftContextRows(activePlan(0, 10000)) == window, "the DFlash plan no longer clips a cold replay");
+
+  const auto skipped = dsparkDraftContextPlan(cachedPlan(4096, 20000, {9000, 15000}));
+  require(!skipped.restoresDraftState && skipped.captureSpans.size() == 1 && skipped.captureSpans[0].begin == 4096 &&
+              skipped.captureSpans[0].end == 20000 && skipped.captureSpans[0].resetDraftState,
+          "a DSpark replay past a skipped draft restore did not capture from the restored length");
+  require(skipped.boundaries.size() == 3 && skipped.boundaries[0].boundary == 9000 &&
+              skipped.boundaries[0].captureBegin == 4096 && skipped.boundaries[1].boundary == 15000 &&
+              skipped.boundaries[1].captureBegin == 9000 && skipped.boundaries[2].boundary == 20000 &&
+              skipped.boundaries[2].captureBegin == 15000 &&
+              skipped.boundaries[2].purpose == DraftBoundaryPurpose::Active,
+          "a DSpark plan's boundaries do not run from the one before");
+  // A dispatch across the second boundary splits its rows between the two.
+  const auto across = draftCaptureSpansForDispatch(skipped, 14336, 16384);
+  require(across.size() == 1 && across[0].materializationRows == 664 && across[0].activeRows == 1384 &&
+              across[0].absoluteBegin == 14336 && across[0].absoluteEnd == 16384 && !across[0].resetDraftState,
+          "a DSpark dispatch across a boundary mis-split its capture rows");
+  uint32_t captured = 0;
+  for (uint32_t begin = 4096; begin < 20000; begin += window) {
+    const auto dispatch = draftCaptureSpansForDispatch(skipped, begin, std::min<uint32_t>(begin + window, 20000));
+    require(dispatch.size() == 1 && dispatch[0].resetDraftState == (begin == 4096),
+            "a DSpark replay did not reset its window at its first dispatch alone");
+    captured += dispatch[0].absoluteEnd - dispatch[0].absoluteBegin;
+  }
+  require(captured == 20000 - 4096, "a DSpark replay did not capture every row of it");
+
+  // A restore that continues the ring continues it for the whole replay.
+  const auto continued = dsparkDraftContextPlan(activePlan(4096, 5000));
+  require(continued.restoresDraftState && continued.captureSpans.size() == 1 &&
+              continued.captureSpans[0].begin == 4096 && continued.captureSpans[0].end == 5000 &&
+              !continued.captureSpans[0].resetDraftState,
+          "a DSpark replay after a draft restore did not continue its ring");
+
+  // A replay that is empty, a restore at the prompt's end, captures nothing.
+  const auto empty = dsparkDraftContextPlan(activePlan(4096, 4096));
+  require(empty.captureSpans.empty() && empty.boundaries.size() == 1 && empty.boundaries[0].captureBegin == 4096,
+          "an empty DSpark replay captured rows");
+}
+
+// The first position of DSpark's global layer after a restore: the restored
+// window's start where the draft state came back, and the restored length
+// where it did not.
+void testDSparkGlobalBaseAfterRestore() {
+  constexpr uint32_t window = model::ExecutionLimits::draftContextTokens;
+  require(dsparkGlobalBase(5000, true, 5000 - window) == 5000 - window,
+          "a restored draft window did not make its start the global base");
+  require(dsparkGlobalBase(1500, true, 0) == 0, "a restore of a short prefix did not keep the global base at 0");
+  require(dsparkGlobalBase(5000, false, 5000 - window) == 5000 && dsparkGlobalBase(5000, false, 0) == 5000,
+          "a restore that skipped the draft state did not make its length the global base");
+  require(dsparkGlobalBase(0, false, 0) == 0, "a cold start's global base is not 0");
+}
+
 void testInvalidInputs() {
   const auto plan = activePlan(0, 4096);
   rejects([&] { (void)draftCaptureSpansForDispatch(plan, 0, 2049); },
@@ -323,6 +385,8 @@ int main() {
     testSparseCheckpointWindowsAndShortResume();
     testCheckpointWindowsAcrossSmallDispatches();
     testRestoresDraftStateFlag();
+    testDSparkPlanCapturesTheWholeReplay();
+    testDSparkGlobalBaseAfterRestore();
     testInvalidInputs();
     std::cout << "draft context plan tests passed\n";
     return EXIT_SUCCESS;

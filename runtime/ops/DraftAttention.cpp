@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -202,6 +203,228 @@ void DraftAttention::addDecode(
             {shape.kvHeads, lanes, kSplits});
   graph.add("draft_attention_bf16_reduce", {buffers.groupedQueries}, params,
             {shape.kvHeads, lanes, 1});
+}
+
+void DraftAttention::addDSparkFusion(metal::CommandGraph &graph, metal::MetalBuffer captured,
+                                      metal::MetalBuffer fuse, metal::MetalBuffer norm, metal::MetalBuffer output,
+                                      uint32_t rows, uint32_t consumer) {
+  constexpr uint32_t width = 2304;
+  if (!rows || consumer >= 4) throw std::invalid_argument("invalid DSpark context fusion");
+  requireBytes(captured, uint64_t{rows} * 4 * width * 2, "DSpark captured target");
+  requireBytes(fuse, 4 * 4 * 2, "DSpark fusion weights");
+  requireBytes(norm, width * 2, "DSpark fusion norm");
+  requireBytes(output, uint64_t{rows} * width * 2, "DSpark fused context");
+  graph.add("dspark_context_fusion", {captured, fuse, norm, output}, DSparkFusionParams{width, consumer},
+            {rows, 1, 1});
+}
+
+void DraftAttention::addDSparkHeadPrepare(metal::CommandGraph &graph, metal::MetalBuffer input,
+                                          metal::MetalBuffer norm, metal::MetalBuffer output, uint32_t rows,
+                                          uint32_t heads, uint32_t startPosition) {
+  if (!rows || (heads != 8 && heads != 24))
+    throw std::invalid_argument("invalid DSpark head preparation");
+  const uint64_t bytes = uint64_t{rows} * heads * 128 * 2;
+  requireBytes(input, bytes, "DSpark head input");
+  requireBytes(norm, 128 * 2, "DSpark head norm");
+  requireBytes(output, bytes, "DSpark head output");
+  graph.add("dspark_head_prepare", {input, norm, output}, DSparkHeadParams{heads, startPosition},
+            {uint64_t{rows} * heads, 1, 1});
+}
+
+uint64_t DraftAttention::dsparkAttentionWorkspaceBytes() {
+  return uint64_t{8} * DSPARK_ATTENTION_MAX_SPLITS * 24 * DSPARK_ATTENTION_PARTIAL * sizeof(float);
+}
+
+namespace {
+
+// A block's keys in splits of about 128 (four 32-key steps), DSPARK_ATTENTION_MAX_SPLITS at most: 8 KV heads x 64
+// threadgroups at a long context, one split for a short one.
+uint32_t dsparkSplits(uint32_t contextRows, uint32_t contextFirst) {
+  const uint32_t keys = contextRows - contextFirst + 8;
+  return std::clamp<uint32_t>((keys + 127) / 128, 1, DSPARK_ATTENTION_MAX_SPLITS);
+}
+
+} // namespace
+
+void DraftAttention::addDSparkAttention(metal::CommandGraph &graph, metal::MetalBuffer queries,
+                                        metal::MetalBuffer contextKeys, metal::MetalBuffer contextValues,
+                                        metal::MetalBuffer blockKeys, metal::MetalBuffer blockValues,
+                                        metal::MetalBuffer output, metal::MetalBuffer workspace, uint32_t contextRows,
+                                        uint32_t contextFirst, uint32_t contextCapacity) {
+  if (contextFirst > contextRows || (contextCapacity && contextRows - contextFirst > contextCapacity))
+    throw std::invalid_argument("invalid DSpark context window");
+  requireBytes(queries, 8 * 24 * 128 * 2, "DSpark queries");
+  const uint64_t storageRows = contextCapacity ? contextCapacity : contextRows;
+  requireBytes(contextKeys, storageRows * 8 * 128 * 2, "DSpark context keys");
+  requireBytes(contextValues, storageRows * 8 * 128 * 2, "DSpark context values");
+  requireBytes(blockKeys, 8 * 8 * 128 * 2, "DSpark block keys");
+  requireBytes(blockValues, 8 * 8 * 128 * 2, "DSpark block values");
+  requireBytes(output, 8 * 24 * 128 * 2, "DSpark attention output");
+  requireBytes(workspace, dsparkAttentionWorkspaceBytes(), "DSpark attention workspace");
+  const DSparkSplitAttentionParams params{contextRows, contextFirst, contextCapacity, 0, 0,
+                                          dsparkSplits(contextRows, contextFirst)};
+  graph.add("dspark_block_attention_split", {queries, contextKeys, contextValues, blockKeys, blockValues, workspace},
+            params, {8, params.splits, 1}, {256, 1, 1});
+  graph.add("dspark_block_attention_reduce", {workspace, output}, params, {8 * 24, 1, 1}, {128, 1, 1});
+}
+
+void DraftAttention::addDSparkBlockInput(metal::CommandGraph &graph, metal::MetalBuffer anchor,
+                                         metal::MetalBuffer mask, metal::MetalBuffer hidden,
+                                         metal::MetalBuffer residual) {
+  constexpr uint64_t row = 2304 * 2, block = 8 * row;
+  requireBytes(anchor, row, "DSpark anchor embedding");
+  requireBytes(mask, row, "DSpark mask embedding");
+  requireBytes(hidden, block, "DSpark block hidden");
+  requireBytes(residual, block, "DSpark block residual");
+  graph.add("dspark_block_input", {anchor, mask, hidden, residual}, {8 * 2304 / 256, 1, 1});
+}
+
+void DraftAttention::addDSparkResidualNorm(metal::CommandGraph &graph, metal::MetalBuffer input,
+                                           metal::MetalBuffer residual, metal::MetalBuffer norm,
+                                           metal::MetalBuffer output) {
+  constexpr uint64_t row = 2304 * 2, block = 8 * row;
+  requireBytes(input, block, "DSpark residual input");
+  requireBytes(residual, block, "DSpark residual");
+  requireBytes(norm, row, "DSpark residual norm");
+  requireBytes(output, block, "DSpark normalized output");
+  graph.add("dspark_residual_norm", {input, residual, norm, output}, {8, 1, 1});
+}
+
+void DraftAttention::addDSparkSwiGlu(metal::CommandGraph &graph, metal::MetalBuffer gate,
+                                     metal::MetalBuffer up, metal::MetalBuffer output) {
+  constexpr uint64_t count = 8 * 9216;
+  requireBytes(gate, count * 2, "DSpark gate");
+  requireBytes(up, count * 2, "DSpark up");
+  requireBytes(output, count * 2, "DSpark intermediate");
+  graph.add("dspark_swiglu", {gate, up, output}, {count / 256, 1, 1});
+}
+
+void DraftAttention::addDSparkContextStore(metal::CommandGraph &graph, metal::MetalBuffer keys,
+                                            metal::MetalBuffer values, metal::MetalBuffer persistentKeys,
+                                            metal::MetalBuffer persistentValues, uint32_t rows,
+                                            uint32_t startPosition, uint32_t basePosition, uint32_t capacity) {
+  if (!rows || !capacity || startPosition < basePosition)
+    throw std::invalid_argument("invalid DSpark context store");
+  requireBytes(keys, uint64_t{rows} * 1024 * 2, "DSpark context keys");
+  requireBytes(values, uint64_t{rows} * 1024 * 2, "DSpark context values");
+  requireBytes(persistentKeys, uint64_t{capacity} * 1024 * 2, "DSpark persistent keys");
+  requireBytes(persistentValues, uint64_t{capacity} * 1024 * 2, "DSpark persistent values");
+  graph.add("dspark_context_store", {keys, values, persistentKeys, persistentValues},
+            DSparkStoreParams{rows, startPosition, basePosition, capacity},
+            {uint64_t{std::min(rows, capacity)} * 4, 1, 1});
+}
+
+void DraftAttention::addDSparkCommitGather(metal::CommandGraph &graph, metal::MetalBuffer captured,
+                                           metal::MetalBuffer retained, metal::MetalBuffer laneRows,
+                                           metal::MetalBuffer output, uint32_t packedRows, uint32_t laneCap) {
+  if (!packedRows || !laneCap || laneCap > SPLASH_TARGET_VERIFY_ROWS)
+    throw std::invalid_argument("invalid DSpark commit gather");
+  constexpr uint64_t bytesPerRow = uint64_t{4} * 2304 * 2;
+  requireBytes(captured, packedRows * bytesPerRow, "DSpark captured target");
+  requireBytes(retained, sizeof(uint32_t), "DSpark retained rows");
+  requireBytes(laneRows, sizeof(LaneRows), "DSpark lane rows");
+  requireBytes(output, (uint64_t{laneCap} + 1) * bytesPerRow, "DSpark compact captures");
+  graph.add("dspark_commit_gather", {captured, retained, laneRows, output},
+            DSparkStoreParams{laneCap, 0, 0, 0}, {uint64_t{laneCap + 1} * 36, 1, 1});
+}
+
+void DraftAttention::addDSparkCommitStore(metal::CommandGraph &graph, metal::MetalBuffer keys,
+                                          metal::MetalBuffer values, metal::MetalBuffer retained,
+                                          metal::MetalBuffer persistentKeys, metal::MetalBuffer persistentValues,
+                                          uint32_t laneCap, uint32_t startPosition, uint32_t basePosition,
+                                          uint32_t capacity) {
+  if (!laneCap || laneCap > SPLASH_TARGET_VERIFY_ROWS || !capacity || startPosition < basePosition)
+    throw std::invalid_argument("invalid DSpark context commit");
+  requireBytes(keys, uint64_t{laneCap} * 1024 * 2, "DSpark context keys");
+  requireBytes(values, uint64_t{laneCap} * 1024 * 2, "DSpark context values");
+  requireBytes(retained, sizeof(uint32_t), "DSpark retained rows");
+  requireBytes(persistentKeys, uint64_t{capacity} * 1024 * 2, "DSpark persistent keys");
+  requireBytes(persistentValues, uint64_t{capacity} * 1024 * 2, "DSpark persistent values");
+  graph.add("dspark_commit_store", {keys, values, retained, persistentKeys, persistentValues},
+            DSparkStoreParams{laneCap, startPosition, basePosition, capacity}, {uint64_t{laneCap} * 4, 1, 1});
+}
+
+DraftSegmentedContext DraftSegmentedContext::make(std::span<const metal::MetalBuffer> keys,
+                                                  std::span<const metal::MetalBuffer> values,
+                                                  uint32_t segmentTokens, uint32_t rows) {
+  auto table = std::make_shared<std::vector<metal::MetalBuffer>>();
+  table->reserve(keys.size() + values.size());
+  table->insert(table->end(), keys.begin(), keys.end());
+  table->insert(table->end(), values.begin(), values.end());
+  DraftSegmentedContext context{std::move(table), segmentTokens, rows};
+  if (keys.size() != values.size()) throw std::invalid_argument("DSpark key and value segments differ in number");
+  context.validate();
+  return context;
+}
+
+void DraftSegmentedContext::validate() const {
+  constexpr uint64_t rowBytes = uint64_t{SPLASH_DRAFT_KV_HEADS} * SPLASH_DRAFT_HEAD_DIMENSION * 2;
+  if (!table || !segmentTokens || !rows) throw std::invalid_argument("invalid DSpark segmented context");
+  const uint32_t count = segmentCount(rows, segmentTokens);
+  if (count > SPLASH_DRAFT_MAX_GLOBAL_SEGMENTS || table->size() != uint64_t{2} * count)
+    throw std::invalid_argument("DSpark segmented context holds " + std::to_string(table->size()) +
+                                " buffers for " + std::to_string(count) + " segments of each plane, at most " +
+                                std::to_string(SPLASH_DRAFT_MAX_GLOBAL_SEGMENTS));
+  for (uint32_t plane = 0; plane < 2; ++plane)
+    for (uint32_t segment = 0; segment < count; ++segment) {
+      const uint64_t inSegment = std::min<uint64_t>(segmentTokens, rows - uint64_t{segment} * segmentTokens);
+      requireBytes((*table)[plane * count + segment], inSegment * rowBytes,
+                   plane ? "DSpark value segment" : "DSpark key segment");
+    }
+}
+
+void DraftAttention::addDSparkSegmentedAttention(metal::CommandGraph &graph, metal::MetalBuffer queries,
+                                                 const DraftSegmentedContext &context,
+                                                 metal::MetalBuffer blockKeys, metal::MetalBuffer blockValues,
+                                                 metal::MetalBuffer output, metal::MetalBuffer workspace,
+                                                 uint32_t contextRows, uint32_t contextFirst) {
+  context.validate();
+  if (contextFirst > contextRows || contextRows > context.rows)
+    throw std::invalid_argument("invalid DSpark segmented context window");
+  requireBytes(queries, 8 * 24 * 128 * 2, "DSpark queries");
+  requireBytes(blockKeys, 8 * 8 * 128 * 2, "DSpark block keys");
+  requireBytes(blockValues, 8 * 8 * 128 * 2, "DSpark block values");
+  requireBytes(output, 8 * 24 * 128 * 2, "DSpark attention output");
+  requireBytes(workspace, dsparkAttentionWorkspaceBytes(), "DSpark attention workspace");
+  const DSparkSplitAttentionParams params{contextRows, contextFirst, 0, context.segmentTokens, context.segments(),
+                                          dsparkSplits(contextRows, contextFirst)};
+  graph.add("dspark_block_attention_split_segmented", {queries, blockKeys, blockValues, workspace}, params,
+            {8, params.splits, 1}, {256, 1, 1});
+  graph.addresses(context.table);
+  graph.add("dspark_block_attention_reduce", {workspace, output}, params, {8 * 24, 1, 1}, {128, 1, 1});
+}
+
+void DraftAttention::addDSparkSegmentedContextStore(metal::CommandGraph &graph, metal::MetalBuffer keys,
+                                                    metal::MetalBuffer values,
+                                                    const DraftSegmentedContext &context, uint32_t rows,
+                                                    uint32_t startPosition, uint32_t basePosition) {
+  context.validate();
+  if (!rows || startPosition < basePosition || uint64_t{startPosition - basePosition} + rows > context.rows)
+    throw std::invalid_argument("invalid DSpark segmented context store");
+  requireBytes(keys, uint64_t{rows} * 1024 * 2, "DSpark context keys");
+  requireBytes(values, uint64_t{rows} * 1024 * 2, "DSpark context values");
+  graph.add("dspark_context_store_segmented", {keys, values},
+            DSparkSegmentedStoreParams{rows, startPosition, basePosition, context.segmentTokens, context.segments()},
+            {uint64_t{rows} * 4, 1, 1});
+  graph.addresses(context.table, true);
+}
+
+void DraftAttention::addDSparkSegmentedCommitStore(metal::CommandGraph &graph, metal::MetalBuffer keys,
+                                                   metal::MetalBuffer values, metal::MetalBuffer retained,
+                                                   const DraftSegmentedContext &context, uint32_t laneCap,
+                                                   uint32_t startPosition, uint32_t basePosition) {
+  context.validate();
+  if (!laneCap || laneCap > SPLASH_TARGET_VERIFY_ROWS || startPosition < basePosition ||
+      uint64_t{startPosition - basePosition} + laneCap > context.rows)
+    throw std::invalid_argument("invalid DSpark segmented context commit");
+  requireBytes(keys, uint64_t{laneCap} * 1024 * 2, "DSpark context keys");
+  requireBytes(values, uint64_t{laneCap} * 1024 * 2, "DSpark context values");
+  requireBytes(retained, sizeof(uint32_t), "DSpark retained rows");
+  graph.add("dspark_commit_store_segmented", {keys, values, retained},
+            DSparkSegmentedStoreParams{laneCap, startPosition, basePosition, context.segmentTokens,
+                                       context.segments()},
+            {uint64_t{laneCap} * 4, 1, 1});
+  graph.addresses(context.table, true);
 }
 
 void DraftAttention::addContextPrefill(

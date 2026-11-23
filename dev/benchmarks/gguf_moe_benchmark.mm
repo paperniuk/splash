@@ -98,11 +98,18 @@ int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, Fmt ga
   // An ungated block's weights carry no scalar gate.
   const QuantizedSegment sharedGateSegment =
       shape.sharedGate ? floatSegment(backend, sharedGate, 1, H) : QuantizedSegment{};
-  BlockMoeWeights gguf{routerSegment, sharedGateSegment,
-                       {planes(gateUpFormat, E * I, H), planes(sharedFormat, shape.sharedSlices * I, H)},
-                       {planes(gateUpFormat, E * I, H), planes(sharedFormat, shape.sharedSlices * I, H)},
-                       {planes(downFormat, E * H, I), planes(sharedFormat, shape.sharedSlices * H, I)},
-                       splash::model::residentExpertSlots(backend, E), E};
+  const auto shared = [&](uint32_t rows, uint32_t k) {
+    return shape.sharedSlices ? planes(sharedFormat, rows, k) : QuantizedSegment{};
+  };
+  BlockMoeWeights gguf{.router = routerSegment, .sharedScalarGate = sharedGateSegment,
+                       .gate = {planes(gateUpFormat, E * I, H), shared(shape.sharedSlices * I, H)},
+                       .up = {planes(gateUpFormat, E * I, H), shared(shape.sharedSlices * I, H)},
+                       .down = {planes(downFormat, E * H, I), shared(shape.sharedSlices * H, I)},
+                       .slotTable = splash::model::residentExpertSlots(backend, E), .slots = E};
+  if (shape.router == splash::ops::MoeRouter::SigmoidCorrected) {
+    const std::vector<float> bias(E, 0.0f);
+    gguf.correctionBias = upload(backend, bias.data(), bias.size() * sizeof(float), "correction-bias");
+  }
   gguf.chunks = splash::ops::residentExpertChunks(gguf);
   const std::array<const BlockMoeWeights *, 1> blocks{&gguf};
   const uint32_t routerFormat = splash::ops::moeRouterFormat(blocks);
@@ -204,6 +211,24 @@ int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, Fmt ga
   for (const uint32_t rows : kPrefillRows)
     printf("  prefill chunk of %4u rows: %.4f\n", rows,
            time(layers(plans.moe(shape, routerFormat, rows), Routing::Random)));
+  // A one-lane verify of 1 to 8 rows, each row routed at random: Inkling's decode.
+  if (shape.router == splash::ops::MoeRouter::SigmoidCorrected) {
+    for (const uint32_t rows : {1u, 2u, 3u, 4u, 6u, 8u}) {
+      const Layers l = layers(plans.moe(shape, routerFormat, rows), Routing::Random);
+      printf("  verify %u rows: %.4f ms (%2.0f%% column)\n", rows, time(l), columnShare(l));
+    }
+    for (const uint32_t rows : {1u, 4u}) {
+      const Layers l = layers(plans.moe(shape, routerFormat, rows), Routing::Random);
+      std::map<std::string, double> spent;
+      for (uint32_t i = 0; i < rounds; ++i)
+        for (const auto &[name, seconds] : splash::benchmark::replayDispatches(backend, l.graph.dispatches()))
+          spent[name] += seconds * 1e3 / (rounds * l.buffers.size());
+      printf("  verify %u rows:", rows);
+      for (const auto &[name, ms] : spent) printf(" %s %.4f", name.c_str(), ms);
+      printf("\n");
+    }
+    return 0;
+  }
   for (uint32_t lanes = 1; lanes <= 4; ++lanes) {
     printf("  decode %2u rows:", lanes * kLaneRows);
     for (const Routing routing : {Routing::Random, Routing::Pooled}) {
@@ -407,15 +432,21 @@ int main(int argc, const char *argv[]) {
     const std::string shapeName = count > 2 ? args[2] : "35b";
     const Fmt gateUp = count > 4 ? fmtNamed(args[4]) : Q4K, down = count > 5 ? fmtNamed(args[5]) : Q5K,
               shared = count > 6 ? fmtNamed(args[6]) : Q80;
-    if (count < 2 || count > 7 || (shapeName != "35b" && shapeName != "flash-next" && shapeName != "flint") ||
+    if (count < 2 || count > 7 ||
+        (shapeName != "35b" && shapeName != "flash-next" && shapeName != "flint" && shapeName != "inkling") ||
         gateUp == FMT_COUNT || down == FMT_COUNT || shared == FMT_COUNT) {
-      std::cerr << "usage: gguf-moe-benchmark <metallib> [tiles] [35b|flash-next|flint] [rounds] [gate/up format] "
+      std::cerr << "usage: gguf-moe-benchmark <metallib> [tiles] [35b|flash-next|flint|inkling] [rounds] [gate/up format] "
                    "[down format] [shared format]\n";
       return 2;
     }
     const bool flashNext = shapeName == "flash-next", flint = shapeName == "flint";
     const uint32_t H = flashNext ? 2560 : 2048, I = flashNext ? 640 : 512;
     MoeShape shape{H, flashNext ? 512u : 256u, flashNext ? 10u : flint ? 6u : 8u, I};
+    if (shapeName == "inkling")
+      shape = {.hiddenSize = 2304, .experts = 128, .expertsPerToken = 8, .expertIntermediateSize = 1152,
+               .router = splash::ops::MoeRouter::SigmoidCorrected, .sharedSlices = 0, .sharedGate = false,
+               .routeScale = 8.0F, .activation = splash::ops::MoeActivation::SoftcappedSwiGlu, .gateSoftcap = 4.0F,
+               .upSoftcap = 25.0F};
     if (flint) {
       shape.router = splash::ops::MoeRouter::SigmoidNormalized;
       shape.sharedSlices = 2;

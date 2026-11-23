@@ -692,9 +692,10 @@ void testSyntheticModel(MetalBackend &backend,
         descriptor.sourceIdentity = "sources";
         auto model = loadModel(backend, root, descriptor);
         const auto &loadedTarget = std::get<Qwen3_8Weights>(model.target);
+        const auto &loadedDraft = std::get<splash::model::DFlashDraftWeights>(model.draft);
         require(loadedTarget.layers.size() == target.layers,
                 "target layer vector is incomplete");
-        require(model.draft.layers.size() == draft.layers,
+        require(loadedDraft.layers.size() == draft.layers,
                 "draft layer vector is incomplete");
         require(std::holds_alternative<QwenGdnWeights>(
                     loadedTarget.layers[0].mixer),
@@ -704,11 +705,11 @@ void testSyntheticModel(MetalBackend &backend,
                 "target full-attention layer has the wrong typed layout");
         require(loadedTarget.files.size() == target.layers + 2,
                 "target file records are incomplete");
-        require(model.draft.files.size() == draft.layers + 1,
+        require(loadedDraft.files.size() == draft.layers + 1,
                 "draft file records are incomplete");
         require(declaredBytes(loadedTarget.files) == expected.targetBytes,
                 "target declared byte accounting is wrong");
-        require(declaredBytes(model.draft.files) == expected.draftBytes,
+        require(declaredBytes(loadedDraft.files) == expected.draftBytes,
                 "draft declared byte accounting is wrong");
         require(model.vision.tensors.blocks.size() == vision.depth &&
                     model.vision.files.size() == 1 &&
@@ -719,7 +720,7 @@ void testSyntheticModel(MetalBackend &backend,
                         expected.visionBytes,
                 "the weight budget does not count every image");
         require(loadedTarget.actualAllocatedBytes +
-                    model.draft.actualAllocatedBytes +
+                    loadedDraft.actualAllocatedBytes +
                     model.vision.actualAllocatedBytes ==
                     backend.memoryStats().allocatedBytes - baseline,
                 "actual model allocation accounting is wrong");
@@ -727,8 +728,8 @@ void testSyntheticModel(MetalBackend &backend,
                 "manifest SHA-256 has the wrong length");
 
         std::vector<WeightFileRecord> records = loadedTarget.files;
-        records.insert(records.end(), model.draft.files.begin(),
-                       model.draft.files.end());
+        records.insert(records.end(), loadedDraft.files.begin(),
+                       loadedDraft.files.end());
         records.insert(records.end(), model.vision.files.begin(),
                        model.vision.files.end());
         require(weightManifestFingerprint(records) ==
@@ -753,9 +754,9 @@ void testSyntheticModel(MetalBackend &backend,
                     model.manifestFingerprintSha256,
                 "manifest fingerprint ignores the sources' identity");
 
-        require(model.draft.layers[0].attentionDynamic.outputSize ==
+        require(loadedDraft.layers[0].attentionDynamic.outputSize ==
                         draft.dynamicSize &&
-                    model.draft.layers[0].downProjection.outputSize ==
+                    loadedDraft.layers[0].downProjection.outputSize ==
                         draft.hiddenSize,
                 "draft projections lost their logical dimensions");
         actualTrackedBytes =
@@ -772,7 +773,7 @@ void testSyntheticModel(MetalBackend &backend,
         model.images->release();
         require(backend.memoryStats().allocatedBytes - baseline ==
                     actualTrackedBytes - declaredBytes(loadedTarget.files) -
-                        declaredBytes(model.draft.files) - declaredBytes(model.vision.files),
+                        declaredBytes(loadedDraft.files) - declaredBytes(model.vision.files),
                 "released weights remain in backend accounting");
         // They come back an image at a time, in load order.
         require(!model.images->restore(splash::test::admitAll) &&
@@ -866,7 +867,7 @@ void testSyntheticBlockModel(MetalBackend &backend, const std::filesystem::path 
                 segmentFormats(weights.logitsProjection) == std::vector<uint32_t>{format("lm_head")} &&
                 weights.tokenEmbedding.rows().formatId == format("embed_tokens"),
             "a block FFN, head or token table did not keep its module's format");
-    require(declaredBytes(weights.files) + declaredBytes(model.draft.files) == planned,
+    require(declaredBytes(weights.files) + declaredBytes(model.draftFiles()) == planned,
             "streamableWeights is not what an MLX block target loads");
 
     std::vector<splash::test::SyntheticTensor> raw = splash::test::mlxTargetTensors(target, bitsAndGroup);
@@ -974,7 +975,7 @@ void testSyntheticFloatModel(MetalBackend &backend, const std::filesystem::path 
     require(g4.rowsPerValue == nvfp4Rows.rows && !g4.bfloat16 && g4.reciprocal == compressed &&
                 g8.rowsPerValue == (compressed ? 1 : fp8Rows.rows) && g8.bfloat16 == compressed && !g8.reciprocal,
             "a " + name + " target's tensor scales are not read as its convention stores them");
-    require(declaredBytes(weights.files) + declaredBytes(model.draft.files) == planned,
+    require(declaredBytes(weights.files) + declaredBytes(model.draftFiles()) == planned,
             "streamableWeights is not what a " + name + " target loads");
 }
 
@@ -1017,7 +1018,7 @@ void testSyntheticFloatMoeModel(MetalBackend &backend, const std::filesystem::pa
                         "a " + name + " layer's experts are not stacked in their index order");
         }
     require(stacks == 3 * target.layers, "a " + name + " layer's experts did not stack into three tensors");
-    require(declaredBytes(weights.files) + declaredBytes(model.draft.files) == planned,
+    require(declaredBytes(weights.files) + declaredBytes(model.draftFiles()) == planned,
             "streamableWeights is not what a " + name + " MoE target loads");
 }
 
@@ -1082,7 +1083,7 @@ void testSyntheticBlockMoeModel(MetalBackend &backend, const std::filesystem::pa
                     ffn.sharedScalarGate.outputSize == 1,
                 "a block MoE did not read its router as its native rows and its shared-expert gate as F32");
     }
-    require(declaredBytes(weights.files) + declaredBytes(model.draft.files) == planned,
+    require(declaredBytes(weights.files) + declaredBytes(model.draftFiles()) == planned,
             "streamableWeights is not what an MLX block MoE target loads");
 }
 

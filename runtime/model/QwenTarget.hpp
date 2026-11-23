@@ -373,6 +373,17 @@ struct QwenTargetFoldBuffers final {
   metal::MetalBuffer fold;
 };
 
+// The auxiliary state after the first rows of the path one lane of a verify
+// accepted, as a cached state stores it (addAuxiliaryCapture): the lane's
+// accepted path and its rows of the step, the lane's state before the step and
+// the cached state's auxiliary view.
+struct QwenTargetCaptureBuffers final {
+  metal::MetalBuffer retainedRows;
+  metal::MetalBuffer laneRows;
+  metal::MetalBuffer auxiliaryIn;
+  metal::MetalBuffer auxiliaryOut;
+};
+
 // The bytes of a target's own step scratch beside the runtime's arenas, a
 // prefill's and a decode's (qwenTargetScratchBytes).
 struct QwenTargetScratchBytes final {
@@ -525,9 +536,17 @@ public:
   // exactly those, as a cached state stores it (its convolution rows and its
   // recurrent state's codes, ops::GDN::addFold), when the lane retained that
   // many. None for a target without GDN layers; a target with auxiliary
-  // state, which its commit writes after every retained row, captures no
-  // state in decode (Model::capturesInDecode).
+  // state captures it in decode only by addAuxiliaryCapture
+  // (Model::capturesInDecode).
   void addStateFold(metal::CommandGraph &graph, QwenTargetFoldBuffers buffers, uint32_t rows) const;
+  // Whether the target writes its auxiliary state after the first rows of a
+  // lane's accepted path (addAuxiliaryCapture), which decode captures need.
+  [[nodiscard]] virtual bool capturesAuxiliary() const noexcept { return false; }
+  // The auxiliary state after the first `rows` rows of one lane's accepted
+  // path of a verify of `step` (QwenTargetCaptureBuffers), when the lane
+  // retained that many; only a target that capturesAuxiliary.
+  virtual void addAuxiliaryCapture(metal::CommandGraph &graph, QwenTargetCaptureBuffers buffers, uint32_t rows,
+                                   const ops::StepRows &step) const;
   // The table rows a lane's rows of the last step read (`rows`, its rows of
   // the step), each row's in order, for tests
   // (RuntimeInstrumentation::lastTableRows); none for a target that reads no

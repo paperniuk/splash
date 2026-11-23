@@ -895,6 +895,69 @@ void testAttentionOnlyTarget(metal::MetalBackend &backend) {
           "an attention-only storage's buffers outlived it");
 }
 
+// DSpark's global layer takes segments of its own, in a table of their
+// addresses, in place of a ring; every other layer, and a layout without a
+// global layer, keep their rings as they were.
+void testSegmentedGlobalRing(metal::MetalBackend &backend) {
+  constexpr uint64_t rowBytes = 8 * 128 * 2;
+  constexpr model::DraftStateLayout dspark{3, 8, 128, 5120, 1024, 11, 1, 64};
+  static_assert(dspark.valid());
+  const uint64_t maximumBuffer = backend.capabilities().maxBufferLengthBytes;
+
+  require(model::draftGlobalSegmentTokens(kDraftState, maximumBuffer) == 0,
+          "a layout without a global layer took segments");
+  require(model::draftGlobalSegmentTokens(dspark, maximumBuffer) == SPLASH_DRAFT_GLOBAL_SEGMENT_TOKENS,
+          "a global layer's segments exceed the ABI's segment rows");
+  require(model::draftGlobalSegmentTokens(dspark, 3 * rowBytes + 100) == 3,
+          "a device with smaller buffers did not take smaller segments");
+  require(model::draftGlobalSegmentTokens(dspark, maximumBuffer, 4) == 4, "a segment row cap is not applied");
+  rejects([&] { (void)model::draftGlobalSegmentTokens(dspark, rowBytes - 1); },
+          "holds no row", "a buffer of no row of the global layer was accepted");
+  model::DraftStateLayout huge = dspark;
+  huge.globalTokens = SPLASH_DRAFT_MAX_GLOBAL_SEGMENTS * 4 + 1;
+  rejects([&] { (void)model::draftGlobalSegmentTokens(huge, maximumBuffer, 4); }, "address table holds",
+          "more segments than an address table holds were accepted");
+
+  auto tracker = std::make_shared<model::StateAllocationTracker>();
+  const model::DFlashDraftRing ring(backend, tracker, dspark, "segmented-ring", 4);
+  require(tracker->bytes.load() >= dspark.ringBytes(), "a segmented ring is accounted below its declared bytes");
+  require(ring.layers().size() == 3, "a segmented ring lost a layer");
+  for (uint32_t layer = 0; layer < 3; ++layer) {
+    const model::DFlashDraftRingLayer &entry = ring.layers()[layer];
+    require(entry.segmented() == (layer == dspark.globalLayer), "only the global layer is segmented");
+    if (layer == dspark.globalLayer) {
+      require(!entry.keys && !entry.values, "a segmented layer also holds a single buffer");
+      continue;
+    }
+    require(entry.keys.sizeBytes() == dspark.tensorBytes() && entry.values.sizeBytes() == dspark.tensorBytes(),
+            "a local layer's ring changed size");
+  }
+  require(ring.feature().sizeBytes() == 64 * dspark.bfloat16Bytes, "a segmented ring lost its feature row");
+  const ops::DraftSegmentedContext &global = ring.layers()[dspark.globalLayer].segments;
+  require(global.segmentTokens == 4 && global.rows == 11 && global.segments() == 3 && global.table->size() == 6,
+          "the global layer is not 11 rows in segments of 4");
+  // Segments of 4, 4 and 3 rows of keys, then of values.
+  for (uint32_t plane = 0; plane < 2; ++plane)
+    for (uint32_t segment = 0; segment < 3; ++segment)
+      require((*global.table)[plane * 3 + segment].sizeBytes() == (segment < 2 ? 4 : 3) * rowBytes,
+              "a global segment holds the wrong rows");
+  global.validate();
+
+  // One segment where the layer fits one, as before segmentation.
+  const model::DFlashDraftRing whole(backend, tracker, dspark, "whole-ring");
+  const ops::DraftSegmentedContext &single = whole.layers()[dspark.globalLayer].segments;
+  require(single.segments() == 1 && single.rows == 11 &&
+              (*single.table)[0].sizeBytes() == 11 * rowBytes,
+          "a small global layer is not one segment");
+
+  // DFlash's rings, and a layout of no global layer, are the buffers they were.
+  const model::DFlashDraftRing dflash(backend, tracker, kDraftState, "dflash-ring");
+  for (const model::DFlashDraftRingLayer &entry : dflash.layers())
+    require(!entry.segmented() && entry.keys.sizeBytes() == kDraftState.tensorBytes() &&
+                entry.values.sizeBytes() == kDraftState.tensorBytes(),
+            "a ring without a global layer changed");
+}
+
 // A lane's start allocates startBytes, the lane's buffers the pool lacks,
 // and the states its claims then evict leave idleBytes after the start to
 // release: they refill the lane's buffers the start took from the pool
@@ -1094,6 +1157,7 @@ void run(const std::string &metallib) {
   testPersistKeepsTheRamCopy(backend);
   testReservations(backend);
   testAttentionOnlyTarget(backend);
+  testSegmentedGlobalRing(backend);
   testKeptLaneBesideALaneInService(backend);
   testAccountingAcrossCapturesAndRestores(backend);
   testStartBytes(backend);

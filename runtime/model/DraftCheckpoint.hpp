@@ -45,6 +45,32 @@ private:
   std::shared_ptr<Planned> planned_;
 };
 
+class DSparkCheckpointLoader final {
+public:
+  DSparkCheckpointLoader(metal::MetalBackend &backend, WeightImages &images,
+                         const std::filesystem::path &directory);
+  DSparkCheckpointLoader(const DSparkCheckpointLoader &) = delete;
+  DSparkCheckpointLoader &operator=(const DSparkCheckpointLoader &) = delete;
+
+  [[nodiscard]] WeightFile layer(uint32_t index);
+  [[nodiscard]] WeightFile model();
+
+private:
+  struct Planned {
+    explicit Planned(const std::filesystem::path &directory) : checkpoint(directory) {}
+    SafetensorsCheckpoint checkpoint;
+    std::vector<gguf::Image> images;
+  };
+  [[nodiscard]] WeightFile open(size_t index);
+
+  metal::MetalBackend &backend_;
+  WeightImages &images_;
+  std::shared_ptr<Planned> planned_;
+};
+
+[[nodiscard]] std::vector<gguf::Image> planDSparkImages(const SafetensorsCheckpoint &checkpoint);
+[[nodiscard]] uint64_t dsparkImageBytes(const std::filesystem::path &directory);
+
 // The BF16 [hidden] embedding of the mask token a draft's checkpoint may ship,
 // in a file of its own beside its weights (mask_embedding.safetensors): its
 // draft rows' input in place of the target's token table row, which a

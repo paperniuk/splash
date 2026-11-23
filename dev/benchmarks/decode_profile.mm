@@ -384,7 +384,7 @@ int main(int argc, char **argv) {
         std::cerr << "usage: decode-profile METALLIB MODEL_ROOT "
                      "[--prompt-tokens N] [--cycles K] [--kv-format int8|bf16] "
                      "[--state-format fp32|bf16] [--expert-memory SIZE] [--ple-memory SIZE] "
-                     "[--dispatch-list FILE] [--verify-rows auto|all] [--step-rows T] [--attribute on|off] [--widths N] "
+                     "[--dispatch-list FILE] [--verify-rows auto|all] [--step-rows T] [--attribute on|off] [--widths N] [--max-context TOKENS] "
                      "[--warmups on|off] [--prompt chat|counting|FILE[,FILE...]] [--step-log on|off] "
                      "[--block-plans on|off] "
                      "[--temperature T [--seed S]] [--thinking-budget TOKENS] [--answer-tokens N]\n"
@@ -396,6 +396,7 @@ int main(int argc, char **argv) {
       uint32_t cycles = 4;
       // The widest width profiled, B1 through it.
       uint32_t widths = 4;
+      uint32_t maxContext = 0;
       kv::Format format = kv::Format::Int8;
       ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
       std::vector<ops::ImageGrid> grids;
@@ -426,6 +427,10 @@ int main(int argc, char **argv) {
           textOptions = true;
         } else if (option == "--cycles")
           cycles = parseCount(argv[index + 1], "--cycles");
+        else if (option == "--max-context") {
+          maxContext = parseCount(argv[index + 1], "--max-context");
+          textOptions = true;
+        }
         else if (option == "--widths") {
           widths = parseCount(argv[index + 1], "--widths");
           if (widths > 4)
@@ -515,8 +520,13 @@ int main(int argc, char **argv) {
       }
       // Streamed weights read on a pool of SSD readers, as the engine's do.
       loadOptions.readers = std::make_shared<model::SsdReaders>(model::kSsdReaders);
-      model::LoadedModel model =
-          model::loadModel(backend, root, model::inspectModelRoot(root), loadOptions);
+      model::ModelDescriptor descriptor = model::inspectModelRoot(root);
+      if (auto *dspark = std::get_if<model::DSparkDraftLayout>(&descriptor.draft)) {
+        const uint32_t context = maxContext ? maxContext : promptTokens + std::max(answer.tokens, kAnswerTokens);
+        dspark->contextCapacity = model::draftContextCapacity(context);
+        descriptor.stateLayout.draft = dspark->stateLayout();
+      }
+      model::LoadedModel model = model::loadModel(backend, root, descriptor, loadOptions);
       ops::ExecutionPlans operators(backend.capabilities(), ops::Int8Activations::On);
 
       // Enough Page32 pages for each width's lanes of prompt plus generated rows.

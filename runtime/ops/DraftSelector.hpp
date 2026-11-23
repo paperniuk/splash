@@ -63,6 +63,27 @@ struct DraftSelectorBuffers final {
   metal::MetalBuffer verifySources;
 };
 
+// DSpark's proposal chain (DraftSelector::addDSpark*): the Markov state and,
+// per position, the corrected argmax of the target head's base logits
+// (`baseLogits`, fp32 [proposals][vocabulary]) over the legal tokens, whose
+// Markov correction is the head folded with the hidden output at load: `foldWeight`
+// bf16 [vocabulary][SPLASH_DSPARK_RANK] and `foldBias` fp32 [vocabulary]
+// (model::foldDSparkCorrection). `partialValues` (two fp32 a group of
+// SPLASH_DSPARK_GROUP_ROWS tokens) and `partialIds` are the scan's workspace,
+// of DSparkPartialBytes.
+struct DSparkMarkovBuffers final {
+  metal::MetalBuffer hidden, feature, recurrentWeights, recurrentBias, embedding;
+  metal::MetalBuffer context, state, raw, latent;
+  metal::MetalBuffer baseLogits, tokens, probabilities;
+  metal::MetalBuffer foldWeight, foldBias, partialValues, partialIds;
+};
+
+// The bytes of DSparkMarkovBuffers::partialValues and partialIds.
+struct DSparkPartialBytes final {
+  uint64_t values = uint64_t{SPLASH_DSPARK_MAX_GROUPS} * 2 * sizeof(float);
+  uint64_t ids = uint64_t{SPLASH_DSPARK_MAX_GROUPS} * sizeof(uint32_t);
+};
+
 // The estimate of a draft step of probability q at proposal position p:
 // logit(estimate) = slope * logit(q) + intercepts[p] (DraftTreeParams).
 struct DraftCalibration final {
@@ -147,6 +168,25 @@ public:
   // numbered in preorder, and the step's rows past them of no lane.
   static void addVerifyRows(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers, const StepRows &step,
                             float floor = 0.0F);
+  // The recurrent context of `rows` proposal rows (1 to 7).
+  static void addDSparkContext(metal::CommandGraph &graph, const DSparkMarkovBuffers &buffers, uint32_t rows);
+  static void addDSparkStep(metal::CommandGraph &graph, const DSparkMarkovBuffers &buffers,
+                            uint32_t position, uint32_t anchor);
+  // Position `position`'s proposal after its step: the largest corrected
+  // logit over the first `legal` tokens of `vocabulary` columns (greedy, the
+  // lowest token on a tie) into buffers.tokens, and its probability.
+  static void addDSparkSelect(metal::CommandGraph &graph, const DSparkMarkovBuffers &buffers, uint32_t position,
+                              uint32_t vocabulary, uint32_t legal);
+  // The fold of the hidden output through the head (model::foldDSparkCorrection):
+  // its SPLASH_DSPARK_RANK + 1 input rows of `hiddenOut`'s (bf16 [2304][rank])
+  // columns and `hiddenOutBias`, and the store of the head's products of
+  // `rows` inputs from `start`.
+  static void addDSparkFoldInputs(metal::CommandGraph &graph, metal::MetalBuffer hiddenOut,
+                                  metal::MetalBuffer hiddenOutBias, metal::MetalBuffer inputs);
+  static void addDSparkFoldStore(metal::CommandGraph &graph, metal::MetalBuffer product, metal::MetalBuffer weight,
+                                 metal::MetalBuffer bias, uint32_t start, uint32_t rows, uint32_t vocabulary);
+  static void addDSparkChain(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers,
+                             metal::MetalBuffer probabilities, std::span<const DraftTreeLane> lanes);
 
 private:
   uint32_t vocabulary_ = 0;

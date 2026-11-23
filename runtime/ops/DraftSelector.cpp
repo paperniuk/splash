@@ -139,4 +139,104 @@ void DraftSelector::addVerifyRows(metal::CommandGraph &graph, const DraftSelecto
             params, {1, 1, 1}, {1, 1, 1});
 }
 
+void DraftSelector::addDSparkContext(metal::CommandGraph &graph, const DSparkMarkovBuffers &b, uint32_t rows) {
+  if (!rows || rows > 7) throw std::invalid_argument("invalid DSpark recurrent context rows");
+  requireBytes(b.hidden, 8 * 2304 * 2, "DSpark Markov hidden");
+  requireBytes(b.feature, 2304 * 2, "DSpark Markov feature");
+  requireBytes(b.recurrentWeights, uint64_t{768} * 5120 * 2, "DSpark recurrent weights");
+  requireBytes(b.recurrentBias, 768 * 2, "DSpark recurrent bias");
+  requireBytes(b.context, 7 * 768 * 4, "DSpark recurrent context");
+  requireBytes(b.state, 256 * 2, "DSpark recurrent state");
+  graph.add("dspark_markov_init", {b.state}, {1, 1, 1});
+  graph.add("dspark_markov_context", {b.hidden, b.feature, b.recurrentWeights, b.recurrentBias, b.context},
+            {uint64_t{rows} * 768, 1, 1});
+}
+
+void DraftSelector::addDSparkStep(metal::CommandGraph &graph, const DSparkMarkovBuffers &b,
+                                  uint32_t position, uint32_t anchor) {
+  if (position >= 7 || anchor >= 201024) throw std::invalid_argument("invalid DSpark Markov step");
+  requireBytes(b.embedding, uint64_t{201024} * 256 * 2, "DSpark Markov embedding");
+  requireBytes(b.recurrentWeights, uint64_t{768} * 5120 * 2, "DSpark recurrent weights");
+  requireBytes(b.context, 7 * 768 * 4, "DSpark recurrent context");
+  requireBytes(b.state, 256 * 2, "DSpark recurrent state");
+  requireBytes(b.raw, 768 * 2, "DSpark recurrent raw");
+  requireBytes(b.latent, 256 * 2, "DSpark Markov latent");
+  requireBytes(b.tokens, 7 * 4, "DSpark tokens");
+  graph.add("dspark_markov_linear", {b.state, b.embedding, b.recurrentWeights, b.context, b.tokens, b.raw},
+            DSparkMarkovParams{position, anchor}, {768, 1, 1});
+  graph.add("dspark_markov_update", {b.raw, b.state, b.latent}, {1, 1, 1});
+}
+
+void DraftSelector::addDSparkSelect(metal::CommandGraph &graph, const DSparkMarkovBuffers &b, uint32_t position,
+                                    uint32_t vocabulary, uint32_t legal) {
+  if (position >= 7 || !legal || legal > vocabulary ||
+      (legal + SPLASH_DSPARK_GROUP_ROWS - 1) / SPLASH_DSPARK_GROUP_ROWS > SPLASH_DSPARK_MAX_GROUPS)
+    throw std::invalid_argument("invalid DSpark proposal position");
+  const DSparkPartialBytes partial;
+  requireBytes(b.foldWeight, uint64_t{legal} * SPLASH_DSPARK_RANK * 2, "DSpark fold weight");
+  requireBytes(b.foldBias, uint64_t{legal} * sizeof(float), "DSpark fold bias");
+  requireBytes(b.latent, uint64_t{SPLASH_DSPARK_RANK} * 2, "DSpark Markov latent");
+  requireBytes(b.baseLogits, (uint64_t{position} * vocabulary + legal) * sizeof(float), "DSpark base logits");
+  requireBytes(b.partialValues, partial.values, "DSpark partial value");
+  requireBytes(b.partialIds, partial.ids, "DSpark partial id");
+  requireBytes(b.tokens, 7 * 4, "DSpark tokens");
+  requireBytes(b.probabilities, 7 * 4, "DSpark probabilities");
+  const DSparkFoldScanParams params{position, legal, vocabulary};
+  graph.add("dspark_fold_scan",
+            {b.foldWeight, b.foldBias, b.latent, b.baseLogits, b.partialValues, b.partialIds}, params,
+            {(legal + SPLASH_DSPARK_GROUP_ROWS - 1) / SPLASH_DSPARK_GROUP_ROWS, 1, 1},
+            {SPLASH_DSPARK_GROUP_THREADS, 1, 1});
+  graph.add("dspark_fold_reduce", {b.partialValues, b.partialIds, b.tokens, b.probabilities}, params, {1, 1, 1},
+            {SPLASH_DSPARK_GROUP_THREADS, 1, 1});
+}
+
+void DraftSelector::addDSparkFoldInputs(metal::CommandGraph &graph, metal::MetalBuffer hiddenOut,
+                                        metal::MetalBuffer hiddenOutBias, metal::MetalBuffer inputs) {
+  constexpr uint64_t rows = SPLASH_DSPARK_RANK + 1, hidden = 2304;
+  requireBytes(hiddenOut, hidden * SPLASH_DSPARK_RANK * 2, "DSpark hidden output");
+  requireBytes(hiddenOutBias, hidden * 2, "DSpark hidden output bias");
+  requireBytes(inputs, rows * hidden * 2, "DSpark fold inputs");
+  graph.add("dspark_fold_inputs", {std::move(hiddenOut), std::move(hiddenOutBias), std::move(inputs)},
+            {rows * hidden / 256, 1, 1});
+}
+
+void DraftSelector::addDSparkFoldStore(metal::CommandGraph &graph, metal::MetalBuffer product,
+                                       metal::MetalBuffer weight, metal::MetalBuffer bias, uint32_t start,
+                                       uint32_t rows, uint32_t vocabulary) {
+  if (!rows || !vocabulary || uint64_t{start} + rows > SPLASH_DSPARK_RANK + 1)
+    throw std::invalid_argument("invalid DSpark fold rows");
+  requireBytes(product, uint64_t{rows} * vocabulary * sizeof(float), "DSpark fold product");
+  requireBytes(weight, uint64_t{vocabulary} * SPLASH_DSPARK_RANK * 2, "DSpark fold weight");
+  requireBytes(bias, uint64_t{vocabulary} * sizeof(float), "DSpark fold bias");
+  graph.add("dspark_fold_store", {std::move(product), std::move(weight), std::move(bias)},
+            DSparkFoldParams{start, rows, vocabulary}, {(vocabulary + 255) / 256, 1, 1});
+}
+
+void DraftSelector::addDSparkChain(metal::CommandGraph &graph, const DraftSelectorBuffers &b,
+                                    metal::MetalBuffer probabilities, std::span<const DraftTreeLane> lanes) {
+  if (lanes.empty() || lanes.size() > SPLASH_MAXIMUM_BATCH_WIDTH)
+    throw std::invalid_argument("invalid DSpark chain batch");
+  DSparkChainParams params{};
+  for (uint32_t i = 0; i < lanes.size(); ++i) {
+    if (lanes[i].depth > 7) throw std::invalid_argument("DSpark proposes at most seven tokens");
+    params.anchor[i] = lanes[i].anchor;
+    params.length[i] = lanes[i].depth;
+    params.forced[i] = lanes[i].children == 0;
+    params.slope[i] = lanes[i].calibration.slope;
+    std::ranges::copy(lanes[i].calibration.intercepts, params.intercept[i]);
+  }
+  const uint64_t count = lanes.size(), treeRows = count * SPLASH_TARGET_VERIFY_ROWS;
+  requireBytes(probabilities, count * SPLASH_DRAFT_PROPOSAL_TOKENS * sizeof(float), "DSpark probabilities");
+  requireBytes(b.chainTokens, count * SPLASH_TREE_CHAIN_TOKENS * 4, "DSpark chain tokens");
+  requireBytes(b.treeTokens, treeRows * 4, "DSpark tree tokens");
+  requireBytes(b.trees, treeRows * sizeof(TreeRow), "DSpark tree rows");
+  requireBytes(b.treeScores, treeRows * 2 * sizeof(float), "DSpark tree scores");
+  requireBytes(b.treeSizes, count * 4, "DSpark tree sizes");
+  requireBytes(b.treeDraws, treeRows * SPLASH_TREE_CHILDREN, "DSpark tree draws");
+  requireBytes(b.treeNext, treeRows * SPLASH_DRAFT_CANDIDATES * sizeof(float), "DSpark tree next");
+  requireBytes(b.treeCaps, treeRows * sizeof(float), "DSpark tree caps");
+  graph.add("dspark_chain_tree", {b.chainTokens, b.treeTokens, b.trees, b.treeScores, b.treeSizes,
+                                  b.treeDraws, b.treeNext, b.treeCaps, probabilities}, params, {count, 1, 1});
+}
+
 } // namespace splash::ops

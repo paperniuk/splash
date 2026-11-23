@@ -51,6 +51,17 @@ public:
   // accepts them at (over tenths of the chance), where a fit of those rows
   // pooled over both targets gives 0.016 and 0.008.
   static constexpr Acceptance kPrior{0.7F, {0.0F, -0.35F, -0.8F, -0.75F, -0.75F, -0.85F, -0.45F}};
+  // DSpark's, whose folded head's probabilities its chain multiplies along a path (DSparkDraft): the fit of its
+  // rows on Inkling 2 Mini, every cycle verifying its block, greedy then sampled (6484 and 6267 labels of ten
+  // prompts apart from any evaluation's; log-loss 0.348 and 0.349 against kPrior's 0.362 and 0.378). Its
+  // probabilities run high: a proposal at q = 0.9 is accepted at 0.68 at its first position, not kPrior's 0.82.
+  static constexpr std::array<Acceptance, 2> kDSparkPriors{{
+      {0.555F, {-0.463F, -0.554F, -0.664F, -0.612F, -0.359F, -0.882F, -0.494F}},
+      {0.513F, {-0.643F, -0.615F, -0.704F, -0.608F, -0.314F, -1.050F, -0.101F}},
+  }};
+
+  // A budget fit toward `priors`, the greedy lanes' then the sampled ones'.
+  explicit VerifyBudget(std::array<Acceptance, 2> priors = {kPrior, kPrior}) : priors_(priors), acceptance_(priors) {}
 
   // A label: a draft row at proposal position `position` (its depth less
   // one), whose draft probability had logit `feature`, under a parent its
@@ -96,7 +107,8 @@ public:
   [[nodiscard]] std::vector<Label> labels(bool samples) const;
   // The maximum a posteriori model of `labels` under the prior, by damped
   // Newton steps from `start`.
-  [[nodiscard]] static Acceptance fit(std::span<const Label> labels, const Acceptance &start);
+  [[nodiscard]] static Acceptance fit(std::span<const Label> labels, const Acceptance &start,
+                                      const Acceptance &prior = kPrior);
   // A lane's chances for a cycle's choice of rows (StepCosts): the estimates
   // that the target accepts each row its tree would add past its anchor,
   // best first, no more of them than its tree's `depth` (its output left
@@ -115,7 +127,8 @@ public:
 
 private:
   // The greedy lanes', then the sampled ones'.
-  std::array<Acceptance, 2> acceptance_{kPrior, kPrior};
+  std::array<Acceptance, 2> priors_;
+  std::array<Acceptance, 2> acceptance_;
   std::array<std::vector<Label>, 2> labels_;
   std::array<size_t, 2> next_{};
   uint64_t cycles_ = 0;

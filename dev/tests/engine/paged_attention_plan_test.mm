@@ -2163,6 +2163,213 @@ void checkPathCommit(metal::MetalBackend &backend, kv::Layout layout) {
   std::cout << what << ": PASS\n";
 }
 
+// `rowCount` of 0 is a prompt of 67 rows, or a tree of 4 forking rows; a tree
+// holds up to 32 rows, which fork, or chain when `chain` as a lane's verify
+// rows do. The attention reads the history in `splits` parts.
+void checkInkling(metal::MetalBackend &backend, kv::Format format, bool sliding, bool treeMode,
+                  uint32_t history, uint32_t rowCount = 0, uint32_t splits = 7, bool chain = false) {
+  constexpr uint32_t heads = 24, kvHeads = 8, dim = 128, relDim = 16;
+  const uint32_t rows = rowCount ? rowCount : treeMode ? 4 : 67;
+  require(!chain || treeMode, "Inkling chain rows are a tree's");
+  require(!treeMode || rows <= 32, "Inkling tree holds at most 32 rows");
+  require(splits >= 1 && splits <= 64, "Inkling attention splits");
+  const kv::Layout layout{.attentionLayers = 1, .kvHeads = kvHeads, .headDimension = dim, .format = format,
+                          .windowTokens = 1023, .windowedLayers = 1};
+  const auto seq = sequenceOf(history, rows);
+  const auto geometry = HostKvExtents::spread(seq.page_table_entries);
+  HostKvExtents pool(backend, layout, geometry.extentPages, geometry.extents);
+  const auto pages = HostKvExtents::mixedPages(geometry, seq.page_table_entries, 17);
+  auto table = test::sharedBuffer(backend, pages.size() * sizeof(SplashKvPage));
+  pool.writeTable(pages, table);
+  for (uint32_t token = 0; token < history; ++token)
+    for (uint32_t head = 0; head < kvHeads; ++head) {
+      const uint32_t page = pages[token / 32], place = token % 32;
+      const uint64_t scale = splash_kv_scale_element(head, place);
+      if (format == kv::Format::Int8) {
+        pool.slab<float>(0, SPLASH_KV_KEY_SCALES, page)[scale] = 0.01f;
+        pool.slab<float>(0, SPLASH_KV_VALUE_SCALES, page)[scale] = 0.012f;
+      }
+      for (uint32_t d = 0; d < dim; ++d) {
+        const int key = int((token * 7 + head * 11 + d * 3) % 101) - 50;
+        const int value = int((token * 13 + head * 5 + d * 7) % 99) - 49;
+        const uint64_t ki = splash_kv_key_element(head, place, d, dim);
+        const uint64_t vi = pool.valueElement(head, place, d);
+        if (format == kv::Format::Int8) {
+          pool.slab<int8_t>(0, SPLASH_KV_KEYS, page)[ki] = int8_t(key);
+          pool.slab<int8_t>(0, SPLASH_KV_VALUES, page)[vi] = int8_t(value);
+        } else {
+          pool.slab<uint16_t>(0, SPLASH_KV_KEYS, page)[ki] = floatToBf16(float(key) * 0.01f);
+          pool.slab<uint16_t>(0, SPLASH_KV_VALUES, page)[vi] = floatToBf16(float(value) * 0.012f);
+        }
+      }
+    }
+  const auto buffer = [&](uint64_t elements) { return test::sharedBuffer(backend, elements * 2); };
+  auto q = buffer(rows * heads * dim), r = buffer(rows * heads * relDim);
+  auto k = buffer(rows * kvHeads * dim), v = buffer(rows * kvHeads * dim);
+  auto qs = buffer(heads * dim), rs = buffer(heads * relDim);
+  auto stagedQ = buffer(rows * heads * dim), stagedR = buffer(rows * heads * relDim);
+  auto rel = buffer(relDim * 1024), sinks = buffer(rows * heads), gate = buffer(rows * heads * dim);
+  auto output = buffer(rows * heads * dim);
+  auto fill = [](metal::MetalBuffer &b, float scale, uint32_t seed) {
+    auto *p = static_cast<uint16_t *>(b.contents());
+    for (uint64_t i = 0; i < b.sizeBytes() / 2; ++i)
+      p[i] = floatToBf16(float(int((i * 29 + seed) % 101) - 50) * scale);
+  };
+  fill(q, 0.08f, 3); fill(r, 0.07f, 9); fill(k, 0.06f, 15); fill(v, 0.03f, 21);
+  fill(rel, 0.002f, 13); fill(sinks, 0.08f, 7); fill(gate, 0.05f, 11);
+  auto *qScale = static_cast<uint16_t *>(qs.contents());
+  auto *rScale = static_cast<uint16_t *>(rs.contents());
+  for (uint32_t i = 0; i < heads * dim; ++i) qScale[i] = floatToBf16(0.5f + float(i % 11) * 0.1f);
+  for (uint32_t i = 0; i < heads * relDim; ++i) rScale[i] = floatToBf16(0.7f + float(i % 7) * 0.1f);
+  auto rowLayout = test::sharedBuffer(backend, sizeof(SplashLaneRows));
+  *static_cast<SplashLaneRows *>(rowLayout.contents()) = {0, rows};
+  auto tree = test::sharedBuffer(backend, rows * sizeof(SplashTreeRow));
+  // The forking tree's row r follows row r - 1, unless it is the second or
+  // third, which follow the anchor's row, or a fourth's, which forks from
+  // row r / 4.
+  std::vector<SplashTreeRow> treeRows;
+  for (uint32_t row = 0; treeMode && row < rows; ++row) {
+    if (chain) {
+      treeRows.push_back(test::chainRow(row));
+      continue;
+    }
+    const uint32_t parent = row < 3 ? 0 : row % 4 == 0 ? row / 4 : row - 1;
+    treeRows.push_back(row ? SplashTreeRow{treeRows[parent].ancestors | (1U << row), static_cast<uint16_t>(parent),
+                                           static_cast<uint16_t>(treeRows[parent].depth + 1)}
+                           : SplashTreeRow{1, SPLASH_TREE_ROOT, 0});
+  }
+  if (treeMode) std::memcpy(tree.contents(), treeRows.data(), treeRows.size() * sizeof(SplashTreeRow));
+  const ops::AttentionRows rowSpec{rowLayout, rows, treeMode ? tree : metal::MetalBuffer{}};
+  auto workspace = test::sharedBuffer(backend, ops::PagedAttention::inklingWorkspaceBytes(rows, splits));
+  const std::array tables{table};
+  const std::array sequences{seq};
+  const std::array histories{ops::AttentionHistory{pool.layer(0), table, {}}};
+  metal::CommandGraph graph;
+  // The packed q|r|gate rows the target's fused projection writes (INKLING_PACKED_WIDTH).
+  auto packed = buffer(uint64_t{rows} * INKLING_PACKED_WIDTH);
+  for (uint32_t row = 0; row < rows; ++row) {
+    auto *destination = static_cast<uint16_t *>(packed.contents()) + uint64_t{row} * INKLING_PACKED_WIDTH;
+    std::memcpy(destination, static_cast<const uint16_t *>(q.contents()) + uint64_t{row} * heads * dim,
+                heads * dim * 2);
+    std::memcpy(destination + INKLING_RELATIVE_OFFSET,
+                static_cast<const uint16_t *>(r.contents()) + uint64_t{row} * heads * relDim, heads * relDim * 2);
+    std::memcpy(destination + INKLING_GATE_OFFSET,
+                static_cast<const uint16_t *>(gate.contents()) + uint64_t{row} * heads * dim, heads * dim * 2);
+  }
+  ops::PagedAttention::addInklingPreparation(graph, packed, k, v, qs, rs, stagedQ, stagedR, pool.layer(0),
+                                             tables, sequences, rowSpec, layout, !sliding);
+  ops::PagedAttention::addInklingAttention(graph, stagedQ, stagedR, rel, sinks, packed, output, workspace, splits,
+                                           sequences, histories, rowSpec, layout, sliding);
+  (void)backend.submitCommandAsync(graph.dispatches()).wait();
+  const auto fp = [](const metal::MetalBuffer &b, uint64_t index) {
+    return bf16ToFloat(static_cast<const uint16_t *>(b.contents())[index]);
+  };
+  for (uint32_t row = 0; row < rows; ++row)
+    for (uint32_t head : {0U, 3U, 7U}) {
+      float kn = 0.0f, vn = 0.0f;
+      for (uint32_t d = 0; d < dim; ++d) {
+        const uint64_t index = (row * kvHeads + head) * dim + d;
+        kn += fp(k, index) * fp(k, index);
+        vn += fp(v, index) * fp(v, index);
+      }
+      const uint32_t slot = history + row, page = pages[slot / 32], place = slot % 32;
+      const uint64_t si = splash_kv_scale_element(head, place);
+      const float ks = format == kv::Format::Int8 ? pool.slab<float>(0, SPLASH_KV_KEY_SCALES, page)[si] : 1.0f;
+      const float vs = format == kv::Format::Int8 ? pool.slab<float>(0, SPLASH_KV_VALUE_SCALES, page)[si] : 1.0f;
+      for (uint32_t d = 0; d < dim; ++d) {
+        const uint64_t index = (row * kvHeads + head) * dim + d;
+        const uint64_t ki = splash_kv_key_element(head, place, d, dim), vi = pool.valueElement(head, place, d);
+        const float key = format == kv::Format::Int8 ? pool.slab<int8_t>(0, SPLASH_KV_KEYS, page)[ki] * ks
+                                                     : bf16ToFloat(pool.slab<uint16_t>(0, SPLASH_KV_KEYS, page)[ki]);
+        const float value = format == kv::Format::Int8 ? pool.slab<int8_t>(0, SPLASH_KV_VALUES, page)[vi] * vs
+                                                       : bf16ToFloat(pool.slab<uint16_t>(0, SPLASH_KV_VALUES, page)[vi]);
+        const float expectedK = bf16ToFloat(floatToBf16(fp(k, index) *
+            std::min(22.627416997969522f / (std::sqrt(kn) + 1e-6f), 1.0f)));
+        const float expectedV = bf16ToFloat(floatToBf16(fp(v, index) / std::sqrt(vn / 128.0f + 1e-6f)));
+        require(std::abs(key - expectedK) <= 0.025f, "Inkling key preparation");
+        require(std::abs(value - expectedV) <= 0.025f, "Inkling value preparation");
+      }
+    }
+  for (uint32_t row = 0; row < rows; ++row)
+    for (uint32_t head : {0U, 5U, 23U}) {
+      const uint32_t position = history + (treeMode ? treeRows[row].depth : row);
+      const float tau = sliding ? 1.0f : 1.0f + 0.1f * std::log(std::max(float(position + 1) / 8192.0f, 1.0f));
+      float norm = 0, relNorm = 0;
+      for (uint32_t d = 0; d < dim; ++d) {
+        const float x = fp(q, (row * heads + head) * dim + d) * fp(qs, head * dim + d);
+        norm += x * x;
+      }
+      for (uint32_t d = 0; d < relDim; ++d) {
+        const float x = fp(r, (row * heads + head) * relDim + d) * fp(rs, head * relDim + d);
+        relNorm += x * x;
+      }
+      for (uint32_t d = 0; d < dim; ++d) {
+        const uint64_t index = (row * heads + head) * dim + d;
+        const float x = fp(q, index) * fp(qs, head * dim + d);
+        const float expected = bf16ToFloat(floatToBf16(bf16ToFloat(floatToBf16(
+            x * std::min(22.627416997969522f / (std::sqrt(norm) + 1e-6f), 1.0f))) * tau));
+        require(std::abs(fp(stagedQ, index) - expected) <= 0.02f, "Inkling query preparation");
+      }
+      for (uint32_t d = 0; d < relDim; ++d) {
+        const uint64_t index = (row * heads + head) * relDim + d;
+        const float x = fp(r, index) * fp(rs, head * relDim + d);
+        const float expected = bf16ToFloat(floatToBf16(bf16ToFloat(floatToBf16(
+            x * std::min(8.0f / (std::sqrt(relNorm) + 1e-6f), 1.0f))) * tau));
+        require(std::abs(fp(stagedR, index) - expected) <= 0.02f, "Inkling relative preparation");
+      }
+      const uint32_t kh = head / 3;
+      double maximum = fp(sinks, row * heads + head), sum = 1.0;
+      std::array<double, 3> numerator{};
+      constexpr std::array<uint32_t, 3> dimensions{0, 31, 127};
+      for (uint32_t slot = 0; slot <= history + row; ++slot) {
+        uint32_t keyPos = slot;
+        if (treeMode && slot >= history) {
+          const uint32_t t = slot - history;
+          if (!(treeRows[row].ancestors & (1U << t))) continue;
+          keyPos = history + treeRows[t].depth;
+        }
+        if (keyPos > position || (sliding && position - keyPos >= 1024)) continue;
+        const uint32_t page = pages[slot / 32], place = slot % 32;
+        const uint64_t scale = splash_kv_scale_element(kh, place);
+        const double ks = format == kv::Format::Int8 ? pool.slab<float>(0, SPLASH_KV_KEY_SCALES, page)[scale] : 1.0;
+        const double vs = format == kv::Format::Int8 ? pool.slab<float>(0, SPLASH_KV_VALUE_SCALES, page)[scale] : 1.0;
+        double dot = 0;
+        for (uint32_t d = 0; d < dim; ++d) {
+          const uint64_t ki = splash_kv_key_element(kh, place, d, dim);
+          const double key = format == kv::Format::Int8 ? pool.slab<int8_t>(0, SPLASH_KV_KEYS, page)[ki] * ks
+                                                        : bf16ToFloat(pool.slab<uint16_t>(0, SPLASH_KV_KEYS, page)[ki]);
+          dot += fp(stagedQ, (row * heads + head) * dim + d) * key;
+        }
+        const uint32_t distance = position - keyPos;
+        float bias = 0;
+        if (distance < 1024) {
+          for (uint32_t d = 0; d < relDim; ++d)
+            bias += fp(stagedR, (row * heads + head) * relDim + d) * fp(rel, d * 1024 + distance);
+          bias = bf16ToFloat(floatToBf16(bias));
+        }
+        const double score = dot / std::sqrt(128.0) + bias;
+        const double next = std::max(maximum, score), oldWeight = std::exp(maximum - next), weight = std::exp(score - next);
+        sum = sum * oldWeight + weight;
+        for (size_t i = 0; i < dimensions.size(); ++i) {
+          const uint64_t vi = pool.valueElement(kh, place, dimensions[i]);
+          const double val = format == kv::Format::Int8 ? pool.slab<int8_t>(0, SPLASH_KV_VALUES, page)[vi] * vs
+                                                         : bf16ToFloat(pool.slab<uint16_t>(0, SPLASH_KV_VALUES, page)[vi]);
+          numerator[i] = numerator[i] * oldWeight + weight * val;
+        }
+        maximum = next;
+      }
+      for (size_t i = 0; i < dimensions.size(); ++i) {
+        const uint64_t index = (row * heads + head) * dim + dimensions[i];
+        const float attention = bf16ToFloat(floatToBf16(float(numerator[i] / sum)));
+        const float expected = attention / (1.0f + std::exp(-fp(gate, index)));
+        require(std::abs(fp(output, index) - expected) < 0.01f, "Inkling attention reference");
+      }
+    }
+  std::cout << "Inkling attention " << kv::formatName(format) << (sliding ? " sliding" : " full")
+            << (treeMode ? (chain ? " chain" : " tree") : " prompt") << " history=" << history << " rows=" << rows
+            << " splits=" << splits << ": PASS\n";
+}
+
 int main(int argc, char **argv) {
   try {
     require(argc >= 1 && argc <= 3, "usage: paged-attention-plan [METALLIB [--long]]");
@@ -2178,12 +2385,40 @@ int main(int argc, char **argv) {
     }
     metal::MetalBackend backend(argv[1]);
     if (backend.capabilities().appleGpuFamily < 9) gTile = ops::AttentionTile::Register;
+    for (auto format : {kv::Format::Int8, kv::Format::BFloat16}) {
+      for (bool sliding : {false, true})
+        for (bool treeMode : {false, true})
+          checkInkling(backend, format, sliding, treeMode, treeMode ? 16385 : 1054);
+      checkInkling(backend, format, false, true, 0);
+      // A lane's verify rows, chained or forking, over histories that cross
+      // the window's edge and a block's, and over more splits than slots.
+      for (bool sliding : {false, true}) {
+        checkInkling(backend, format, sliding, true, 1023, 32, 5, true);
+        checkInkling(backend, format, sliding, true, 1100, 1, 16, true);
+        checkInkling(backend, format, sliding, true, 1100, 16, 7, true);
+        checkInkling(backend, format, sliding, true, 4099, 32, 7);
+        checkInkling(backend, format, sliding, true, 16385, 16, 7, true);
+        checkInkling(backend, format, sliding, true, 40, 8, 64, true);
+        checkInkling(backend, format, sliding, true, 0, 32, 64);
+      }
+      // A full-attention history of 65569 tokens over several splits, in verify
+      // rows chained and forking and in rows with no tree, and a window of it
+      // over many.
+      for (uint32_t splits : {3U, 16U, 64U})
+        checkInkling(backend, format, false, true, 65569, 16, splits, true);
+      checkInkling(backend, format, false, true, 65569, 16, 16);
+      checkInkling(backend, format, false, false, 65569, 8, 16);
+      checkInkling(backend, format, true, true, 65569, 16, 64, true);
+    }
+    if (argc == 3 && std::string_view(argv[2]) == "--inkling")
+      return 0;
     checkBf16StoreEdges(backend);
     for (auto format : {kv::Format::Int8, kv::Format::BFloat16})
       for (const kv::Layout layout :
            {kv::Layout{.attentionLayers = 1, .kvHeads = 4, .headDimension = 256},
             kv::Layout{.attentionLayers = 1, .kvHeads = 2, .headDimension = 256},
             kv::Layout{.attentionLayers = 1, .kvHeads = 4, .headDimension = 128},
+            kv::Layout{.attentionLayers = 1, .kvHeads = 8, .headDimension = 128},
             kv::Layout{.attentionLayers = 1, .kvHeads = 2, .headDimension = 256, .valuesTokenMajor = true,
                        .reads = kv::Reads::SelectedBlocks}}) {
         kv::Layout formatted = layout;

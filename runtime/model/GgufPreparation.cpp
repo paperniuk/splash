@@ -91,6 +91,8 @@ std::vector<float> tensorScales(const gguf::TensorRows &rows, uint64_t start, ui
   return result;
 }
 
+uint16_t nearestBfloat16(float value);
+
 // Native bytes [column, column + span) of `count` source rows of a quantized
 // safetensors tensor from source row `start` on, back to back, read from its
 // tensors: per native block an affine tensor's scale, bias and codes; an
@@ -107,7 +109,8 @@ void readSafetensorsRows(const gguf::TensorRows &rows, uint64_t start, uint64_t 
   // Bytes of a native block from the scales tensor (its biases take as many
   // as its scales) and from the codes tensor.
   const uint64_t block = format.block_bytes, groups = rows.rowBytes / block;
-  const uint64_t scaleBytes = affine ? 2 : id == GGUF_FMT_NVFP4 ? QUANT_NVFP4_G : id == GGUF_FMT_FP8 ? 0 : 1;
+  const bool floatScales = affine && rows.safetensors.scales->dtype == "F32";
+  const uint64_t scaleBytes = affine ? (floatScales ? 4 : 2) : id == GGUF_FMT_NVFP4 ? QUANT_NVFP4_G : id == GGUF_FMT_FP8 ? 0 : 1;
   const uint64_t codes =
       block - (affine ? 4 : id == GGUF_FMT_NVFP4 ? QUANT_NVFP4_CODES : id == GGUF_FMT_FP8 ? QUANT_FP8_VALUES : 1);
   if (column % block || span % block)
@@ -115,20 +118,30 @@ void readSafetensorsRows(const gguf::TensorRows &rows, uint64_t start, uint64_t 
   // One read of each tensor per run of rows when they are read whole, else per row.
   const uint64_t perRead = span == rows.rowBytes ? count : 1, spanBlocks = span / block;
   std::vector<uint8_t> codeBytes(perRead * spanBlocks * codes), scales(perRead * spanBlocks * scaleBytes),
-      biases(affine ? perRead * spanBlocks * 2 : 0);
+      biases(affine ? perRead * spanBlocks * scaleBytes : 0);
   const std::vector<float> g = tensorScales(rows, start, count);
   for (uint64_t row = 0; row < count; row += perRead) {
     const uint64_t at = (start + row) * groups + column / block;
     rows.safetensors.codes->read(at * codes, codeBytes);
     if (scaleBytes) rows.safetensors.scales->read(at * scaleBytes, scales);
-    if (affine) rows.safetensors.biases->read(at * 2, biases);
+    if (affine) rows.safetensors.biases->read(at * scaleBytes, biases);
     for (uint64_t b = 0; b < perRead * spanBlocks; ++b) {
       uint8_t *out = to + row * span + b * block;
       const uint8_t *in = codeBytes.data() + b * codes;
       const float scale = g[row + b / spanBlocks];
       if (affine) {
-        std::memcpy(out, scales.data() + 2 * b, 2);
-        std::memcpy(out + 2, biases.data() + 2 * b, 2);
+        if (floatScales) {
+          float s, z;
+          std::memcpy(&s, scales.data() + 4 * b, 4);
+          std::memcpy(&z, biases.data() + 4 * b, 4);
+          // Native affine metadata is BF16, so F32 metadata rounds once to nearest even.
+          const uint16_t sb = nearestBfloat16(s), zb = nearestBfloat16(z);
+          std::memcpy(out, &sb, 2);
+          std::memcpy(out + 2, &zb, 2);
+        } else {
+          std::memcpy(out, scales.data() + 2 * b, 2);
+          std::memcpy(out + 2, biases.data() + 2 * b, 2);
+        }
         std::memcpy(out + 4, in, codes);
       } else if (id == GGUF_FMT_NVFP4) {
         std::memcpy(out, scales.data() + QUANT_NVFP4_G * b, QUANT_NVFP4_G);

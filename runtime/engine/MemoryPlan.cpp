@@ -147,6 +147,11 @@ void writeBudget(json::Writer &w, const EngineMemoryBreakdown &budget) {
         w.field("slim_page_bytes", budget.kvSlimPageBytes).field("floor_pages", budget.kvWindowFloorPages);
       });
     }
+    if (budget.draftContextTokenBytes) {
+      w.object("draft_context", [&] {
+        w.field("token_bytes", budget.draftContextTokenBytes).field("capacity_tokens", budget.draftContextTokens);
+      });
+    }
     w.key("kv_spill");
     writeSpillPlan(w, budget.kvSpill);
     w.object("context_bounds", [&] {
@@ -156,6 +161,7 @@ void writeBudget(json::Writer &w, const EngineMemoryBreakdown &budget) {
           .field("spilled", bounds.spilled)
           .field("disk", bounds.disk)
           .field("bound", bounds.bound());
+      if (bounds.draft != std::numeric_limits<uint32_t>::max()) w.field("draft", bounds.draft);
     });
     w.field("minimum_dynamic_bytes", budget.minimumDynamicBytes)
         .field("minimum_required_bytes", budget.minimumRequiredBytes)
@@ -209,12 +215,13 @@ uint64_t kvPagesWithin(const kv::Layout &layout, uint64_t bytes, uint32_t floorP
 }
 
 uint32_t ContextBounds::maximum() const noexcept {
-  return std::min(window, std::max(resident, std::min(spilled, disk)));
+  return std::min({draft, window, std::max(resident, std::min(spilled, disk))});
 }
 
 std::string_view ContextBounds::bound() const noexcept {
   const uint32_t context = maximum();
   if (context == window) return "model";
+  if (context == draft) return "memory";
   return context == resident || disk >= spilled ? "memory" : "disk";
 }
 
@@ -297,6 +304,9 @@ std::string EngineMemoryBreakdown::describe() const {
       << bytesAndMiB(kvExtentBytes) << '\n'
       << "KV capacity of one request: " << kvCapacityPages << " pages / "
       << kvCapacityTokens << " tokens\n";
+  if (draftContextTokenBytes)
+    out << "draft context per lane: " << draftContextTokens << " tokens of "
+        << draftContextTokenBytes << " bytes, in the lane state\n";
   if (kvSlimPageBytes)
     out << "KV past the windows: Slim pages of " << bytesAndMiB(kvSlimPageBytes) << ", a lane keeping "
         << kvWindowFloorPages << " pages Full\n";
@@ -409,9 +419,18 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
       breakdown.hardBudgetBytes > breakdown.fixedRuntimeBytes
           ? breakdown.hardBudgetBytes - breakdown.fixedRuntimeBytes
           : 0;
+  // A lane's state holds a draft's global K/V for the capacity of the context
+  // it serves, beside its fixed bytes (ModelMemoryPlan::draftContextTokenBytes);
+  // one start needs the least capacity, warmup's.
+  const uint64_t fixedLaneBytes = model.footprint.runtime.laneStatePlannedAllocatedBytes;
+  const uint64_t draftTokenBytes = model.footprint.runtime.draftContextTokenBytes;
+  breakdown.draftContextTokenBytes = draftTokenBytes;
+  const auto laneAt = [&](uint32_t context) {
+    return fixedLaneBytes + draftTokenBytes * model::draftContextCapacity(context);
+  };
   const std::optional<uint64_t> required =
       minimumRequiredBytes(breakdown.fixedRuntimeBytes,
-                           breakdown.laneStateBytes, model.targetKvLayout);
+                           draftTokenBytes ? laneAt(0) : fixedLaneBytes, model.targetKvLayout);
   if (!required) {
     return {std::nullopt,
             failure(BudgetErrorCode::ArithmeticOverflow,
@@ -428,6 +447,7 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
   breakdown.kvWindowFloorPages = kvWindowFloorPages(kvLayout, model.commandPages);
   if (kvLayout.slimmable())
     breakdown.kvSlimPageBytes = kvLayout.bytesPerModelPage(kv::PageForm::Slim);
+  const KvSpillPlan &spill = model.spill;
   // Page ids stay 32-bit. One request's KV capacity is the whole extents of
   // the size that leaves the fewest of the budget's pages, priced one by one,
   // unused; a windowed layout's Full and Slim pages take extents of their
@@ -438,40 +458,66 @@ evaluateEngineMemoryPlan(const DeviceCapabilities &device,
   // start takes. Beside the state alone, a Qwen3.8-Flash-Next start that can
   // spill advertised an extent more than a lone start could take wherever
   // the room past its last extent was less than its 6,881,280 bytes of Index
-  // runway and tables.
-  const uint64_t availableForOneRequestKv =
-      saturatingSubtract(breakdown.dynamicBudgetBytes,
-                         breakdown.laneStateBytes + (model.spill.enabled ? model.spill.heldBytes() : 0));
-  const auto pagesWithin = [&](uint32_t extentPages) {
-    return std::min<uint64_t>(
-        kvPagesWithin(kvLayout, availableForOneRequestKv, breakdown.kvWindowFloorPages, extentPages),
-        std::numeric_limits<uint32_t>::max());
+  // runway and tables. False where the capacity's bytes overflow.
+  const auto sizeKv = [&](uint64_t laneBytes) {
+    const uint64_t availableForOneRequestKv =
+        saturatingSubtract(breakdown.dynamicBudgetBytes, laneBytes + (spill.enabled ? spill.heldBytes() : 0));
+    const auto pagesWithin = [&](uint32_t extentPages) {
+      return std::min<uint64_t>(
+          kvPagesWithin(kvLayout, availableForOneRequestKv, breakdown.kvWindowFloorPages, extentPages),
+          std::numeric_limits<uint32_t>::max());
+    };
+    const uint64_t budgetPages = pagesWithin(1);
+    breakdown.kvExtentPages = model.targetKvLayout.extentPagesFor(budgetPages);
+    breakdown.kvCapacityPages =
+        static_cast<uint32_t>(kvLayout.slimmable() && breakdown.kvExtentPages
+                                  ? pagesWithin(breakdown.kvExtentPages)
+                                  : kvCapacityPagesFor(model.targetKvLayout, budgetPages));
+    breakdown.kvCapacityBytes =
+        kvPagesBytes(kvLayout, breakdown.kvCapacityPages, breakdown.kvWindowFloorPages, breakdown.kvExtentPages);
+    return checkedMultiply(breakdown.kvPageBytes, breakdown.kvExtentPages, breakdown.kvExtentBytes) &&
+           checkedMultiply(breakdown.kvPageTokens, breakdown.kvCapacityPages, breakdown.kvCapacityTokens);
   };
-  const uint64_t budgetPages = pagesWithin(1);
-  breakdown.kvExtentPages = model.targetKvLayout.extentPagesFor(budgetPages);
-  breakdown.kvCapacityPages =
-      static_cast<uint32_t>(kvLayout.slimmable() && breakdown.kvExtentPages
-                                ? pagesWithin(breakdown.kvExtentPages)
-                                : kvCapacityPagesFor(model.targetKvLayout, budgetPages));
-  breakdown.kvCapacityBytes =
-      kvPagesBytes(kvLayout, breakdown.kvCapacityPages, breakdown.kvWindowFloorPages, breakdown.kvExtentPages);
-
-  if (!checkedMultiply(breakdown.kvPageBytes, breakdown.kvExtentPages,
-                       breakdown.kvExtentBytes) ||
-      !checkedMultiply(breakdown.kvPageTokens, breakdown.kvCapacityPages,
-                       breakdown.kvCapacityTokens)) {
+  // The bounds of the context beside the KV of the last sizing.
+  const auto boundsOf = [&](uint32_t draft) {
+    return ContextBounds{
+        .window = model.maximumContextTokens,
+        .resident = static_cast<uint32_t>(std::min<uint64_t>(
+            model.maximumContextTokens,
+            saturatingSubtract(breakdown.kvCapacityTokens, model::ExecutionLimits::speculativeScratchTokens))),
+        .spilled = spill.memoryTokens,
+        .disk = spill.diskTokens,
+        .draft = draft};
+  };
+  // A draft's lane holds more with the context it serves, which leaves its KV
+  // less: the context served is the most tokens whose lane (laneAt) leaves KV
+  // that holds them. A shorter context charges less and holds at least as
+  // much, so the most is found by bisection. --max-context's context, where
+  // the plan holds it, is the one served, so that its lane charges the
+  // capacity of exactly that.
+  uint32_t draftContext = std::numeric_limits<uint32_t>::max();
+  if (draftTokenBytes) {
+    const auto holds = [&](uint32_t tokens) {
+      return sizeKv(laneAt(tokens)) && breakdown.kvExtentPages && boundsOf(draftContext).maximum() >= tokens;
+    };
+    uint32_t low = 0, high = model.maximumContextTokens;
+    while (low < high) {
+      const uint32_t middle = high - (high - low) / 2;
+      if (holds(middle))
+        low = middle;
+      else
+        high = middle - 1;
+    }
+    draftContext = model.draftContextTokens && model.draftContextTokens <= low ? model.draftContextTokens : low;
+  }
+  breakdown.laneStateBytes = draftTokenBytes ? laneAt(draftContext) : fixedLaneBytes;
+  breakdown.draftContextTokens = draftTokenBytes ? model::draftContextCapacity(draftContext) : 0;
+  if (!sizeKv(breakdown.laneStateBytes)) {
     return {std::nullopt, failure(BudgetErrorCode::ArithmeticOverflow,
                                   "KV capacity overflows uint64",
                                   std::move(breakdown))};
   }
-  const KvSpillPlan &spill = model.spill;
-  breakdown.contextBounds = {
-      .window = model.maximumContextTokens,
-      .resident = static_cast<uint32_t>(std::min<uint64_t>(
-          model.maximumContextTokens,
-          saturatingSubtract(breakdown.kvCapacityTokens, model::ExecutionLimits::speculativeScratchTokens))),
-      .spilled = spill.memoryTokens,
-      .disk = spill.diskTokens};
+  breakdown.contextBounds = boundsOf(draftContext);
   if (!breakdown.kvExtentPages ||
       breakdown.dynamicBudgetBytes < breakdown.minimumDynamicBytes) {
     if (breakdown.minimumRequiredBytes > breakdown.hardBudgetBytes) {

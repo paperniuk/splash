@@ -260,6 +260,7 @@ public:
   [[nodiscard]] const GdnParityBuffers &current(uint32_t lane) const;
   [[nodiscard]] const GdnParityBuffers &next(uint32_t lane) const;
   [[nodiscard]] const std::vector<DFlashDraftRingLayer> &draft(uint32_t lane) const;
+  [[nodiscard]] const metal::MetalBuffer &draftFeature(uint32_t lane) const;
   [[nodiscard]] const metal::MetalBuffer &window(uint32_t lane) const;
 
   // Activation takes pooled buffers and asks the governor once for all the

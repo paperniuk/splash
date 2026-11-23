@@ -66,6 +66,21 @@ inline void column_dot(device const bfloat *x, uint rows, uint input_size, devic
   }
 }
 
+// column_dot of each of the first `rows` rows on its own (at most Rows), a row's sum bitwise column_dot's: one row's
+// registers instead of Rows' let more threads run, where a row's second pass reads weights the first just brought
+// into cache. The MoE column tiles (moe_gguf_mma.metal) run it: an Inkling 2 Mini expert layer of one row took 0.169
+// ms against 0.193 at two rows' registers on an M1 Max (gguf-moe-benchmark inkling).
+template <class F, ushort Rows>
+inline void column_dot_rows(device const bfloat *x, uint rows, uint input_size, device uchar *w0, device uchar *w1,
+                            device uchar *meta, uint column, uint g_begin, uint g_end, threadgroup half2 *tl,
+                            thread float (&sums)[Rows]) {
+  for (ushort r = 0; r < Rows; ++r) {
+    float one[1] = {0.0f};
+    if (r < rows) column_dot<F, 1>(x + ulong(r) * input_size, 1, input_size, w0, w1, meta, column, g_begin, g_end, tl, one);
+    sums[r] = one[0];
+  }
+}
+
 // column_dot of two weight sets over the same activations, as a gate/up pass needs them (moe_gguf_mma.metal): each
 // set's chain runs in column_dot's order, so `first` and `second` are bitwise column_dot's sums, but the two chains
 // run interleaved, so their FMAs overlap, and each activation load serves both.

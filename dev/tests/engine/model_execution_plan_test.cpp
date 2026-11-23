@@ -98,7 +98,7 @@ model::LoadedModel loadedModel(const decltype(Weights::layout) &family = {},
       "operator workspace test", target.layout, draft, vision,
       model::TargetSource::Safetensors, model::VisionSource::Safetensors);
   result.target = std::move(target);
-  result.draft.layout = draft;
+  std::get<model::DFlashDraftWeights>(result.draft).layout = draft;
   return result;
 }
 
@@ -149,7 +149,7 @@ void checkGateUpLayers() {
   target.layers.front().upProjection = ops::Projection(
       up.outputSize, up.inputSize + 256,
       ops::BlockWeights{{ops::QuantizedSegment::planes(GGUF_FMT_Q4K, up.outputSize, up.inputSize + 256, {}, {}, {})}});
-  rejects([&] { static_cast<void>(model::qwenTargetGeometry(target, dense.draft.layout.targetLayerIds())); },
+  rejects([&] { static_cast<void>(model::qwenTargetGeometry(target, std::get<model::DFlashDraftWeights>(dense.draft).layout.targetLayerIds())); },
           "fused gate/up projections must have matching shapes", "mismatched fused gate/up shapes reached execution");
   target.layers.front().upProjection = up;
   // The last layer's gate in F16 and its up in Q8_0.
@@ -472,7 +472,7 @@ void checkUnsizedProjection() {
 void checkCaptureLayers() {
   const auto refuses = [](uint32_t index, uint32_t layer, const std::string &what) {
     auto model = loadedModel<model::Qwen3_8Weights>();
-    model.draft.layout.targetLayers[index] = layer;
+    std::get<model::DFlashDraftWeights>(model.draft).layout.targetLayers[index] = layer;
     rejects([&] {
       static_cast<void>(model::RuntimeGeometry::from(model, kv::Format::Int8, ops::GdnStateFormat::Float32));
     }, "invalid model runtime geometry", what + " reached arena sizing");
@@ -505,8 +505,11 @@ void checkGdnWidths() {
   withoutGates.packedGdnWidth = shipped.convolutionDimension + shipped.attentionWidth;
   rejects([&] { sizeArenas(withoutGates); }, "invalid model runtime geometry",
           "packed GDN rows without the gates reached arena sizing");
-  // Every family's layout, the 122B's among them, passes the layout check.
-  model::forEachFamily([](const auto &family) { model::requireQwenLayout(family); });
+  // Qwen layouts, including the 122B, pass the shared layout check.
+  model::forEachFamily([](const auto &family) {
+    if constexpr (!std::is_same_v<std::remove_cvref_t<decltype(family)>, model::InklingLayout>)
+      model::requireQwenLayout(family);
+  });
   // A layout without GDN layers sets none of the GDN dimensions.
   auto strayGdn = model::FlintLayout{};
   strayGdn.gdnKeyHeads = 16;

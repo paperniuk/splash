@@ -67,6 +67,30 @@ template <ushort Rows, uint Count, class Body> inline void moe_mma_grid_column(u
   });
 }
 
+// Whether a pass's formats (function constants 0 to Count - 1) are all a split format (moe_mma_split_format): its
+// grid holds MOE_MMA_SPLIT times its column tiles.
+template <ushort Rows, uint Count> inline bool moe_mma_split_pass() {
+  bool all = moe_mma_split_format(kMmaMoeFormat0, Rows) && moe_mma_split_format(kMmaMoeFormat1, Rows);
+  if constexpr (Count > 2)
+    all = all && moe_mma_split_format(kMmaMoeFormat2, Rows) && moe_mma_split_format(kMmaMoeFormat3, Rows);
+  return all;
+}
+// A split pass's column tile: lane l sums column `column + l % W` (W = 32 / MOE_MMA_SPLIT) over part l / W of K's
+// groups, and the lanes add the other parts' down to the first W, which hold the W columns' sums.
+constant constexpr uint kSplitWidth = 32 / MOE_MMA_SPLIT;
+template <ushort Rows, uint Count>
+inline void moe_mma_split_column(uint format, device bfloat *x, uint rows, uint K, MoeGgufSegment s, uint column,
+                                 uint lane, threadgroup half2 *table, thread float (&sums)[GGUF_COLUMN_ROWS]) {
+  const uint groups = K / 32, which = lane / kSplitWidth;
+  moe_mma_grid_column<Rows, Count>(format, [&](auto f) {
+    column_dot_rows<decltype(f), GGUF_COLUMN_ROWS>(x, rows, K, s.w0, s.w1, s.meta, column + lane % kSplitWidth,
+                                                  which * groups / MOE_MMA_SPLIT, (which + 1) * groups / MOE_MMA_SPLIT,
+                                                  table, sums);
+  });
+  for (uint r = 0; r < GGUF_COLUMN_ROWS; ++r)
+    for (uint width = 16; width >= kSplitWidth; width /= 2) sums[r] += simd_shuffle_down(sums[r], width);
+}
+
 // Runs body(integral_constant<uint, FM>) with the fewest 8-row fragments that hold a tile's live rows.
 template <ushort Rows, class Body> inline void moe_mma_live_rows(uint rows, Body body) {
   if constexpr (Rows == 8) body(integral_constant<uint, 1>{});
@@ -106,7 +130,7 @@ kernel void moe_expert_gguf_mma_down(device bfloat *input [[buffer(0)]], device 
   // skips; formats not measured stay on the staged MMA.
   if (moe_column_tile(tiles, t) && s.format == FmtQ20::Id) {
     float sums[GGUF_COLUMN_ROWS];
-    column_dot<FmtQ20, GGUF_COLUMN_ROWS>(x, tile.rows, p.input_size, s.w0, s.w1, s.meta, origin + simd_lane, 0,
+    column_dot_rows<FmtQ20, GGUF_COLUMN_ROWS>(x, tile.rows, p.input_size, s.w0, s.w1, s.meta, origin + simd_lane, 0,
                                              p.input_size / 32, tl, sums);
     for (uint row = 0; row < tile.rows; ++row)
       output[out + ulong(row) * p.output_size + origin + simd_lane] = bfloat(sums[row]);
@@ -117,7 +141,7 @@ kernel void moe_expert_gguf_mma_down(device bfloat *input [[buffer(0)]], device 
     // The grid formats (moe_mma_grid_column_pass), whose grids are constant tables.
     float sums[GGUF_COLUMN_ROWS];
     moe_mma_grid_column<Rows, 2>(s.format, [&](auto f) {
-      column_dot<decltype(f), GGUF_COLUMN_ROWS>(x, tile.rows, p.input_size, s.w0, s.w1, s.meta,
+      column_dot_rows<decltype(f), GGUF_COLUMN_ROWS>(x, tile.rows, p.input_size, s.w0, s.w1, s.meta,
                                                     origin + simd_lane, 0, p.input_size / 32, tl, sums);
     });
     for (uint row = 0; row < tile.rows; ++row)
@@ -152,6 +176,8 @@ template [[host_name("moe_expert_gguf_mma_m32_down")]] kernel MoeExpertGgufMmaDo
 // Flint's shared expert of two slices (CompiledMoeRouting "_s2").
 template [[host_name("moe_expert_gguf_mma_m8_down_s2")]] kernel MoeExpertGgufMmaDownKernel moe_expert_gguf_mma_down<8, 2>;
 template [[host_name("moe_expert_gguf_mma_m32_down_s2")]] kernel MoeExpertGgufMmaDownKernel moe_expert_gguf_mma_down<32, 2>;
+template [[host_name("moe_expert_gguf_mma_m8_down_s0")]] kernel MoeExpertGgufMmaDownKernel moe_expert_gguf_mma_down<8, 0>;
+template [[host_name("moe_expert_gguf_mma_m32_down_s0")]] kernel MoeExpertGgufMmaDownKernel moe_expert_gguf_mma_down<32, 0>;
 
 // Gate and up in one pass: the bindings and grid of moe_expert_gguf_m<rows>_gate_up (kernels/shared/moe_gguf.metal),
 // threadgroup (x, y) a gate and an up simdgroup on the same 32 columns of tile y of the pass's range. The gate
@@ -168,7 +194,7 @@ template [[host_name("moe_expert_gguf_mma_m32_down_s2")]] kernel MoeExpertGgufMm
 // lanes. IQ2_XXS and IQ2_S gate and up run column_dot on their own simdgroups, which beat their pair at pooled routing
 // (a verify's rows sharing their experts) on an M2 Max; their decode layer runs 8 to 32 rows 16-19% faster at random
 // routing and 1-4% at pooled than on the 8-row MMA. Other tiles run the MMAs that hold their live rows.
-template <ushort Rows, ushort Tables, uint Shared>
+template <ushort Rows, ushort Tables, uint Shared, bool Softcap = false>
 kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
                                         device const MoeTileDescriptor *tiles [[buffer(1)]],
                                         device const uint *tile_count [[buffer(2)]], device uchar *gsw0 [[buffer(3)]],
@@ -195,7 +221,11 @@ kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
   const uint K = p.input_size, N = p.output_size;
   device bfloat *x = input + ulong(tile.first_row) * K;
   const ulong out = ulong(tile.first_row) * N;
-  const uint origin = group.x * kColumns, thread_index = simd_group * 32 + simd_lane;
+  // A split pass's MOE_MMA_SPLIT threadgroups (moe_mma_split_format): the first runs an MMA tile, and of a column
+  // tile each takes its part of the 32 columns.
+  const bool split = moe_mma_split_pass<Rows, 4>();
+  const uint tile_x = split ? group.x / MOE_MMA_SPLIT : group.x, part = split ? group.x % MOE_MMA_SPLIT : 0;
+  const uint origin = tile_x * kColumns, thread_index = simd_group * 32 + simd_lane;
   const bool up = simd_group == 1;
   threadgroup bfloat *gate = reinterpret_cast<threadgroup bfloat *>(stage);
   const bool column = moe_column_tile(tiles, t);
@@ -203,7 +233,7 @@ kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
   const bool grid = moe_mma_grid_column_pass<Rows, 4>() && column;
   const bool gate_grid = grid && moe_mma_grid_column_format<Rows>(gs.format);
   const bool up_grid = grid && moe_mma_grid_column_format<Rows>(us.format);
-  const auto product = [](float v, bfloat g) { return bfloat(float(bfloat(v)) * splash_silu(float(g))); };
+  const auto product = [&](float v, bfloat g) { return moe_gate_product<Softcap>(v, g, p.gate_softcap, p.up_softcap); };
   if (gate_column && up_column) {
     // As many simdgroups as the two passes' column tiles run: the even threadgroup's two take the odd one's columns
     // (N is a multiple of the passes' 64 columns, so every odd threadgroup has an even one).
@@ -232,6 +262,20 @@ kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
   threadgroup half *my = stage + simd_group * kSimdgroupStage;
   const sgmatrix::Lane l = sgmatrix::lane_map(simd_lane);
   static_assert(Rows * kColumns * sizeof(bfloat) <= kSimdgroupStage * sizeof(half), "the gate fits a stage");
+  if (split && column) {
+    // Each simdgroup its projection's columns of the threadgroup's part; the gate parks bf16(gate) for the up.
+    float sums[GGUF_COLUMN_ROWS];
+    const uint first = origin + part * kSplitWidth;
+    moe_mma_split_column<Rows, 4>(s.format, x, tile.rows, K, s, first, simd_lane, table, sums);
+    if (!up && simd_lane < kSplitWidth)
+      for (uint row = 0; row < tile.rows; ++row) gate[row * kColumns + simd_lane] = bfloat(sums[row]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (up && simd_lane < kSplitWidth)
+      for (uint row = 0; row < tile.rows; ++row)
+        output[out + ulong(row) * N + first + simd_lane] = product(sums[row], gate[row * kColumns + simd_lane]);
+    return;
+  }
+  if (split && part) return;
   if (column) {
     // At most GGUF_COLUMN_ROWS live rows, one fragment. Each simdgroup sums its projection on its own tile, the
     // gate parks bf16(gate) in its stage, and both meet at the one barrier before the up writes the products: the
@@ -242,11 +286,11 @@ kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
     float2 acc[FN][1];
     const bool on_grid = up ? up_grid : gate_grid, on_dot = on_column || on_grid;
     if (on_column) {
-      column_dot<FmtQ20, GGUF_COLUMN_ROWS>(x, tile.rows, K, s.w0, s.w1, s.meta, origin + simd_lane, 0, K / 32,
+      column_dot_rows<FmtQ20, GGUF_COLUMN_ROWS>(x, tile.rows, K, s.w0, s.w1, s.meta, origin + simd_lane, 0, K / 32,
                                                table, sums);
     } else if (on_grid) {
       moe_mma_grid_column<Rows, 4>(s.format, [&](auto f) {
-        column_dot<decltype(f), GGUF_COLUMN_ROWS>(x, tile.rows, K, s.w0, s.w1, s.meta, origin + simd_lane, 0,
+        column_dot_rows<decltype(f), GGUF_COLUMN_ROWS>(x, tile.rows, K, s.w0, s.w1, s.meta, origin + simd_lane, 0,
                                                       K / 32, table, sums);
       });
     } else {
@@ -309,3 +353,24 @@ using MoeExpertGgufMmaGateUpKernel = void(device bfloat *, device const MoeTileD
 MOE_MMA_GATE_UP(8)
 MOE_MMA_GATE_UP(32)
 #undef MOE_MMA_GATE_UP
+#define MOE_MMA_S0_SOFTCAP(R) \
+  template [[host_name("moe_expert_gguf_mma_m" #R "_gate_up_s0_softcap")]] kernel MoeExpertGgufMmaGateUpKernel \
+      moe_expert_gguf_mma_gate_up<R, 1, 0, true>; \
+  template [[host_name("moe_expert_gguf_mma_m" #R "_gate_up_mixed_s0_softcap")]] kernel MoeExpertGgufMmaGateUpKernel \
+      moe_expert_gguf_mma_gate_up<R, 2, 0, true>;
+MOE_MMA_S0_SOFTCAP(8)
+MOE_MMA_S0_SOFTCAP(32)
+#undef MOE_MMA_S0_SOFTCAP
+#define MOE_MMA_EXTRA(R, S, SUFFIX, SOFT, ACT) \
+  template [[host_name("moe_expert_gguf_mma_m" #R "_gate_up" SUFFIX ACT)]] kernel MoeExpertGgufMmaGateUpKernel \
+      moe_expert_gguf_mma_gate_up<R, 1, S, SOFT>; \
+  template [[host_name("moe_expert_gguf_mma_m" #R "_gate_up_mixed" SUFFIX ACT)]] kernel MoeExpertGgufMmaGateUpKernel \
+      moe_expert_gguf_mma_gate_up<R, 2, S, SOFT>;
+#define MOE_MMA_EXTRA_HEIGHT(R) \
+  MOE_MMA_EXTRA(R, 0, "_s0", false, "") \
+  MOE_MMA_EXTRA(R, 1, "", true, "_softcap") \
+  MOE_MMA_EXTRA(R, 2, "_s2", true, "_softcap")
+MOE_MMA_EXTRA_HEIGHT(8)
+MOE_MMA_EXTRA_HEIGHT(32)
+#undef MOE_MMA_EXTRA_HEIGHT
+#undef MOE_MMA_EXTRA

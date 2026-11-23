@@ -1706,15 +1706,98 @@ int laneRowsRoute(MetalBackend &backend, const std::string &name, uint32_t rows,
   return failures;
 }
 
+int inklingMoe(MetalBackend &backend) {
+  constexpr uint32_t H = 256, I = 64, E = 16, K = 8;
+  constexpr MoeShape shape{.hiddenSize = H, .experts = E, .expertsPerToken = K,
+                           .expertIntermediateSize = I, .router = splash::ops::MoeRouter::SigmoidCorrected,
+                           .sharedSlices = 0, .sharedGate = false, .routeScale = 8.0F,
+                           .activation = splash::ops::MoeActivation::SoftcappedSwiGlu,
+                           .gateSoftcap = 4.0F, .upSoftcap = 25.0F};
+  constexpr MoeShape full{.hiddenSize = 2304, .experts = 128, .expertsPerToken = 8,
+                          .expertIntermediateSize = 1152, .router = splash::ops::MoeRouter::SigmoidCorrected,
+                          .sharedSlices = 0, .sharedGate = false, .routeScale = 8.0F,
+                          .activation = splash::ops::MoeActivation::SoftcappedSwiGlu,
+                          .gateSoftcap = 4.0F, .upSoftcap = 25.0F};
+  static_assert(shape.valid() && full.valid());
+  const auto fmt = Fmt(GGUF_FMT_AF4G64);
+  const Tensor gate = quantized(backend, fmt, E * I, H);
+  const Tensor up = quantized(backend, fmt, E * I, H);
+  const Tensor down = quantized(backend, fmt, E * H, I);
+  std::vector<float> router(E * H, 0.0F);
+  std::vector<float> bias(E, 0.0F), score(E);
+  for (uint32_t e = 0; e < E; ++e) {
+    router[e * H] = e < 8 ? 2.0F : float(std::min(e, 14u) - 8) / 8.0F;
+    bias[e] = e < 8 ? 0.0F : 1.0F;
+    score[e] = 1.0F / (1.0F + std::exp(-router[e * H]));
+  }
+  const float denominator = std::accumulate(score.begin() + 8, score.end(), 0.0F);
+  const std::array<uint32_t, K> order{14, 15, 13, 12, 11, 10, 9, 8};
+  const std::vector<__bf16> routerBf16(router.begin(), router.end());
+  BlockMoeWeights weights;
+  weights.router = QuantizedSegment::rows(GGUF_FMT_BF16, E, H,
+      upload(backend, routerBf16.data(), routerBf16.size() * sizeof(__bf16), "ink-router"));
+  weights.correctionBias = upload(backend, bias.data(), bias.size() * sizeof(float), "ink-bias");
+  weights.gate.routed = gate.segment;
+  weights.up.routed = up.segment;
+  weights.down.routed = down.segment;
+  weights.slotTable = splash::model::residentExpertSlots(backend, E);
+  weights.slots = E;
+  weights.chunks = splash::ops::residentExpertChunks(weights);
+  std::vector<float> x = activations(H);
+  x[0] = 1.0F;
+  std::vector<float> expected(H, 0.0F);
+  for (uint32_t e = 8; e < E; ++e) {
+    std::vector<float> intermediate(I);
+    for (uint32_t c = 0; c < I; ++c) {
+      const float g = bf16(dot(x.data(), gate.row(e * I + c), H).value);
+      const float u = bf16(dot(x.data(), up.row(e * I + c), H).value);
+      intermediate[c] = bf16(std::tanh(g / 4.0F) * 4.0F / (1.0F + std::exp(-g)) *
+                             std::tanh(u / 25.0F) * 25.0F);
+    }
+    for (uint32_t c = 0; c < H; ++c)
+      expected[c] += bf16(dot(intermediate.data(), down.row(e * H + c), I).value) * (8.0F * score[e] / denominator);
+  }
+  for (const auto tile : {MoeGgufTile::Staged, MoeGgufTile::Mma})
+    for (const uint32_t rows : {1u, 8u, 16u, 64u}) {
+      Buffers b;
+      for (uint32_t r = 0; r < rows; ++r) b.input.insert(b.input.end(), x.begin(), x.end());
+      b.moe.input = bfloatBuffer(backend, b.input, "ink-input");
+      b.moe.residual = zeros(backend, uint64_t{rows} * H * 2, "ink-residual");
+      b.moe.output = zeros(backend, uint64_t{rows} * H * 2, "ink-output");
+      const auto plan = MoE::plan(shape, rows, {.expertTile = rows <= 8 ? MoeExpertTile::M8 : MoeExpertTile::M32,
+                                               .ggufTile = tile});
+      allocate(backend, b, plan);
+      CommandGraph graph;
+      splash::test::addMoeStep(graph, b.moe, weights, plan);
+      static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+      const auto *selected = static_cast<const uint32_t *>(b.moe.scratch.selectedExperts.contents());
+      const auto *routing = static_cast<const float *>(b.moe.scratch.routingWeights.contents());
+      const auto *output = static_cast<const __bf16 *>(b.moe.output.contents());
+      for (uint32_t r = 0; r < rows; ++r) {
+        for (uint32_t k = 0; k < K; ++k) {
+          require(selected[r * K + k] == order[k], "corrected routing selection and tie break");
+          require(std::fabs(routing[r * K + k] - 8.0F * score[order[k]] / denominator) < 1e-6F,
+                  "corrected routing weights");
+        }
+        for (uint32_t c = 0; c < H; ++c)
+          require(std::fabs(float(output[r * H + c]) - bf16(expected[c])) <=
+                      0.1F + 0.04F * std::fabs(expected[c]), "softcapped affine expert output");
+      }
+    }
+  return 0;
+}
+
 int main(int argc, const char *argv[]) {
   @autoreleasepool {
     const bool stress = argc == 4 && std::string(argv[2]) == "float-stress";
-    if (argc != 2 && !stress) {
+    const bool inkling = argc == 3 && std::string(argv[2]) == "inkling";
+    if (argc != 2 && !stress && !inkling) {
       std::cerr << "usage: gguf-moe <production-and-test.metallib> [float-stress <iterations>]\n";
       return 2;
     }
     try {
       MetalBackend backend(argv[1]);
+      if (inkling) return inklingMoe(backend);
       if (stress) {
         const int iterations = std::atoi(argv[3]);
         int failed = 0;
@@ -1726,7 +1809,7 @@ int main(int argc, const char *argv[]) {
       const int failures = floatProjection(backend) + bfloat16Weights(backend) + nativeRowWeights(backend) +
                            nativePairs(backend) + floatPairs(backend) +
                            floatSegments(backend, 64) + floatSegments(backend, 96) + floatOnlyChain(backend) +
-                           moe(backend) + routingLoads(backend) + nativeRouter(backend) + permutedSlots(backend) +
+                           moe(backend) + routingLoads(backend) + nativeRouter(backend) + permutedSlots(backend) + inklingMoe(backend) +
                            laneRowsRoute(backend, "lanes of 8/5/2/1 rows, 16 of no lane", 32,
                                          {{0, 8}, {8, 5}, {13, 2}, {15, 1}}) +
                            laneRowsRoute(backend, "rows of no lane around lanes of 6/2/3/1", 26,

@@ -68,7 +68,8 @@ QwenTarget::QwenTarget(const QwenTargetWeightsBase &weights, const QwenTargetGeo
                        metal::MetalBackend &backend, const ops::ExecutionPlans &operators)
     : weightsBase_(weights), geometry_(geometry), backend_(backend), operators_(operators) {
   if (!geometry_.valid()) throw std::invalid_argument("Qwen target weights do not match execution geometry");
-  if (!ops::PagedAttention::compiles(geometry_.attentionQueryHeads, geometry_.kvLayout, geometry_.attentionGate,
+  if (!geometry_.familyAttention &&
+      !ops::PagedAttention::compiles(geometry_.attentionQueryHeads, geometry_.kvLayout, geometry_.attentionGate,
                                      geometry_.rotaryPairs))
     throw std::invalid_argument("no attention kernel for the target's output gate and RoPE");
 }
@@ -115,15 +116,20 @@ void QwenTarget::addStateCommit(metal::CommandGraph &, QwenTargetCommitBuffers b
 }
 
 void QwenTarget::addStateFold(metal::CommandGraph &graph, QwenTargetFoldBuffers buffers, uint32_t rows) const {
-  if (geometry_.stateLayout.auxiliaryBytes)
-    throw std::logic_error("a target with auxiliary state folds no state in decode");
   if (!geometry_.stateLayout.layers)
     return;
+  if (geometry_.stateLayout.auxiliaryBytes)
+    throw std::logic_error("a target with auxiliary state folds no GDN state in decode");
   ops::GDN::addFold(graph,
                     {std::move(buffers.state), std::move(buffers.gdnTape), buffers.stepSlot,
                      std::move(buffers.retainedRows), std::move(buffers.fold)},
                     geometry_.gdnShape(), geometry_.stateLayout.layers, rows, geometry_.stateLayout.strides(),
                     geometry_.stateLayout.cachedRecurrentLayerBytes(), geometry_.stateLayout.cachedCodes);
+}
+
+void QwenTarget::addAuxiliaryCapture(metal::CommandGraph &, QwenTargetCaptureBuffers, uint32_t,
+                                     const ops::StepRows &) const {
+  throw std::logic_error("the target captures no auxiliary state in decode");
 }
 
 void QwenTarget::requireLayers(size_t layers, size_t attentionLayers) const {
@@ -166,13 +172,15 @@ QwenTarget::PrefillStep QwenTarget::prefillStep(metal::CommandGraph &graph, cons
     step.chunks[index] = sequence.chunk;
     step.pageTables[index] = sequence.pageTable;
   }
-  const ops::AttentionWorkspace workspace{chunk.buffers.attentionPartials.sizeBytes(),
-                                          chunk.buffers.attentionStatistics.sizeBytes()};
-  step.attention.emplace(operators_.attention(step.attentionSequences(), geometry_.attentionQueryHeads,
-                                              geometry_.kvLayout, workspace));
-  if (const uint32_t window = geometry_.kvLayout.windowTokens)
-    step.windowedAttention.emplace(operators_.attention(step.attentionSequences(), geometry_.attentionQueryHeads,
-                                                        geometry_.kvLayout, workspace, {.windowTokens = window}));
+  if (!geometry_.familyAttention) {
+    const ops::AttentionWorkspace workspace{chunk.buffers.attentionPartials.sizeBytes(),
+                                            chunk.buffers.attentionStatistics.sizeBytes()};
+    step.attention.emplace(operators_.attention(step.attentionSequences(), geometry_.attentionQueryHeads,
+                                                geometry_.kvLayout, workspace));
+    if (const uint32_t window = geometry_.kvLayout.windowTokens)
+      step.windowedAttention.emplace(operators_.attention(step.attentionSequences(), geometry_.attentionQueryHeads,
+                                                          geometry_.kvLayout, workspace, {.windowTokens = window}));
+  }
   if (geometry_.ffnKind == QwenFfnKind::SparseMoe)
     step.moe = operators_.moe(geometry_.moeBlockShape(), geometry_.moeRouterFormat, chunk.rows);
   if (aneFfn && (paired ? aneFfn->pairs(chunk.rows) : aneFfn->splits(chunk.rows))) step.aneFfn = aneFfn;

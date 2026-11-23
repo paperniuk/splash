@@ -60,6 +60,11 @@ struct QwenTargetDimensions {
   // after its queries, by whose sigmoid the attention's output rows multiply
   // (Qwen3.5's attn_output_gate); else it holds the queries alone.
   bool attentionGate = true;
+  // Whether the family's attention is its own op over the engine's KV pages
+  // (Inkling 2's relative bias, row sinks and convolved keys, ops::
+  // PagedAttention::addInklingAttention), which the shared attention plans
+  // do not compile.
+  bool familyAttention = false;
   // The rotated dimension pairs of each attention head and their RoPE base.
   uint32_t rotaryPairs = 0;
   float rotaryTheta = 0.0F;
@@ -103,6 +108,12 @@ struct QwenTargetDimensions {
   ops::MoeRouter moeRouter = ops::MoeRouter::Softmax;
   uint32_t sharedExpertSlices = 1;
   bool sharedExpertGate = true;
+  // SigmoidCorrected's weight scale and the experts' activation with its
+  // softcaps (ops::MoeShape).
+  float moeRouteScale = 1.0F;
+  ops::MoeActivation moeActivation = ops::MoeActivation::SwiGlu;
+  float moeGateSoftcap = 0.0F;
+  float moeUpSoftcap = 0.0F;
   // The first layers of a sparse MoE target, which run a dense FFN of
   // intermediateSize instead (a config's mlp_only_layers); its MoE blocks
   // are those of the layers after them, in layer order.
@@ -128,6 +139,9 @@ struct QwenTargetDimensions {
   uint32_t pleHeadsPerNgram = 0;
   uint32_t pleHeadDimension = 0;
   uint32_t pleConvolutionTaps = 0;
+  // A family's own bytes of a state cell after those above (Inkling 2's
+  // short-convolution histories, model/Inkling.hpp), zero for the others.
+  uint64_t familyStateBytes = 0;
 
   [[nodiscard]] constexpr bool
   isFullAttentionLayer(uint32_t layer) const noexcept {
@@ -154,7 +168,11 @@ struct QwenTargetDimensions {
             .expertIntermediateSize = expertIntermediateSize,
             .router = moeRouter,
             .sharedSlices = sharedExpertSlices,
-            .sharedGate = sharedExpertGate};
+            .sharedGate = sharedExpertGate,
+            .routeScale = moeRouteScale,
+            .activation = moeActivation,
+            .gateSoftcap = moeGateSoftcap,
+            .upSoftcap = moeUpSoftcap};
   }
   // The window the target serves with `scaling`: the native one, or YaRN's,
   // the native one times its factor, rounded to the nearest token so that a
@@ -241,7 +259,7 @@ struct QwenHybridLayout : QwenTargetDimensions {
             .recurrentGroups = gdnValueHeads,
             .recurrentRows = gdnHeadDimension,
             .recurrentColumns = gdnHeadDimension,
-            .auxiliaryBytes = pleHistoryBytes() + indexerPendingBytes()};
+            .auxiliaryBytes = pleHistoryBytes() + indexerPendingBytes() + familyStateBytes};
   }
   bool operator==(const QwenHybridLayout &) const = default;
 };

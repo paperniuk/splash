@@ -3,6 +3,7 @@
 #include "model/DraftCheckpoint.hpp"
 #include "model/ExpertStore.hpp"
 #include "model/GgufTarget.hpp"
+#include "model/InklingImage.hpp"
 #include "model/ModelFactory.hpp"
 #include "model/SafetensorsImage.hpp"
 #include "model/SparseRowStore.hpp"
@@ -82,6 +83,18 @@ StreamableWeights streamableWeights(const std::filesystem::path &root, const Mod
   StreamableWeights result = std::visit(
       [&](const auto &layout) {
         const std::filesystem::path directory = root / "target";
+        if constexpr (std::is_same_v<std::decay_t<decltype(layout)>, InklingLayout>) {
+          if (descriptor.targetSource != TargetSource::Safetensors)
+            throw std::invalid_argument("Inkling loads from safetensors only");
+          const SafetensorsCheckpoint checkpoint(directory);
+          StreamableWeights weights;
+          for (uint32_t layer = 0; layer < InklingLayout::storedLayers; ++layer)
+            weights.loadedBytes += gguf::loadedBytes(planInklingLayer(checkpoint, layer));
+          weights.loadedBytes += gguf::loadedBytes(planInklingHead(checkpoint));
+          weights.loadedBytes += gguf::loadedBytes(planInklingEmbedding(checkpoint));
+          weights.loadedBytes += residentExpertSlotsBytes(layout.experts);
+          return weights;
+        } else {
         if (descriptor.targetSource == TargetSource::Gguf) {
           const OpenGguf target(findTargetGgufs(directory));
           return targetWeights(
@@ -95,9 +108,14 @@ StreamableWeights streamableWeights(const std::filesystem::path &root, const Mod
         return targetWeights(
             layout, [&](gguf::PlanOptions options) { return safetensors::planImages(checkpoint, layout, options); },
             streams);
+        }
       },
       descriptor.target);
-  result.loadedBytes += draftImageBytes(root / "draft", descriptor.draft);
+  result.loadedBytes += std::visit([&](const auto &layout) {
+    using T = std::decay_t<decltype(layout)>;
+    if constexpr (std::is_same_v<T, DFlashDraftLayout>) return draftImageBytes(root / "draft", layout);
+    else return dsparkImageBytes(root / "draft") + dsparkFoldBytes();
+  }, descriptor.draft);
   if (descriptor.hasVision()) result.loadedBytes += visionImageBytes(descriptor.vision);
   return result;
 }

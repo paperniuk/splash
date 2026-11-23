@@ -93,6 +93,43 @@ gguf::Image modelImage(const SafetensorsCheckpoint &checkpoint, const DFlashDraf
   return b.finish();
 }
 
+gguf::Image dsparkLayerImage(const SafetensorsCheckpoint &checkpoint, uint32_t layer) {
+  Builder b(checkpoint, "layer-" + std::to_string(layer) + ".bin", layer, 0);
+  const std::string p = "layers." + std::to_string(layer) + ".";
+  const std::string a = p + "self_attn.";
+  constexpr uint64_t hidden = 2304, attention = 3072, kv = 1024, intermediate = 9216, head = 128;
+  b.stored(p + "dflare_norm.weight", {hidden});
+  b.stored(p + "input_layernorm.weight", {hidden});
+  b.stored(a + "q_proj.weight", {attention, hidden});
+  b.stored(a + "k_proj.weight", {kv, hidden});
+  b.stored(a + "v_proj.weight", {kv, hidden});
+  b.stored(a + "k_proj_ctx.weight", {kv, hidden});
+  b.stored(a + "v_proj_ctx.weight", {kv, hidden});
+  b.stored(a + "q_norm.weight", {head});
+  b.stored(a + "k_norm.weight", {head});
+  b.stored(a + "k_norm_ctx.weight", {head});
+  b.stored(a + "o_proj.weight", {hidden, attention});
+  b.stored(p + "post_attention_layernorm.weight", {hidden});
+  b.stored(p + "mlp.gate_proj.weight", {intermediate, hidden});
+  b.stored(p + "mlp.up_proj.weight", {intermediate, hidden});
+  b.stored(p + "mlp.down_proj.weight", {hidden, intermediate});
+  return b.finish();
+}
+
+gguf::Image dsparkModelImage(const SafetensorsCheckpoint &checkpoint) {
+  Builder b(checkpoint, "model.bin", 3, 1);
+  b.stored("fuse_weight", {4, 4});
+  b.stored("mask_embed", {2304});
+  b.stored("norm.weight", {2304});
+  b.stored("markov_head.dflare_norm.weight", {2304});
+  b.stored("markov_head.markov_w1.weight", {201024, 256});
+  b.stored("markov_head.rnn_proj.weight", {768, 5120});
+  b.stored("markov_head.rnn_proj.bias", {768});
+  b.stored("markov_head.hidden_out.weight", {2304, 256});
+  b.stored("markov_head.hidden_out.bias", {2304});
+  return b.finish();
+}
+
 } // namespace
 
 std::vector<gguf::Image> planDraftImages(const SafetensorsCheckpoint &checkpoint, const DFlashDraftLayout &layout) {
@@ -101,6 +138,39 @@ std::vector<gguf::Image> planDraftImages(const SafetensorsCheckpoint &checkpoint
   images.push_back(modelImage(checkpoint, layout));
   return images;
 }
+
+std::vector<gguf::Image> planDSparkImages(const SafetensorsCheckpoint &checkpoint) {
+  std::vector<gguf::Image> images;
+  images.reserve(4);
+  for (uint32_t layer = 0; layer < 3; ++layer) images.push_back(dsparkLayerImage(checkpoint, layer));
+  images.push_back(dsparkModelImage(checkpoint));
+  return images;
+}
+
+uint64_t dsparkImageBytes(const std::filesystem::path &directory) {
+  const SafetensorsCheckpoint checkpoint(directory);
+  uint64_t bytes = 0;
+  for (const gguf::Image &image : planDSparkImages(checkpoint)) bytes += image.bytes;
+  return bytes;
+}
+
+DSparkCheckpointLoader::DSparkCheckpointLoader(metal::MetalBackend &backend, WeightImages &images,
+                                               const std::filesystem::path &directory)
+    : backend_(backend), images_(images), planned_(std::make_shared<Planned>(directory)) {
+  planned_->images = planDSparkImages(planned_->checkpoint);
+}
+
+WeightFile DSparkCheckpointLoader::open(size_t index) {
+  return loadImage(backend_, images_, "draft/", {planned_, &planned_->images[index]},
+                   [planned = planned_] { planned->checkpoint.checkUnchanged(); });
+}
+
+WeightFile DSparkCheckpointLoader::layer(uint32_t index) {
+  if (index >= 3) throw WeightStoreError("DSpark draft layer is out of range");
+  return open(index);
+}
+
+WeightFile DSparkCheckpointLoader::model() { return open(3); }
 
 uint64_t draftImageBytes(const std::filesystem::path &directory, const DFlashDraftLayout &layout) {
   const SafetensorsCheckpoint checkpoint(directory);

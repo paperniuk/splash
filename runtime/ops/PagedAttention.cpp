@@ -76,8 +76,11 @@ bool storesLayout(const CompiledAttention &compiled, kv::Layout layout) {
 }
 
 // The KV path commit kernels' suffix of a layout's KV heads, head dimension
-// and value order, whose pages a compiled geometry stores.
+// and value order.
 std::string_view commitSuffix(kv::Layout layout) {
+  if (layout.valid() && layout.kvHeads == 8 && layout.headDimension == 128 &&
+      !layout.valuesTokenMajor)
+    return "_kv8_d128";
   if (layout.valid())
     for (const CompiledAttention &compiled : kCompiledAttention)
       if (storesLayout(compiled, layout)) return compiled.commitSuffix;
@@ -487,6 +490,114 @@ void PagedAttention::addProjection(metal::CommandGraph &graph, metal::MetalBuffe
                          queryNorm, keyNorm, layout.headDimension),
             std::move(bindings), everyRow(sequences, command, rows, layer),
             rowGroups(queryHeads + layout.kvHeads, command, sequences.size()), {layout.headDimension, 1, 1});
+}
+
+void PagedAttention::addInklingPreparation(metal::CommandGraph &graph, metal::MetalBuffer packed,
+                                            metal::MetalBuffer k, metal::MetalBuffer v, metal::MetalBuffer qScale,
+                                            metal::MetalBuffer relScale, metal::MetalBuffer queries,
+                                            metal::MetalBuffer relative, SplashKvLayer layer,
+                                            std::span<const metal::MetalBuffer> pageTables,
+                                            std::span<const kv::ChunkedPrefillParams> sequences,
+                                            const AttentionRows &rows, kv::Layout layout, bool full) {
+  if (!layout.valid() || layout.kvHeads != 8 || layout.headDimension != 128 ||
+      layout.valuesTokenMajor || layout.reads != kv::Reads::EveryPage)
+    throw std::invalid_argument("invalid Inkling attention layout");
+  const CommandRows command = commandRows(sequences, layout);
+  if (pageTables.size() != sequences.size())
+    throw std::invalid_argument("Inkling preparation takes a page table per sequence");
+  requireRows(rows, command, sequences.size());
+  for (size_t s = 0; s < sequences.size(); ++s) requirePageTable(pageTables[s], sequences[s]);
+  requireBytes(packed, uint64_t{rows.rows} * INKLING_PACKED_WIDTH * 2, "Inkling packed q|r|gate rows");
+  requireBytes(k, uint64_t{rows.rows} * 1024 * 2, "Inkling key");
+  requireBytes(v, uint64_t{rows.rows} * 1024 * 2, "Inkling value");
+  requireBytes(qScale, 3072 * 2, "Inkling query scale");
+  requireBytes(relScale, 384 * 2, "Inkling relative scale");
+  requireBytes(queries, uint64_t{rows.rows} * 3072 * 2, "Inkling staged query");
+  requireBytes(relative, uint64_t{rows.rows} * 384 * 2, "Inkling staged relative query");
+  auto params = everyRow(sequences, command, rows, layer);
+  params.last_rows = full ? 1U : 0U;
+  std::vector<metal::MetalBuffer> bindings{std::move(packed), std::move(k), std::move(v),
+                                            std::move(qScale), std::move(relScale), std::move(queries),
+                                            std::move(relative)};
+  const auto tables = laneBindings(pageTables);
+  bindings.insert(bindings.end(), tables.begin(), tables.end());
+  bindings.push_back(rows.layout);
+  bindings.push_back(rows.tree ? rows.tree : rows.layout);
+  graph.add("attention_" + kernelFormat(layout) + "_inkling_prepare", std::move(bindings), params,
+            rowGroups(32, command, sequences.size()), {128, 1, 1});
+}
+
+uint64_t PagedAttention::inklingWorkspaceBytes(uint32_t rows, uint32_t splits) {
+  if (!rows || !splits || splits > 64)
+    throw std::invalid_argument("invalid Inkling attention workspace geometry");
+  return uint64_t{rows} * 24 * splits * 130 * sizeof(float) +
+         (splits > 1 ? uint64_t{rows} * 24 * 1024 * sizeof(uint16_t) : 0);
+}
+
+void PagedAttention::addInklingAttention(metal::CommandGraph &graph, metal::MetalBuffer queries,
+                                         metal::MetalBuffer relative, metal::MetalBuffer relProjection,
+                                         metal::MetalBuffer sinks, metal::MetalBuffer packed, metal::MetalBuffer output,
+                                         metal::MetalBuffer workspace, uint32_t splits,
+                                         std::span<const kv::ChunkedPrefillParams> sequences,
+                                         std::span<const AttentionHistory> histories, const AttentionRows &rows,
+                                         kv::Layout layout, bool sliding) {
+  if (!layout.valid() || layout.kvHeads != 8 || layout.headDimension != 128 || layout.valuesTokenMajor ||
+      layout.reads != kv::Reads::EveryPage || (sliding && layout.windowTokens != 1023))
+    throw std::invalid_argument("invalid Inkling attention layout");
+  const CommandRows command = commandRows(sequences, layout);
+  requireRows(rows, command, sequences.size());
+  if (histories.size() != sequences.size())
+    throw std::invalid_argument("Inkling attention takes a history per sequence");
+  requireBytes(queries, uint64_t{rows.rows} * 3072 * 2, "Inkling staged query");
+  requireBytes(relative, uint64_t{rows.rows} * 384 * 2, "Inkling staged relative query");
+  requireBytes(relProjection, 16 * 1024 * 2, "Inkling relative projection");
+  requireBytes(sinks, uint64_t{rows.rows} * 24 * 2, "Inkling sinks");
+  requireBytes(packed, uint64_t{rows.rows} * INKLING_PACKED_WIDTH * 2, "Inkling packed q|r|gate rows");
+  requireBytes(output, uint64_t{rows.rows} * 3072 * 2, "Inkling output");
+  requireBytes(workspace, inklingWorkspaceBytes(rows.rows, splits), "Inkling attention workspace");
+  for (size_t s = 0; s < sequences.size(); ++s) {
+    if (rows.tree && sequences[s].chunk_tokens > 32)
+      throw std::invalid_argument("Inkling tree holds at most 32 rows per sequence");
+    requirePageTable(histories[s].pageTable, sequences[s]);
+    if (histories[s].blocks.stride)
+      throw std::invalid_argument("Inkling attention does not take block lists");
+  }
+  for (size_t s = 0; s < sequences.size(); ++s) {
+    kv::AttentionParams params{.sequences = 1, .first_sequence = static_cast<uint32_t>(s), .rows = rows.rows,
+                               .tiles = 0, .trees = rows.tree ? 1U : 0U,
+                               .last_rows = sliding ? layout.windowTokens : 0U,
+                               .kv = histories[s].kv, .sequence = {}};
+    params.sequence[0] = sequenceRows(sequences[s], command, s, 0);
+    const uint32_t visible = sequences[s].committed_tokens + sequences[s].chunk_tokens;
+    const uint32_t pages = (visible + kv::kPageTokens - 1) / kv::kPageTokens;
+    // Below 128 tokens, the scalar kernel avoids matrix setup on short decode.
+    constexpr uint32_t kShortHistoryTokens = 128;
+    const bool shortHistory = rows.tree && visible <= kShortHistoryTokens;
+    // Split per 8 pages, with the same minimum to keep the GPU occupied.
+    constexpr uint32_t kPagesPerSplit = 8;
+    const uint32_t windowPages = (layout.windowTokens + sequences[s].chunk_tokens + kv::kPageTokens - 1) /
+                                     kv::kPageTokens + 1;
+    const uint32_t readPages = sliding ? std::min(pages, windowPages) : pages;
+    // The short scalar path needs 16 splits to occupy the GPU.
+    constexpr uint32_t kShortSplits = 16;
+    params.sequence[0].split_count = shortHistory
+        ? std::min(splits, kShortSplits)
+        : std::min(splits, std::max(kPagesPerSplit, (readPages + kPagesPerSplit - 1) / kPagesPerSplit));
+    params.tiles = rows.tree && sequences[s].committed_tokens >= 1024 && splits > 1 ? splits : 0;
+    if (params.tiles)
+      graph.add("attention_inkling_bias", {relative, relProjection, workspace, rows.layout}, params,
+                {24, sequences[s].chunk_tokens, 8}, {128, 1, 1});
+    const uint32_t tileRows = rows.tree ? 8 : 16;
+    const auto suffix = shortHistory ? "_inkling_short" : !rows.tree ? "_inkling_prefill"
+        : params.tiles ? "_inkling_staged" : "_inkling_split";
+    graph.add("attention_" + kernelFormat(layout) + suffix,
+              {queries, relative, relProjection, histories[s].pageTable, rows.layout,
+               rows.tree ? rows.tree : rows.layout, workspace}, params,
+              {8, shortHistory ? sequences[s].chunk_tokens : (sequences[s].chunk_tokens + tileRows - 1) / tileRows,
+               params.sequence[0].split_count}, {shortHistory ? 96U : tileRows * 12, 1, 1});
+    graph.add("attention_inkling_reduce", {workspace, sinks, packed, output, rows.layout}, params,
+              {8, sequences[s].chunk_tokens, 1}, {96, 1, 1});
+  }
 }
 
 PreparedInput PagedAttention::addAttention(metal::CommandGraph &graph, const AttentionPlan &plan,

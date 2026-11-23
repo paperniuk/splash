@@ -125,8 +125,8 @@ public:
     auto found = observations_.find(requestId);
     if (found == observations_.end() || !found->second.completed ||
         !found->second.failure.empty())
-      throw std::runtime_error("score request " + std::to_string(requestId) +
-                               " did not complete");
+      throw std::runtime_error("score request " + std::to_string(requestId) + " did not complete" +
+                               (found == observations_.end() ? "" : ": " + found->second.failure));
     return std::move(found->second.optionLogits);
   }
 
@@ -916,7 +916,7 @@ int main(int argc, char **argv) {
                    "[--scenario NAME[,NAME...]] [--ane-ffn-share SHARE "
                    "[--ane-ffn-minimum-rows ROWS]] [--max-context TOKENS] "
                    "[--activations auto|bf16] [--verify-rows all|auto] "
-                   "[--logits DIR [--logits-from DIR] [--logits-width LANES]]\n"
+                   "[--logits DIR [--logits-from DIR | --logits-questions FILE] [--logits-width LANES]]\n"
                    "  NAME: decode, partial, short, transcripts, context, exact, logits or resume "
                    "(default: decode,partial,context)\n"
                    "  SHARE: the prefill FFN's Neural Engine share in [0, 1) "
@@ -944,7 +944,7 @@ int main(int argc, char **argv) {
     uint32_t maxContext = 0;
     ops::Int8Activations int8Activations = ops::Int8Activations::On;
     model::VerifyRows verifyRows = model::VerifyRows::All;
-    std::optional<std::filesystem::path> logitsDirectory, logitsFrom;
+    std::optional<std::filesystem::path> logitsDirectory, logitsFrom, logitsQuestions;
     uint32_t logitsWidth = 1;
     bool logitsOptions = false;
     for (int index = 3; index < argc; index += 2) {
@@ -974,6 +974,8 @@ int main(int argc, char **argv) {
         logitsDirectory = std::filesystem::path(argv[index + 1]);
       } else if (option == "--logits-from") {
         logitsFrom = std::filesystem::path(argv[index + 1]);
+      } else if (option == "--logits-questions") {
+        logitsQuestions = std::filesystem::path(argv[index + 1]);
         logitsOptions = true;
       } else if (option == "--logits-width") {
         logitsWidth = parseSamples(argv[index + 1]);
@@ -1467,7 +1469,14 @@ int main(int argc, char **argv) {
       if (logitsFrom) {
         dump = readLogitDump(*logitsFrom);
       } else {
-        for (const std::span<const uint32_t> question : benchmark::kTranscriptPrompts) {
+        // The requests answered: TranscriptPrompts.hpp's, or a file's token
+        // ids a line, of a target whose vocabulary is not the Qwen families'.
+        std::vector<std::vector<uint32_t>> questions;
+        if (logitsQuestions) questions = readNumberLines(*logitsQuestions);
+        else
+          for (const std::span<const uint32_t> question : benchmark::kTranscriptPrompts)
+            questions.emplace_back(question.begin(), question.end());
+        for (const std::vector<uint32_t> &question : questions) {
           evictAllCache(resources->cache());
           const Measurement answer =
               runRequest(engine, driver, *executor, events, progress.get(), requestId++, "logits_answer", 0,
@@ -1479,7 +1488,7 @@ int main(int argc, char **argv) {
         // holds as many sequences.
         for (uint32_t prefix = 0; prefix < kPrefixes; ++prefix)
           for (uint32_t sequence = 0; sequence < dump.sequences.size(); ++sequence) {
-            const uint32_t question = static_cast<uint32_t>(benchmark::kTranscriptPrompts[sequence].size());
+            const uint32_t question = static_cast<uint32_t>(questions[sequence].size());
             const uint32_t answered = static_cast<uint32_t>(dump.sequences[sequence].size()) - question;
             if (answered)
               dump.records.emplace_back(sequence, question + prefix * answered / kPrefixes);

@@ -245,3 +245,372 @@ PAGED_ATTENTION_SINK_REDUCE(attention_reduce_kv4_g8_d128_w512_sinks, 4, 8, 128, 
 #undef PAGED_ATTENTION_REDUCE
 #undef PAGED_ATTENTION_SINK_REDUCE_KERNEL
 #undef PAGED_ATTENTION_REDUCE_KERNEL
+
+template <typename CacheElement>
+inline void inkling_short_phase(device const bfloat *queries, device const bfloat *relative,
+                                device const bfloat *projection, device const SplashKvPage *page_table,
+                                device const SplashLaneRows *layout, device const SplashTreeRow *tree,
+                                device float *workspace, constant SplashAttentionParams &params,
+                                uint3 group, uint lane, uint sg) {
+  constant SplashAttentionSequence &sequence = params.sequence[0];
+  const SplashAttentionRows rows = splash_attention_rows(layout, params, 0);
+  if (group.y >= rows.rows || !splash_attention_rows_valid(params, sequence))
+    return;
+  const ulong row = ulong(rows.first) + group.y;
+  const uint head = group.x * 3 + sg;
+  const uint pos = sequence.committed_tokens + (params.trees ? tree[row].depth : group.y);
+  const uint anchor = sequence.committed_tokens;
+  const uint first = params.last_rows && pos > params.last_rows ? pos - params.last_rows : 0;
+  const uint end = anchor + group.y + 1;
+  const uint per = (end - first + sequence.split_count - 1) / sequence.split_count;
+  const uint begin = min(end, first + group.z * per);
+  const uint stop = min(end, begin + per);
+  const uint ancestors = params.trees ? tree[row].ancestors : ~0u;
+  const SplashKvAddressing<8, 128, CacheElement> addressing(params.kv, group.x);
+  float q[4], accum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  for (uint i = 0; i < 4; ++i)
+    q[i] = float(queries[row * 3072 + head * 128 + lane + i * 32]);
+  float maximum = -INFINITY, denominator = 0.0f;
+  for (uint slot = begin; slot < stop; ++slot) {
+    uint key_pos = slot;
+    if (params.trees && slot >= anchor) {
+      const uint tree_row = slot - anchor;
+      if (!((ancestors >> tree_row) & 1u))
+        continue;
+      key_pos = anchor + tree[ulong(rows.first) + tree_row].depth;
+    }
+    if (key_pos > pos || (params.last_rows && pos - key_pos > params.last_rows))
+      continue;
+    const uint distance = pos - key_pos, token = slot % SplashKvPageTokens;
+    const SplashKvPageTensors<CacheElement> page = addressing.page(page_table[slot / SplashKvPageTokens]);
+    float dot = 0.0f;
+    for (uint i = 0; i < 4; ++i)
+      dot += q[i] * float(page.keys[token * 128 + lane + i * 32]);
+    dot = simd_sum(dot);
+    if constexpr (is_same<CacheElement, int8_t>::value)
+      dot *= page.key_scales[token];
+    const float product = distance < 1024 && lane < 16
+        ? float(relative[row * 384 + head * 16 + lane]) * float(projection[lane * 1024 + distance]) : 0.0f;
+    const float score = dot * 0.08838834764831845f + float(bfloat(simd_sum(product)));
+    const float next = max(maximum, score);
+    const float old_scale = maximum == -INFINITY ? 0.0f : exp(maximum - next);
+    const float weight = exp(score - next);
+    float value_scale = 1.0f;
+    if constexpr (is_same<CacheElement, int8_t>::value)
+      value_scale = page.value_scales[token];
+    for (uint i = 0; i < 4; ++i) {
+      const uint dim = lane + i * 32;
+      accum[i] = accum[i] * old_scale + weight * value_scale * float(page.values[dim * SplashKvPageTokens + token]);
+    }
+    denominator = denominator * old_scale + weight;
+    maximum = next;
+  }
+  device float *partial = workspace + ((row * 24 + head) * sequence.split_count + group.z) * 130;
+  for (uint i = 0; i < 4; ++i) partial[lane + i * 32] = accum[i];
+  if (lane == 0) {
+    partial[128] = maximum;
+    partial[129] = denominator;
+  }
+}
+
+#define INKLING_SHORT(Name, CacheElement) \
+kernel void Name(device const bfloat *queries [[buffer(0)]], device const bfloat *relative [[buffer(1)]], \
+                 device const bfloat *projection [[buffer(2)]], device const SplashKvPage *pages [[buffer(3)]], \
+                 device const SplashLaneRows *layout [[buffer(4)]], device const SplashTreeRow *tree [[buffer(5)]], \
+                 device float *workspace [[buffer(6)]], constant SplashAttentionParams &params [[buffer(7)]], \
+                 uint3 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]], \
+                 uint sg [[simdgroup_index_in_threadgroup]]) { \
+  inkling_short_phase<CacheElement>(queries, relative, projection, pages, layout, tree, workspace, params, \
+                                    group, lane, sg); \
+}
+INKLING_SHORT(attention_q8_inkling_short, int8_t)
+INKLING_SHORT(attention_bf16_inkling_short, bfloat)
+#undef INKLING_SHORT
+
+kernel void attention_inkling_bias(device const bfloat *relative [[buffer(0)]],
+                                   device const bfloat *projection [[buffer(1)]],
+                                   device float *workspace [[buffer(2)]],
+                                   device const SplashLaneRows *layout [[buffer(3)]],
+                                   constant SplashAttentionParams &params [[buffer(4)]],
+                                   uint3 group [[threadgroup_position_in_grid]],
+                                   uint lane [[thread_index_in_threadgroup]]) {
+  const SplashAttentionRows rows = splash_attention_rows(layout, params, 0);
+  if (group.y >= rows.rows)
+    return;
+  const ulong row = ulong(rows.first) + group.y;
+  const uint distance = group.z * 128 + lane;
+  float bias = 0.0f;
+#pragma unroll
+  for (uint k = 0; k < 16; ++k)
+    bias += float(relative[row * 384 + group.x * 16 + k]) * float(projection[k * 1024 + distance]);
+  device bfloat *biases = reinterpret_cast<device bfloat *>(
+      workspace + ulong(params.rows) * 24 * params.tiles * 130);
+  biases[(row * 24 + group.x) * 1024 + distance] = bfloat(bias);
+}
+
+// The distances an inline bias stage holds a fused query (inkling_split_phase): a page's 32 keys from rows up to 8
+// positions apart.
+constant constexpr uint kInklingBiasSpan = 40;
+template <typename CacheElement, uint TileRows, bool CachedBias>
+inline void inkling_split_phase(device const bfloat *queries, device const bfloat *relative,
+                                device const bfloat *projection, device const SplashKvPage *page_table,
+                                device const SplashLaneRows *layout, device const SplashTreeRow *tree,
+                                device float *workspace, constant SplashAttentionParams &params,
+                                uint3 group, uint lane, uint sg, threadgroup uint *query_stage,
+                                threadgroup float *bias_stage) {
+  constant SplashAttentionSequence &sequence = params.sequence[0];
+  const SplashAttentionRows rows = splash_attention_rows(layout, params, 0);
+  const uint first_row = group.y * TileRows;
+  if (first_row >= rows.rows || !splash_attention_rows_valid(params, sequence))
+    return;
+  const uint active = min(TileRows, rows.rows - first_row);
+  if (sg * 8 >= active * 3)
+    return;
+  const uint anchor = sequence.committed_tokens;
+  const uint visible = anchor + first_row + active;
+  const uint first_pos = anchor + first_row;
+  const uint first_page = params.last_rows && !params.trees && first_pos > params.last_rows
+                              ? (first_pos - params.last_rows) / SplashKvPageTokens
+                              : params.last_rows && params.trees && anchor > params.last_rows
+                                    ? (anchor - params.last_rows) / SplashKvPageTokens : 0;
+  const uint pages = splash_attention_pages(visible);
+  const uint per = splash_attention_pages_per_split(pages - first_page, sequence.split_count);
+  const uint begin = min(pages, first_page + group.z * per);
+  const uint end = min(pages, begin + per);
+  const sgmatrix::Lane l = sgmatrix::lane_map(lane);
+  const uint fm = l.fm, fn = l.fn;
+  const uint fused = sg * 8 + fn;
+  const uint r0 = min(fused / 3, active - 1);
+  const uint r1 = min((fused + 1) / 3, active - 1);
+  const uint h0 = group.x * 3 + fused % 3;
+  const uint h1 = group.x * 3 + (fused + 1) % 3;
+  const ulong row0 = ulong(rows.first) + first_row + r0;
+  const ulong row1 = ulong(rows.first) + first_row + r1;
+  const uint pos0 = anchor + (params.trees ? tree[row0].depth : first_row + r0);
+  const uint pos1 = anchor + (params.trees ? tree[row1].depth : first_row + r1);
+  const uint anc0 = params.trees ? tree[row0].ancestors : ~0u;
+  const uint anc1 = params.trees ? tree[row1].ancestors : ~0u;
+  threadgroup uint *qstage = query_stage + sg * 512;
+  device const ushort *q0 = reinterpret_cast<device const ushort *>(queries + row0 * 3072 + h0 * 128);
+  device const ushort *q1 = reinterpret_cast<device const ushort *>(queries + row1 * 3072 + h1 * 128);
+#pragma unroll
+  for (uint b = 0; b < 2; ++b)
+#pragma unroll
+    for (uint t = 0; t < 8; ++t) {
+      const uint d = 64 * b + q8sgf::block_dimension(fm, t);
+      qstage[(b * 8 + t) * 32 + lane] = uint(q0[d]) | (uint(q1[d]) << 16);
+    }
+  float2 output[16];
+#pragma unroll
+  for (uint d = 0; d < 16; ++d) output[d] = float2(0.0f);
+  float2 maximum(-INFINITY), denominator(0.0f);
+  const SplashKvAddressing<8, 128, CacheElement> addressing(params.kv, group.x);
+  // The relative bias reaches keys under 1024 positions before a row: a page every key of which lies that far
+  // before the tile's first row, as most of a long history's do, skips its sums. Summed for every key, their
+  // device loads took 63% of a 512-row prompt chunk's full-layer attention at a 64K history on an M1 Max.
+  const uint nearest_row = params.trees ? anchor : first_pos;
+  // An inline bias as one matrix product a page: the simdgroup's eight fused queries' relative queries (A, 8 x 16,
+  // loaded once) times the projection at the kInklingBiasSpan distances from its lowest row less the page's last
+  // key (B, 16 x span) into its stage, from which each score takes its distance's. Summed key by key, the bias was
+  // 65% of a 512-row prompt chunk's sliding attention on an M1 Max. A tree's rows (a short history's verify,
+  // whose draft keys may sit before their page) sum key by key.
+  threadgroup float *bias_rows = bias_stage + sg * 8 * kInklingBiasSpan;
+  const uint pos_lo = simd_min(min(pos0, pos1)), pos_hi = simd_max(max(pos0, pos1));
+  const bool matrix_bias = !CachedBias && !params.trees && pos_hi - pos_lo + 32 <= kInklingBiasSpan;
+  float2 rel_a[2] = {float2(0.0f), float2(0.0f)};
+  if (!CachedBias && matrix_bias) {
+    const uint fq = sg * 8 + fm;
+    const ulong row_q = ulong(rows.first) + first_row + min(fq / 3, active - 1);
+    const uint head_q = group.x * 3 + fq % 3;
+#pragma unroll
+    for (uint step = 0; step < 2; ++step)
+      rel_a[step] = q8sgf::bfloat_pair(
+          reinterpret_cast<device const uint *>(relative + row_q * 384 + head_q * 16 + step * 8 + fn)[0]);
+  }
+  for (uint page = begin; page < end; ++page) {
+    const SplashKvPageTensors<CacheElement> tensors = addressing.page(page_table[page]);
+    const bool near = page * 32 + 31 + 1024 > nearest_row;
+    // The span's first distance: the lowest row's from the page's last key (negative distances are masked).
+    const int first_distance = int(pos_lo) - int(page * 32 + 31);
+    if (!CachedBias && matrix_bias && near) {
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+#pragma unroll
+      for (uint tile = 0; tile < kInklingBiasSpan / 8; ++tile) {
+        float2 c(0.0f);
+#pragma unroll
+        for (uint step = 0; step < 2; ++step) {
+          const int d = first_distance + int(tile * 8 + fn);
+          const uint k = step * 8 + fm;
+          const float b0 = d >= 0 && d < 1024 ? float(projection[k * 1024 + d]) : 0.0f;
+          const float b1 = d + 1 >= 0 && d + 1 < 1024 ? float(projection[k * 1024 + d + 1]) : 0.0f;
+          sgmatrix::mma_acc<float>(c, rel_a[step], float2(b0, b1));
+        }
+        bias_rows[fm * kInklingBiasSpan + tile * 8 + fn] = c.x;
+        bias_rows[fm * kInklingBiasSpan + tile * 8 + fn + 1] = c.y;
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float2 scores[4] = {float2(0.0f), float2(0.0f), float2(0.0f), float2(0.0f)};
+#pragma unroll
+    for (uint b = 0; b < 2; ++b)
+#pragma unroll
+      for (uint s = 0; s < 4; ++s) {
+        q8sgf::KeyRun<CacheElement> run;
+        run.load(tensors.keys + q8sgf::page_token(fm, s) * 128 + 64 * b + 8 * fn);
+#pragma unroll
+        for (uint t = 0; t < 8; ++t)
+          q8sgf::mma(scores[s], run.step(t), q8sgf::bfloat_pair(qstage[(b * 8 + t) * 32 + lane]));
+      }
+    bool2 seen[4];
+    float2 local_max(-INFINITY);
+#pragma unroll
+    for (uint s = 0; s < 4; ++s) {
+      const uint token = page * 32 + q8sgf::page_token(fm, s);
+      uint key_pos = token;
+      if (params.trees && token >= anchor && token < visible)
+        key_pos = anchor + tree[ulong(rows.first) + token - anchor].depth;
+      const bool on0 = token < anchor || !params.trees || ((anc0 >> min(token - anchor, 31u)) & 1u);
+      const bool on1 = token < anchor || !params.trees || ((anc1 >> min(token - anchor, 31u)) & 1u);
+      const bool valid0 = token < anchor + first_row + r0 + 1 && key_pos <= pos0 && on0 &&
+                          (!params.last_rows || pos0 - key_pos <= params.last_rows);
+      const bool valid1 = token < anchor + first_row + r1 + 1 && key_pos <= pos1 && on1 &&
+                          (!params.last_rows || pos1 - key_pos <= params.last_rows);
+      seen[s] = bool2(valid0, valid1);
+      float2 bias(0.0f);
+      const uint dist0 = pos0 - key_pos, dist1 = pos1 - key_pos;
+      if (!near) {
+      } else if constexpr (CachedBias) {
+        device const bfloat *biases = reinterpret_cast<device const bfloat *>(
+            workspace + ulong(params.rows) * 24 * params.tiles * 130);
+        if (valid0 && dist0 < 1024)
+          bias.x = float(biases[(row0 * 24 + h0) * 1024 + dist0]);
+        if (valid1 && dist1 < 1024)
+          bias.y = float(biases[(row1 * 24 + h1) * 1024 + dist1]);
+      } else if (matrix_bias) {
+        if (valid0 && dist0 < 1024) bias.x = bias_rows[fn * kInklingBiasSpan + uint(int(dist0) - first_distance)];
+        if (valid1 && dist1 < 1024)
+          bias.y = bias_rows[(fn + 1) * kInklingBiasSpan + uint(int(dist1) - first_distance)];
+      } else {
+#pragma unroll
+        for (uint k = 0; k < 16; ++k) {
+          if (valid0 && dist0 < 1024)
+            bias.x += float(relative[row0 * 384 + h0 * 16 + k]) * float(projection[k * 1024 + dist0]);
+          if (valid1 && dist1 < 1024)
+            bias.y += float(relative[row1 * 384 + h1 * 16 + k]) * float(projection[k * 1024 + dist1]);
+        }
+      }
+      if constexpr (is_same<CacheElement, int8_t>::value)
+        scores[s] *= tensors.key_scales[token % 32];
+      scores[s] = scores[s] * 0.08838834764831845f + float2(bfloat(bias.x), bfloat(bias.y));
+      scores[s] = float2(valid0 ? scores[s].x : -INFINITY, valid1 ? scores[s].y : -INFINITY);
+      local_max = max(local_max, scores[s]);
+    }
+    local_max = max(local_max, simd_shuffle_xor(local_max, 2));
+    local_max = max(local_max, simd_shuffle_xor(local_max, 4));
+    local_max = max(local_max, simd_shuffle_xor(local_max, 16));
+    const float2 next = max(maximum, local_max);
+    float2 weights[4], sum(0.0f);
+#pragma unroll
+    for (uint s = 0; s < 4; ++s) {
+      float2 p(seen[s].x ? fast::exp(scores[s].x - next.x) : 0.0f,
+               seen[s].y ? fast::exp(scores[s].y - next.y) : 0.0f);
+      sum += p;
+      if constexpr (is_same<CacheElement, int8_t>::value)
+        p *= tensors.value_scales[q8sgf::page_token(fm, s)];
+      weights[s] = p;
+    }
+    sum += simd_shuffle_xor(sum, 2);
+    sum += simd_shuffle_xor(sum, 4);
+    sum += simd_shuffle_xor(sum, 16);
+    const float2 scale(next.x == -INFINITY || next.x == maximum.x ? 1.0f : fast::exp(maximum.x - next.x),
+                       next.y == -INFINITY || next.y == maximum.y ? 1.0f : fast::exp(maximum.y - next.y));
+    denominator = denominator * scale + sum;
+    maximum = next;
+#pragma unroll
+    for (uint d = 0; d < 16; ++d) {
+      output[d] *= scale;
+      q8sgf::ValueRun<CacheElement> run;
+      run.load(tensors.values + (fm + d * 8) * 32 + 4 * fn);
+      q8sgf::mma(output[d], run.step(0), weights[0]);
+      q8sgf::mma(output[d], run.step(1), weights[1]);
+      q8sgf::mma(output[d], run.step(2), weights[2]);
+      q8sgf::mma(output[d], run.step(3), weights[3]);
+    }
+  }
+  if (fused / 3 < active) {
+    device float *part = workspace + ((row0 * 24 + h0) * sequence.split_count + group.z) * 130;
+#pragma unroll
+    for (uint d = 0; d < 16; ++d) part[8 * d + fm] = output[d].x;
+    if (fm == 0) { part[128] = maximum.x; part[129] = denominator.x; }
+  }
+  if ((fused + 1) / 3 < active) {
+    device float *part = workspace + ((row1 * 24 + h1) * sequence.split_count + group.z) * 130;
+#pragma unroll
+    for (uint d = 0; d < 16; ++d) part[8 * d + fm] = output[d].y;
+    if (fm == 0) { part[128] = maximum.y; part[129] = denominator.y; }
+  }
+}
+
+#define INKLING_SPLIT(Name, CacheElement, TileRows, CachedBias) \
+kernel void Name(device const bfloat *queries [[buffer(0)]], device const bfloat *relative [[buffer(1)]], \
+                 device const bfloat *projection [[buffer(2)]], device const SplashKvPage *pages [[buffer(3)]], \
+                 device const SplashLaneRows *layout [[buffer(4)]], device const SplashTreeRow *tree [[buffer(5)]], \
+                 device float *workspace [[buffer(6)]], constant SplashAttentionParams &params [[buffer(7)]], \
+                 uint3 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]], \
+                 uint sg [[simdgroup_index_in_threadgroup]]) { \
+  threadgroup uint query_stage[(TileRows * 3 / 8) * 512]; \
+  threadgroup float bias_stage[CachedBias ? 1 : (TileRows * 3 / 8) * 8 * kInklingBiasSpan]; \
+  inkling_split_phase<CacheElement, TileRows, CachedBias>(queries, relative, projection, pages, layout, tree, workspace, params, \
+                                     group, lane, sg, query_stage, bias_stage); \
+}
+INKLING_SPLIT(attention_q8_inkling_split, int8_t, 8, false)
+INKLING_SPLIT(attention_bf16_inkling_split, bfloat, 8, false)
+INKLING_SPLIT(attention_q8_inkling_staged, int8_t, 8, true)
+INKLING_SPLIT(attention_bf16_inkling_staged, bfloat, 8, true)
+INKLING_SPLIT(attention_q8_inkling_prefill, int8_t, 16, false)
+INKLING_SPLIT(attention_bf16_inkling_prefill, bfloat, 16, false)
+#undef INKLING_SPLIT
+
+kernel void attention_inkling_reduce(
+    device const float *workspace [[buffer(0)]], device const bfloat *sinks [[buffer(1)]],
+    device const bfloat *gate [[buffer(2)]], device bfloat *output [[buffer(3)]],
+    device const SplashLaneRows *layout [[buffer(4)]], constant SplashAttentionParams &params [[buffer(5)]],
+    uint3 group [[threadgroup_position_in_grid]], uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+  constant SplashAttentionSequence &sequence = params.sequence[0];
+  const SplashAttentionRows rows = splash_attention_rows(layout, params, 0);
+  if (group.y >= rows.rows)
+    return;
+  const ulong row = ulong(rows.first) + group.y;
+  const uint head = group.x * 3 + sg;
+  // Lane j holds splits j and j + 32 (at most 64), so their maxima and denominators load at once; then each
+  // split's outputs, eight splits' loads in flight: a loop that waits for each split's load in turn took 20 us
+  // at 16 splits on an M1 Max.
+  device const float *partials = workspace + (row * 24 + head) * sequence.split_count * 130;
+  const uint splits = sequence.split_count;
+  const float sink = float(sinks[row * 24 + head]);
+  float m[2], d[2];
+  for (uint h = 0; h < 2; ++h) {
+    const uint split = min(lane + h * 32, splits - 1);
+    m[h] = partials[split * 130 + 128];
+    d[h] = partials[split * 130 + 129];
+    if (lane + h * 32 >= splits) m[h] = -INFINITY;
+  }
+  const float maximum = max(sink, simd_max(max(m[0], m[1])));
+  float w[2];
+  for (uint h = 0; h < 2; ++h) w[h] = m[h] == -INFINITY ? 0.0f : exp(m[h] - maximum);
+  const float denominator = exp(sink - maximum) + simd_sum(w[0] * d[0] + w[1] * d[1]);
+  float accum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll(8)
+  for (uint split = 0; split < splits; ++split) {
+    device const float *part = partials + split * 130;
+    const float weight = simd_shuffle(split < 32 ? w[0] : w[1], ushort(split & 31));
+    for (uint i = 0; i < 4; ++i) accum[i] += weight * part[lane + i * 32];
+  }
+  for (uint i = 0; i < 4; ++i) {
+    const ulong index = row * 3072 + head * 128 + lane + i * 32;
+    const float attention = float(bfloat(accum[i] / denominator));
+    const float g = float(gate[row * INKLING_PACKED_WIDTH + INKLING_GATE_OFFSET + head * 128 + lane + i * 32]);
+    output[index] = bfloat(attention / (1.0f + exp(-g)));
+  }
+}

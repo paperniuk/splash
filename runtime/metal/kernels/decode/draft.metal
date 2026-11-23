@@ -3,6 +3,7 @@
 #include "metal/kernels/common/draft_context_window.h"
 #include "metal/kernels/common/lane_bindings.h"
 #include "metal/kernels/common/rms_inverse.h"
+#include "metal/kernels/common/sgmatrix.h"
 
 inline void draft_conv_phase(device const bfloat *input,
                              device const bfloat *dynamic,
@@ -590,4 +591,420 @@ kernel void draft_attention_bf16_reduce(
           PartialFloats;
   draft_attention_reduce_phase(partials, queries + batch * Rows * Attention,
                                group.x, thread_index);
+}
+
+kernel void dspark_context_fusion(
+    device const bfloat *captured [[buffer(0)]],
+    device const bfloat *fuse [[buffer(1)]],
+    device const bfloat *norm [[buffer(2)]],
+    device bfloat *output [[buffer(3)]],
+    constant DSparkFusionParams &params [[buffer(4)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+#pragma clang fp contract(off)
+#pragma clang fp reassociate(off)
+  float logits[4];
+  float maximum = -INFINITY;
+  for (uint tap = 0; tap < 4; ++tap) {
+    logits[tap] = float(fuse[params.consumer * 4 + tap]);
+    maximum = max(maximum, logits[tap]);
+  }
+  float alpha[4];
+  float mass = 0.0f;
+  for (uint tap = 0; tap < 4; ++tap) {
+    alpha[tap] = exp(logits[tap] - maximum);
+    mass += alpha[tap];
+  }
+  for (uint tap = 0; tap < 4; ++tap)
+    alpha[tap] = float(bfloat(alpha[tap] / mass));
+  float mixed[9];
+  float squares = 0.0f;
+  for (uint i = 0; i < 9; ++i) {
+    const uint column = tid + 256 * i;
+    float value = 0.0f;
+    for (uint tap = 0; tap < 4; ++tap)
+      value += float(captured[(ulong(row) * 4 + tap) * params.width + column]) * alpha[tap];
+    mixed[i] = value;
+    squares += value * value;
+  }
+  threadgroup float reductions[8];
+  const float inverse = rms_inverse_of_sums(squares, params.width, reductions, tid, lane, simd_group);
+  for (uint i = 0; i < 9; ++i) {
+    const uint column = tid + 256 * i;
+    output[ulong(row) * params.width + column] = bfloat(mixed[i] * inverse * float(norm[column]));
+  }
+}
+
+kernel void dspark_head_prepare(
+    device const bfloat *input [[buffer(0)]],
+    device const bfloat *norm [[buffer(1)]],
+    device bfloat *output [[buffer(2)]],
+    constant DSparkHeadParams &params [[buffer(3)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float reductions[8];
+  threadgroup bfloat values[128];
+  const float value = tid < 128 ? float(input[ulong(group) * 128 + tid]) : 0.0f;
+  const float inverse = rms_inverse_of_sums(value * value, 128, reductions, tid, lane, simd_group);
+  if (tid < 128) values[tid] = bfloat(value * inverse * float(norm[tid]));
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid < 64) {
+    const float angle = float(params.start_position + group / params.heads) * pow(1000000.0f, -float(tid) / 64.0f);
+    const float cosine = cos(angle), sine = sin(angle);
+    const float first = float(values[tid]), second = float(values[tid + 64]);
+    output[ulong(group) * 128 + tid] = bfloat(first * cosine - second * sine);
+    output[ulong(group) * 128 + tid + 64] = bfloat(second * cosine + first * sine);
+  }
+}
+
+// Where the block attention reads a context row's key and value of one KV
+// head: a single buffer or a ring of `capacity` rows (a capacity of zero
+// reads a row where it is), or DSpark's segmented global layer
+// (SPLASH_DRAFT_GLOBAL_SEGMENT_TOKENS), whose row r is row r % segment_tokens
+// of the segment r / segment_tokens, reached through the table of the
+// segments' addresses (keys, then values; metal::AddressTable).
+struct DSparkRingContext {
+  device const bfloat *keys;
+  device const bfloat *values;
+  uint capacity;
+  device const bfloat *row(uint row, uint kv_head, uint plane) const {
+    const uint source_row = capacity ? row % capacity : row;
+    return (plane ? values : keys) + (ulong(source_row) * 8 + kv_head) * 128;
+  }
+};
+
+struct DSparkSegmentedContext {
+  constant ulong *table;
+  uint segment_tokens;
+  uint segments;
+  device const bfloat *row(uint row, uint kv_head, uint plane) const {
+    const uint segment = row / segment_tokens;
+    return reinterpret_cast<device const bfloat *>(table[plane * segments + segment]) +
+           (ulong(row - segment * segment_tokens) * 8 + kv_head) * 128;
+  }
+};
+
+// One KV head's 24 queries (8 rows x 3 heads, query q = 3 row + head % 3) over one split of the block's keys, the
+// context rows then the block's own 8 (bidirectional), 32 keys a step staged in threadgroup memory, on 8x8 MMAs:
+// simdgroup s scores key tile s % 4 against every query over dimensions 64 (s / 4) on, holding its queries in
+// registers; simdgroup s's lanes then take queries 3s..3s+2 (online softmax, lane j key j), and simdgroup s sums the
+// weighted values of output dimensions 16s..16s+15 for every query. Scalar sums over a key a lane took 1.4 ms a cycle
+// at a 16K-token context on an M1 Max.
+constant constexpr uint kDSparkKeys = 32;
+struct DSparkAttentionStage {
+  bfloat qs[24][128];
+  bfloat ks[kDSparkKeys][130];
+  bfloat vs[kDSparkKeys][128];
+  // The two dimension halves' scores; the softmax writes its weights over the first.
+  float scores[2][24][kDSparkKeys];
+  float scales[24];
+};
+template <typename Context>
+inline void dspark_block_attend_split(Context context, device const bfloat *queries, device const bfloat *block_keys,
+                                      device const bfloat *block_values, device float *workspace,
+                                      constant DSparkSplitAttentionParams &p, uint kv, uint split, uint tid,
+                                      uint lane, uint sg, threadgroup DSparkAttentionStage &stage) {
+  threadgroup auto &qs = stage.qs;
+  threadgroup auto &ks = stage.ks;
+  threadgroup auto &vs = stage.vs;
+  threadgroup auto &scores = stage.scores;
+  const uint context_count = p.context_rows - p.context_first, count = context_count + 8;
+  const uint per = (count + p.splits - 1) / p.splits, begin = min(count, split * per), end = min(count, begin + per);
+  for (uint i = tid; i < 24 * 128; i += 256) {
+    const uint q = i / 128, d = i % 128;
+    qs[q][d] = queries[(ulong(q / 3) * 24 + kv * 3 + q % 3) * 128 + d];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const sgmatrix::Lane l = sgmatrix::lane_map(lane);
+  const uint fm = l.fm, fn = l.fn, tile = sg % 4, dims = sg / 4;
+  float2 qf[3][8];
+  for (uint qt = 0; qt < 3; ++qt)
+    for (uint ds = 0; ds < 8; ++ds) {
+      const uint d = dims * 64 + ds * 8 + fn;
+      qf[qt][ds] = float2(float(qs[qt * 8 + fm][d]), float(qs[qt * 8 + fm][d + 1]));
+    }
+  float maximum[3] = {-INFINITY, -INFINITY, -INFINITY}, denominator[3] = {0, 0, 0};
+  float2 out[3][2] = {{float2(0), float2(0)}, {float2(0), float2(0)}, {float2(0), float2(0)}};
+  const uint r = tid / 8, part = (tid % 8) * 16;
+  for (uint first = begin; first < end; first += kDSparkKeys) {
+    const uint n = min(kDSparkKeys, end - first);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+      // Rows past the step's keys hold zeros: their weights are zero, and a zero weight times stale bits could be NaN.
+      uint4 k0 = uint4(0), k1 = uint4(0), v0 = uint4(0), v1 = uint4(0);
+      if (r < n) {
+        const uint i = first + r;
+        device const bfloat *k, *v;
+        if (i < context_count) {
+          k = context.row(p.context_first + i, kv, 0);
+          v = context.row(p.context_first + i, kv, 1);
+        } else {
+          const ulong offset = (ulong(i - context_count) * 8 + kv) * 128;
+          k = block_keys + offset;
+          v = block_values + offset;
+        }
+        k0 = *reinterpret_cast<device const uint4 *>(k + part);
+        k1 = *reinterpret_cast<device const uint4 *>(k + part + 8);
+        v0 = *reinterpret_cast<device const uint4 *>(v + part);
+        v1 = *reinterpret_cast<device const uint4 *>(v + part + 8);
+      }
+      *reinterpret_cast<threadgroup uint4 *>(&vs[r][part]) = v0;
+      *reinterpret_cast<threadgroup uint4 *>(&vs[r][part + 8]) = v1;
+      for (uint e = 0; e < 4; ++e) {
+        *reinterpret_cast<threadgroup uint *>(&ks[r][part + 2 * e]) = k0[e];
+        *reinterpret_cast<threadgroup uint *>(&ks[r][part + 8 + 2 * e]) = k1[e];
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    {
+      float2 s[3] = {float2(0), float2(0), float2(0)};
+      for (uint ds = 0; ds < 8; ++ds) {
+        const uint d = dims * 64 + ds * 8 + fm;
+        const float2 b = float2(float(ks[tile * 8 + fn][d]), float(ks[tile * 8 + fn + 1][d]));
+        for (uint qt = 0; qt < 3; ++qt) sgmatrix::mma_acc<float>(s[qt], qf[qt][ds], b);
+      }
+      for (uint qt = 0; qt < 3; ++qt) {
+        scores[dims][qt * 8 + fm][tile * 8 + fn] = s[qt].x;
+        scores[dims][qt * 8 + fm][tile * 8 + fn + 1] = s[qt].y;
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint q = 0; q < 3; ++q) {
+      const uint qq = 3 * sg + q;
+      const float score = scores[0][qq][lane] + scores[1][qq][lane];
+      const float s = lane < n ? score * 0.08838834764831845f : -INFINITY;
+      const float next = max(maximum[q], simd_max(s));
+      const float scale = exp(maximum[q] - next);
+      const float weight = lane < n ? exp(s - next) : 0.0f;
+      denominator[q] = denominator[q] * scale + simd_sum(weight);
+      maximum[q] = next;
+      scores[0][qq][lane] = weight;
+      if (lane == 0) stage.scales[qq] = scale;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint qt = 0; qt < 3; ++qt) {
+      const float scale = stage.scales[qt * 8 + fm];
+      out[qt][0] *= scale;
+      out[qt][1] *= scale;
+    }
+    for (uint kt = 0; kt < kDSparkKeys / 8; ++kt) {
+      float2 a[3];
+      for (uint qt = 0; qt < 3; ++qt)
+        a[qt] = float2(scores[0][qt * 8 + fm][kt * 8 + fn], scores[0][qt * 8 + fm][kt * 8 + fn + 1]);
+      for (uint j = 0; j < 2; ++j) {
+        const uint d = (2 * sg + j) * 8 + fn;
+        const float2 b = float2(float(vs[kt * 8 + fm][d]), float(vs[kt * 8 + fm][d + 1]));
+        for (uint qt = 0; qt < 3; ++qt) sgmatrix::mma_acc<float>(out[qt][j], a[qt], b);
+      }
+    }
+  }
+  const ulong base = (ulong(kv) * p.splits + split) * 24;
+  for (uint qt = 0; qt < 3; ++qt)
+    for (uint j = 0; j < 2; ++j) {
+      device float *partial = workspace + (base + qt * 8 + fm) * DSPARK_ATTENTION_PARTIAL + (2 * sg + j) * 8 + fn;
+      partial[0] = out[qt][j].x;
+      partial[1] = out[qt][j].y;
+    }
+  if (lane == 0)
+    for (uint q = 0; q < 3; ++q) {
+      device float *partial = workspace + (base + 3 * sg + q) * DSPARK_ATTENTION_PARTIAL;
+      partial[128] = maximum[q];
+      partial[129] = denominator[q];
+    }
+}
+
+// Grid (8 KV heads, splits), 256 threads.
+kernel void dspark_block_attention_split(
+    device const bfloat *queries [[buffer(0)]], device const bfloat *context_keys [[buffer(1)]],
+    device const bfloat *context_values [[buffer(2)]], device const bfloat *block_keys [[buffer(3)]],
+    device const bfloat *block_values [[buffer(4)]], device float *workspace [[buffer(5)]],
+    constant DSparkSplitAttentionParams &params [[buffer(6)]], uint2 group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup DSparkAttentionStage stage;
+  dspark_block_attend_split(DSparkRingContext{context_keys, context_values, params.context_capacity}, queries,
+                            block_keys, block_values, workspace, params, group.x, group.y, tid, lane, sg, stage);
+}
+
+kernel void dspark_block_attention_split_segmented(
+    device const bfloat *queries [[buffer(0)]], device const bfloat *block_keys [[buffer(1)]],
+    device const bfloat *block_values [[buffer(2)]], device float *workspace [[buffer(3)]],
+    constant DSparkSplitAttentionParams &params [[buffer(4)]], constant ulong *segments [[buffer(5)]],
+    uint2 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup DSparkAttentionStage stage;
+  dspark_block_attend_split(DSparkSegmentedContext{segments, params.segment_tokens, params.segments}, queries,
+                            block_keys, block_values, workspace, params, group.x, group.y, tid, lane, sg, stage);
+}
+
+// Joins a query's split partials in split order: grid (8 rows x 24 heads), 128 threads, one output each; the
+// splits' maxima and denominators load lane-parallel.
+kernel void dspark_block_attention_reduce(
+    device const float *workspace [[buffer(0)]], device bfloat *output [[buffer(1)]],
+    constant DSparkSplitAttentionParams &p [[buffer(2)]], uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+  threadgroup float maxima[DSPARK_ATTENTION_MAX_SPLITS], weights[DSPARK_ATTENTION_MAX_SPLITS];
+  threadgroup float scaled[DSPARK_ATTENTION_MAX_SPLITS];
+  const uint row = group / 24, head = group % 24, kv = head / 3, q = row * 3 + head % 3;
+  const auto partial = [&](uint split) {
+    return workspace + ((ulong(kv) * p.splits + split) * 24 + q) * DSPARK_ATTENTION_PARTIAL;
+  };
+  float d = 0;
+  if (tid < p.splits) {
+    maxima[tid] = partial(tid)[128];
+    d = partial(tid)[129];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float maximum = -INFINITY;
+  for (uint s = 0; s < p.splits; ++s) maximum = max(maximum, maxima[s]);
+  if (tid < p.splits) {
+    const float w = maxima[tid] == -INFINITY ? 0.0f : exp(maxima[tid] - maximum);
+    weights[tid] = w;
+    scaled[tid] = w * d;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float denominator = 0, acc = 0;
+  for (uint s = 0; s < p.splits; ++s) denominator += scaled[s];
+#pragma unroll(8)
+  for (uint s = 0; s < p.splits; ++s) acc += weights[s] * partial(s)[tid];
+  output[ulong(group) * 128 + tid] = bfloat(acc / denominator);
+}
+
+kernel void dspark_block_input(
+    device const bfloat *anchor [[buffer(0)]],
+    device const bfloat *mask [[buffer(1)]],
+    device bfloat *hidden [[buffer(2)]],
+    device bfloat *residual [[buffer(3)]],
+    uint i [[thread_position_in_grid]]) {
+  const bfloat value = i < 2304 ? anchor[i] : mask[i % 2304];
+  hidden[i] = value;
+  residual[i] = value;
+}
+
+kernel void dspark_residual_norm(
+    device const bfloat *input [[buffer(0)]],
+    device bfloat *residual [[buffer(1)]],
+    device const bfloat *norm [[buffer(2)]],
+    device bfloat *output [[buffer(3)]],
+    uint row [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  float values[9], squares = 0.0f;
+  for (uint i = 0; i < 9; ++i) {
+    const uint col = tid + 256 * i;
+    const uint index = row * 2304 + col;
+    values[i] = float(input[index]) + float(residual[index]);
+    squares += values[i] * values[i];
+  }
+  threadgroup float reductions[8];
+  const float inverse = rms_inverse_of_sums(squares, 2304, reductions, tid, lane, simd_group);
+  for (uint i = 0; i < 9; ++i) {
+    const uint col = tid + 256 * i;
+    const uint index = row * 2304 + col;
+    residual[index] = bfloat(values[i]);
+    output[index] = bfloat(values[i] * inverse * float(norm[col]));
+  }
+}
+
+kernel void dspark_swiglu(
+    device const bfloat *gate [[buffer(0)]],
+    device const bfloat *up [[buffer(1)]],
+    device bfloat *output [[buffer(2)]],
+    uint i [[thread_position_in_grid]]) {
+  const float x = float(gate[i]);
+  output[i] = bfloat((x / (1.0f + exp(-x))) * float(up[i]));
+}
+
+kernel void dspark_context_store(
+    device const bfloat *keys [[buffer(0)]],
+    device const bfloat *values [[buffer(1)]],
+    device bfloat *persistent_keys [[buffer(2)]],
+    device bfloat *persistent_values [[buffer(3)]],
+    constant DSparkStoreParams &params [[buffer(4)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+  const uint first = params.rows > params.capacity ? params.rows - params.capacity : 0;
+  const uint row = first + group / 4, column = (group % 4) * 256 + tid;
+  const uint slot = (params.start_position + row - params.base_position) % params.capacity;
+  persistent_keys[ulong(slot) * 1024 + column] = keys[ulong(row) * 1024 + column];
+  persistent_values[ulong(slot) * 1024 + column] = values[ulong(row) * 1024 + column];
+}
+
+kernel void dspark_commit_gather(
+    device const bfloat *captured [[buffer(0)]],
+    device const uint *retained [[buffer(1)]],
+    device const SplashLaneRows *lane_rows [[buffer(2)]],
+    device bfloat *output [[buffer(3)]],
+    constant DSparkStoreParams &params [[buffer(4)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+  const uint destination = group / 36, column = (group % 36) * 256 + tid;
+  uint mask = retained[0];
+  const uint count = popcount(mask);
+  if (!count) {
+    output[ulong(destination) * 9216 + column] = bfloat(0.0f);
+    return;
+  }
+  const uint selected = destination == params.rows ? count - 1 : min(destination, count - 1);
+  for (uint i = 0; i < selected; ++i) mask &= mask - 1;
+  const uint source = ctz(mask);
+  output[ulong(destination) * 9216 + column] =
+      captured[(ulong(lane_rows[0].first) + source) * 9216 + column];
+}
+
+kernel void dspark_commit_store(
+    device const bfloat *keys [[buffer(0)]],
+    device const bfloat *values [[buffer(1)]],
+    device const uint *retained [[buffer(2)]],
+    device bfloat *persistent_keys [[buffer(3)]],
+    device bfloat *persistent_values [[buffer(4)]],
+    constant DSparkStoreParams &params [[buffer(5)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+  const uint row = group / 4, column = (group % 4) * 256 + tid;
+  if (row >= popcount(retained[0])) return;
+  const uint slot = (params.start_position + row - params.base_position) % params.capacity;
+  persistent_keys[ulong(slot) * 1024 + column] = keys[ulong(row) * 1024 + column];
+  persistent_values[ulong(slot) * 1024 + column] = values[ulong(row) * 1024 + column];
+}
+
+// Writes row `row` of the stored rows to its position's row of the segmented
+// global layer, wherever its segment is.
+inline void dspark_segmented_store(constant ulong *table, constant DSparkSegmentedStoreParams &params,
+                                   device const bfloat *keys, device const bfloat *values, uint row,
+                                   uint column) {
+  const uint position = params.start_position + row - params.base_position;
+  const uint segment = position / params.segment_tokens;
+  const ulong destination = ulong(position - segment * params.segment_tokens) * 1024 + column;
+  reinterpret_cast<device bfloat *>(table[segment])[destination] = keys[ulong(row) * 1024 + column];
+  reinterpret_cast<device bfloat *>(table[params.segments + segment])[destination] =
+      values[ulong(row) * 1024 + column];
+}
+
+kernel void dspark_context_store_segmented(
+    device const bfloat *keys [[buffer(0)]],
+    device const bfloat *values [[buffer(1)]],
+    constant DSparkSegmentedStoreParams &params [[buffer(2)]],
+    constant ulong *segments [[buffer(3)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+  dspark_segmented_store(segments, params, keys, values, group / 4, (group % 4) * 256 + tid);
+}
+
+kernel void dspark_commit_store_segmented(
+    device const bfloat *keys [[buffer(0)]],
+    device const bfloat *values [[buffer(1)]],
+    device const uint *retained [[buffer(2)]],
+    constant DSparkSegmentedStoreParams &params [[buffer(3)]],
+    constant ulong *segments [[buffer(4)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]]) {
+  const uint row = group / 4;
+  if (row >= popcount(retained[0])) return;
+  dspark_segmented_store(segments, params, keys, values, row, (group % 4) * 256 + tid);
 }

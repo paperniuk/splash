@@ -308,7 +308,7 @@ int main(int argc, char **argv) {
                   tokens.size());
       for (size_t index = 0; index < windows.size(); ++index)
         runWindow(executor, tokens, windows[index], index + 1, pageTable, vocabulary, argv[4],
-                  captures ? model.draft.layout.targetHiddenSize() : 0);
+                  captures ? model::draftTargetHiddenSize(model.descriptor.draft) : 0);
       return 0;
     } catch (const std::exception &error) {
       std::cerr << "teacher-logits: " << error.what() << '\n';

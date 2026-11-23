@@ -60,7 +60,9 @@ TargetRows prefillTargetRows(const RuntimeGeometry &geometry, const ops::Executi
                    .chunks = geometry.prefillChunks,
                    // Any one sequence's splits: a chunk's sequences share the
                    // workspace in turn where they do not fit together.
-                   .attention = operators.sequenceAttentionWorkspace(target.attentionQueryHeads, target.kvLayout),
+                   .attention = target.familyAttention ? ops::AttentionWorkspace{}
+                                                       : operators.sequenceAttentionWorkspace(
+                                                             target.attentionQueryHeads, target.kvLayout),
                    .moe = {}};
   if (target.ffnKind == QwenFfnKind::SparseMoe)
     shape.moe = operators.moeWorkspace(target.moeBlockShape(), target.moeRouterFormat, kPrefillRows);
@@ -72,7 +74,10 @@ TargetRows decodeTargetRows(const RuntimeGeometry &geometry, const ops::Executio
   // Every lane's tiles at the most splits, so a step's lanes attend in one
   // dispatch whatever their histories, and the MoE plan of every step of up
   // to its most rows.
-  const ops::AttentionWorkspace lane = operators.laneAttentionWorkspace(target.attentionQueryHeads, target.kvLayout);
+  const ops::AttentionWorkspace lane = target.familyAttention
+                                           ? ops::AttentionWorkspace{}
+                                           : operators.laneAttentionWorkspace(target.attentionQueryHeads,
+                                                                              target.kvLayout);
   TargetRows shape{.rows = kDecodeStepRows,
                    .chunks = 1,
                    .attention = {lane.partialsBytes * kLaneCount, lane.statisticsBytes * kLaneCount},
@@ -178,7 +183,8 @@ std::array<uint64_t, decodeTensorCount>
 decodeTensorBytes(const RuntimeGeometry &geometry,
                   const ops::ExecutionPlans &operators) {
   std::array<uint64_t, decodeTensorCount> result{};
-  const auto draftWorkspace =
+  const bool dspark = std::holds_alternative<DSparkDraftLayout>(geometry.draft.model);
+  const auto draftWorkspace = dspark ? ops::DraftAttentionWorkspace{} :
       operators.draftAttentionWorkspacePerLane(geometry.draft.attentionShape());
   const auto samplingWorkspace = ops::Sampling::workspace(kDecodeRows);
   const auto selectorWorkspace = ops::DraftSelector::workspace(kDraftProposalTokens);
@@ -230,7 +236,15 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
   put(DecodeTensor::AcceptedCount, sizeof(uint32_t));
   put(DecodeTensor::LaneLayout, sizeof(ops::LaneRows));
   // The draft's own rows: its block's, kDraftRows a lane.
-  const uint64_t d = kDraftRows;
+  uint64_t d = kDraftRows;
+  if (dspark) {
+    for (const auto &shape : {ops::ProjectionShape{3072, 2304}, {1024, 2304}, {2304, 3072},
+                              {9216, 2304}, {2304, 9216}})
+      d = std::max<uint64_t>(d, operators.draftLinear().storageRows(kDraftRows, shape));
+    // The base logits of 1 to 7 proposal rows, from row 1 of the block's output.
+    for (uint32_t rows = 1; rows < kDraftRows; ++rows)
+      d = std::max<uint64_t>(d, 1 + operators.linear().storageRows(rows, {201024, 2304}));
+  }
   put(DecodeTensor::DraftInputTokens, bytesFor<uint32_t>(d));
   for (uint32_t index = 0; index < 2; ++index) {
     put(static_cast<DecodeTensor>(
@@ -243,7 +257,8 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
       bytesFor<uint16_t>(d * geometry.draft.dynamicSize));
   put(DecodeTensor::DraftConvolved, draftWorkspace.convolutionBytes);
   put(DecodeTensor::DraftProposalQkv, draftWorkspace.qkvBytes);
-  put(DecodeTensor::DraftAttention, draftWorkspace.groupedQueriesBytes);
+  put(DecodeTensor::DraftAttention,
+      dspark ? bytesFor<uint16_t>(d * 3072) : draftWorkspace.groupedQueriesBytes);
   put(DecodeTensor::DraftProjected,
       bytesFor<uint16_t>(d * geometry.draft.hiddenSize));
   put(DecodeTensor::DraftResidual,
@@ -252,6 +267,24 @@ decodeTensorBytes(const RuntimeGeometry &geometry,
       bytesFor<uint16_t>(d * geometry.draft.intermediateSize));
   put(DecodeTensor::DraftFinalHidden,
       bytesFor<uint16_t>(d * geometry.draft.hiddenSize));
+  if (dspark) {
+    put(DecodeTensor::DSparkRawQuery, bytesFor<uint16_t>(d * 3072));
+    put(DecodeTensor::DSparkRawKey, bytesFor<uint16_t>(d * 1024));
+    put(DecodeTensor::DSparkQuery, bytesFor<uint16_t>(d * 3072));
+    put(DecodeTensor::DSparkKey, bytesFor<uint16_t>(d * 1024));
+    put(DecodeTensor::DSparkValue, bytesFor<uint16_t>(d * 1024));
+    put(DecodeTensor::DSparkGate, bytesFor<uint16_t>(d * 9216));
+    put(DecodeTensor::DSparkUp, bytesFor<uint16_t>(d * 9216));
+    put(DecodeTensor::DSparkCompact, bytesFor<uint16_t>((kDecodeRows + 1) * uint64_t{4} * 2304));
+    put(DecodeTensor::DSparkContext, bytesFor<float>(7 * 768));
+    put(DecodeTensor::DSparkState, bytesFor<uint16_t>(256));
+    put(DecodeTensor::DSparkRaw, bytesFor<uint16_t>(768));
+    put(DecodeTensor::DSparkLatent, bytesFor<uint16_t>(d * 256));
+    put(DecodeTensor::DSparkProbabilities, bytesFor<float>(7));
+    const ops::DSparkPartialBytes partial;
+    put(DecodeTensor::DSparkPartialValues, partial.values);
+    put(DecodeTensor::DSparkPartialIds, partial.ids);
+  }
   put(DecodeTensor::SelectorHidden,
       bytesFor<uint16_t>(d * geometry.draft.selectorRank));
   put(DecodeTensor::Candidates, selectorWorkspace.candidatesBytes);
@@ -310,11 +343,17 @@ ops::LinearScratchSize DecodeArena::linearScratchSize(
        {ops::ProjectionShape{d.hiddenSize, d.targetHiddenSize()}, {d.contextKvSize(), d.hiddenSize}})
     result.include(operators.draftLinear().scratchSize(shape, kDecodeStepRows));
   // The draft's own block, kDraftRows a lane.
-  for (const ops::ProjectionShape shape : {ops::ProjectionShape{d.dynamicSize, d.hiddenSize},
-       {d.qkvSize, d.hiddenSize}, {d.hiddenSize, d.attentionSize},
-       {d.intermediateSize, d.hiddenSize}, {d.hiddenSize, d.intermediateSize},
-       {d.selectorRank, d.hiddenSize}})
-    result.include(operators.draftLinear().scratchSize(shape, kLaneCount * kDraftRows));
+  if (std::holds_alternative<DSparkDraftLayout>(d.model)) {
+    for (const ops::ProjectionShape shape : {ops::ProjectionShape{3072, 2304}, {1024, 2304}, {2304, 3072},
+                                            {9216, 2304}, {2304, 9216}})
+      result.include(operators.draftLinear().scratchSize(shape, kLaneCount * kDraftRows));
+  } else {
+    for (const ops::ProjectionShape shape : {ops::ProjectionShape{d.dynamicSize, d.hiddenSize},
+         {d.qkvSize, d.hiddenSize}, {d.hiddenSize, d.attentionSize},
+         {d.intermediateSize, d.hiddenSize}, {d.hiddenSize, d.intermediateSize},
+         {d.selectorRank, d.hiddenSize}})
+      result.include(operators.draftLinear().scratchSize(shape, kLaneCount * kDraftRows));
+  }
   return result;
 }
 

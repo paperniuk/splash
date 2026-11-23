@@ -22,8 +22,11 @@ constexpr double kHealthCheckIntervalMilliseconds = 1000.0;
 // fails its request; the batch's command slot is not held longer.
 constexpr double kMaskWaitMilliseconds = double(supervision::kMaskWait.count());
 // A junction costs a cached state, its capture and up to a draft window of
-// draft-context rows; a later request must save at least that much prefill.
-constexpr uint32_t kMinimumJunctionGain = model::ExecutionLimits::draftContextTokens;
+// draft-context rows; a later request must save at least half a window of
+// prefill. Agents' sessions share their system prompt and tools: pi's 1.4K
+// tokens of them, at a whole window, were prefilled anew by every session (2.6
+// s on an M1 Max, Inkling 2 Mini), and at half one 0.37 s from the third on.
+constexpr uint32_t kMinimumJunctionGain = model::ExecutionLimits::draftContextTokens / 2;
 
 constexpr std::string_view kKvUnreadableMessage =
     "KV of an earlier part of the conversation could not be read from the SSD cache";

@@ -258,6 +258,56 @@ std::optional<SizeDifference> sizeDifference(NSDictionary *text, const QwenHybri
   return std::nullopt;
 }
 
+std::optional<SizeDifference> sizeDifference(NSDictionary *text, const InklingLayout &target, TargetSource source) {
+  const std::initializer_list<ExpectedNumber> sizes{
+      {"hidden_size", target.hiddenSize}, {"num_hidden_layers", target.storedLayers},
+      {"vocab_size", target.vocabularySize}, {"model_max_length", target.nativeContextTokens},
+      {"num_attention_heads", target.attentionQueryHeads}, {"num_key_value_heads", target.attentionKvHeads},
+      {"head_dim", target.attentionHeadDimension}};
+  size_t matched = 0;
+  for (const auto &size : sizes) {
+    const std::string label = std::string("text config ") + size.key;
+    NSNumber *value = requireNumber(text[@(size.key)], label);
+    if (value.doubleValue != size.value)
+      return SizeDifference{matched, label + " differs from " + std::string(target.family) + " (" +
+                                      std::string(sourceName(source)) + ")"};
+    ++matched;
+  }
+  return std::nullopt;
+}
+
+void validateTextConfig(NSDictionary *text, const InklingLayout &target, TargetSource source) {
+  if (source != TargetSource::Safetensors)
+    throw std::invalid_argument("Inkling loads from safetensors only");
+  requireEqual(requireString(text, @"model_type", "text model type"), "inkling2_loop_text",
+               sourceName(source), "text model type");
+  if (const auto difference = sizeDifference(text, target, source)) throw unsupportedModel(difference->difference);
+  requireNumbers(text, sourceName(source), "text config",
+                 {{"d_rel", 16}, {"rel_extent", 1024}, {"log_scaling_n_floor", 8192},
+                  {"log_scaling_alpha", 0.1}, {"rms_norm_eps", 1e-6},
+                  {"qk_l2_clip_threshold", 22.627416997969522}, {"rel_l2_clip_threshold", 8.0},
+                  {"sconv_kernel_size", 4}, {"unpadded_vocab_size", 200058},
+                  {"final_logit_softcapping", 30.0}, {"swa_head_dim", 128},
+                  {"swa_num_attention_heads", 24}, {"swa_num_key_value_heads", 8},
+                  {"sliding_window_size", 1024}, {"n_layers_per_attn_res_block", 6},
+                  {"n_routed_experts", 128}, {"num_experts_per_tok", 8}, {"n_shared_experts", 0},
+                  {"intermediate_size", 1152}, {"mlp_gate_softcap", 4.0},
+                  {"mlp_up_softcap", 25.0}, {"route_scale", 8.0}});
+  requireBooleans(text, "text config", {{"q_bias", false}, {"o_bias", false},
+                   {"use_value_norm_no_gamma", true}, {"attn_res_normalize_values", true}, {"use_gate_bias", true}});
+  NSDictionary *loop = requireObject(text, @"loop_config", "text config loop_config");
+  requireNumbers(loop, sourceName(source), "text config loop_config",
+                 {{"core_start", 6}, {"core_end", 18}, {"num_passes", 3}, {"gate_rank", 64}});
+  requireBooleans(loop, "text config loop_config", {{"is_varloop", false}});
+  NSArray *local = requireArray(text, @"local_layer_ids", "text config local_layer_ids");
+  std::vector<uint32_t> expected;
+  for (uint32_t i = 0; i < target.storedLayers; ++i) if (target.isSlidingLayer(i)) expected.push_back(i);
+  if (local.count != expected.size()) throw std::invalid_argument("text config local_layer_ids count mismatch");
+  for (size_t i = 0; i < expected.size(); ++i)
+    if (requireWhole(local[i], "text config local_layer_ids") != expected[i])
+      throw std::invalid_argument("text config local_layer_ids mismatch");
+}
+
 // The target's text configuration, of its family (describeSourceModel), whose
 // sizes it holds (sizeDifference). A safetensors target's config.json also
 // holds the rest of what the kernels compute; a GGUF's is what the installer
@@ -655,6 +705,33 @@ void requireQuantization(NSDictionary *config, const QwenTargetDimensions &geome
                               "GGUF");
 }
 
+void requireQuantization(NSDictionary *config, const InklingLayout &) {
+  NSDictionary *quant = requireObject(config, @"quantization", "quantization");
+  const auto check = [&](NSDictionary *entry, const std::string &label, bool module) {
+    NSString *mode = entry[@"mode"] ?: @"affine";
+    if (![mode isEqual:@"affine"]) throw std::invalid_argument(label + " must use affine quantization");
+    const uint32_t bits = module && !entry[@"bits"] ? 4 : requireWhole(entry[@"bits"], label + " bits");
+    const uint32_t group = module && !entry[@"group_size"] ? 64 : requireWhole(entry[@"group_size"], label + " group_size");
+    if (bits != 4 || group != 64) throw std::invalid_argument(label + " must be 4-bit in groups of 64");
+  };
+  check(quant, "quantization", false);
+  std::vector<std::string> modules{"language_model.model.embed_tokens", "language_model.lm_head"};
+  for (uint32_t i = 0; i < InklingLayout::storedLayers; ++i) {
+    const std::string prefix = "language_model.model.layers." + std::to_string(i) + ".";
+    for (const char *name : {"q_proj", "k_proj", "v_proj", "r_proj", "gate_proj", "o_proj"})
+      modules.push_back(prefix + "self_attn." + name);
+    for (const char *name : {"gate_proj", "up_proj", "down_proj"})
+      modules.push_back(prefix + "mlp.switch_mlp." + name);
+  }
+  for (const auto &module : modules) {
+    id entry = quant[@(module.c_str())];
+    if (!entry) continue;
+    if (![entry isKindOfClass:[NSDictionary class]])
+      throw std::invalid_argument("quantization leaves " + module + " unquantized");
+    check(entry, "quantization " + module, true);
+  }
+}
+
 // A DFlash2 checkpoint's config: the draft's layout. Its attention widths,
 // window, convolutions and selector must be those the draft kernels are built
 // for, and its block at least their rows; its hidden size, vocabulary and
@@ -727,6 +804,24 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
   return layout;
 }
 
+DSparkDraftLayout readDSparkLayout(NSDictionary *config, const QwenTargetDimensions &target) {
+  NSDictionary *mtp = requireObject(config, @"mtp_config", "mtp_config");
+  requireNumbers(mtp, "checkpoint", "mtp_config",
+                 {{"hidden_size", 2304}, {"num_hidden_layers", 3}, {"num_attention_heads", 24},
+                  {"num_key_value_heads", 8}, {"head_dim", 128}, {"intermediate_size", 9216},
+                  {"rms_norm_eps", 1e-6}, {"rope_theta", 1000000}, {"sliding_window_size", 1024},
+                  {"block_size", 8}, {"markov_rank", 256}});
+  requireBooleans(mtp, "mtp_config", {{"q_bias", false}, {"o_bias", false}});
+  requireEqual(requireString(mtp, @"markov_head_type", "mtp_config markov_head_type"),
+               "rnn_hidden", "checkpoint", "mtp_config markov_head_type");
+  if (![requireArray(mtp, @"target_layer_ids", "mtp_config target_layer_ids") isEqualToArray:@[@5, @23, @41, @48]] ||
+      ![requireArray(mtp, @"local_layer_ids", "mtp_config local_layer_ids") isEqualToArray:@[@0, @2]] ||
+      target.hiddenSize != 2304 || target.vocabularySize != 201024 || target.layers != 48)
+    throw std::invalid_argument("DSpark checkpoint does not match the Inkling target");
+  return {target.nativeContextTokens};
+}
+
+
 // The vision tower's config, config.json's vision_config, which the
 // installer derives from a GGUF's mmproj too: the tower the layout describes,
 // over RGB patches of two frames, without deepstack layers.
@@ -766,7 +861,9 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
   });
   NSDictionary *text = flat ? config : config[@"text_config"];
   if (![text isKindOfClass:[NSDictionary class]]) throw unsupportedModel("its config has no text_config");
-  const auto type = requireString(text, @"model_type", "text model type");
+  const auto type = [config[@"model_type"] isEqual:@"inkling2_loop"]
+                        ? requireString(config, @"model_type", "model type")
+                        : requireString(text, @"model_type", "text model type");
   TargetSource targetSource;
   // "mlx-affine" names every safetensors target, as installations record it.
   if (targetFormat == "mlx-affine") targetSource = TargetSource::Safetensors;
@@ -792,18 +889,27 @@ ModelDescriptor describeSourceModel(std::string name, std::string_view targetFor
   // Without a draft config the descriptor names the family but has no draft
   // (inspectSourceConfiguration), and is not valid; a model root always
   // holds its draft's.
-  DFlashDraftLayout dflashLayout;
+  DraftLayout selectedDraft = DFlashDraftLayout{};
   std::visit([&](auto &layout) {
     if (targetSource == TargetSource::Safetensors && !layout.loadsSafetensors)
       throw std::invalid_argument(std::string(layout.family) + " loads from a GGUF only");
     validateTextConfig(text, layout, targetSource);
+    if constexpr (std::is_same_v<std::decay_t<decltype(layout)>, InklingLayout>)
+      requireNumbers(config, sourceName(targetSource), "config", {{"eos_token_id", 200006}});
     if (targetSource == TargetSource::Safetensors) requireQuantization(config, layout);
     if (targetSource == TargetSource::Gguf && layout.ffnKind == QwenFfnKind::SparseMoe)
       layout.experts = ggufRoutedExperts(text, layout);
-    if (draft && layout.draftChoosesMaskToken()) layout.maskToken = draftMaskToken(draft, layout);
-    if (draft) dflashLayout = readDraftLayout(draft, layout);
+    if (draft && [draft[@"model_type"] isEqual:@"inkling2_dspark"]) {
+      if constexpr (std::is_same_v<std::decay_t<decltype(layout)>, InklingLayout>)
+        selectedDraft = readDSparkLayout(config, layout);
+      else
+        throw std::invalid_argument("DSpark requires an Inkling target");
+    } else if (draft) {
+      if (layout.draftChoosesMaskToken()) layout.maskToken = draftMaskToken(draft, layout);
+      selectedDraft = readDraftLayout(draft, layout);
+    }
   }, *target);
-  ModelDescriptor result = makeModelDescriptor(std::move(name), *target, dflashLayout,
+  ModelDescriptor result = makeModelDescriptor(std::move(name), *target, selectedDraft,
                                                {.outputHiddenSize = std::visit(
                                                     [](const auto &layout) { return layout.hiddenSize; }, *target)},
                                                targetSource, visionSource);
@@ -828,7 +934,7 @@ std::optional<SparseKvShape> sparseKvShape(const QwenHybridLayout &layout) {
 } // namespace
 
 ModelDescriptor makeModelDescriptor(std::string name, TargetLayout target,
-                                    DFlashDraftLayout draft,
+                                    DraftLayout draft,
                                     ops::VisionLayout vision,
                                     TargetSource targetSource,
                                     VisionSource visionSource) {
@@ -844,7 +950,7 @@ ModelDescriptor makeModelDescriptor(std::string name, TargetLayout target,
         result.capabilities = {layout.vocabularySize,
                                layout.nativeContextTokens, sparseKvShape(layout)};
         result.targetKvLayout = layout.kvLayout();
-        result.stateLayout = {layout.gdnStateLayout(), draft.stateLayout()};
+        result.stateLayout = {layout.gdnStateLayout(), draftStateLayout(draft)};
       },
       target);
   return result;
@@ -855,8 +961,8 @@ bool ModelDescriptor::valid() const noexcept {
       !capabilities.vocabularySize ||
       !capabilities.maximumContextTokens ||
       !targetKvLayout.valid() || !stateLayout.valid() ||
-      stateLayout.draft != draft.stateLayout() ||
-      vision.outputHiddenSize != draft.hiddenSize) {
+      stateLayout.draft != draftStateLayout(draft) ||
+      vision.outputHiddenSize != draftHiddenSize(draft)) {
     return false;
   }
   return std::visit(
@@ -871,9 +977,12 @@ bool ModelDescriptor::valid() const noexcept {
                  capabilities.maximumContextTokens <= layout.yarnContextTokens)) &&
                capabilities.sparseKv == sparseKvShape(layout) &&
                (!capabilities.sparseKv || capabilities.sparseKv->blockTokens == SPLASH_ATTENTION_BLOCK_TOKENS) &&
-               layout.hiddenSize == draft.hiddenSize &&
-               draft.targetLayerCount && draft.targetLayerCount <= ExecutionLimits::maximumDraftTargetLayers &&
-               draft.targetLayers[draft.targetLayerCount - 1] < layout.layers &&
+               layout.hiddenSize == draftHiddenSize(draft) &&
+               !draftTargetLayerIds(draft).empty() &&
+               draftTargetLayerIds(draft).size() <= ExecutionLimits::maximumDraftTargetLayers &&
+               draftTargetLayerIds(draft).back() < layout.layers &&
+               (!std::holds_alternative<DSparkDraftLayout>(draft) ||
+                std::is_same_v<std::decay_t<decltype(layout)>, InklingLayout>) &&
                // A family whose drafts choose the mask token holds its draft's.
                (!layout.draftChoosesMaskToken() ||
                 (layout.maskToken >= layout.firstDraftMaskToken && layout.maskToken <= layout.lastDraftMaskToken)) &&
@@ -906,7 +1015,8 @@ std::vector<FamilyFacts> familyFacts() {
   std::vector<FamilyFacts> facts;
   forEachFamily([&](const auto &layout) {
     facts.push_back({.family = layout.family,
-                     .experts = layout.ffnKind == QwenFfnKind::SparseMoe,
+                     .experts = layout.ffnKind == QwenFfnKind::SparseMoe &&
+                                !std::is_same_v<std::decay_t<decltype(layout)>, InklingLayout>,
                      .recurrentState = layout.gdnStateLayout().layers > 0,
                      .pleTable = layout.pleNgram > 0,
                      .sparseKv = sparseKvShape(layout).has_value(),
@@ -926,10 +1036,12 @@ ModelDescriptor inspectModelRoot(const std::filesystem::path &root) {
     const std::string targetFormat = requireString(record, @"target_format", "target format");
     const std::string visionFormat = requireString(record, @"vision_format", "vision format");
     NSDictionary *config = readObject(root / "config.json", "upstream model config");
-    // Every family decodes with its DFlash2 draft, in draft/.
     if (!std::filesystem::exists(root / "draft"))
-      throw std::invalid_argument("the model's root holds no draft/ for its DFlash2 draft");
+      throw std::invalid_argument("the model's root holds no draft/");
     NSDictionary *draft = readObject(root / "draft" / "config.json", "draft config");
+    const bool dsparkFile = std::filesystem::exists(root / "draft" / "mtp.safetensors");
+    if (dsparkFile != [draft[@"model_type"] isEqual:@"inkling2_dspark"])
+      throw std::invalid_argument("draft config and mtp.safetensors disagree");
     ModelDescriptor result = describeSourceModel(std::move(name), targetFormat, visionFormat, config, draft);
     result.sourceIdentity = std::move(sourceIdentity);
     if (!result.valid()) throw std::invalid_argument("incompatible target and draft model");

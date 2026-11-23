@@ -474,6 +474,39 @@ void reportSpill(const model::ModelDescriptor &model, const EngineMemoryBreakdow
           " buffers; SSD room for active KV ", gibibytes(activeLimitBytes), ".");
 }
 
+// The bytes a token of context takes in a lane's draft global K/V (K and V of
+// every KV head at the global layer, DraftStateLayout::tensorBytes): 4,096 for
+// DSpark, zero for a draft whose lane keeps no global K/V (DFlash).
+uint64_t draftContextTokenBytesOf(const model::DraftStateLayout &draft) {
+  return draft.globalTokens ? 2 * uint64_t{draft.kvHeads} * draft.headDimension * model::DraftStateLayout::bfloat16Bytes
+                            : 0;
+}
+
+// A lane's bytes less its draft's global K/V as `draft` holds it now, which
+// the engine charges beside them for the capacity of the context served
+// (ModelMemoryPlan::draftContextTokenBytes).
+model::ModelMemoryPlan withFixedLane(model::ModelMemoryPlan plan, const model::DraftStateLayout &draft) {
+  const uint64_t tokenBytes = draftContextTokenBytesOf(draft);
+  plan.laneStatePlannedAllocatedBytes -= uint64_t{draft.globalTokens} * tokenBytes;
+  plan.draftContextTokenBytes = tokenBytes;
+  return plan;
+}
+
+// A DSpark descriptor's lane state holds global K/V that grows with the
+// context, 2 x 1,024 K/V values of bf16 a token, and a DFlash one none: the
+// planners charge the context by these bytes, so a descriptor that names its
+// draft one way and lays its state out the other is refused rather than
+// planned as the other draft. DSpark's 4,096 bytes are derived from its
+// geometry, not from the state layout under test.
+void requireDraftGeometry(const model::ModelDescriptor &descriptor) {
+  const bool dspark = std::holds_alternative<model::DSparkDraftLayout>(descriptor.draft);
+  const uint64_t expected = dspark ? 2 * uint64_t{model::DSparkGeometry::kv} * model::DraftStateLayout::bfloat16Bytes : 0;
+  const model::DraftStateLayout &draft = descriptor.stateLayout.draft;
+  if (draftContextTokenBytesOf(draft) != expected || (dspark && !draft.globalTokens))
+    throw std::invalid_argument(dspark ? "the DSpark draft's state layout does not hold its global K/V"
+                                       : "a draft other than DSpark's holds global K/V in its state layout");
+}
+
 std::array<uint8_t, 32> parseSha256(std::string_view value) {
   if (value.size() != 64) {
     throw std::invalid_argument(
@@ -491,7 +524,7 @@ std::array<uint8_t, 32> parseSha256(std::string_view value) {
 
 void requireLoadedModel(const model::LoadedModel &loaded) {
   if (!loaded.targetActualAllocatedBytes() ||
-      !loaded.draft.actualAllocatedBytes ||
+      !loaded.draftActualAllocatedBytes() ||
       (loaded.descriptor.hasVision() && !loaded.vision.actualAllocatedBytes) ||
       loaded.manifestFingerprintSha256.empty() ||
       loaded.targetManifestFingerprint().empty()) {
@@ -711,6 +744,18 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   model::CompositeStateLayout stateLayout = config.model.stateLayout;
   stateLayout.target.format = config.stateFormat;
   stateLayout.target.cachedCodes = !config.exactCachedStates;
+  // A DSpark draft's lane holds global K/V for the context it serves, so its
+  // state is planned as the bytes it holds whatever the context and the bytes
+  // a token of context adds (the planners charge it for the context they
+  // plan), and its capacity is set once the plan holds the context, before
+  // any state is allocated.
+  try {
+    requireDraftGeometry(config.model);
+  } catch (const std::exception &error) {
+    throw RuntimeResourcesError(RuntimeResourceStage::Configuration, error.what());
+  }
+  const uint64_t draftTokenBytes = draftContextTokenBytesOf(stateLayout.draft);
+  const uint64_t fixedLaneBytes = stateLayout.laneBytes() - uint64_t{stateLayout.draft.globalTokens} * draftTokenBytes;
   const uint64_t stateBytes = stateLayout.cachedBytes();
   const bool automaticDisk = config.cacheDisk.automatic;
   const uint64_t cacheDiskBytes = automaticDisk ? kAutomaticCacheDiskBytes : config.cacheDisk.bytes;
@@ -794,7 +839,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
                        stagingBytes + aneFfnBytes,
          .arenaBytes = arenaBytes,
          .spillArenaBytes = spillArenaBytes,
-         .laneStateBytes = stateLayout.laneBytes(),
+         .laneStateBytes = fixedLaneBytes,
+         .draftContextTokenBytes = draftTokenBytes,
          .kvLayout = kvLayout,
          .windowTokens = config.model.capabilities.maximumContextTokens,
          .requestedContextTokens = requestedContextTokens,
@@ -950,11 +996,16 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
                                   error.what());
     }
     try {
-      modelMemoryPlan = model::plannedRuntimeMemory(loaded, operators, config.kvFormat, config.stateFormat,
-                                                    model::StreamedParts::loaded(loaded));
+      requireDraftGeometry(loaded.descriptor);
+      const model::DraftStateLayout &nativeDraft = loaded.descriptor.stateLayout.draft;
+      modelMemoryPlan = withFixedLane(model::plannedRuntimeMemory(loaded, operators, config.kvFormat, config.stateFormat,
+                                                                  model::StreamedParts::loaded(loaded)),
+                                      nativeDraft);
       if (kvMaySpill)
-        spillModelMemoryPlan = model::plannedRuntimeMemory(loaded, operators, config.kvFormat, config.stateFormat,
-                                                           model::StreamedParts::loaded(loaded, true));
+        spillModelMemoryPlan =
+            withFixedLane(model::plannedRuntimeMemory(loaded, operators, config.kvFormat, config.stateFormat,
+                                                      model::StreamedParts::loaded(loaded, true)),
+                          nativeDraft);
     } catch (const std::exception &error) {
       throw RuntimeResourcesError(
           RuntimeResourceStage::MemoryPlanning,
@@ -1001,7 +1052,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         stagingBytes, aneFfnBytes);
     ModelMemoryFootprint footprint{
         loaded.targetActualAllocatedBytes(),
-        loaded.draft.actualAllocatedBytes,
+        loaded.draftActualAllocatedBytes(),
         loaded.vision.actualAllocatedBytes,
         streamed.plan && streamed.plan->spill.enabled ? spillModelMemoryPlan : modelMemoryPlan,
         stagingBytes,
@@ -1014,7 +1065,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     const uint32_t commandPages = loadOptions.expertMemoryBytes ? groupPages : 0;
     ModelMemoryProfile modelProfile{
         loaded.name(), loaded.maximumContextTokens(), loaded.targetKvLayout(config.kvFormat), footprint,
-        config.stateFormat, streamed.plan ? streamed.plan->spill : KvSpillPlan{}, commandPages};
+        config.stateFormat, streamed.plan ? streamed.plan->spill : KvSpillPlan{}, commandPages,
+        requestedContextTokens};
     EngineMemoryPlanResult result = evaluateEngineMemoryPlan(device, modelProfile, config.maximumMemoryBytes);
     if (streamed.plan || !result.plan)
       return result;
@@ -1192,6 +1244,29 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     AneFfnStart aneFfn = startAneFfn(splitModel, config.aneFfn, splitContext, planMemory, config.cancelled);
     if (aneFfn.plan)
       memoryPlan = std::move(*aneFfn.plan);
+    // The draft's context capacity is now the context this start serves: the
+    // one asked for (--max-context), the one a relaunch keeps where the plan
+    // holds it, or the automatic one, with the speculative scratch and at
+    // least a prefill chunk, which warmup writes (model::draftContextCapacity).
+    // The plan charged each lane the capacity of the context it holds
+    // (EngineMemoryBreakdown::laneStateBytes): the one asked for, where it
+    // does, else the most it holds, which the automatic and a relaunch's
+    // context never pass (AneFfnOutcome::context is what the plan with the
+    // split it assumes holds, which the plan the start makes holds at least).
+    if (auto *dspark = std::get_if<model::DSparkDraftLayout>(&loaded.descriptor.draft)) {
+      const uint32_t planned = memoryPlan.maximumContextTokens();
+      const uint32_t served = requestedContextTokens ? requestedContextTokens
+                              : config.relaunchContext ? std::min(config.relaunchContext, planned)
+                                                       : aneFfn.outcome.context;
+      if (!requestedContextTokens && served > planned)
+        throw std::logic_error("the automatic context of " + std::to_string(served) +
+                               " tokens exceeds the " + std::to_string(planned) +
+                               " the memory plan charged each lane's draft context for");
+      dspark->contextCapacity = model::draftContextCapacity(served);
+      loaded.descriptor.stateLayout.draft = dspark->stateLayout();
+      logLine("DSpark draft context: ", dspark->contextCapacity, " tokens a lane, ",
+              mebibytes(uint64_t{dspark->contextCapacity} * draftTokenBytes), " MiB.");
+    }
     const EngineMemoryBreakdown &budget = memoryPlan.breakdown();
     const KvSpillPlan &spill = budget.kvSpill;
     const std::string spillOff = spillOffReason(config.model, kvLayout, spill, stateStagingBytes && kvFileOpen);
@@ -1501,7 +1576,7 @@ ActualMemoryReport RuntimeResources::actualMemoryReport(
     const model::ModelMemoryActual &modelMemory) const {
   ActualMemoryReport report;
   report.targetWeightsBytes = model_.targetActualAllocatedBytes();
-  report.draftWeightsBytes = model_.draft.actualAllocatedBytes;
+  report.draftWeightsBytes = model_.draftActualAllocatedBytes();
   report.visionWeightsBytes = model_.vision.actualAllocatedBytes;
   report.stateAllocatedBytes = modelMemory.stateActualAllocatedBytes;
   report.sharedPrefillBytes = modelMemory.sharedPrefillActualAllocatedBytes;

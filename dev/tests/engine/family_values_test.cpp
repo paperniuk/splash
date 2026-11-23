@@ -43,6 +43,11 @@ model::DFlashDraftLayout draftOf(std::string_view family) {
     return test::flashNextDraft();
   if (family == model::FlintLayout{}.family)
     return test::flintDraft();
+  if (family == model::InklingLayout{}.family) {
+    constexpr model::InklingLayout target;
+    constexpr std::array<uint32_t, 4> layers{4, 22, 40, 47};
+    return model::draftLayout(target.hiddenSize, target.vocabularySize, 3, 9216, 1'000'000.0F, layers);
+  }
   throw std::logic_error(std::string(family) + " has no draft to take its values with");
 }
 

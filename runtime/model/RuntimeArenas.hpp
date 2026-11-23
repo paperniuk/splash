@@ -53,9 +53,39 @@ inline constexpr uint32_t kDraftCacheStride = ExecutionLimits::draftContextToken
 inline constexpr uint32_t kMaximumPageTableEntries =
     (kv::kMaximumPhysicalTokens + kv::kPageTokens - 1) / kv::kPageTokens;
 
+struct DraftRuntimeLayout final {
+  DraftLayout model;
+  uint32_t layers = 0, hiddenSize = 0, vocabularySize = 0, dynamicSize = 0, qkvSize = 0;
+  uint32_t attentionSize = 0, intermediateSize = 0, attentionHeadDimension = 0, selectorRank = 0, kvHeads = 0;
+  float rotaryTheta = 0;
+
+  explicit DraftRuntimeLayout(DraftLayout source = DFlashDraftLayout{}) : model(std::move(source)) {
+    std::visit([&](const auto &layout) {
+      using T = std::decay_t<decltype(layout)>;
+      if constexpr (std::is_same_v<T, DFlashDraftLayout>) {
+        layers = layout.layers; hiddenSize = layout.hiddenSize; vocabularySize = layout.vocabularySize;
+        dynamicSize = layout.dynamicSize; qkvSize = layout.qkvSize; attentionSize = layout.attentionSize;
+        intermediateSize = layout.intermediateSize; attentionHeadDimension = layout.attentionHeadDimension;
+        selectorRank = layout.selectorRank; kvHeads = layout.kvHeads; rotaryTheta = layout.rotaryTheta;
+      } else {
+        layers = DSparkGeometry::layers; hiddenSize = DSparkGeometry::hidden;
+        vocabularySize = DSparkGeometry::vocabulary; qkvSize = 5120; attentionSize = DSparkGeometry::attention;
+        intermediateSize = DSparkGeometry::intermediate; attentionHeadDimension = DSparkGeometry::head;
+        kvHeads = 8; rotaryTheta = 1000000;
+      }
+    }, model);
+  }
+  [[nodiscard]] DraftStateLayout stateLayout() const { return draftStateLayout(model); }
+  [[nodiscard]] uint32_t targetHiddenSize() const { return draftTargetHiddenSize(model); }
+  [[nodiscard]] uint32_t contextKvSize() const { return qkvSize - attentionSize; }
+  [[nodiscard]] ops::DraftAttentionShape attentionShape() const {
+    return std::get<DFlashDraftLayout>(model).attentionShape();
+  }
+};
+
 struct RuntimeGeometry final {
   QwenTargetGeometry target;
-  DFlashDraftLayout draft;
+  DraftRuntimeLayout draft;
   // The attention of a target whose K/V spills (ModelCapabilities::sparseKv),
   // whose runtime reads it through the hot block cache and the history
   // stream (RuntimeContext); none for K/V that stays in memory.
@@ -84,9 +114,11 @@ struct RuntimeGeometry final {
   }
   [[nodiscard]] static RuntimeGeometry from(const LoadedModel &model, kv::Format kvFormat,
                                             ops::GdnStateFormat stateFormat, StreamedParts parts) {
-    const DFlashDraftLayout &draft = model.draft.layout;
+    const DraftLayout draft = std::holds_alternative<DFlashDraftWeights>(model.draft)
+                                  ? DraftLayout{std::get<DFlashDraftWeights>(model.draft).layout}
+                                  : model.descriptor.draft;
     return from(model.descriptor, draft,
-                std::visit([&](const auto &weights) { return qwenTargetGeometry(weights, draft.targetLayerIds()); },
+                std::visit([&](const auto &weights) { return qwenTargetGeometry(weights, draftTargetLayerIds(draft)); },
                            model.target),
                 kvFormat, stateFormat, parts);
   }
@@ -102,11 +134,11 @@ struct RuntimeGeometry final {
   // whose target's weights give `target` (qwenTargetGeometry, as they loaded
   // or as their files plan them, plannedTargetGeometry), with `parts`
   // streaming.
-  [[nodiscard]] static RuntimeGeometry from(const ModelDescriptor &descriptor, const DFlashDraftLayout &draft,
+  [[nodiscard]] static RuntimeGeometry from(const ModelDescriptor &descriptor, const DraftLayout &draft,
                                             QwenTargetGeometry target, kv::Format kvFormat,
                                             ops::GdnStateFormat stateFormat, StreamedParts parts) {
     RuntimeGeometry result;
-    result.draft = draft;
+    result.draft = DraftRuntimeLayout(draft);
     result.target = std::move(target);
     result.target.kvLayout = descriptor.targetKvLayout;
     result.target.kvLayout.format = kvFormat;
@@ -482,11 +514,13 @@ public:
         get(PrefillTensor::TargetInverseFrequencies).contents());
     auto *draft = static_cast<float *>(
         get(PrefillTensor::DraftInverseFrequencies).contents());
-    if (!target || !draft)
+    // A NoPE target (Inkling 2) has no frequencies of its own.
+    if ((!target && geometry.target.rotaryPairs) || !draft)
       throw std::logic_error("RoPE frequencies are not CPU-visible");
-    rotaryInverseFrequencies(geometry.target.rotaryTheta, geometry.target.rotaryPairs,
-                             geometry.target.ropeScaling,
-                             {target, geometry.target.rotaryPairs});
+    if (geometry.target.rotaryPairs)
+      rotaryInverseFrequencies(geometry.target.rotaryTheta, geometry.target.rotaryPairs,
+                               geometry.target.ropeScaling,
+                               {target, geometry.target.rotaryPairs});
     for (uint32_t dim = 0; dim < geometry.draftRotaryPairs(); ++dim) {
       draft[dim] = std::pow(geometry.draft.rotaryTheta,
                             -static_cast<float>(dim) / geometry.draftRotaryPairs());
@@ -574,6 +608,22 @@ enum class DecodeTensor : uint32_t {
   DraftResidual,
   DraftIntermediate,
   DraftFinalHidden,
+  DSparkRawQuery,
+  DSparkRawKey,
+  DSparkQuery,
+  DSparkKey,
+  DSparkValue,
+  DSparkGate,
+  DSparkUp,
+  DSparkCompact,
+  DSparkContext,
+  DSparkState,
+  DSparkRaw,
+  DSparkLatent,
+  DSparkProbabilities,
+  // A proposal step's scan workspace (ops::DSparkMarkovBuffers).
+  DSparkPartialValues,
+  DSparkPartialIds,
   SelectorHidden,
   Candidates,
   Unary,

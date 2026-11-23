@@ -27,6 +27,14 @@ uint64_t pagesOf(uint64_t tokens) noexcept { return (tokens + kv::kPageTokens - 
 // The KV of a context of `tokens` tokens holds its speculative rows too.
 uint64_t kvTokens(uint64_t tokens) noexcept { return tokens + model::ExecutionLimits::speculativeScratchTokens; }
 
+// What a lane's draft holds for a context of `tokens` tokens beyond the least
+// capacity the floors charge (model::draftContextCapacity(0), warmup's).
+uint64_t draftExtraBytes(const StreamedMemoryInputs &in, uint64_t tokens) noexcept {
+  return in.draftContextTokenBytes *
+         saturatingSubtract(std::max<uint64_t>(kvTokens(tokens), model::ExecutionLimits::prefillTokenBudget),
+                            model::draftContextCapacity(0));
+}
+
 // `pages` pages of `pageBytes` bytes in whole extents of whichever size a
 // pool of `layout` takes (kv::Layout::mostOverExtents): the plan is made
 // before the pool's extent is.
@@ -98,7 +106,7 @@ struct SpillFloors final {
   }
   [[nodiscard]] uint64_t bytes(uint64_t tokens, uint32_t buffers) const {
     return geometry.spillFloorBytes(kvTokens(tokens)) + kvTokens(tokens) * model::kLookupIndexTokenBytes +
-           indexRunwayBytes + readerTableBytes(in, hotFloorBytes, buffers) +
+           draftExtraBytes(in, tokens) + indexRunwayBytes + readerTableBytes(in, hotFloorBytes, buffers) +
            std::max(stagingBytes(tokens, buffers), hotFloorBytes);
   }
 };
@@ -180,9 +188,10 @@ StreamedMemoryResult planParts(const StreamedMemoryInputs &in, const Part &exper
   uint64_t loaded = 0;
   for (const uint64_t bytes : {in.fixedBytes, arenaBytes, experts.charged, table.charged})
     if (!checkedAdd(loaded, bytes, loaded)) return overflow();
-  const std::optional<uint64_t> minimum = minimumRequiredBytes(loaded, in.laneStateBytes, layout);
+  const uint64_t laneBytes = in.laneStateBytes + in.draftContextTokenBytes * model::draftContextCapacity(0);
+  const std::optional<uint64_t> minimum = minimumRequiredBytes(loaded, laneBytes, layout);
   if (!minimum) return overflow();
-  const uint64_t runwayBytes = *minimum - loaded - in.laneStateBytes;
+  const uint64_t runwayBytes = *minimum - loaded - laneBytes;
   uint64_t floors = *minimum;
   // A plan that spills holds the arenas of a runtime whose K/V spills
   // instead, at least as large, beside which its spill floors must fit.
@@ -266,8 +275,13 @@ StreamedMemoryResult planParts(const StreamedMemoryInputs &in, const Part &exper
     // extents of its own.
     const uint32_t floorPages = kvWindowFloorPages(layout, streaming ? in.groupPages : 0);
     const uint64_t index = budget * kv::kPageTokens * model::kLookupIndexTokenBytes;
+    // The draft's capacity for the context is charged once: a plan that spills
+    // has its floors charge it for the Spill request's context
+    // (SpillFloors::bytes), which this resident context lies within.
+    const uint64_t draft = saturatingSubtract(draftExtraBytes(in, tokens),
+                                              spill.enabled ? draftExtraBytes(in, spill.floorTokens) : 0);
     return static_cast<int64_t>(saturatingSubtract(
-        kvPagesBytes(layout, budget, floorPages, layout.extentPagesFor(budget)) + index, runwayBytes));
+        kvPagesBytes(layout, budget, floorPages, layout.extentPagesFor(budget)) + index + draft, runwayBytes));
   };
   const int64_t tableShare =
       table.automatic

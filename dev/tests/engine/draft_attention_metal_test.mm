@@ -22,9 +22,11 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <initializer_list>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -1087,6 +1089,485 @@ void bufferExtents(MetalBackend &backend, DraftAttentionShape shape) {
                                });
 }
 
+void dsparkFusion(MetalBackend &backend) {
+  constexpr uint32_t width = 2304, rows = 2;
+  Random random(0x5eed);
+  MetalBuffer captured = randomBfloat(backend, rows * 4 * width, random, "DSpark taps");
+  MetalBuffer fuse = randomBfloat(backend, 16, random, "DSpark fuse");
+  MetalBuffer norm = randomBfloat(backend, width, random, "DSpark norm");
+  MetalBuffer output = backend.allocateBuffer(rows * width * 2, BufferStorage::Shared, "DSpark context");
+  const auto *taps = static_cast<const uint16_t *>(captured.contents());
+  const auto *weights = static_cast<const uint16_t *>(fuse.contents());
+  const auto *scale = static_cast<const uint16_t *>(norm.contents());
+  for (uint32_t consumer = 0; consumer < 4; ++consumer) {
+    CommandGraph graph;
+    DraftAttention::addDSparkFusion(graph, captured, fuse, norm, output, rows, consumer);
+    (void)backend.submitCommandAsync(graph.dispatches()).wait();
+    const auto *actual = static_cast<const uint16_t *>(output.contents());
+    float alpha[4], mass = 0.0F, maxWeight = -INFINITY;
+    for (uint32_t tap = 0; tap < 4; ++tap)
+      maxWeight = std::max(maxWeight, bf16ToFloat(weights[consumer * 4 + tap]));
+    for (uint32_t tap = 0; tap < 4; ++tap) {
+      alpha[tap] = std::exp(bf16ToFloat(weights[consumer * 4 + tap]) - maxWeight);
+      mass += alpha[tap];
+    }
+    for (float &a : alpha) a = bf16ToFloat(floatToBf16(a / mass));
+    for (uint32_t row = 0; row < rows; ++row) {
+      std::vector<float> mixed(width);
+      float squares = 0.0F;
+      for (uint32_t col = 0; col < width; ++col) {
+        for (uint32_t tap = 0; tap < 4; ++tap)
+          mixed[col] += bf16ToFloat(taps[(row * 4 + tap) * width + col]) * alpha[tap];
+        squares += mixed[col] * mixed[col];
+      }
+      const float inv = 1.0F / std::sqrt(squares / width + 1e-6F);
+      for (uint32_t col = 0; col < width; ++col) {
+        const float expected = mixed[col] * inv * bf16ToFloat(scale[col]);
+        require(std::fabs(bf16ToFloat(actual[row * width + col]) - expected) < 0.02F,
+                "DSpark weighted context and norm");
+      }
+    }
+  }
+}
+
+void dsparkAttention(MetalBackend &backend) {
+  constexpr uint32_t dim = 128, kv = 8 * dim, q = 24 * dim, contextRows = 3;
+  const auto buffer = [&](uint64_t count, const char *name) {
+    return backend.allocateBuffer(count * 2, BufferStorage::Shared, name);
+  };
+  MetalBuffer query = buffer(8 * q, "DSpark query");
+  MetalBuffer contextKey = buffer(contextRows * kv, "DSpark context key");
+  MetalBuffer contextValue = buffer(contextRows * kv, "DSpark context value");
+  MetalBuffer blockKey = buffer(8 * kv, "DSpark block key");
+  MetalBuffer blockValue = buffer(8 * kv, "DSpark block value");
+  MetalBuffer result = buffer(8 * q, "DSpark attention result");
+  std::memset(query.contents(), 0, query.sizeBytes());
+  std::memset(contextKey.contents(), 0, contextKey.sizeBytes());
+  std::memset(blockKey.contents(), 0, blockKey.sizeBytes());
+  auto *cv = static_cast<uint16_t *>(contextValue.contents());
+  auto *bv = static_cast<uint16_t *>(blockValue.contents());
+  for (uint32_t row = 0; row < contextRows; ++row)
+    for (uint32_t head = 0; head < 8; ++head)
+      for (uint32_t d = 0; d < dim; ++d)
+        cv[row * kv + head * dim + d] = floatToBf16(float(row + head));
+  for (uint32_t row = 0; row < 8; ++row)
+    for (uint32_t head = 0; head < 8; ++head)
+      for (uint32_t d = 0; d < dim; ++d)
+        bv[row * kv + head * dim + d] = floatToBf16(float(row + head));
+  CommandGraph graph;
+  const MetalBuffer workspace = backend.allocateBuffer(DraftAttention::dsparkAttentionWorkspaceBytes(),
+                                                       BufferStorage::Shared, "DSpark attention workspace");
+  DraftAttention::addDSparkAttention(graph, query, contextKey, contextValue, blockKey, blockValue,
+                                    result, workspace, contextRows, 2, 0);
+  (void)backend.submitCommandAsync(graph.dispatches()).wait();
+  const auto *values = static_cast<const uint16_t *>(result.contents());
+  for (uint32_t row = 0; row < 8; ++row)
+    for (uint32_t head = 0; head < 24; ++head)
+      for (uint32_t d = 0; d < dim; ++d) {
+        const float expected = (30.0F + 9 * float(head / 3)) / 9;
+        require(std::fabs(bf16ToFloat(values[row * q + head * dim + d]) - expected) < 0.04F,
+                "DSpark block is bidirectional and context is windowed");
+      }
+}
+
+// Random queries, keys and values over a context of several splits, against a CPU softmax: each output element
+// of each query row and head is its softmax-weighted value sum over the context's rows from `first` and the block's
+// own 8 rows.
+void dsparkAttentionSplits(MetalBackend &backend) {
+  constexpr uint32_t dim = 128, kv = 8 * dim, q = 24 * dim, contextRows = 700, first = 37;
+  Random random(0xd5a7);
+  MetalBuffer query = randomBfloat(backend, 8 * q, random, "DSpark query");
+  MetalBuffer contextKey = randomBfloat(backend, contextRows * kv, random, "DSpark context key");
+  MetalBuffer contextValue = randomBfloat(backend, contextRows * kv, random, "DSpark context value");
+  MetalBuffer blockKey = randomBfloat(backend, 8 * kv, random, "DSpark block key");
+  MetalBuffer blockValue = randomBfloat(backend, 8 * kv, random, "DSpark block value");
+  MetalBuffer result = backend.allocateBuffer(8 * q * 2, BufferStorage::Shared, "DSpark attention result");
+  const MetalBuffer workspace = backend.allocateBuffer(DraftAttention::dsparkAttentionWorkspaceBytes(),
+                                                       BufferStorage::Shared, "DSpark attention workspace");
+  CommandGraph graph;
+  DraftAttention::addDSparkAttention(graph, query, contextKey, contextValue, blockKey, blockValue, result, workspace,
+                                    contextRows, first, 0);
+  (void)backend.submitCommandAsync(graph.dispatches()).wait();
+  const auto value = [](const MetalBuffer &b, uint64_t i) {
+    return double(bf16ToFloat(static_cast<const uint16_t *>(b.contents())[i]));
+  };
+  double worst = 0;
+  for (uint32_t row = 0; row < 8; ++row)
+    for (uint32_t head = 0; head < 24; ++head) {
+      const uint32_t group = head / 3;
+      std::vector<double> scores;
+      const auto keyAt = [&](uint32_t key, uint32_t d) {
+        return key < contextRows - first ? value(contextKey, uint64_t{first + key} * kv + group * dim + d)
+                                         : value(blockKey, uint64_t{key - (contextRows - first)} * kv + group * dim + d);
+      };
+      const auto valueAt = [&](uint32_t key, uint32_t d) {
+        return key < contextRows - first
+                   ? value(contextValue, uint64_t{first + key} * kv + group * dim + d)
+                   : value(blockValue, uint64_t{key - (contextRows - first)} * kv + group * dim + d);
+      };
+      const uint32_t keys = contextRows - first + 8;
+      double maximum = -1e300;
+      for (uint32_t key = 0; key < keys; ++key) {
+        double dot = 0;
+        for (uint32_t d = 0; d < dim; ++d) dot += value(query, uint64_t{row} * q + head * dim + d) * keyAt(key, d);
+        scores.push_back(dot / std::sqrt(double(dim)));
+        maximum = std::max(maximum, scores.back());
+      }
+      double total = 0;
+      for (double &s : scores) total += (s = std::exp(s - maximum));
+      for (uint32_t d = 0; d < dim; ++d) {
+        double expected = 0;
+        for (uint32_t key = 0; key < keys; ++key) expected += scores[key] / total * valueAt(key, d);
+        worst = std::max(worst, std::fabs(value(result, uint64_t{row} * q + head * dim + d) - expected));
+      }
+    }
+  require(worst < 0.01, "DSpark split attention matches a CPU softmax over several splits");
+}
+
+void dsparkHeadPrepare(MetalBackend &backend) {
+  constexpr uint32_t heads = 8, dim = 128;
+  MetalBuffer input = backend.allocateBuffer(heads * dim * 2, BufferStorage::Shared, "DSpark head input");
+  MetalBuffer norm = backend.allocateBuffer(dim * 2, BufferStorage::Shared, "DSpark head norm");
+  MetalBuffer output = backend.allocateBuffer(heads * dim * 2, BufferStorage::Shared, "DSpark head output");
+  std::fill_n(static_cast<uint16_t *>(input.contents()), heads * dim, floatToBf16(1.0F));
+  std::fill_n(static_cast<uint16_t *>(norm.contents()), dim, floatToBf16(1.0F));
+  CommandGraph graph;
+  DraftAttention::addDSparkHeadPrepare(graph, input, norm, output, 1, heads, 2);
+  (void)backend.submitCommandAsync(graph.dispatches()).wait();
+  const auto *values = static_cast<const uint16_t *>(output.contents());
+  for (uint32_t h = 0; h < heads; ++h) {
+    require(std::fabs(bf16ToFloat(values[h * dim]) - (std::cos(2.0F) - std::sin(2.0F))) < 0.01F,
+            "DSpark NeoX first half");
+    require(std::fabs(bf16ToFloat(values[h * dim + 64]) - (std::sin(2.0F) + std::cos(2.0F))) < 0.01F,
+            "DSpark NeoX second half");
+  }
+}
+
+void dsparkContextRing(MetalBackend &backend) {
+  constexpr uint32_t width = 1024, rows = 5, capacity = 3;
+  const auto alloc = [&](uint32_t count) {
+    return backend.allocateBuffer(count * width * 2, BufferStorage::Shared, "DSpark ring");
+  };
+  MetalBuffer keys = alloc(rows), values = alloc(rows), ringKeys = alloc(capacity), ringValues = alloc(capacity);
+  auto *k = static_cast<uint16_t *>(keys.contents());
+  auto *v = static_cast<uint16_t *>(values.contents());
+  for (uint32_t row = 0; row < rows; ++row) {
+    std::fill_n(k + row * width, width, floatToBf16(float(row)));
+    std::fill_n(v + row * width, width, floatToBf16(float(row + 10)));
+  }
+  CommandGraph graph;
+  DraftAttention::addDSparkContextStore(graph, keys, values, ringKeys, ringValues, rows, 7, 0, capacity);
+  (void)backend.submitCommandAsync(graph.dispatches()).wait();
+  const auto *rk = static_cast<const uint16_t *>(ringKeys.contents());
+  const auto *rv = static_cast<const uint16_t *>(ringValues.contents());
+  for (uint32_t row = 2; row < rows; ++row) {
+    const uint32_t slot = (7 + row) % capacity;
+    for (uint32_t col = 0; col < width; ++col)
+      require(rk[slot * width + col] == k[row * width + col] &&
+              rv[slot * width + col] == v[row * width + col], "DSpark context ring wrap");
+  }
+}
+
+void dsparkCommit(MetalBackend &backend) {
+  constexpr uint32_t width = 9216, rows = 6, cap = 5, kv = 1024, slots = 8;
+  const auto alloc = [&](uint64_t bytes) {
+    return backend.allocateBuffer(bytes, BufferStorage::Shared, "DSpark commit");
+  };
+  MetalBuffer captured = alloc(rows * width * 2), compact = alloc((cap + 1) * width * 2);
+  MetalBuffer retained = alloc(4), lanes = alloc(sizeof(LaneRows));
+  MetalBuffer keys = alloc(cap * kv * 2), values = alloc(cap * kv * 2);
+  MetalBuffer ringKeys = alloc(slots * kv * 2), ringValues = alloc(slots * kv * 2);
+  auto *source = static_cast<uint16_t *>(captured.contents());
+  for (uint32_t i = 0; i < rows; ++i) std::fill_n(source + i * width, width, floatToBf16(float(i)));
+  *static_cast<uint32_t *>(retained.contents()) = 0b10101;
+  *static_cast<LaneRows *>(lanes.contents()) = {1, cap};
+  auto *k = static_cast<uint16_t *>(keys.contents());
+  auto *v = static_cast<uint16_t *>(values.contents());
+  for (uint32_t i = 0; i < cap; ++i) {
+    std::fill_n(k + i * kv, kv, floatToBf16(float(i)));
+    std::fill_n(v + i * kv, kv, floatToBf16(float(i + 10)));
+  }
+  std::memset(ringKeys.contents(), 0, ringKeys.sizeBytes());
+  std::memset(ringValues.contents(), 0, ringValues.sizeBytes());
+  CommandGraph graph;
+  DraftAttention::addDSparkCommitGather(graph, captured, retained, lanes, compact, rows, cap);
+  DraftAttention::addDSparkCommitStore(graph, keys, values, retained, ringKeys, ringValues, cap, 7, 0, slots);
+  (void)backend.submitCommandAsync(graph.dispatches()).wait();
+  const auto *out = static_cast<const uint16_t *>(compact.contents());
+  for (uint32_t i = 0; i <= cap; ++i) {
+    const uint32_t expected = i < 3 ? 1 + 2 * i : 5;
+    for (uint32_t col = 0; col < width; ++col)
+      require(out[i * width + col] == floatToBf16(float(expected)), "DSpark accepted capture order");
+  }
+  const auto *stored = static_cast<const uint16_t *>(ringKeys.contents());
+  for (uint32_t i = 0; i < 3; ++i)
+    require(stored[((7 + i) % slots) * kv] == floatToBf16(float(i)), "DSpark accepted KV commit");
+  require(stored[2 * kv] == 0, "DSpark rejected KV is not committed");
+}
+
+// A segmented global layer of `rows` rows in segments of `segmentTokens`, the
+// last shorter, which the tests keep small so that attention, prefill stores
+// and commits cross segment boundaries (production's segments hold
+// SPLASH_DRAFT_GLOBAL_SEGMENT_TOKENS rows).
+struct SegmentedFixture final {
+  std::vector<MetalBuffer> keys, values;
+  DraftSegmentedContext context;
+  uint32_t segmentTokens, rows;
+
+  SegmentedFixture(MetalBackend &backend, uint32_t tokens, uint32_t total) : segmentTokens(tokens), rows(total) {
+    for (uint32_t first = 0; first < rows; first += segmentTokens) {
+      const uint64_t bytes = uint64_t{std::min(segmentTokens, rows - first)} * 1024 * 2;
+      keys.push_back(backend.allocateBuffer(bytes, BufferStorage::Shared, "DSpark key segment"));
+      values.push_back(backend.allocateBuffer(bytes, BufferStorage::Shared, "DSpark value segment"));
+      std::memset(keys.back().contents(), 0, bytes);
+      std::memset(values.back().contents(), 0, bytes);
+    }
+    context = DraftSegmentedContext::make(keys, values, segmentTokens, rows);
+  }
+  // The 1024 values of global row `at` of the keys, or the values.
+  uint16_t *row(bool value, uint32_t at) const {
+    const MetalBuffer &segment = (value ? values : keys)[at / segmentTokens];
+    return static_cast<uint16_t *>(segment.contents()) + uint64_t{at % segmentTokens} * 1024;
+  }
+};
+
+void dsparkSegmentedContext(MetalBackend &backend) {
+  const MetalBuffer workspace = backend.allocateBuffer(DraftAttention::dsparkAttentionWorkspaceBytes(),
+                                                       BufferStorage::Shared, "DSpark attention workspace");
+  constexpr uint32_t kv = 1024, q = 3072, rows = 8, segmentTokens = 3;
+  require(DraftSegmentedContext::segmentCount(rows, segmentTokens) == 3 &&
+              DraftSegmentedContext::segmentCount(6, 3) == 2 && DraftSegmentedContext::segmentCount(1, 3) == 1,
+          "DSpark segment count");
+
+  // Attention over segments is bitwise the attention over one buffer holding
+  // the same rows: a window of rows 1 to 7 reads segments 0, 1 and 2.
+  {
+    Random random(0x5e6);
+    SegmentedFixture fixture(backend, segmentTokens, rows);
+    MetalBuffer flatKeys = randomBfloat(backend, uint64_t{rows} * kv, random, "DSpark flat keys");
+    MetalBuffer flatValues = randomBfloat(backend, uint64_t{rows} * kv, random, "DSpark flat values");
+    for (uint32_t row = 0; row < rows; ++row) {
+      std::memcpy(fixture.row(false, row), static_cast<uint16_t *>(flatKeys.contents()) + row * kv, kv * 2);
+      std::memcpy(fixture.row(true, row), static_cast<uint16_t *>(flatValues.contents()) + row * kv, kv * 2);
+    }
+    MetalBuffer query = randomBfloat(backend, 8 * q, random, "DSpark query");
+    MetalBuffer blockKey = randomBfloat(backend, 8 * kv, random, "DSpark block key");
+    MetalBuffer blockValue = randomBfloat(backend, 8 * kv, random, "DSpark block value");
+    for (const auto [contextRows, first] : {std::pair{7u, 1u}, {8u, 0u}, {2u, 2u}, {0u, 0u}, {4u, 0u}}) {
+      MetalBuffer expected = backend.allocateBuffer(8 * q * 2, BufferStorage::Shared, "DSpark flat attention");
+      MetalBuffer actual = backend.allocateBuffer(8 * q * 2, BufferStorage::Shared, "DSpark segmented attention");
+      CommandGraph graph;
+      DraftAttention::addDSparkAttention(graph, query, flatKeys, flatValues, blockKey, blockValue, expected,
+                                         workspace, contextRows, first, 0);
+      DraftAttention::addDSparkSegmentedAttention(graph, query, fixture.context, blockKey, blockValue, actual,
+                                                  workspace, contextRows, first);
+      (void)backend.submitCommandAsync(graph.dispatches()).wait();
+      require(std::memcmp(expected.contents(), actual.contents(), 8 * q * 2) == 0,
+              "DSpark segmented attention matches one buffer across segments");
+    }
+  }
+
+  // A prefill store of five rows at positions 4 to 8 of a global layer based
+  // at 2 lands in rows 2 to 6: segment 0's last row, all of segment 1, and
+  // segment 2's first, and touches nothing else.
+  {
+    Random random(0x57);
+    SegmentedFixture fixture(backend, segmentTokens, rows);
+    constexpr uint32_t stored = 5, start = 4, base = 2;
+    MetalBuffer keys = randomBfloat(backend, uint64_t{stored} * kv, random, "DSpark stored keys");
+    MetalBuffer values = randomBfloat(backend, uint64_t{stored} * kv, random, "DSpark stored values");
+    CommandGraph graph;
+    DraftAttention::addDSparkSegmentedContextStore(graph, keys, values, fixture.context, stored, start, base);
+    (void)backend.submitCommandAsync(graph.dispatches()).wait();
+    for (uint32_t row = 0; row < rows; ++row) {
+      const bool written = row >= start - base && row < start - base + stored;
+      for (uint32_t col = 0; col < kv; ++col) {
+        const uint16_t key = written ? static_cast<uint16_t *>(keys.contents())[(row - (start - base)) * kv + col] : 0;
+        const uint16_t value =
+            written ? static_cast<uint16_t *>(values.contents())[(row - (start - base)) * kv + col] : 0;
+        require(fixture.row(false, row)[col] == key && fixture.row(true, row)[col] == value,
+                "DSpark segmented prefill store crosses segments");
+      }
+    }
+    CommandGraph invalid;
+    rejects([&] { DraftAttention::addDSparkSegmentedContextStore(invalid, keys, values, fixture.context, stored,
+                                                                 start + 2, base); },
+            "invalid DSpark segmented context store", "a store past the last segment was accepted");
+    rejects([&] { DraftAttention::addDSparkSegmentedContextStore(invalid, keys, values, fixture.context, stored,
+                                                                 base - 1, base); },
+            "invalid DSpark segmented context store", "a store before the global base was accepted");
+    require(invalid.empty(), "a rejected segmented store encoded a dispatch");
+  }
+
+  // An accepted-row commit writes only the rows its retained mask counts:
+  // three of five, at global rows 2, 3 and 4, from segment 0 into segment 1.
+  {
+    Random random(0xc0);
+    SegmentedFixture fixture(backend, segmentTokens, rows);
+    constexpr uint32_t cap = 5, start = 2;
+    MetalBuffer keys = randomBfloat(backend, uint64_t{cap} * kv, random, "DSpark commit keys");
+    MetalBuffer values = randomBfloat(backend, uint64_t{cap} * kv, random, "DSpark commit values");
+    MetalBuffer retained = backend.allocateBuffer(sizeof(uint32_t), BufferStorage::Shared, "DSpark retained");
+    *static_cast<uint32_t *>(retained.contents()) = 0b10101;
+    CommandGraph graph;
+    DraftAttention::addDSparkSegmentedCommitStore(graph, keys, values, retained, fixture.context, cap, start, 0);
+    (void)backend.submitCommandAsync(graph.dispatches()).wait();
+    for (uint32_t row = 0; row < rows; ++row) {
+      const bool written = row >= start && row < start + 3;
+      for (uint32_t col = 0; col < kv; ++col) {
+        const uint16_t key = written ? static_cast<uint16_t *>(keys.contents())[(row - start) * kv + col] : 0;
+        const uint16_t value = written ? static_cast<uint16_t *>(values.contents())[(row - start) * kv + col] : 0;
+        require(fixture.row(false, row)[col] == key && fixture.row(true, row)[col] == value,
+                "DSpark segmented commit crosses segments and skips rejected rows");
+      }
+    }
+    CommandGraph invalid;
+    rejects([&] { DraftAttention::addDSparkSegmentedCommitStore(invalid, keys, values, retained, fixture.context,
+                                                                cap, rows - cap + 1, 0); },
+            "invalid DSpark segmented context commit", "a commit past the last segment was accepted");
+  }
+
+  // Segments that do not hold the rows, or hold too many to address, are
+  // refused before any dispatch.
+  {
+    SegmentedFixture fixture(backend, segmentTokens, rows);
+    rejects([&] { (void)DraftSegmentedContext::make({fixture.keys.data(), 2}, {fixture.values.data(), 2},
+                                                    segmentTokens, rows); },
+            "segmented context holds", "too few segments for the rows were accepted");
+    rejects([&] { (void)DraftSegmentedContext::make(fixture.keys, fixture.values, segmentTokens, rows + 1); },
+            "buffer holds", "a short last segment was accepted");
+    rejects([&] { (void)DraftSegmentedContext::make(fixture.keys, fixture.values, segmentTokens, 0); },
+            "invalid DSpark segmented context", "an empty segmented context was accepted");
+    rejects([&] { (void)DraftSegmentedContext::make(fixture.keys, {fixture.values.data(), 2}, segmentTokens, rows); },
+            "segments differ", "unpaired key and value segments were accepted");
+  }
+}
+
+// What a rewind and a restore leave of DSpark's global layer. Rows are stored
+// by position and read only up to the lane's committed length, so a rewind
+// needs no clearing: the rows past the rewound length are stale and never
+// read, and the rows a later cycle commits overwrite them. A restore sets the
+// global base, the position of row 0, and what the layer held of another
+// request, or of the same one before, is out of the attention's reach.
+void dsparkSegmentedRewindAndRestore(MetalBackend &backend) {
+  const MetalBuffer workspace = backend.allocateBuffer(DraftAttention::dsparkAttentionWorkspaceBytes(),
+                                                       BufferStorage::Shared, "DSpark attention workspace");
+  constexpr uint32_t kv = 1024, q = 3072, rows = 12, segmentTokens = 5;
+  Random random(0x4e77);
+  MetalBuffer query = randomBfloat(backend, 8 * q, random, "DSpark query");
+  MetalBuffer blockKey = randomBfloat(backend, 8 * kv, random, "DSpark block key");
+  MetalBuffer blockValue = randomBfloat(backend, 8 * kv, random, "DSpark block value");
+  using Source = std::tuple<const MetalBuffer *, uint32_t, uint32_t>;
+  // One buffer of `count` rows of each source from its `first`, in order.
+  const auto join = [&](std::initializer_list<Source> sources) {
+    uint32_t total = 0;
+    for (const auto &[buffer, first, count] : sources) total += count;
+    MetalBuffer flat = backend.allocateBuffer(uint64_t{total} * kv * 2, BufferStorage::Shared, "DSpark joined rows");
+    uint32_t at = 0;
+    for (const auto &[buffer, first, count] : sources) {
+      std::memcpy(static_cast<uint16_t *>(flat.contents()) + uint64_t{at} * kv,
+                  static_cast<const uint16_t *>(buffer->contents()) + uint64_t{first} * kv, uint64_t{count} * kv * 2);
+      at += count;
+    }
+    return flat;
+  };
+  // True where attention over the first `contextRows` rows of the segments is
+  // bitwise attention over those rows held in one buffer.
+  const auto matches = [&](const SegmentedFixture &fixture, const MetalBuffer &flatKeys,
+                           const MetalBuffer &flatValues, uint32_t contextRows) {
+    MetalBuffer expected = backend.allocateBuffer(8 * q * 2, BufferStorage::Shared, "DSpark flat attention");
+    MetalBuffer actual = backend.allocateBuffer(8 * q * 2, BufferStorage::Shared, "DSpark segmented attention");
+    CommandGraph graph;
+    DraftAttention::addDSparkAttention(graph, query, flatKeys, flatValues, blockKey, blockValue, expected,
+                                       workspace, contextRows, 0, 0);
+    DraftAttention::addDSparkSegmentedAttention(graph, query, fixture.context, blockKey, blockValue, actual,
+                                                workspace, contextRows, 0);
+    (void)backend.submitCommandAsync(graph.dispatches()).wait();
+    return std::memcmp(expected.contents(), actual.contents(), 8 * q * 2) == 0;
+  };
+  const auto store = [&](const SegmentedFixture &fixture, const MetalBuffer &keys, const MetalBuffer &values,
+                         uint32_t count, uint32_t start, uint32_t base) {
+    CommandGraph graph;
+    DraftAttention::addDSparkSegmentedContextStore(graph, keys, values, fixture.context, count, start, base);
+    (void)backend.submitCommandAsync(graph.dispatches()).wait();
+  };
+  const auto commit = [&](const SegmentedFixture &fixture, const MetalBuffer &keys, const MetalBuffer &values,
+                          uint32_t retainedMask, uint32_t cap, uint32_t start, uint32_t base) {
+    MetalBuffer retained = backend.allocateBuffer(sizeof(uint32_t), BufferStorage::Shared, "DSpark retained");
+    *static_cast<uint32_t *>(retained.contents()) = retainedMask;
+    CommandGraph graph;
+    DraftAttention::addDSparkSegmentedCommitStore(graph, keys, values, retained, fixture.context, cap, start, base);
+    (void)backend.submitCommandAsync(graph.dispatches()).wait();
+  };
+  const auto poison = [&](const SegmentedFixture &fixture, uint32_t at) {
+    std::memset(fixture.row(false, at), 0xFF, kv * 2);
+    std::memset(fixture.row(true, at), 0xFF, kv * 2);
+  };
+
+  // Rewind: ten rows are committed, the lane rewinds to position 7, and the
+  // next cycle commits two rows of four there.
+  {
+    SegmentedFixture fixture(backend, segmentTokens, rows);
+    MetalBuffer keys = randomBfloat(backend, uint64_t{10} * kv, random, "DSpark first keys");
+    MetalBuffer values = randomBfloat(backend, uint64_t{10} * kv, random, "DSpark first values");
+    store(fixture, keys, values, 10, 0, 0);
+    require(matches(fixture, keys, values, 10), "DSpark segmented rows before a rewind match one buffer");
+    // Rewound to 7: rows 7 to 9 are stale, and attention over 7 rows reads none of them.
+    poison(fixture, 7);
+    poison(fixture, 8);
+    poison(fixture, 9);
+    require(matches(fixture, keys, values, 7), "a rewound DSpark global layer read a row past its length");
+    MetalBuffer newKeys = randomBfloat(backend, uint64_t{4} * kv, random, "DSpark cycle keys");
+    MetalBuffer newValues = randomBfloat(backend, uint64_t{4} * kv, random, "DSpark cycle values");
+    commit(fixture, newKeys, newValues, 0b11, 4, 7, 0);
+    const MetalBuffer joinedKeys = join({{&keys, 0, 7}, {&newKeys, 0, 2}});
+    const MetalBuffer joinedValues = join({{&values, 0, 7}, {&newValues, 0, 2}});
+    require(matches(fixture, joinedKeys, joinedValues, 9),
+            "a DSpark cycle after a rewind did not attend to its committed rows");
+    require(static_cast<uint16_t *>(fixture.row(false, 9))[0] == 0xFFFF &&
+                static_cast<uint16_t *>(fixture.row(true, 9))[kv - 1] == 0xFFFF,
+            "a DSpark commit wrote a row it did not retain");
+  }
+
+  // Restore: a window of eight rows, positions 6 to 13, makes the base 6; a
+  // cycle then commits four rows at 14, up to the layer's last row.
+  {
+    SegmentedFixture fixture(backend, segmentTokens, rows);
+    MetalBuffer keys = randomBfloat(backend, uint64_t{8} * kv, random, "DSpark window keys");
+    MetalBuffer values = randomBfloat(backend, uint64_t{8} * kv, random, "DSpark window values");
+    store(fixture, keys, values, 8, 6, 6);
+    require(matches(fixture, keys, values, 8), "a restored DSpark window is not rows 0 to 7 of the global layer");
+    MetalBuffer newKeys = randomBfloat(backend, uint64_t{4} * kv, random, "DSpark cycle keys");
+    MetalBuffer newValues = randomBfloat(backend, uint64_t{4} * kv, random, "DSpark cycle values");
+    commit(fixture, newKeys, newValues, 0b1111, 4, 14, 6);
+    require(matches(fixture, join({{&keys, 0, 8}, {&newKeys, 0, 4}}), join({{&values, 0, 8}, {&newValues, 0, 4}}), 12),
+            "a DSpark cycle after a restore did not attend to the window and its commit");
+    CommandGraph invalid;
+    MetalBuffer retained = backend.allocateBuffer(sizeof(uint32_t), BufferStorage::Shared, "DSpark retained");
+    *static_cast<uint32_t *>(retained.contents()) = 1;
+    MetalBuffer extraKeys = randomBfloat(backend, uint64_t{5} * kv, random, "DSpark extra keys");
+    MetalBuffer extraValues = randomBfloat(backend, uint64_t{5} * kv, random, "DSpark extra values");
+    rejects([&] { DraftAttention::addDSparkSegmentedCommitStore(invalid, extraKeys, extraValues, retained,
+                                                                fixture.context, 5, 14, 6); },
+            "invalid DSpark segmented context commit", "a commit past the restored layer's capacity was accepted");
+    require(invalid.empty(), "a rejected commit encoded a dispatch");
+
+    // The lane serves another request restored at base 20: its window of
+    // eight rows replaces rows 0 to 7, and the first request's rows 8 to 11
+    // left in the layer are never read.
+    MetalBuffer otherKeys = randomBfloat(backend, uint64_t{8} * kv, random, "DSpark other keys");
+    MetalBuffer otherValues = randomBfloat(backend, uint64_t{8} * kv, random, "DSpark other values");
+    store(fixture, otherKeys, otherValues, 8, 20, 20);
+    poison(fixture, 8);
+    poison(fixture, 9);
+    poison(fixture, 10);
+    poison(fixture, 11);
+    require(matches(fixture, otherKeys, otherValues, 8),
+            "a lane's next restore read rows its earlier request left in the global layer");
+  }
+}
+
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -1095,6 +1576,14 @@ int main(int argc, char **argv) {
       throw std::invalid_argument("usage: draft-attention METALLIB");
     planGeometry();
     MetalBackend backend(argv[1]);
+    dsparkFusion(backend);
+    dsparkAttention(backend);
+    dsparkAttentionSplits(backend);
+    dsparkHeadPrepare(backend);
+    dsparkContextRing(backend);
+    dsparkCommit(backend);
+    dsparkSegmentedContext(backend);
+    dsparkSegmentedRewindAndRestore(backend);
     for (const auto shape : kShapes) {
       bufferExtents(backend, shape);
       for (uint32_t lanes = 1; lanes <= kLanes; ++lanes)

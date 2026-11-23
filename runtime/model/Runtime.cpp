@@ -411,6 +411,7 @@ struct Runtime::Impl {
       uint32_t rows = 0;
     };
     std::optional<DraftRebuild> draftRebuild;
+    uint32_t dsparkGlobalBase = 0;
     std::vector<ImageState> images;
     // What its activation took from a cached state: the images that end
     // there were left out (ModelRequest::restoredTokens).
@@ -548,7 +549,7 @@ struct Runtime::Impl {
   ModelTelemetry counters;
   ops::Sampling sampling;
   std::unique_ptr<QwenTarget> targetModel;
-  DFlashDraft draftModel;
+  std::variant<DFlashDraft, DSparkDraft> draftModel;
   // The acceptance model and costs a decode cycle's rows follow
   // (--verify-rows auto): its step's rows, by the costs the start measures
   // (StepCosts), each of which a lane holds it verifies, or for a target
@@ -711,6 +712,20 @@ struct Runtime::Impl {
   // takeStepChoices).
   std::vector<RuntimeInstrumentation::StepChoice> stepChoices;
 #endif
+  static std::variant<DFlashDraft, DSparkDraft> makeDraft(const LoadedModel &model, metal::MetalBackend &backend,
+                                                          const ops::ExecutionPlans &operators,
+                                                          const ops::Projection &head,
+                                                          ops::DraftVocabulary vocabulary) {
+    return std::visit([&](const auto &weights) -> std::variant<DFlashDraft, DSparkDraft> {
+      using T = std::decay_t<decltype(weights)>;
+      if constexpr (std::is_same_v<T, DFlashDraftWeights>)
+        return std::variant<DFlashDraft, DSparkDraft>(std::in_place_type<DFlashDraft>, weights, backend, operators,
+                                                     head, vocabulary);
+      else
+        return std::variant<DFlashDraft, DSparkDraft>(std::in_place_type<DSparkDraft>, weights, backend, operators);
+    }, model.draft);
+  }
+
   explicit Impl(RuntimeContext value)
       : backend(value.backend),
         model(value.model),
@@ -726,8 +741,8 @@ struct Runtime::Impl {
                                                 geometry.prefillChunks);
                         },
                         value.model.target)),
-        draftModel(value.model.draft, value.backend, operators, targetModel->vocabularyProjection(),
-                   geometry.target.draftVocabulary),
+        draftModel(makeDraft(value.model, value.backend, operators, targetModel->vocabularyProjection(),
+                             geometry.target.draftVocabulary)),
         aneFfn(value.aneFfn), aneFfnPair(value.aneFfnPair), blockCache(value.blockCache), historyStream(value.historyStream),
         limits(splash::model::commandLimits(geometry, aneFfn ? aneFfn->minimumRows() : 0)) {
     if (states.layout() != model.stateLayout(states.layout().target.format, states.layout().target.cachedCodes) ||
@@ -753,7 +768,8 @@ struct Runtime::Impl {
       mostStepRows = std::min(kDecodeStepRows, ExpertStore::cycleRows());
     stepClasses = operators.decodeRowClasses(mostStepRows, moe);
     if (value.verifyRows == VerifyRows::Auto) {
-      verifyBudget.emplace();
+      if (std::holds_alternative<DSparkDraft>(draftModel)) verifyBudget.emplace(VerifyBudget::kDSparkPriors);
+      else verifyBudget.emplace();
       if (model.expertStore()) {
         costLine.emplace(stepClasses);
       } else {
@@ -1975,15 +1991,46 @@ struct Runtime::Impl {
     return chunks;
   }
 
+  DSparkContextBuffers dsparkPrefillBuffers(uint32_t chunk, uint32_t lane, MetalBuffer captured) const {
+    auto p = [&](PrefillTensor tensor) { return prefillArena->get(tensor, chunk); };
+    DSparkContextBuffers b;
+    b.captured = std::move(captured);
+    b.fused = p(PrefillTensor::ContextProjected);
+    b.projectedValues = p(PrefillTensor::ContextHidden);
+    const auto kv = p(PrefillTensor::ContextKv);
+    const uint64_t half = kv.sizeBytes() / 2;
+    b.rawKeys = backend.view(kv, 0, half);
+    b.preparedKeys = backend.view(kv, half, half);
+    const auto &rings = states.draft(lane);
+    for (uint32_t i = 0; i < DSparkGeometry::layers; ++i) {
+      if (i == DSparkGeometry::globalLayer) {
+        b.global = rings[i].segments;
+        continue;
+      }
+      b.keys[i] = rings[i].keys;
+      b.values[i] = rings[i].values;
+    }
+    b.markovFeature = states.draftFeature(lane);
+    b.scratch = prefillScratch(*prefillArena);
+    return b;
+  }
+
   // Computes a restored lane's draft rings from its context window.
   void addDraftRebuild(CommandGraph &graph, uint32_t lane,
                        const Request::DraftRebuild &rebuild) const {
     auto p = [&](PrefillTensor tensor) { return prefillArena->get(tensor, 0); };
-    ops::RoPE::addDraftRangeTables(graph, p(PrefillTensor::DraftInverseFrequencies),
-                                   p(PrefillTensor::DraftRopeCos), p(PrefillTensor::DraftRopeSin),
-                                   rebuild.rows, rebuild.begin, kPrefillRows);
-    draftModel.addContextRebuild(graph, draftPrefillBuffers(*prefillArena, 0), states.window(lane),
-                                 states.draft(lane), rebuild.rows, rebuild.begin);
+    if (const auto *dspark = std::get_if<DSparkDraft>(&draftModel)) {
+      const auto captured = p(PrefillTensor::Captured);
+      ops::DraftAttention::addWindowLoad(graph, states.window(lane), captured, rebuild.rows, rebuild.begin,
+                                         DSparkGeometry::hidden * 4);
+      dspark->addContext(graph, dsparkPrefillBuffers(0, lane, captured), rebuild.rows, rebuild.begin, rebuild.begin);
+    } else {
+      ops::RoPE::addDraftRangeTables(graph, p(PrefillTensor::DraftInverseFrequencies),
+                                     p(PrefillTensor::DraftRopeCos), p(PrefillTensor::DraftRopeSin),
+                                     rebuild.rows, rebuild.begin, kPrefillRows);
+      std::get<DFlashDraft>(draftModel).addContextRebuild(graph, draftPrefillBuffers(*prefillArena, 0),
+          states.window(lane), states.draft(lane), rebuild.rows, rebuild.begin);
+    }
   }
 
   // Creates the pipelines of a draft rebuild of `rows` on `lane` without
@@ -2083,7 +2130,7 @@ struct Runtime::Impl {
     if (!capturesInDecode())
       return;
     CommandGraph graph;
-    encodeCapture(graph, lane, stateLane, states.current(stateLane).stateBase, states.window(stateLane), 1, 0,
+    encodeCapture(graph, lane, stateLane, states.current(stateLane), states.window(stateLane), 1, 0,
                   {1, kDraftRows, ops::verifyLaneCap(kDraftRows, 1)});
     backend.preparePipelines(graph.dispatches());
   }
@@ -2125,8 +2172,30 @@ struct Runtime::Impl {
           }
         }
     }
-    draftModel.addContextPrefill(graph, draftPrefillBuffers(*prefillArena, index), chunk.capturedRows,
-                                 std::span(spans).first(spanCount), windowCaptures);
+    if (const auto *dspark = std::get_if<DSparkDraft>(&draftModel)) {
+      constexpr uint64_t rowBytes = uint64_t{4} * DSparkGeometry::hidden * 2;
+      const MetalBuffer captured = prefillArena->get(PrefillTensor::Captured, index);
+      for (const PrefillSequence &sequence : chunk.sequences)
+        for (const DispatchDraftCaptureSpan &capture : sequence.captures) {
+          const uint32_t count = capture.absoluteEnd - capture.absoluteBegin;
+          const uint64_t offset = uint64_t{sequence.captureBegin + capture.compactDestinationRow} * rowBytes;
+          const auto rows = backend.view(captured, offset, uint64_t{count} * rowBytes);
+          const uint32_t lane = sequence.entry->stateLane;
+          dspark->addContext(graph, dsparkPrefillBuffers(index, lane, rows), count, capture.absoluteBegin,
+                             sequence.entry->dsparkGlobalBase);
+          ops::DraftAttention::addWindowStore(graph, rows, states.window(lane), count, capture.absoluteBegin,
+                                               4 * DSparkGeometry::hidden);
+        }
+      for (const DFlashWindowCapture &capture : windowCaptures) {
+        const auto rows = backend.view(captured, uint64_t{capture.compactRow} * rowBytes,
+                                       uint64_t{capture.rows} * rowBytes);
+        ops::DraftAttention::addWindowStore(graph, rows, capture.window, capture.rows, capture.startPosition,
+                                             4 * DSparkGeometry::hidden);
+      }
+    } else {
+      std::get<DFlashDraft>(draftModel).addContextPrefill(graph, draftPrefillBuffers(*prefillArena, index),
+          chunk.capturedRows, std::span(spans).first(spanCount), windowCaptures);
+    }
   }
 
   // What a prefill command leaves its completion, by lane, indexed like
@@ -2386,8 +2455,11 @@ struct Runtime::Impl {
   }
 
   // A target whose commit writes auxiliary state after every retained row
-  // has none of a fold's rows alone to give.
-  bool capturesInDecode() const noexcept { return !geometry.target.stateLayout.auxiliaryBytes; }
+  // captures in decode only if it writes that state after a path's first
+  // rows too (QwenTarget::addAuxiliaryCapture).
+  bool capturesInDecode() const noexcept {
+    return !geometry.target.stateLayout.auxiliaryBytes || targetModel->capturesAuxiliary();
+  }
 
   // The state a decode item captures, at most one: at the page boundary
   // past the lane's position that a verify block's rows may reach within the
@@ -2448,7 +2520,9 @@ struct Runtime::Impl {
   // Lanes of storage a draft step of `lanes` lanes binds: its own
   // projections' and the target's vocabulary head's, which it shares.
   uint32_t draftStorageLanes(uint32_t lanes) const {
-    return std::max(targetModel->headStorageLanes(lanes), draftModel.decodeStorageLanes(lanes));
+    const auto *dflash = std::get_if<DFlashDraft>(&draftModel);
+    return dflash ? std::max(targetModel->headStorageLanes(lanes), dflash->decodeStorageLanes(lanes))
+                  : targetModel->headStorageLanes(lanes);
   }
 
   // The cycle's step (`step`): each lane's tree of the draft's proposals and
@@ -2474,6 +2548,82 @@ struct Runtime::Impl {
     std::array<uint32_t, kLaneCount> cacheLengths{};
     for (uint32_t lane = 0; lane < lanes; ++lane)
       cacheLengths[lane] = static_cast<uint32_t>(logicalPositions[lane]);
+    if (const auto *dspark = std::get_if<DSparkDraft>(&draftModel)) {
+      const auto &target = std::get<InklingWeights>(model.target);
+      std::array<ops::DraftTreeLane, kLaneCount> trees{};
+      // A tree of depth n verifies n + 1 rows, its anchor and proposals: a
+      // lane's chain runs kDSparkLookahead proposals deeper than the step's
+      // rows hold (a lane's cap and the rows its lanes' anchors leave), whose
+      // chances the next cycle's step weighs: a chain no deeper than the step
+      // kept the chances past it from the last longer one, and on a math
+      // prompt the steps stayed at 2 rows for every retained 2 (Inkling 2
+      // Mini, M1 Max). The rows past the step stay unverified. A forced chain
+      // is the step's own.
+      constexpr uint32_t kDSparkLookahead = 2;
+      const uint32_t budget = std::min(step.laneCap - 1, step.rows - lanes + kDSparkLookahead);
+      for (uint32_t lane = 0; lane < lanes; ++lane) {
+        Request &entry = *entries[lane];
+        if (!entry.pendingToken) throw std::invalid_argument("draft batch lane has no anchor");
+        trees[lane].anchor = *entry.pendingToken;
+        trees[lane].depth = proposals[lane].forced
+                                ? std::min<uint32_t>(depths[lane], proposals[lane].chain)
+                                : std::min({depths[lane], DSparkGeometry::block - 1, budget});
+        trees[lane].children = proposals[lane].forced ? 0 : 1;
+        const auto &acceptance = verifyBudget ? verifyBudget->acceptance(samplingEnabled(entry))
+                                              : VerifyBudget::kDSparkPriors[samplingEnabled(entry)];
+        trees[lane].calibration = {acceptance.slope, acceptance.intercepts};
+        if (proposals[lane].forced || !trees[lane].depth) continue;
+        const auto get = [&](DecodeTensor tensor) { return decodeArena->get(lane, tensor); };
+        ops::Normalization::addRms(graph, get(DecodeTensor::DraftHidden0), target.embeddingNorm,
+                                   get(DecodeTensor::DraftProjected), DSparkGeometry::hidden, 1);
+        DSparkBlockBuffers b;
+        b.anchor = get(DecodeTensor::DraftProjected);
+        b.hidden = {get(DecodeTensor::DraftHidden0), get(DecodeTensor::DraftHidden1)};
+        b.residual = get(DecodeTensor::DraftResidual);
+        b.normalized = get(DecodeTensor::DraftNormalized);
+        b.rawQuery = get(DecodeTensor::DSparkRawQuery); b.rawKey = get(DecodeTensor::DSparkRawKey);
+        b.query = get(DecodeTensor::DSparkQuery); b.key = get(DecodeTensor::DSparkKey);
+        b.value = get(DecodeTensor::DSparkValue); b.attention = get(DecodeTensor::DraftAttention);
+        b.projected = get(DecodeTensor::DraftProjected); b.gate = get(DecodeTensor::DSparkGate);
+        b.up = get(DecodeTensor::DSparkUp); b.intermediate = get(DecodeTensor::DraftIntermediate);
+        b.finalHidden = get(DecodeTensor::DraftFinalHidden);
+        const auto &rings = states.draft(entry.stateLane);
+        for (uint32_t i = 0; i < DSparkGeometry::layers; ++i) {
+          if (i == DSparkGeometry::globalLayer) {
+            b.global = rings[i].segments;
+            continue;
+          }
+          b.contextKeys[i] = rings[i].keys;
+          b.contextValues[i] = rings[i].values;
+        }
+        b.scratch = decodeArena->linearScratch();
+        const auto &lengths = states.metadata(entry.stateLane).lengths;
+        dspark->addBlock(graph, b, cacheLengths[lane], static_cast<uint32_t>(lengths.draftBase),
+                         entry.dsparkGlobalBase);
+        ops::DSparkMarkovBuffers markov;
+        markov.hidden = b.finalHidden; markov.feature = states.draftFeature(entry.stateLane);
+        markov.context = get(DecodeTensor::DSparkContext); markov.state = get(DecodeTensor::DSparkState);
+        markov.raw = get(DecodeTensor::DSparkRaw); markov.latent = get(DecodeTensor::DSparkLatent);
+        markov.baseLogits = get(DecodeTensor::Logits);
+        markov.tokens = get(DecodeTensor::ChainTokens); markov.probabilities = get(DecodeTensor::DSparkProbabilities);
+        markov.partialValues = get(DecodeTensor::DSparkPartialValues);
+        markov.partialIds = get(DecodeTensor::DSparkPartialIds);
+        dspark->addChain(graph, markov, targetModel->vocabularyProjection(), b.scratch,
+                         *entry.pendingToken, trees[lane].depth);
+      }
+      const ops::DraftSelectorBuffers selection{
+          d(DecodeTensor::Logits),          d(DecodeTensor::TopPartialIds),   d(DecodeTensor::TopPartialValues),
+          d(DecodeTensor::Candidates),      d(DecodeTensor::Unary),           d(DecodeTensor::SelectorHidden),
+          d(DecodeTensor::ChainTokens),     d(DecodeTensor::ChainRates),      d(DecodeTensor::DraftTreeTokens),
+          d(DecodeTensor::DraftTrees),      d(DecodeTensor::DraftTreeScores), d(DecodeTensor::DraftTreeSizes),
+          d(DecodeTensor::DraftTreeDraws),  d(DecodeTensor::DraftTreeNext),   d(DecodeTensor::DraftTreeCaps),
+          d(DecodeTensor::InputTokens),     d(DecodeTensor::TreeRows),        d(DecodeTensor::LaneLayout),
+          d(DecodeTensor::VerifySources)};
+      ops::DraftSelector::addDSparkChain(graph, selection, d(DecodeTensor::DSparkProbabilities),
+                                         std::span(trees).first(lanes));
+      ops::DraftSelector::addVerifyRows(graph, selection, step, floor);
+      return;
+    }
 
     DFlashDecodeBuffers buffers;
     buffers.linearScratch = decodeArena->linearScratch();
@@ -2528,9 +2678,10 @@ struct Runtime::Impl {
         tree.noise = entry.cycleNoise;
       }
     }
-    const DFlashDraftStep draft = draftModel.step(std::span(cacheLengths).first(lanes),
-                                                  std::span(tokens).first(lanes), std::span(trees).first(lanes));
-    draftModel.addDecode(graph, std::move(buffers), draft);
+    const auto &dflash = std::get<DFlashDraft>(draftModel);
+    const DFlashDraftStep draft = dflash.step(std::span(cacheLengths).first(lanes),
+                                             std::span(tokens).first(lanes), std::span(trees).first(lanes));
+    dflash.addDecode(graph, std::move(buffers), draft);
     const ops::DraftSelectorBuffers selection{
         d(DecodeTensor::Logits),          d(DecodeTensor::TopPartialIds),   d(DecodeTensor::TopPartialValues),
         d(DecodeTensor::Candidates),      d(DecodeTensor::Unary),           d(DecodeTensor::SelectorHidden),
@@ -2539,7 +2690,7 @@ struct Runtime::Impl {
         d(DecodeTensor::DraftTreeDraws),  d(DecodeTensor::DraftTreeNext),   d(DecodeTensor::DraftTreeCaps),
         d(DecodeTensor::InputTokens),     d(DecodeTensor::TreeRows),        d(DecodeTensor::LaneLayout),
         d(DecodeTensor::VerifySources)};
-    draftModel.addSelection(graph, selection, draft);
+    dflash.addSelection(graph, selection, draft);
     ops::DraftSelector::addVerifyRows(graph, selection, step, floor);
   }
 
@@ -2642,6 +2793,21 @@ struct Runtime::Impl {
       anchorDrafted = anchorDrafted || (tree[row].parent == 0 && drafted(row));
     if (!anchorDrafted)
       return;
+    // Keep the unmeasured tail's conditional chances: a shorter step makes
+    // only its first 1 to 7 proposals, not evidence that deeper ones vanished.
+    if (std::holds_alternative<DSparkDraft>(draftModel)) {
+      std::vector<float> previous = entry.chances ? std::move(entry.chances->draft) : std::vector<float>{};
+      Request::Chances &kept = entry.chances.emplace();
+      for (uint32_t row = 1; row < size; ++row)
+        kept.draft.push_back(scores[2 * row + 1]);
+      const size_t measured = kept.draft.size();
+      if (measured && previous.size() > measured && previous[measured - 1] > 0.0F) {
+        const float scale = kept.draft.back() / previous[measured - 1];
+        for (size_t i = measured; i < previous.size(); ++i)
+          kept.draft.push_back(previous[i] * scale);
+      }
+      return;
+    }
     // A chain token's row is its predecessor's child of its token.
     uint32_t chained = 0;
     for (uint32_t depth = 0, parent = 0; depth < entry.lookupChain.size(); ++depth) {
@@ -2668,6 +2834,10 @@ struct Runtime::Impl {
   // chain's path that draft steps joined, which its draft proposes again.
   std::vector<float> laneCurve(const Request &entry, const LaneProposals &proposals, uint32_t depth) const {
     static const std::vector<float> unknown(kDraftRows - 1, 1.0F);
+    // DSpark builds only its own chain; a lookup chain adds no verify row.
+    if (!proposals.forced && std::holds_alternative<DSparkDraft>(draftModel))
+      return VerifyBudget::laneChances(entry.chances ? std::span<const float>(entry.chances->draft)
+                                                      : std::span<const float>(unknown), {}, depth);
     std::span<const float> draft, chain = proposals.chances;
     if (!proposals.forced) {
       draft = entry.chances ? std::span<const float>(entry.chances->draft) : std::span<const float>(unknown);
@@ -2787,6 +2957,40 @@ struct Runtime::Impl {
     std::array<uint32_t, kLaneCount> startPositions{};
     for (uint32_t lane = 0; lane < lanes; ++lane)
       startPositions[lane] = static_cast<uint32_t>(items[lane].logicalPosition);
+    if (const auto *dspark = std::get_if<DSparkDraft>(&draftModel)) {
+      const MetalBuffer captured = d(DecodeTensor::CapturedTargetHidden);
+      for (uint32_t lane = 0; lane < lanes; ++lane) {
+        const auto get = [&](DecodeTensor tensor) { return decodeArena->get(lane, tensor); };
+        const uint32_t stateLane = entries[lane]->stateLane;
+        DSparkContextBuffers b;
+        b.captured = captured;
+        b.fused = get(DecodeTensor::ContextProjected);
+        b.projectedValues = get(DecodeTensor::ContextHidden);
+        const auto kv = get(DecodeTensor::ContextKv);
+        const uint64_t half = kv.sizeBytes() / 2;
+        b.rawKeys = backend.view(kv, 0, half);
+        b.preparedKeys = backend.view(kv, half, half);
+        const auto &rings = states.draft(stateLane);
+        for (uint32_t i = 0; i < DSparkGeometry::layers; ++i) {
+          if (i == DSparkGeometry::globalLayer) {
+            b.global = rings[i].segments;
+            continue;
+          }
+          b.keys[i] = rings[i].keys;
+          b.values[i] = rings[i].values;
+        }
+        b.markovFeature = states.draftFeature(stateLane);
+        b.scratch = decodeArena->linearScratch();
+        dspark->addContextCommit(graph, b, get(DecodeTensor::DSparkCompact), get(DecodeTensor::RetainedRows),
+                                 get(DecodeTensor::LaneLayout), step.rows, std::min(step.laneCap, step.rows),
+                                 startPositions[lane], entries[lane]->dsparkGlobalBase);
+        if (capturesInDecode())
+          ops::DraftAttention::addWindowCommit(graph, captured, states.window(stateLane),
+              get(DecodeTensor::RetainedRows), get(DecodeTensor::LaneLayout), step.rows,
+              std::min(step.laneCap, step.rows), startPositions[lane], 4 * DSparkGeometry::hidden);
+      }
+      return;
+    }
     // Where decode captures states, each lane's window takes the rows it
     // retained as its rings do, so that it stays current for a capture.
     DFlashContextBuffers buffers;
@@ -2802,7 +3006,7 @@ struct Runtime::Impl {
     buffers.retainedRows = d(DecodeTensor::RetainedRows);
     buffers.laneRows = d(DecodeTensor::LaneLayout);
     bindDraftRings(entries, buffers.persistentKeys, buffers.persistentValues);
-    draftModel.addContextCommit(graph, std::move(buffers), std::span(startPositions).first(lanes), step);
+    std::get<DFlashDraft>(draftModel).addContextCommit(graph, std::move(buffers), std::span(startPositions).first(lanes), step);
   }
 
   void encodeBatchAcceptance(CommandGraph &graph,
@@ -2885,8 +3089,8 @@ struct Runtime::Impl {
         if (rows > maximumRetained[lane])
           continue;
         const QwenCachedBuffers &state = static_cast<QwenStateReservation &>(*capture.reservation).buffers();
-        encodeCapture(graph, lane, entries[lane]->stateLane, state.gdn->buffers().stateBase, state.window->buffer(),
-                      rows, static_cast<uint32_t>(items[lane].logicalPosition), step);
+        encodeCapture(graph, lane, entries[lane]->stateLane, state.gdn->buffers(), state.window->buffer(), rows,
+                      static_cast<uint32_t>(items[lane].logicalPosition), step);
       }
     }
   }
@@ -2894,21 +3098,30 @@ struct Runtime::Impl {
   // A capture's commands on decode lane `lane` of state lane `stateLane`
   // (encodeDecodeCaptures), in a cycle of `step`: the fold of the first
   // `rows` rows of the lane's retained path in the verify's tape into the GDN
-  // state `fold` and the commit of their context rows, from `position`, to
+  // state of `cell`, or the target's auxiliary state after them into its
+  // auxiliary view, and the commit of their context rows, from `position`, to
   // the state's `window`.
-  void encodeCapture(CommandGraph &graph, uint32_t lane, uint32_t stateLane, const MetalBuffer &fold,
+  void encodeCapture(CommandGraph &graph, uint32_t lane, uint32_t stateLane, const GdnParityBuffers &cell,
                      const MetalBuffer &window, uint32_t rows, uint32_t position, const ops::StepRows &step) const {
+    if (geometry.target.stateLayout.auxiliaryBytes)
+      targetModel->addAuxiliaryCapture(graph,
+                                       {decodeArena->get(lane, DecodeTensor::RetainedRows),
+                                        decodeArena->get(lane, DecodeTensor::LaneLayout),
+                                        states.current(stateLane).auxiliary, cell.auxiliary},
+                                       rows, step);
     targetModel->addStateFold(graph,
                               {decodeArena->get(lane, DecodeTensor::RetainedRows), states.next(stateLane).stateBase,
                                decodeArena->batchSlice(DecodeTensor::GdnTape, kLaneCount),
-                               decodeArena->gdnTapeSlot(stateLane, states.metadata(stateLane).activeParity ^ 1), fold},
+                               decodeArena->gdnTapeSlot(stateLane, states.metadata(stateLane).activeParity ^ 1),
+                               cell.stateBase},
                               rows);
     // The window takes the first rows of the lane's retained path, which
     // its capture holds when the lane retained them.
-    ops::DraftAttention::addWindowCommit(graph, decodeArena->batchSlice(DecodeTensor::ContextHidden, kLaneCount),
-                                         window, decodeArena->get(lane, DecodeTensor::RetainedRows),
-                                         decodeArena->get(lane, DecodeTensor::LaneLayout), step.rows, rows, position,
-                                         geometry.draft.hiddenSize);
+    const bool dspark = std::holds_alternative<DSparkDraft>(draftModel);
+    ops::DraftAttention::addWindowCommit(graph,
+        decodeArena->batchSlice(dspark ? DecodeTensor::CapturedTargetHidden : DecodeTensor::ContextHidden, kLaneCount),
+        window, decodeArena->get(lane, DecodeTensor::RetainedRows), decodeArena->get(lane, DecodeTensor::LaneLayout),
+        step.rows, rows, position, dspark ? 4 * DSparkGeometry::hidden : geometry.draft.hiddenSize);
   }
 
   // A verify's selection, acceptance and commits, which end its cycle's last
@@ -3468,6 +3681,10 @@ StateAdmission Runtime::resume(const ModelRequest &request) {
     entry.maxNewTokens = request.maxNewTokens;
     entry.images = std::move(images);
     entry.restoredTokens = request.restoredTokens;
+    // The replay rebuilds the context from position 0 on a lane whose global
+    // layer holds another request's rows; a restore that follows
+    // (finishRestore) sets the base it restores.
+    entry.dsparkGlobalBase = 0;
     impl_->bindPenalties(entry, request.prompt);
   }
   rollback.committed = admission.granted();
@@ -3555,6 +3772,11 @@ void Runtime::finishRestore(uint64_t requestId, uint32_t restoredPrefixLength,
   }
   entry.draftContextPlan.reset();
   entry.draftRebuild.reset();
+  // The global layer holds the rows of the positions from the restored
+  // window's start, or from the restored length when the window was skipped:
+  // a restore leaves nothing of the context before them (dsparkGlobalBase).
+  if (std::holds_alternative<DSparkDraft>(impl_->draftModel))
+    entry.dsparkGlobalBase = dsparkGlobalBase(restoredPrefixLength, restoreDraftState, lengths.draftBase);
   if (restoreDraftState)
     entry.draftRebuild = Impl::Request::DraftRebuild{
         static_cast<uint32_t>(lengths.draftBase), lengths.draftLength};
@@ -3569,6 +3791,8 @@ void Runtime::setDraftContextPlan(uint64_t requestId, DraftContextPlan plan) {
       impl_->states.metadata(entry.stateLane).lengths.targetTokens;
   if (plan.replayBegin != current)
     throw std::invalid_argument("draft context plan restore boundary is stale");
+  if (std::holds_alternative<DSparkDraft>(impl_->draftModel))
+    plan = dsparkDraftContextPlan(std::move(plan));
   entry.draftContextPlan = std::move(plan);
 }
 
@@ -3990,10 +4214,16 @@ Runtime::decodeAsync(const BatchPlan &plan,
   impl_->addRopeTables(draft, {}, 0, impl_->decodeArena->batchSlice(DecodeTensor::DraftPositions, width),
                        width * kDecodeRows, {}, {}, impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeCos, width),
                        impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeSin, width));
-  impl_->encodeBatchEmbedding(draft, DecodeTensor::DraftInputTokens,
-                              impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width), width,
-                              width * kDraftRows);
-  impl_->draftModel.addMaskRows(draft, impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width), width);
+  if (const auto *dflash = std::get_if<DFlashDraft>(&impl_->draftModel)) {
+    impl_->encodeBatchEmbedding(draft, DecodeTensor::DraftInputTokens,
+                                impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width), width,
+                                width * kDraftRows);
+    dflash->addMaskRows(draft, impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width), width);
+  } else {
+    for (uint32_t lane = 0; lane < width; ++lane)
+      impl_->targetModel->addEmbedding(draft, impl_->decodeArena->get(lane, DecodeTensor::DraftInputTokens),
+                                       impl_->decodeArena->get(lane, DecodeTensor::DraftHidden0), 1);
+  }
   impl_->encodeDraftBatchGraph(draft, entries, {logicalPositions.data(), width}, {depths.data(), width},
                                std::span(proposals).first(width), step, choice.floor);
   std::shared_ptr<SpilledKvReads> reads = impl_->decodeReads(items);

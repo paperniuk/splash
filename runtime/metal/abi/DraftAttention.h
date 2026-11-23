@@ -88,6 +88,72 @@ struct DraftContextBatchParams {
 static_assert(sizeof(DraftContextBatchParams) == 16,
               "Draft context commit parameters are 16 bytes on both sides");
 
+struct DSparkFusionParams {
+  uint32_t width;
+  uint32_t consumer;
+};
+
+static_assert(sizeof(DSparkFusionParams) == 8, "DSpark fusion parameters are 8 bytes on both sides");
+
+struct DSparkHeadParams {
+  uint32_t heads;
+  uint32_t start_position;
+};
+
+struct DSparkStoreParams {
+  uint32_t rows;
+  uint32_t start_position;
+  uint32_t base_position;
+  uint32_t capacity;
+};
+
+static_assert(sizeof(DSparkHeadParams) == 8 && sizeof(DSparkStoreParams) == 16,
+              "DSpark attention parameters match on both sides");
+
+// DSpark's global layer keeps its context K/V (rows of 8 KV heads x 128
+// values, [row][head][dimension] for both) in fixed-size segments, never a
+// ring: the row of position p lives at row (p - base) % segment_tokens of
+// segment (p - base) / segment_tokens, each segment a buffer of its own so
+// that no one buffer holds the whole context. The kernels reach the segments
+// through a table of their GPU addresses (metal::AddressTable), in the
+// constant address space: the `segments` key segments' addresses first, then
+// the `segments` value segments'. setBytes passes at most 4 KiB, so a table
+// holds at most SPLASH_DRAFT_MAX_GLOBAL_SEGMENTS segments of each. A device
+// whose maxBufferLength is below a segment's bytes takes smaller segments;
+// the last segment may hold fewer rows than segment_tokens.
+#define SPLASH_DRAFT_GLOBAL_SEGMENT_TOKENS 65536u
+#define SPLASH_DRAFT_MAX_GLOBAL_SEGMENTS 256u
+
+// A block's attention over its context rows [context_first, context_rows) and its own 8 rows, split over `splits`
+// ranges of those keys, each a threadgroup per KV head (dspark_block_attention_split*), whose partials
+// (DSPARK_ATTENTION_PARTIAL floats: 128 outputs, maximum, denominator) of the head's 24 queries (8 rows x 3 heads)
+// dspark_block_attention_reduce joins. The context is a ring of context_capacity rows (0: rows where they are) or
+// the global layer's segments (segment_tokens rows each, `segments` of each plane).
+#define DSPARK_ATTENTION_MAX_SPLITS 64u
+#define DSPARK_ATTENTION_PARTIAL 130u
+struct DSparkSplitAttentionParams {
+  uint32_t context_rows;
+  uint32_t context_first;
+  uint32_t context_capacity;
+  uint32_t segment_tokens;
+  uint32_t segments;
+  uint32_t splits;
+};
+
+// A store of `rows` rows to the rows of positions start_position + row of the
+// segments, counted from base_position; the commit store writes only as many
+// rows as its retained mask counts.
+struct DSparkSegmentedStoreParams {
+  uint32_t rows;
+  uint32_t start_position;
+  uint32_t base_position;
+  uint32_t segment_tokens;
+  uint32_t segments;
+};
+
+static_assert(sizeof(DSparkSplitAttentionParams) == 24 && sizeof(DSparkSegmentedStoreParams) == 20,
+              "DSpark segmented parameters match on both sides");
+
 // A context window holds, per ring slot, the draft's context row, from which
 // every layer's ring keys and values are computed: 4-bit codes over groups of
 // SPLASH_DRAFT_CONTEXT_GROUP values, all slots' codes first, then each

@@ -322,6 +322,31 @@ public:
                             std::span<const metal::MetalBuffer> pageTables,
                             std::span<const kv::ChunkedPrefillParams> sequences, const AttentionRows &rows,
                             uint32_t queryHeads, kv::Layout layout, AttentionVariant variant = {});
+  // Inkling's BF16 packed q|r|gate rows (INKLING_PACKED_WIDTH, metal/abi/
+  // PagedAttention.h), k/v [rows][8][128] and per-head qScale/relScale. K/V
+  // are stored through each sequence's table at its row slots; queries and
+  // relative are packed rows.
+  // `full` applies position-dependent scaling, using tree depth when present.
+  static void addInklingPreparation(metal::CommandGraph &graph, metal::MetalBuffer packed,
+                                     metal::MetalBuffer k, metal::MetalBuffer v, metal::MetalBuffer qScale,
+                                     metal::MetalBuffer relScale, metal::MetalBuffer queries,
+                                     metal::MetalBuffer relative, SplashKvLayer layer,
+                                     std::span<const metal::MetalBuffer> pageTables,
+                                     std::span<const kv::ChunkedPrefillParams> sequences, const AttentionRows &rows,
+                                     kv::Layout layout, bool full);
+  // Partials of 1..64 splits, sized from packed row count.
+  [[nodiscard]] static uint64_t inklingWorkspaceBytes(uint32_t rows, uint32_t splits);
+  // Attends the prepared BF16 rows through each history's pages, with BF16
+  // relProjection [16][1024], sinks [rows][24] and the packed rows' gates.
+  // Output is BF16 [rows][24][128] in packed order. A sliding layer requires
+  // layout.windowTokens == 1023; its own key is in addition to those.
+  static void addInklingAttention(metal::CommandGraph &graph, metal::MetalBuffer queries,
+                                  metal::MetalBuffer relative, metal::MetalBuffer relProjection,
+                                  metal::MetalBuffer sinks, metal::MetalBuffer packed, metal::MetalBuffer output,
+                                  metal::MetalBuffer workspace, uint32_t splits,
+                                  std::span<const kv::ChunkedPrefillParams> sequences,
+                                  std::span<const AttentionHistory> histories, const AttentionRows &rows,
+                                  kv::Layout layout, bool sliding);
   // The plan's dispatches over the staged queries into the out-projection's
   // input rows (`output`, AttentionOutputRows), which must not alias them,
   // each sequence reading its history where `histories` say: each reduce

@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -178,6 +179,12 @@ struct ModelMemoryProfile final {
   // its routed experts stream (model::kPrefillGroupChunks chunks), zero for
   // a chunk's. A windowed layout's lane keeps them Full (kvWindowFloorPages).
   uint32_t commandPages = 0;
+  // The context --max-context asks for, zero for none, of a draft whose lane
+  // holds global K/V that grows with the context
+  // (model::ModelMemoryPlan::draftContextTokenBytes): the plan then charges
+  // each lane the capacity of that context where the plan holds it, and
+  // otherwise of the longest context it holds, as the context it serves.
+  uint32_t draftContextTokens = 0;
 
   [[nodiscard]] std::optional<std::string> validationError() const;
   [[nodiscard]] uint64_t fixedRuntimeBytes() const;
@@ -245,8 +252,13 @@ struct ContextBounds final {
   uint32_t resident = 0;
   uint32_t spilled = 0;
   uint32_t disk = 0;
+  // The context the capacity of a draft's global K/V holds, which each lane is
+  // charged (EngineMemoryBreakdown::draftContextTokens); unbounded for a draft
+  // without it.
+  uint32_t draft = std::numeric_limits<uint32_t>::max();
 
-  // The window, unless resident KV or spilling holds less of it.
+  // The window, unless resident KV, spilling or the draft's capacity holds
+  // less of it.
   [[nodiscard]] uint32_t maximum() const noexcept;
   // What the maximum is: model, memory or disk.
   [[nodiscard]] std::string_view bound() const noexcept;
@@ -275,6 +287,12 @@ struct EngineMemoryBreakdown {
   uint64_t streamedTableBytes = 0;
   uint64_t hostHeldBackBytes = 0;
   uint64_t fixedRuntimeBytes = 0;
+  // A draft whose lane holds global K/V that grows with the context: its bytes
+  // a token, and the tokens each lane is charged, in laneStateBytes beside the
+  // lane's fixed state (draftContextCapacity of the context served). Zero for
+  // a draft without it.
+  uint64_t draftContextTokenBytes = 0;
+  uint32_t draftContextTokens = 0;
 
   // All lanes' state, cached composite states, and KV extents grow from this
   // one governor-controlled byte budget; none is preallocated.

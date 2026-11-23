@@ -78,6 +78,18 @@ planDraftContext(uint32_t replayBegin, uint32_t replayEnd,
   return result;
 }
 
+DraftContextPlan dsparkDraftContextPlan(DraftContextPlan plan) {
+  uint32_t begin = plan.replayBegin;
+  for (DraftBoundaryPlan &boundary : plan.boundaries) {
+    boundary.captureBegin = begin;
+    begin = boundary.boundary;
+  }
+  plan.captureSpans.clear();
+  if (plan.replayBegin < plan.replayEnd)
+    plan.captureSpans.push_back({plan.replayBegin, plan.replayEnd, !plan.restoresDraftState});
+  return plan;
+}
+
 // A dispatch holds at most two capture spans (DispatchDraftCapturePlan):
 // every span after the first is at least draftContextTokens long, so a third
 // would need a dispatch of more rows than the window, 2048.

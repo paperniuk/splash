@@ -1,5 +1,15 @@
 #pragma once
 
+// Inkling 2's attention rows as its fused projection writes them: a row of
+// 8576 bf16, the 24 heads' queries (3072), relative queries (24 x 16), output
+// gates (3072), then a sliding layer's keys (1024) and values (1024) where
+// they read the same rows; else those stay unwritten (model/Inkling.cpp).
+#define INKLING_PACKED_WIDTH 8576u
+#define INKLING_RELATIVE_OFFSET 3072u
+#define INKLING_GATE_OFFSET 3456u
+#define INKLING_KEY_OFFSET 6528u
+#define INKLING_VALUE_OFFSET 7552u
+
 // Parameter layouts shared by host dispatch code and Metal kernels.
 #ifdef __METAL_VERSION__
 #include <metal_stdlib>

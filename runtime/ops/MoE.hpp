@@ -23,7 +23,15 @@ namespace splash::ops {
 // by the softmax of their scores; SigmoidNormalized, by each one's
 // sigmoid(score) over the sum of theirs plus 1e-20, in fp32. A sigmoid
 // router selects by score as it would by sigmoid(score), which is monotonic.
-enum class MoeRouter : uint8_t { Softmax, SigmoidNormalized };
+// SigmoidCorrected (Inkling 2) selects by sigmoid(score) plus the block's
+// correction bias (BlockMoeWeights::correctionBias) and weights the selected
+// as SigmoidNormalized does, times MoeShape::routeScale.
+enum class MoeRouter : uint8_t { Softmax, SigmoidNormalized, SigmoidCorrected };
+
+// The expert activation of gate g and up u, in fp32 from their bf16 values:
+// SwiGlu, silu(g) * u; SoftcappedSwiGlu (Inkling 2), tanh(g / 4) * 4 *
+// sigmoid(g) * tanh(u / 25) * 25 (MoeShape::gateSoftcap, upSoftcap).
+enum class MoeActivation : uint8_t { SwiGlu, SoftcappedSwiGlu };
 
 // The routings the MoE kernels compile (kernels/shared/moe.metal,
 // kernels/shared/moe_gguf.metal):
@@ -45,6 +53,7 @@ inline constexpr std::array kCompiledMoeRoutings{
     // Flint's: a sigmoid router, and an ungated shared expert twice the
     // routed experts' width.
     CompiledMoeRouting{MoeRouter::SigmoidNormalized, 2, false, SPLASH_MOE_EXPERT_SLOTS, "_sigmoid_s2", "_s2"},
+    CompiledMoeRouting{MoeRouter::SigmoidCorrected, 0, false, 128, "_corrected_s0", "_s0"},
 };
 
 // The shared expert is sharedSlices experts every row visits after its
@@ -61,12 +70,18 @@ struct MoeShape final {
   MoeRouter router = MoeRouter::Softmax;
   uint32_t sharedSlices = 1;
   bool sharedGate = true;
+  // SigmoidCorrected's weight scale; 1 for the other routers.
+  float routeScale = 1.0F;
+  MoeActivation activation = MoeActivation::SwiGlu;
+  float gateSoftcap = 0.0F;
+  float upSoftcap = 0.0F;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
     // Experts of an intermediate width that fills 64-column tiles, and a
     // routing compiled for the router, shared slices, gate and experts.
     return hiddenSize && hiddenSize % 256 == 0 && experts && expertsPerToken && expertsPerToken <= experts &&
-           expertIntermediateSize && expertIntermediateSize % 64 == 0 && compiledRouting();
+           expertIntermediateSize && expertIntermediateSize % 64 == 0 && compiledRouting() &&
+           (activation != MoeActivation::SoftcappedSwiGlu || (gateSoftcap > 0.0F && upSoftcap > 0.0F));
   }
   // The compiled routing of the router, the shared slices and the experts,
   // or none.
@@ -210,6 +225,8 @@ class MoeExpertStream;
 struct BlockMoeWeights final {
   QuantizedSegment router;           // [experts][hidden]
   QuantizedSegment sharedScalarGate; // [1][hidden]
+  // SigmoidCorrected's selection bias, F32 [experts]; empty otherwise.
+  metal::MetalBuffer correctionBias;
   BlockExpertProjection gate;
   BlockExpertProjection up;
   BlockExpertProjection down;
@@ -421,7 +438,7 @@ struct MoE final {
   static void addRoutes(metal::CommandGraph &graph, const metal::MetalBuffer &input, const QuantizedSegment &router,
                         const QuantizedSegment &sharedScalarGate, const metal::MetalBuffer &scores,
                         const metal::MetalBuffer &selected, const metal::MetalBuffer &routingWeights, uint32_t rows,
-                        MoeShape shape, FloatTile routerTile);
+                        MoeShape shape, FloatTile routerTile, const metal::MetalBuffer &correctionBias = {});
   // A streamed experts' load (MoeExpertStream::addLoad): the gate, up and
   // down projections of up to `jobs` experts, job j's projection z's native
   // rows in `staging` from sources[3j + z] (bytes) on, repacked into the

@@ -112,17 +112,23 @@ struct DraftStateLayout final {
   uint32_t kvHeads = 0;
   uint32_t headDimension = 0;
   uint32_t contextWidth = 0;
+  uint32_t localTokens = SPLASH_DRAFT_SLIDING_WINDOW;
+  uint32_t globalTokens = 0;
+  uint32_t globalLayer = UINT32_MAX;
+  uint32_t featureWidth = 0;
 
   [[nodiscard]] constexpr bool valid() const noexcept {
-    return layers && kvHeads && headDimension && contextWidth &&
-           contextWidth % SPLASH_DRAFT_CONTEXT_GROUP == 0;
+    return layers && kvHeads && headDimension && contextWidth && localTokens &&
+           contextWidth % SPLASH_DRAFT_CONTEXT_GROUP == 0 &&
+           (globalTokens ? globalLayer < layers : globalLayer == UINT32_MAX);
   }
-  [[nodiscard]] constexpr uint64_t tensorBytes() const noexcept {
-    return uint64_t{kvHeads} * SPLASH_DRAFT_SLIDING_WINDOW * headDimension *
-           bfloat16Bytes;
+  [[nodiscard]] constexpr uint64_t tensorBytes(uint32_t layer = UINT32_MAX) const noexcept {
+    const uint32_t tokens = globalTokens && layer == globalLayer ? globalTokens : localTokens;
+    return uint64_t{kvHeads} * tokens * headDimension * bfloat16Bytes;
   }
   [[nodiscard]] constexpr uint64_t ringBytes() const noexcept {
-    return uint64_t{layers} * 2 * tensorBytes();
+    return 2 * ((uint64_t{layers} - (globalTokens != 0)) * tensorBytes() +
+                (globalTokens ? tensorBytes(globalLayer) : 0)) + uint64_t{featureWidth} * bfloat16Bytes;
   }
   [[nodiscard]] constexpr uint64_t windowBytes() const noexcept {
     return draft_context_window_bytes(contextWidth);

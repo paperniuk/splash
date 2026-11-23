@@ -63,7 +63,9 @@ using splash::test::require;
 // The target and draft checkpoints of `model` under root, which weight
 // planning reads; its vision tower stays absent, so loading stops there.
 void writeCheckpoints(const std::filesystem::path &root, const model::ModelDescriptor &model) {
-  std::visit([&](const auto &target) { test::writeSyntheticCheckpoints(root, target, model.draft); },
+  std::visit([&](const auto &target) {
+    test::writeSyntheticCheckpoints(root, target, std::get<model::DFlashDraftLayout>(model.draft));
+  },
              model.target);
 }
 
@@ -207,7 +209,7 @@ void testStreamableWeightsAreWhatLoads(const RuntimeResourcesConfig &config) {
               !weights.tableMinimumBytes && !weights.tableRowBytes && weights.tableRefusal.empty(),
           "the streamable weights of a MoE without a table are not its experts'");
   const auto allocated = [](const model::LoadedModel &loaded) {
-    return loaded.targetActualAllocatedBytes() + loaded.draft.actualAllocatedBytes +
+    return loaded.targetActualAllocatedBytes() + loaded.draftActualAllocatedBytes() +
            loaded.vision.actualAllocatedBytes;
   };
   metal::MetalBackend backend(config.metallibPath.string());
@@ -816,7 +818,7 @@ void testLoadedVisionIsRequiredOnlyWithVision() {
   target.actualAllocatedBytes = 1;
   target.manifestFingerprintSha256 = "target";
   loaded.target = std::move(target);
-  loaded.draft.actualAllocatedBytes = 1;
+  std::get<model::DFlashDraftWeights>(loaded.draft).actualAllocatedBytes = 1;
   loaded.manifestFingerprintSha256 = "model";
   require(loaded.descriptor.hasVision(), "the test model has no vision");
   rejects([&] { requireLoadedModel(loaded); },

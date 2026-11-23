@@ -19,13 +19,21 @@
 namespace splash::model {
 
 void requireCompatibleModel(const LoadedModel &model) {
-  if (!model.descriptor.valid() ||
-      model.descriptor.draft != model.draft.layout ||
+  const bool draftsMatch = model.descriptor.draft.index() == model.draft.index() &&
+      std::visit([&](const auto &layout) {
+        using T = std::decay_t<decltype(layout)>;
+        if constexpr (std::is_same_v<T, DFlashDraftLayout>) {
+          const auto *weights = std::get_if<DFlashDraftWeights>(&model.draft);
+          return weights && weights->layout == layout;
+        } else {
+          return std::holds_alternative<DSparkDraftWeights>(model.draft);
+        }
+      }, model.descriptor.draft);
+  if (!model.descriptor.valid() || !draftsMatch ||
       !std::visit(
           [&](const auto &target) {
             return model.descriptor.target == TargetLayout{target.layout} &&
-                   target.layout.vocabularySize ==
-                       model.draft.layout.vocabularySize;
+                   target.layout.vocabularySize == draftVocabularySize(model.descriptor.draft);
           },
           model.target)) {
     throw std::invalid_argument(
@@ -73,6 +81,8 @@ SparseRowStoreOptions streamedTableRows(const Qwen3_6MoeLayout &) { return {}; }
 
 SparseRowStoreOptions streamedTableRows(const FlintLayout &) { return {}; }
 
+SparseRowStoreOptions streamedTableRows(const InklingLayout &) { return {}; }
+
 StreamedParts StreamedParts::loaded(const LoadedModel &model, bool kv) noexcept {
   const SparseRowStore *table = model.streamedTable();
   return {.experts = model.expertStore() != nullptr, .tableRowBytes = table ? table->table().rowBytes : 0, .kv = kv};
@@ -92,6 +102,11 @@ TargetWeights loadTarget(metal::MetalBackend &backend, WeightImages &images, con
   return std::visit(
       [&](const auto &layout) -> TargetWeights {
         const std::filesystem::path directory = root / "target";
+        if constexpr (std::is_same_v<std::decay_t<decltype(layout)>, InklingLayout>) {
+          if (descriptor.targetSource != TargetSource::Safetensors)
+            throw std::invalid_argument("Inkling loads from safetensors only");
+          return loadInklingWeights(backend, layout, images, directory, experts);
+        } else {
         switch (descriptor.targetSource) {
         case TargetSource::Safetensors: {
           SafetensorsTargetLoader loader(backend, images, directory, layout, experts);
@@ -106,6 +121,7 @@ TargetWeights loadTarget(metal::MetalBackend &backend, WeightImages &images, con
           GgufTargetLoader loader(backend, images, findTargetGgufs(directory), layout.ggufArchitecture, layout, table,
                                   experts);
           return readTarget(backend, layout, std::ref(loader));
+        }
         }
         }
         throw std::invalid_argument("unknown target source");
@@ -125,7 +141,7 @@ QwenTargetGeometry plannedTargetGeometry(metal::MetalBackend &backend, const std
   const TargetWeights target = loadTarget(backend, images, root, descriptor,
                                           {.streamedTableBytes = streamedTableBytes, .readers = std::move(readers)});
   return std::visit(
-      [&](const auto &weights) { return qwenTargetGeometry(weights, descriptor.draft.targetLayerIds()); }, target);
+      [&](const auto &weights) { return qwenTargetGeometry(weights, draftTargetLayerIds(descriptor.draft)); }, target);
 }
 
 LoadedModel loadModel(metal::MetalBackend &backend,
@@ -141,15 +157,31 @@ LoadedModel loadModel(metal::MetalBackend &backend,
   // Every source's metadata is checked before the first image is written:
   // the vision tower's and the draft's here, the target's by its loader.
   const auto vision = planVisionLoader(root, result.descriptor);
-  DraftCheckpointLoader draft(backend, images, root / "draft", result.descriptor.draft);
-  result.target = loadTarget(backend, images, root, result.descriptor, options);
-  result.draft = loadDFlashDraftWeights(backend, draft, result.descriptor.draft);
+  std::visit([&](const auto &layout) {
+    using T = std::decay_t<decltype(layout)>;
+    if constexpr (std::is_same_v<T, DFlashDraftLayout>) {
+      DraftCheckpointLoader draft(backend, images, root / "draft", layout);
+      result.target = loadTarget(backend, images, root, result.descriptor, options);
+      result.draft = loadDFlashDraftWeights(backend, draft, layout);
+    } else {
+      DSparkCheckpointLoader draft(backend, images, root / "draft");
+      result.target = loadTarget(backend, images, root, result.descriptor, options);
+      result.draft = loadDSparkDraftWeights(backend, draft);
+      // The Markov correction folded through the target's head, which the
+      // draft's proposals then add to the head's logits a token at a time
+      // (a hidden correction's logits are the head's rows times it). The
+      // fold runs bf16 activations: it projects weights, not activations.
+      const ops::Linear linear(backend.capabilities(), ops::Int8Activations::Off);
+      foldDSparkCorrection(backend, linear, std::get<InklingWeights>(result.target).logitsProjection,
+                           std::get<DSparkDraftWeights>(result.draft));
+    }
+  }, result.descriptor.draft);
   result.vision = loadVisionWeights(backend, images, vision.get());
 
   std::vector<WeightFileRecord> records(result.targetFiles().begin(),
                                         result.targetFiles().end());
-  records.insert(records.end(), result.draft.files.begin(),
-                 result.draft.files.end());
+  const auto draftRecords = result.draftFiles();
+  records.insert(records.end(), draftRecords.begin(), draftRecords.end());
   records.insert(records.end(), result.vision.files.begin(),
                  result.vision.files.end());
   result.manifestFingerprintSha256 = weightManifestFingerprint(records);

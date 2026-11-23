@@ -32,7 +32,8 @@ class QwenStateStorage;
 class SsdReaders;
 class VisionLoader;
 
-using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights, Qwen4ExpWeights, FlintWeights>;
+using TargetWeights = std::variant<Qwen3_8Weights, Qwen3_6MoeWeights, Qwen4ExpWeights, FlintWeights, InklingWeights>;
+using DraftWeights = std::variant<DFlashDraftWeights, DSparkDraftWeights>;
 
 // How a model loads beside its descriptor: with streamedTableBytes, the rows
 // of a table the target's GGUF holds (model/ModelSizing.hpp) stream from its
@@ -58,7 +59,7 @@ struct LoadedModel final {
   // The memory of every image the weights below are views of.
   std::shared_ptr<WeightImages> images;
   TargetWeights target;
-  DFlashDraftWeights draft;
+  DraftWeights draft;
   QwenVisionWeights vision;
   std::string manifestFingerprintSha256;
 
@@ -78,6 +79,12 @@ struct LoadedModel final {
   }
   [[nodiscard]] uint32_t maximumContextTokens() const noexcept {
     return descriptor.capabilities.maximumContextTokens;
+  }
+  [[nodiscard]] uint64_t draftActualAllocatedBytes() const noexcept {
+    return std::visit([](const auto &weights) { return weights.actualAllocatedBytes; }, draft);
+  }
+  [[nodiscard]] std::span<const WeightFileRecord> draftFiles() const noexcept {
+    return std::visit([](const auto &weights) -> std::span<const WeightFileRecord> { return weights.files; }, draft);
   }
   [[nodiscard]] uint64_t targetActualAllocatedBytes() const noexcept {
     return std::visit([](const auto &weights) {
@@ -164,6 +171,7 @@ void requireCompatibleModel(const LoadedModel &model);
 [[nodiscard]] SparseRowStoreOptions streamedTableRows(const Qwen3_8Layout &layout);
 [[nodiscard]] SparseRowStoreOptions streamedTableRows(const Qwen3_6MoeLayout &layout);
 [[nodiscard]] SparseRowStoreOptions streamedTableRows(const FlintLayout &layout);
+[[nodiscard]] SparseRowStoreOptions streamedTableRows(const InklingLayout &layout);
 
 // The vision role's source, planned; null for a model without vision.
 [[nodiscard]] std::unique_ptr<VisionLoader> planVisionLoader(const std::filesystem::path &root,

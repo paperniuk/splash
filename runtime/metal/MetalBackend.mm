@@ -9,6 +9,7 @@
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
+#import <objc/runtime.h>
 
 #include <IOKit/IOKitLib.h>
 #include <dispatch/dispatch.h>
@@ -334,6 +335,9 @@ id<MTLLibrary> loadLibrary(id<MTLDevice> device, const std::string &metallibPath
     return library;
 }
 
+// The key of a pipeline's written buffer entries (pipelineWrites).
+const char kPipelineWritesKey = 0;
+
 // The pipeline of function `name` of `source` at these function constants.
 // It touches no backend state, and Metal's device and library are
 // thread-safe, so any thread may create one.
@@ -355,14 +359,32 @@ id<MTLComputePipelineState> createPipeline(id<MTLDevice> device, id<MTLLibrary> 
             "missing Metal function: " + std::string(name) +
             (error ? ": " + errorDescription(error) : ""));
     }
+    MTLAutoreleasedComputePipelineReflection reflection = nil;
     id<MTLComputePipelineState> result =
-        [device newComputePipelineStateWithFunction:function error:&error];
+        [device newComputePipelineStateWithFunction:function
+                                            options:MTLPipelineOptionBindingInfo
+                                         reflection:&reflection
+                                              error:&error];
     if (!result) {
         throw MetalBackendError(
             "unable to create Metal pipeline " + std::string(name) +
             ": " + errorDescription(error));
     }
+    // The buffer bindings the function may write (pipelineWrites).
+    uint32_t writes = 0;
+    for (id<MTLBinding> binding in reflection.bindings)
+        if (binding.type == MTLBindingTypeBuffer && binding.access != MTLBindingAccessReadOnly && binding.index < 32)
+            writes |= uint32_t{1} << binding.index;
+    objc_setAssociatedObject(result, &kPipelineWritesKey, @(writes), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     return result;
+}
+
+// The buffer argument entries a pipeline's function may write, one bit
+// each, or every entry for a pipeline whose function's bindings were not
+// reflected.
+uint32_t pipelineWrites(id<MTLComputePipelineState> pipeline) {
+    NSNumber *writes = objc_getAssociatedObject(pipeline, &kPipelineWritesKey);
+    return writes ? writes.unsignedIntValue : ~uint32_t{0};
 }
 
 }  // namespace
@@ -1995,16 +2017,70 @@ struct MetalBackend::Impl {
                     __unsafe_unretained id<MTLBuffer> buffers[kBufferArgumentEntries];
                     NSUInteger offsets[kBufferArgumentEntries];
                     EncoderResidency encoderResidency(encoderStamps, tables);
+                    // Dispatches run concurrently but for a buffer barrier before one whose
+                    // bound ranges meet a range a dispatch since the last barrier bound (any
+                    // binding may be written), and around one that reaches memory through an
+                    // address table, its own or a bound buffer that holds addresses (a KV
+                    // page table, setTableReach): consecutive independent dispatches (a
+                    // layer's projections of different rows) overlap instead of waiting each
+                    // for the one before, which a serial encoder makes them do.
+                    struct Touched {
+                        const MetalAllocation *allocation;
+                        uint64_t begin, end;
+                        bool written;
+                    };
+                    std::vector<Touched> touched;
+                    bool tableSinceBarrier = false;
+                    // Whether a binding of `b`, written or read, meets a range a dispatch
+                    // since the barrier wrote, or (written) one it read.
+                    const auto meets = [&](const MetalBuffer::Impl &b, bool written) {
+                        const uint64_t begin = b.offsetBytes, end = b.offsetBytes + b.lengthBytes;
+                        for (const Touched &t : touched)
+                            if ((written || t.written) && t.allocation == b.allocation.get() && begin < t.end &&
+                                t.begin < end)
+                                return true;
+                        return false;
+                    };
                     for (size_t index = 0; index < dispatches.size(); ++index) {
                         encodeSteps(index);
                         const PreparedDispatch &item = dispatches[index];
                         const ComputeDispatch &dispatch = *item.source;
                         if (!encoder) {
-                            encoder = [command computeCommandEncoder];
+                            encoder = [command computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
                             if (!encoder) {
                                 failEncoding("unable to create Metal compute encoder");
                             }
                             encoderResidency.begin(encoder);
+                            touched.clear();
+                            tableSinceBarrier = false;
+                        }
+                        {
+                            bool table = item.table != PreparedDispatch::kNoTable;
+                            for (const BufferBinding &binding : dispatch.buffers)
+                                table = table || !binding.buffer.impl_->allocation->reaches.empty();
+                            const uint32_t writes = pipelineWrites(item.pipeline);
+                            const auto writesEntry = [&](uint32_t index) { return index >= 32 || (writes >> index & 1); };
+                            bool conflict = tableSinceBarrier || (table && !touched.empty());
+                            for (const BufferBinding &binding : dispatch.buffers)
+                                conflict = conflict || meets(*binding.buffer.impl_, writesEntry(binding.index));
+                            if (dispatch.indirectThreadgroups.buffer)
+                                conflict = conflict || meets(*dispatch.indirectThreadgroups.buffer.impl_, false);
+                            if (conflict) {
+                                [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                                touched.clear();
+                                tableSinceBarrier = false;
+                            }
+                            for (const BufferBinding &binding : dispatch.buffers) {
+                                const MetalBuffer::Impl &b = *binding.buffer.impl_;
+                                touched.push_back({b.allocation.get(), b.offsetBytes, b.offsetBytes + b.lengthBytes,
+                                                   writesEntry(binding.index)});
+                            }
+                            if (dispatch.indirectThreadgroups.buffer) {
+                                const MetalBuffer::Impl &b = *dispatch.indirectThreadgroups.buffer.impl_;
+                                touched.push_back({b.allocation.get(), b.offsetBytes, b.offsetBytes + b.lengthBytes,
+                                                   false});
+                            }
+                            tableSinceBarrier = table;
                         }
                         [encoder setComputePipelineState:item.pipeline];
                         for (const BufferBinding &binding : dispatch.buffers) {

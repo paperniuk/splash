@@ -193,6 +193,58 @@ struct SelectorBatchParams {
 static_assert(sizeof(SelectorBatchParams) == 36,
               "Draft selector parameters are 36 bytes on both sides");
 
+struct DSparkMarkovParams {
+  uint32_t position;
+  uint32_t anchor;
+};
+
+static_assert(sizeof(DSparkMarkovParams) == 8, "DSpark Markov parameters are 8 bytes on both sides");
+
+struct DSparkChainParams {
+  uint32_t anchor[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t length[SPLASH_MAXIMUM_BATCH_WIDTH];
+  uint32_t forced[SPLASH_MAXIMUM_BATCH_WIDTH];
+  float slope[SPLASH_MAXIMUM_BATCH_WIDTH];
+  float intercept[SPLASH_MAXIMUM_BATCH_WIDTH][SPLASH_DRAFT_PROPOSAL_TOKENS];
+};
+
+static_assert(sizeof(DSparkChainParams) == 176, "DSpark chain parameters are 176 bytes on both sides");
+
+// DSpark's Markov correction of the target head's logits, folded through the
+// head once at load: the hidden output's rank (SPLASH_DSPARK_RANK) is the
+// width of a vocabulary row's fold weight, and a proposal step's correction
+// of token t is fold_bias[t] + fold_weight[t] . latent. A step scans the legal
+// tokens (the first `legal` of a head's rows) in groups of
+// SPLASH_DSPARK_GROUP_ROWS rows, one threadgroup of SPLASH_DSPARK_GROUP_THREADS
+// threads a group (a simdgroup a row, each lane eight of the rank), and a
+// second dispatch merges the groups' bests. SPLASH_DSPARK_MAX_GROUPS holds
+// the groups of the head's vocabulary.
+#define SPLASH_DSPARK_RANK 256u
+#define SPLASH_DSPARK_GROUP_ROWS 64u
+#define SPLASH_DSPARK_GROUP_THREADS 256u
+#define SPLASH_DSPARK_MAX_GROUPS 3141u
+
+// The fold's products, `rows` of them from fold input `start`, as the head
+// projects them: fp32 [rows][vocabulary], to the fold weight's columns
+// start.. (the inputs past SPLASH_DSPARK_RANK are the bias).
+struct DSparkFoldParams {
+  uint32_t start;
+  uint32_t rows;
+  uint32_t vocabulary;
+};
+
+static_assert(sizeof(DSparkFoldParams) == 12, "DSpark fold parameters are 12 bytes on both sides");
+
+// A proposal step's scan of position `position`'s base logits row (`stride`
+// fp32 columns) over the first `legal` tokens.
+struct DSparkFoldScanParams {
+  uint32_t position;
+  uint32_t legal;
+  uint32_t stride;
+};
+
+static_assert(sizeof(DSparkFoldScanParams) == 12, "DSpark fold scan parameters are 12 bytes on both sides");
+
 // The most tokens a host chain proposes: a verify block's rows after its
 // anchor.
 #define SPLASH_TREE_CHAIN_TOKENS (SPLASH_TARGET_VERIFY_ROWS - 1u)

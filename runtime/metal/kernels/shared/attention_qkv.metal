@@ -88,3 +88,76 @@ ATTENTION_QKV_NOPE(attention_bf16_qkv_kv4_g8_d128_nope_f32, 32, 4, 128, false, f
 #undef ATTENTION_QKV_FORMATS
 #undef ATTENTION_QKV_NOPE
 #undef ATTENTION_QKV
+
+template <typename CacheElement>
+inline void inkling_prepare_phase(
+    device const bfloat *q, device const bfloat *k, device const bfloat *v,
+    device const bfloat *q_scale, device const bfloat *rel_scale, device bfloat *queries,
+    device bfloat *relative, device const SplashKvPage *page_table, device const SplashLaneRows *layout,
+    device const SplashTreeRow *tree, constant SplashAttentionParams &params, uint3 group,
+    uint dimension, uint lane, uint sg, threadgroup float *sums, threadgroup float *maxima) {
+  constant SplashAttentionSequence &sequence = params.sequence[group.z];
+  const SplashAttentionRows rows = splash_attention_rows(layout, params, group.z);
+  if (!splash_attention_rows_valid(params, sequence) || group.y >= rows.rows)
+    return;
+  const ulong row = ulong(rows.first) + group.y;
+  const bool query = group.x < 24;
+  const uint head = query ? group.x : group.x - 24;
+  float x = query ? float(q[row * INKLING_PACKED_WIDTH + head * 128 + dimension]) *
+                        float(q_scale[head * 128 + dimension])
+                  : float(k[row * 1024 + head * 128 + dimension]);
+  const float y = query ? 0.0f : float(v[row * 1024 + head * 128 + dimension]);
+  const float x_sum = simd_sum(x * x);
+  const float y_sum = simd_sum(y * y);
+  if (lane == 0) {
+    sums[sg] = x_sum;
+    sums[4 + sg] = y_sum;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float norm = 0.0f, v_norm = 0.0f;
+  for (uint i = 0; i < 4; ++i) {
+    norm += sums[i];
+    v_norm += sums[4 + i];
+  }
+  x *= min(22.627416997969522f / (sqrt(norm) + 1e-6f), 1.0f);
+  const bfloat clipped = bfloat(x);
+  if (query) {
+    const uint position = sequence.committed_tokens + (params.trees ? tree[row].depth : group.y);
+    const float tau = params.last_rows ? 1.0f + 0.1f * log(max(float(position + 1) / 8192.0f, 1.0f)) : 1.0f;
+    queries[row * 3072 + head * 128 + dimension] = bfloat(float(clipped) * tau);
+    if (sg == 0) {
+      const float rv = lane < 16 ? float(q[row * INKLING_PACKED_WIDTH + INKLING_RELATIVE_OFFSET + head * 16 + lane]) *
+                                     float(rel_scale[head * 16 + lane]) : 0.0f;
+      const float rn = simd_sum(rv * rv);
+      if (lane < 16) {
+        const bfloat rc = bfloat(rv * min(8.0f / (sqrt(rn) + 1e-6f), 1.0f));
+        relative[row * 384 + head * 16 + lane] = bfloat(float(rc) * tau);
+      }
+    }
+    return;
+  }
+  const bfloat value = bfloat(y * rsqrt(v_norm / 128.0f + 1e-6f));
+  splash_store_kv_slot<8, 128, CacheElement, false>(
+      splash_store_page(page_table, sequence, group.y), sequence, params.kv, maxima,
+      head, group.y, clipped, value, dimension, lane, sg);
+}
+
+#define INKLING_PREPARE(Name, CacheElement) \
+kernel void Name(device const bfloat *q [[buffer(0)]], \
+                 device const bfloat *k [[buffer(1)]], device const bfloat *v [[buffer(2)]], \
+                 device const bfloat *q_scale [[buffer(3)]], device const bfloat *rel_scale [[buffer(4)]], \
+                 device bfloat *queries [[buffer(5)]], device bfloat *relative [[buffer(6)]], \
+                 device const SplashKvPage *p0 [[buffer(7)]], device const SplashKvPage *p1 [[buffer(8)]], \
+                 device const SplashKvPage *p2 [[buffer(9)]], device const SplashKvPage *p3 [[buffer(10)]], \
+                 device const SplashLaneRows *layout [[buffer(11)]], device const SplashTreeRow *tree [[buffer(12)]], \
+                 constant SplashAttentionParams &params [[buffer(13)]], \
+                 uint3 group [[threadgroup_position_in_grid]], uint dim [[thread_index_in_threadgroup]], \
+                 uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) { \
+  threadgroup float sums[8]; \
+  SPLASH_STORE_MAXIMA_##CacheElement(128) \
+  inkling_prepare_phase<CacheElement>(q, k, v, q_scale, rel_scale, queries, relative, \
+      SPLASH_LANE_BINDING(group.z, p0, p1, p2, p3), layout, tree, params, group, dim, lane, sg, sums, maxima); \
+}
+INKLING_PREPARE(attention_q8_inkling_prepare, int8_t)
+INKLING_PREPARE(attention_bf16_inkling_prepare, bfloat)
+#undef INKLING_PREPARE

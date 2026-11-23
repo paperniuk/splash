@@ -52,14 +52,18 @@ std::vector<uint32_t> ExecutionPlans::prefillRowClasses() const {
 // only at the accelerator tile's fewest rows, as they fill one 64-row tile
 // (selectFloatTile); and a MoE target's expert tile (32-row tiles once its
 // rows' routes outnumber its experts). Its router's tile changes with them
-// on no device.
+// on no device. A MoE target's every row up to a lane's verify block is a
+// class of its own: each row's routes add experts its passes read, so a row
+// inside a class is not free (Inkling 2 Mini on an M1 Max: 3 rows 44.8 ms, 8
+// rows 64.7, one class of its projections' tiles); past the block, the
+// classes' steps would outrun the startup runway (StepCosts::requireRunway).
 std::vector<uint32_t> ExecutionPlans::decodeRowClasses(uint32_t mostRows,
                                                        std::optional<std::pair<MoeShape, uint32_t>> moe) const {
   if (mostRows > SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS)
     throw std::invalid_argument("a decode step holds at most a verify block a lane");
   const FloatTileCalibration &floats = calibration().floatTile;
   std::vector<uint32_t> first;
-  std::tuple<LinearTile, uint32_t, bool, uint32_t> last{};
+  std::tuple<LinearTile, uint32_t, bool, uint32_t, uint32_t> last{};
   for (uint32_t rows = 1; rows <= mostRows; ++rows) {
     const LinearPlan plan = linear_.plan({{GGUF_TILE_COLUMNS, GGUF_TILE_COLUMNS}, rows});
     const LinearTile tile = plan.configuration().tile;
@@ -67,7 +71,7 @@ std::vector<uint32_t> ExecutionPlans::decodeRowClasses(uint32_t mostRows,
     MoeConfig config{};
     if (moe) config = selectMoe(calibration(), moe->first, moe->second, rows);
     const std::tuple key{tile, named ? plan.storageRows() : 0, floats.neuralAccelerator && rows >= floats.minimumRows,
-                         uint32_t(config.expertTile)};
+                         uint32_t(config.expertTile), moe && rows <= SPLASH_TARGET_VERIFY_ROWS ? rows : 0};
     if (first.empty() || key != last) first.push_back(rows);
     last = key;
   }

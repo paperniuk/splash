@@ -23,17 +23,35 @@ struct DFlashDraftRingLayer final {
   metal::MetalBuffer keys;
   // V is [head][dimension][ring_position].
   metal::MetalBuffer values;
+  // DSpark's global layer (DraftStateLayout::globalLayer) keeps its K/V, rows
+  // of [row][head][dimension] from the committed position the global layer
+  // starts at, in segments of its own instead, and leaves keys and values
+  // empty.
+  ops::DraftSegmentedContext segments;
+
+  [[nodiscard]] bool segmented() const noexcept { return segments.table != nullptr; }
 };
+
+// The rows of a segment of a layout's global layer (SPLASH_DRAFT_GLOBAL_SEGMENT_TOKENS
+// at most; fewer where a device's maxBufferLengthBytes holds fewer rows of
+// them), or 0 for a layout without one. std::invalid_argument where the
+// layer takes more segments than a table holds
+// (SPLASH_DRAFT_MAX_GLOBAL_SEGMENTS) or a buffer holds no row.
+[[nodiscard]] uint32_t draftGlobalSegmentTokens(const DraftStateLayout &layout, uint64_t maxBufferLengthBytes,
+                                                uint32_t maximumSegmentTokens = SPLASH_DRAFT_GLOBAL_SEGMENT_TOKENS);
 
 // A lane's draft rings: every draft layer's keys and values of the last
 // SPLASH_DRAFT_SLIDING_WINDOW positions, which its decode attends to. Cached
 // states keep their context window (DFlashContextWindow) instead.
 class DFlashDraftRing final {
 public:
+  // `maximumSegmentTokens` caps the rows of a segment of a global layer
+  // (draftGlobalSegmentTokens); tests set it low to cross segments cheaply.
   DFlashDraftRing(metal::MetalBackend &backend,
                   std::shared_ptr<StateAllocationTracker> tracker,
                   DraftStateLayout layout,
-                  std::string_view label);
+                  std::string_view label,
+                  uint32_t maximumSegmentTokens = SPLASH_DRAFT_GLOBAL_SEGMENT_TOKENS);
   ~DFlashDraftRing();
   DFlashDraftRing(const DFlashDraftRing &) = delete;
   DFlashDraftRing &operator=(const DFlashDraftRing &) = delete;
@@ -41,10 +59,12 @@ public:
   [[nodiscard]] const std::vector<DFlashDraftRingLayer> &layers() const noexcept {
     return layers_;
   }
+  [[nodiscard]] const metal::MetalBuffer &feature() const noexcept { return feature_; }
 
 private:
   std::shared_ptr<StateAllocationTracker> tracker_;
   std::vector<DFlashDraftRingLayer> layers_;
+  metal::MetalBuffer feature_;
   uint64_t actualAllocatedBytes_ = 0;
 };
 

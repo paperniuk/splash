@@ -322,10 +322,35 @@ const OracleTokens kFlintTokens{
     // <|user|>...<|assistant|><think></think>
     .productionSeed = {150003, 3201, 29915, 497,  220,  16,   11,    3758, 1218, 1067,   299,    869,    5095,  1060, 358,
                        260,    618,  1507,  13,   27110, 2843, 361, 4495, 220,  905,    13,     150004, 150006, 150007}};
+const OracleTokens kInklingTokens{
+    .vocabulary = 201024,
+    // <|message_user|>...<|message_model|><|content_thinking|>, at medium effort
+    .thinkingPrompt = {200002, 200004, 34182, 279, 154554, 150628, 25, 220, 15, 13, 22, 200010,
+                       200000, 200004, 1738, 150710, 152200, 150107, 150134, 220, 16, 149880, 220, 68273,
+                       11, 150126, 150918, 150154, 150011, 149910, 156703, 155775, 150463, 149941, 150893, 13,
+                       200010, 200001, 200008},
+    // <|end_message|>, which ends the thinking message
+    .thinkEnd = 200010,
+    .thinkingEnds = {std::vector<uint32_t>{200010},
+                     std::vector<uint32_t>{51187, 279, 149876, 153534, 150038, 11, 149904, 149952, 149882, 150865, 149876, 150493,
+                                       150567, 149894, 149876, 154762, 152721, 150386, 13, 198, 200010}},
+    // <|message_system|>...<|message_user|>Hello<|end_message|>: the model
+    // writes its message's opening itself.
+    .samplingSeed = {200002, 200004, 34358, 279, 154554, 149884, 150076, 149882, 149924, 1327, 13, 155958,
+                     150634, 164966, 150225, 149876, 152103, 11, 161158, 150452, 163684, 11, 150476, 189677,
+                     174005, 11, 149880, 150918, 150039, 150173, 150463, 149941, 150893, 13, 200010, 200002,
+                     200004, 34182, 279, 154554, 150628, 25, 220, 15, 13, 22, 200010, 200000,
+                     200004, 32269, 200010},
+    // <|message_user|>... at effort none
+    .productionSeed = {200002, 200004, 34182, 279, 154554, 150628, 25, 220, 15, 200010, 200000, 200004,
+                       3711, 149878, 150131, 149890, 153939, 149876, 149934, 12, 258, 181713, 150107, 13,
+                       200010}};
 // The target's texts (oracleTokens), which main chooses before any check
 // runs; the Qwen families' until then.
 const OracleTokens *targetTokens = &kQwenTokens;
 [[nodiscard]] const OracleTokens &oracleTokens(const model::ModelDescriptor &descriptor) {
+  if (std::holds_alternative<model::InklingLayout>(descriptor.target))
+    return kInklingTokens;
   return std::holds_alternative<model::FlintLayout>(descriptor.target) ? kFlintTokens : kQwenTokens;
 }
 
@@ -2145,11 +2170,14 @@ void requireCapturesOutliveTheirItems(model::Runtime &executor,
 // recurrent state through the codes (StateCodecReference.hpp). Beside it, a
 // prefill of the same tokens captured at the same page: its own arithmetic
 // for the rows past the prompt leaves a state a little off the decode's, so
-// its codes are compared for the record only.
+// its codes are compared for the record only. A target's auxiliary state,
+// which its commit writes after the rows the lane retained, is the lane's
+// own right after the capturing cycle, which retained exactly the rows
+// before the page: the restored capture holds those bytes.
 void requireDecodeCaptureMatchesTheLane(model::Runtime &executor, model::QwenStateStorage &states,
                                         std::span<const uint32_t> chat) {
   if (!executor.capturesInDecode()) {
-    std::cout << "decode_capture=SKIP (the target writes auxiliary state with its retained rows)\n";
+    std::cout << "decode_capture=SKIP (the target captures no auxiliary state in decode)\n";
     return;
   }
   const std::vector<uint32_t> decodePages = pageRange(100, 5), prefillPages = pageRange(105, 5);
@@ -2211,6 +2239,9 @@ void requireDecodeCaptureMatchesTheLane(model::Runtime &executor, model::QwenSta
   const auto [retained, generated] = firstCycle(430, prompt, boundary, captured);
   require(prompt + retained == boundary && captured.size() == 1 && generated.size() >= retained,
           "the capturing cycle did not retain exactly the rows before its page, as the same cycle did before");
+  const model::GdnStateLayout &stateLayout = states.layout().target;
+  const std::vector<uint8_t> laneAuxiliary =
+      stateLayout.auxiliaryBytes ? bytesOf(states.current(0).auxiliary) : std::vector<uint8_t>{};
   // The lane's next cycle folds those rows: its cell is then the state at
   // the page.
   const ModelStepResult next = decodeOne(executor, 430, boundary, decodePages);
@@ -2225,6 +2256,16 @@ void requireDecodeCaptureMatchesTheLane(model::Runtime &executor, model::QwenSta
   std::vector<uint32_t> probe = through;
   probe.push_back(chat[boundary % chat.size()]);
   const StateBytes fromDecode = restoredBytes(executor, states, 432, 2, probe, boundary, captured.front());
+  // The restored lane's auxiliary state, after its convolution rows and
+  // recurrent state.
+  const auto auxiliaryOf = [&](const std::vector<uint8_t> &cell) {
+    const uint64_t at = stateLayout.convolutionBytes() + stateLayout.recurrentBytes();
+    return std::vector<uint8_t>(cell.begin() + static_cast<std::ptrdiff_t>(at),
+                                cell.begin() + static_cast<std::ptrdiff_t>(at + stateLayout.auxiliaryBytes));
+  };
+  if (stateLayout.auxiliaryBytes)
+    require(auxiliaryOf(fromDecode.cell) == laneAuxiliary,
+            "a decode capture's auxiliary state is not the lane's at its page");
 
   const bool bfloat = layout.format == ops::GdnStateFormat::BFloat16;
   const uint32_t rows = layout.recurrentGroups * layout.recurrentRows, columns = layout.recurrentColumns;
@@ -2288,7 +2329,18 @@ void requireDecodeCaptureMatchesTheLane(model::Runtime &executor, model::QwenSta
     for (uint64_t index = 0; index < left.size(); ++index)
       recurrent.add(left[index], right[index]);
   }
+  // The auxiliary state as bf16 values, which Inkling's histories are.
+  SimilarityAccumulator auxiliary;
+  if (stateLayout.auxiliaryBytes) {
+    const std::vector<uint8_t> left = auxiliaryOf(fromDecode.cell), right = auxiliaryOf(fromPrefill.cell);
+    for (uint64_t index = 0; index + 1 < left.size(); index += 2)
+      auxiliary.add(test::bf16ToFloat(static_cast<uint16_t>(left[index] | left[index + 1] << 8)),
+                    test::bf16ToFloat(static_cast<uint16_t>(right[index] | right[index + 1] << 8)));
+  }
   const std::streamsize precision = std::cout.precision(9);
+  if (stateLayout.auxiliaryBytes)
+    std::cout << "decode_capture prefill_auxiliary_cos=" << auxiliary.result().cosine
+              << " max_abs=" << auxiliary.result().maximumAbsolute << '\n';
   std::cout << "decode_capture prompt=" << prompt << " rows=" << retained << " lane_codes_equal=1"
             << " prefill_recurrent_cos=" << recurrent.result().cosine << '\n';
   std::cout.precision(precision);
@@ -5955,7 +6007,8 @@ void warmupEos(model::RuntimeContext context, model::LoadedModel &model) {
 
 int main(int argc, char **argv) {
   try {
-    bool imagesOnly = false, warmupEosOnly = false, prefillGroupsOnly = false, spillOnly = false;
+    bool imagesOnly = false, warmupEosOnly = false, prefillGroupsOnly = false, spillOnly = false,
+         decodeCaptureOnly = false;
     SpillOptions spill;
     kv::Format format = kv::Format::Int8;
     ops::GdnStateFormat stateFormat = ops::GdnStateFormat::Float32;
@@ -5986,12 +6039,14 @@ int main(int argc, char **argv) {
            "[--cached-states int8|exact] "
            "[--ane-ffn-share SHARE] [--ane-ffn-fault EVALUATION] [--ple-memory SIZE] "
            "[--expert-memory SIZE] [--max-context TOKENS] [--spill-tokens N] [--spill-window PAGES] "
-           "[--spill-buffers 1|2] [--images-only | --warmup-eos-only | --prefill-groups-only | --spill-only]");
+           "[--spill-buffers 1|2] [--images-only | --warmup-eos-only | --prefill-groups-only | --spill-only | "
+           "--decode-capture-only]");
     for (int i = 3; i < argc; ++i) {
       const std::string_view option(argv[i]);
       if (option == "--images-only") imagesOnly = true;
       else if (option == "--warmup-eos-only") warmupEosOnly = true;
       else if (option == "--prefill-groups-only") prefillGroupsOnly = true;
+      else if (option == "--decode-capture-only") decodeCaptureOnly = true;
       else if (option == "--spill-only") spillOnly = true;
       else if ((option == "--spill-tokens" || option == "--spill-window" || option == "--spill-buffers") &&
                i + 1 < argc) {
@@ -6090,7 +6145,7 @@ int main(int argc, char **argv) {
     const auto planMemory = [&](uint64_t aneFfnBytes) {
       ModelMemoryFootprint footprint{
           model.targetActualAllocatedBytes(),
-          model.draft.actualAllocatedBytes,
+          model.draftActualAllocatedBytes(),
           model.vision.actualAllocatedBytes,
           executorPlan, 0, aneFfnBytes,
           model.streamedTable() ? model.streamedTable()->committedBytes() : 0};
@@ -6333,6 +6388,12 @@ int main(int argc, char **argv) {
       std::cout << "PASS model-runtime-oracle scope=prefill-groups-only model=" << model.name()
                 << " (a prefill group leaves what its chunks' commands leave, and in passes what it leaves "
                    "whole)\n";
+      return 0;
+    }
+    if (decodeCaptureOnly) {
+      requireDecodeCaptureMatchesTheLane(executor, states, samplingSeedTokens);
+      std::cout << "PASS model-runtime-oracle scope=decode-capture-only model=" << model.name()
+                << " (a decode cycle's captured state restores the lane's at its page)\n";
       return 0;
     }
     // A natural token pattern: a run of zero tokens can make the target select

@@ -26,10 +26,11 @@ struct MoeRouteParams {
   uint32_t input_size;
   uint32_t experts;
   uint32_t top_k;
+  float route_scale;
 };
 
-static_assert(sizeof(MoeRouteParams) == 16,
-              "MoE routing parameters are 16 bytes on both sides");
+static_assert(sizeof(MoeRouteParams) == 20,
+              "MoE routing parameters are 20 bytes on both sides");
 
 // Every row carries top_k routed experts followed by the slices of the shared
 // expert, ids `experts` on, whose routing weight is the sigmoid of the
@@ -65,10 +66,24 @@ inline bool moe_column_tile(Tiles tiles, uint32_t t) {
 }
 
 // Whether Apple7/8's MMA expert passes (kernels/shared/moe_gguf_mma.metal) of `tile_rows`-row tiles run a projection
-// in `format` on the column tile of a moe_column_tile tile, rather than the 8-row MMA: Q2_0 in every pass, IQ2_XXS and
-// IQ2_S in the 8-row (decode) passes only. The kernels and the MoE test's expected tile kinds ask this.
+// in `format` on the column tile of a moe_column_tile tile, rather than the 8-row MMA: Q2_0 in every pass, IQ2_XXS,
+// IQ2_S and MLX affine 4-bit (group 64) in the 8-row (decode) passes only. The kernels and the MoE test's expected
+// tile kinds ask this. Affine 4-bit: Inkling 2 Mini's one-row decode experts on M1 Max ran at ~120 GB/s on the
+// staged 8-row MMA, whose 8-row step and stage barrier bound a one-row tile.
 constexpr inline bool moe_mma_column_format(uint32_t format, uint32_t tile_rows) {
-  return format == GGUF_FMT_Q20 || (tile_rows == 8 && (format == GGUF_FMT_IQ2XXS || format == GGUF_FMT_IQ2S));
+  return format == GGUF_FMT_Q20 || (tile_rows == 8 && (format == GGUF_FMT_IQ2XXS || format == GGUF_FMT_IQ2S ||
+                                                       format == GGUF_FMT_AF4G64));
+}
+
+// Whether an Apple7/8 MMA gate/up pass of `tile_rows`-row tiles whose formats are all `format` runs its grid at
+// MOE_MMA_SPLIT times its column tiles (MoeGroupParams): the first of a tile's threadgroups runs its MMAs as before and
+// the others return, while a column tile's threadgroups take a part of its columns each, a lane's column over a part
+// of K beside the lanes that sum the other parts: MLX affine 4-bit in the 8-row passes, whose decode gate/up tiles
+// summing a column's rows one at a time ran 11.39 ms a 3-row cycle at 4 parts, 11.16 at 2, 12.04 at 8 on a 32-core
+// M1 Max (Inkling 2 Mini); its down pass, at ~200 GB/s, took no gain.
+#define MOE_MMA_SPLIT 2u
+constexpr inline bool moe_mma_split_format(uint32_t format, uint32_t tile_rows) {
+  return tile_rows == 8 && format == GGUF_FMT_AF4G64;
 }
 
 // The column tiles of the gate/up and down passes, whose grids the grouping
@@ -207,10 +222,12 @@ struct MoeGgufGateUpParams {
   uint32_t floor_slots;
   uint32_t chunk_slots;
   uint32_t tiles; // MOE_TILES_*
+  float gate_softcap;
+  float up_softcap;
 };
 
-static_assert(sizeof(MoeGgufGateUpParams) == 40,
-              "MoE GGUF gate/up parameters are 40 bytes on both sides");
+static_assert(sizeof(MoeGgufGateUpParams) == 48,
+              "MoE GGUF gate/up parameters are 48 bytes on both sides");
 
 // One projection (gate, up or down) of the experts a load writes into their
 // slots (moe_expert_load, model/ExpertStore.cpp): rows x columns in `format`,

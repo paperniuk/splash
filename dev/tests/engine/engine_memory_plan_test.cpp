@@ -2,6 +2,7 @@
 #include "TestJson.hpp"
 #include "engine/MemoryPlan.hpp"
 #include "engine/StreamedMemoryPlan.hpp"
+#include "model/StateLayout.hpp"
 #include "TestModel.hpp"
 
 #include <array>
@@ -1136,6 +1137,193 @@ void testResidentContextIsWhatALoneStartTakes() {
   }
 }
 
+// DSpark's lane holds, beside its fixed state, global K/V of 4,096 bytes a
+// token of context (2 x 8 KV heads x 128 x bf16), which the plan charges each
+// lane for the capacity of the context it serves.
+constexpr uint64_t kDSparkTokenBytes = 4096;
+
+ModelMemoryProfile dsparkModel(uint32_t requestedContext = 0) {
+  ModelMemoryProfile profile = model();
+  profile.footprint.runtime.draftContextTokenBytes = kDSparkTokenBytes;
+  profile.draftContextTokens = requestedContext;
+  return profile;
+}
+
+// The context one request's KV holds beside a lane charged for `context`,
+// from the budget's bytes as the plan computes it for a dense layout.
+uint64_t residentBesideLaneFor(const ModelMemoryProfile &profile, const EngineMemoryBreakdown &budget,
+                               uint32_t context) {
+  const uint64_t lane = profile.footprint.runtime.laneStatePlannedAllocatedBytes +
+                        budget.draftContextTokenBytes * model::draftContextCapacity(context);
+  const uint64_t pages = (budget.dynamicBudgetBytes - lane) / (budget.kvPageBytes + 32 * model::kLookupIndexTokenBytes);
+  const uint64_t tokens = kvCapacityPagesFor(profile.targetKvLayout, pages) * 32;
+  return std::min<uint64_t>(profile.maximumContextTokens,
+                            tokens > model::ExecutionLimits::speculativeScratchTokens
+                                ? tokens - model::ExecutionLimits::speculativeScratchTokens
+                                : 0);
+}
+
+// The automatic context is the most that holds beside the lane it charges:
+// the lane's capacity for the context, its scratch rows and at least warmup's
+// chunk; one token more would not hold, and asking for it leaves the same
+// context.
+void testDSparkAutoContextIsTheLargestFeasible() {
+  const ModelMemoryProfile profile = dsparkModel();
+  const uint64_t fixedLane = profile.footprint.runtime.laneStatePlannedAllocatedBytes;
+  const EngineMemoryPlan plan = test::requireMemoryPlan(device(), profile);
+  const EngineMemoryPlan dflash = test::requireMemoryPlan(device(), model());
+  const EngineMemoryBreakdown &budget = plan.breakdown();
+  const uint32_t context = plan.maximumContextTokens();
+  require(dflash.maximumContextTokens() < model().maximumContextTokens,
+          "the fixture's DFlash context reaches its window, so a DSpark lane's cost could not show");
+  require(context && context < dflash.maximumContextTokens(),
+          "a DSpark lane's global K/V did not cost context beside the same KV budget");
+  require(budget.draftContextTokenBytes == kDSparkTokenBytes &&
+              budget.draftContextTokens == std::max<uint32_t>(context + 15, 2048) &&
+              budget.laneStateBytes == fixedLane + kDSparkTokenBytes * budget.draftContextTokens &&
+              budget.contextBounds.draft == context && budget.contextBounds.bound() == std::string_view("memory"),
+          "the published lane state is not the fixed lane and the capacity of the context served");
+  require(residentBesideLaneFor(profile, budget, context) >= context &&
+              residentBesideLaneFor(profile, budget, context + 1) < context + 1 &&
+              budget.contextBounds.resident >= context,
+          "the automatic DSpark context is not the largest that holds beside its own lane");
+  require(test::requireMemoryPlan(device(), dsparkModel(context + 1)).maximumContextTokens() == context,
+          "a DSpark context one token past the feasible was planned");
+  const std::string json = test::jsonOf(plan);
+  require(json.find("\"draft_context\":{\"token_bytes\":4096,\"capacity_tokens\":" +
+                    std::to_string(budget.draftContextTokens) + "}") != std::string::npos &&
+              json.find("\"draft\":" + std::to_string(context)) != std::string::npos,
+          "the memory status did not name the DSpark lane's draft context");
+}
+
+// An explicit context charges the capacity of exactly that context: its
+// tokens and the speculative scratch's 15, and at least a prefill chunk's
+// 2,048 tokens, which warmup writes.
+void testDSparkExplicitContextChargesItsCapacity() {
+  const uint64_t fixedLane = model().footprint.runtime.laneStatePlannedAllocatedBytes;
+  const EngineMemoryBreakdown automatic = test::requireMemoryPlan(device(), dsparkModel()).breakdown();
+  const uint32_t most = automatic.contextBounds.draft;
+  const std::pair<uint32_t, uint32_t> cases[] = {
+      {1, 2048}, {100, 2048}, {2033, 2048}, {2034, 2049}, {most / 2, most / 2 + 15}, {most, most + 15}};
+  for (const auto &[request, capacity] : cases) {
+    const EngineMemoryPlan plan = test::requireMemoryPlan(device(), dsparkModel(request));
+    const EngineMemoryBreakdown &budget = plan.breakdown();
+    require(plan.maximumContextTokens() == request && budget.contextBounds.draft == request &&
+                budget.draftContextTokens == capacity &&
+                budget.laneStateBytes == fixedLane + kDSparkTokenBytes * capacity &&
+                budget.laneStateBytes <= automatic.laneStateBytes,
+            "--max-context " + std::to_string(request) + " did not charge a lane " + std::to_string(capacity) +
+                " tokens of draft context");
+  }
+}
+
+// The least a DSpark start needs holds a lane at warmup's capacity, 2,048
+// tokens, beside the KV runway.
+void testDSparkMinimumHoldsWarmupsCapacity() {
+  const ModelMemoryProfile profile = dsparkModel();
+  const EngineMemoryBreakdown budget = test::requireMemoryPlan(device(), profile).breakdown();
+  const EngineMemoryBreakdown dflash = test::requireMemoryPlan(device(), model()).breakdown();
+  require(budget.minimumRequiredBytes == dflash.minimumRequiredBytes + kDSparkTokenBytes * 2048 &&
+              budget.minimumRequiredBytes ==
+                  *minimumRequiredBytes(budget.fixedRuntimeBytes,
+                                        profile.footprint.runtime.laneStatePlannedAllocatedBytes +
+                                            kDSparkTokenBytes * 2048,
+                                        profile.targetKvLayout),
+          "the DSpark minimum does not hold a lane at warmup's capacity");
+  require(!evaluateEngineMemoryPlan(device(), profile, budget.minimumRequiredBytes - 1).plan,
+          "a DSpark start was admitted below its minimum");
+}
+
+// A draft without global K/V is planned as it always was, whatever context
+// is asked for.
+void testDFlashPlanIsUnchangedByTheDraftContext() {
+  ModelMemoryProfile asked = model();
+  asked.draftContextTokens = 123;
+  const EngineMemoryPlan plain = test::requireMemoryPlan(device(), model());
+  const EngineMemoryPlan withRequest = test::requireMemoryPlan(device(), asked);
+  const EngineMemoryBreakdown &budget = withRequest.breakdown();
+  require(test::jsonOf(withRequest) == test::jsonOf(plain) && budget.draftContextTokenBytes == 0 &&
+              budget.draftContextTokens == 0 &&
+              budget.contextBounds.draft == std::numeric_limits<uint32_t>::max() &&
+              budget.laneStateBytes == model().footprint.runtime.laneStatePlannedAllocatedBytes &&
+              withRequest.maximumContextTokens() == plain.maximumContextTokens() &&
+              test::jsonOf(plain).find("draft_context") == std::string::npos,
+          "a draft without global K/V was planned differently for a requested context");
+}
+
+// The streamed-store planner charges a lane the least capacity in its floors
+// and the context's beyond it where it holds it: Flash-Next with a 16K context
+// on the M6 (testSpillAllowanceFollowsASmallerRequestedContext) with a DSpark
+// lane beside it. The spill floors charge the context's capacity, so the
+// resident allowance does not charge it again.
+void testStreamedPlanChargesTheDraftContextOfASpillingTarget() {
+  const uint64_t page = test::sparseKvLayout().bytesPerModelPage();
+  StreamedMemoryInputs inputs = kFlashNext.inputs(kM6);
+  inputs.requestedContextTokens = 16'384;
+  const StreamedMemoryPlan without = requirePlan(inputs);
+  inputs.draftContextTokenBytes = kDSparkTokenBytes;
+  const StreamedMemoryPlan plan = requirePlan(inputs);
+  const auto beyondWarmup = [](uint64_t tokens) {
+    return kDSparkTokenBytes * (std::max<uint64_t>(tokens + 15, 2048) - 2048);
+  };
+  const uint64_t allowanceDraft = beyondWarmup(16'384) - beyondWarmup(plan.spill.floorTokens);
+  const uint64_t charged = inputs.fixedBytes + inputs.arenaBytes[plan.expertBytes != 0][1] + inputs.laneStateBytes +
+                           kDSparkTokenBytes * 2048 + plan.spill.floorBytes + plan.expertBytes + plan.tableBytes +
+                           budgetPagesHolding(test::sparseKvLayout(), 513) *
+                               (page + 32 * model::kLookupIndexTokenBytes) +
+                           allowanceDraft;
+  require(plan.spill.enabled && plan.expertBytes && plan.expertBytes < without.expertBytes && charged == hardBudget(kM6),
+          "the streamed plan did not charge a DSpark lane's draft context beside Flash-Next's 16K context");
+}
+
+// A dense target's explicit context charges its lane the capacity of that
+// context, so the experts stream from a lower context than without the draft
+// context's bytes: the 35B's 229,361 tokens (testDenseExplicitContextKeepsMainsExperts)
+// fall to the most whose KV and draft context both hold beside every expert.
+void testStreamedPlanChargesTheDraftContextOfADenseTarget() {
+  StreamedMemoryInputs inputs = k35BQ2.inputs(kM6);
+  const auto streams = [&](uint32_t context) {
+    inputs.requestedContextTokens = context;
+    return requirePlan(inputs).expertBytes != 0;
+  };
+  // The most context whose plan loads every expert.
+  const auto mostLoadedWhole = [&] {
+    uint32_t low = 1, high = k35BQ2.window;
+    while (low < high) {
+      const uint32_t middle = high - (high - low) / 2;
+      if (!streams(middle))
+        low = middle;
+      else
+        high = middle - 1;
+    }
+    return low;
+  };
+  const uint32_t mains = mostLoadedWhole();
+  inputs.draftContextTokenBytes = kDSparkTokenBytes;
+  const uint32_t withDraft = mostLoadedWhole();
+  require(mains == 229'361 && withDraft + 1000 < mains && !streams(withDraft) && streams(withDraft + 1),
+          "a DSpark lane's draft context did not move the 35B's experts' streaming to a lower context");
+  inputs.draftContextTokenBytes = 0;
+  require(mostLoadedWhole() == mains, "a draft without global K/V moved the 35B's streaming context");
+}
+
+// A DSpark draft's state layout always holds global K/V, which the planners
+// derive its per-token cost from: a layout without it is not a valid one, so
+// a DSpark descriptor cannot be planned as a draft that costs nothing.
+void testDSparkLaneGeometryIsWhatThePlannersCharge() {
+  const auto draft = [](uint32_t capacity) {
+    return model::DraftStateLayout{3, 8, 128, 4 * 2304, 1024, capacity, 1, 2304};
+  };
+  require(!draft(0).valid() && draft(2048).valid() && draft(2049).valid(),
+          "a DSpark state layout without global K/V is valid");
+  require(draft(2049).ringBytes() - draft(2048).ringBytes() == kDSparkTokenBytes &&
+              kDSparkTokenBytes == 2 * uint64_t{draft(1).kvHeads} * draft(1).headDimension *
+                                       model::DraftStateLayout::bfloat16Bytes &&
+              draft(2048).ringBytes() - 2048 * kDSparkTokenBytes ==
+                  draft(262'144).ringBytes() - 262'144 * kDSparkTokenBytes,
+          "a DSpark lane's bytes are not its fixed bytes and 4,096 a token of global K/V");
+}
+
 // A disk bound below the resident context leaves the resident context, and
 // names what bounds the maximum.
 void testContextBoundNames() {
@@ -1241,6 +1429,13 @@ int main() {
     testPlanSetsTheStoresFloor();
     testEnginePlanServesTheSpilledContext();
     testResidentContextIsWhatALoneStartTakes();
+    testDSparkAutoContextIsTheLargestFeasible();
+    testDSparkExplicitContextChargesItsCapacity();
+    testDSparkMinimumHoldsWarmupsCapacity();
+    testDFlashPlanIsUnchangedByTheDraftContext();
+    testStreamedPlanChargesTheDraftContextOfASpillingTarget();
+    testStreamedPlanChargesTheDraftContextOfADenseTarget();
+    testDSparkLaneGeometryIsWhatThePlannersCharge();
     testContextBoundNames();
     testDeviceValidationNamesTheMacosFloor();
     testDeviceValidationNamesTheThreadgroupWidth();

@@ -304,6 +304,24 @@ planDraftContext(uint32_t replayBegin, uint32_t replayEnd,
 draftCaptureSpansForDispatch(const DraftContextPlan &plan,
                              uint32_t dispatchBegin, uint32_t dispatchEnd);
 
+// DSpark's global layer attends to every position of a replay, not only the
+// last window of it, so the capture rows of `plan` (from planDraftContext) are
+// the whole replay as one span, and each boundary's rows run from the one
+// before it. The span continues the restored draft ring when the plan
+// restores one (restoresDraftState) and starts a new one otherwise.
+[[nodiscard]] DraftContextPlan dsparkDraftContextPlan(DraftContextPlan plan);
+
+// The first position whose context rows DSpark's global layer holds after a
+// restore to `restoredPrefixLength`: where the restored draft window begins
+// (`draftBase`) when it was restored, since the window is the only context the
+// state keeps, and the restored length itself when the draft state was not,
+// since the replay computes the rows from there. Every position before it is
+// out of the global layer's reach, whatever the request had before.
+[[nodiscard]] constexpr uint32_t dsparkGlobalBase(uint32_t restoredPrefixLength, bool restoredDraftState,
+                                                  uint64_t draftBase) noexcept {
+  return restoredDraftState ? static_cast<uint32_t>(draftBase) : restoredPrefixLength;
+}
+
 struct BatchItem final {
   uint64_t requestId = 0;
   uint32_t tokenCount = 0;
@@ -674,6 +692,13 @@ struct ExecutionLimits final {
   static constexpr uint32_t maximumScoreOptions = 255;
 };
 
+// The tokens of a draft's global K/V that a lane holds to serve `context`
+// tokens of context: the context and its speculative scratch rows, and at
+// least a prefill chunk, which startup warmup writes.
+[[nodiscard]] constexpr uint32_t draftContextCapacity(uint32_t context) noexcept {
+  return std::max(context + ExecutionLimits::speculativeScratchTokens, ExecutionLimits::prefillTokenBudget);
+}
+
 static_assert(ExecutionLimits::draftQueryRows ==
               ExecutionLimits::draftProposalTokens + 1);
 static_assert(ExecutionLimits::draftQueryRows <= ExecutionLimits::targetVerifyRows);
@@ -726,10 +751,17 @@ struct StateAllocationTracker final {
 // Startup sizing and observability are part of the concrete model runtime,
 // not cache or scheduler state. The engine consumes these values without
 // knowing the target or draft architecture that produced them.
+// laneStatePlannedAllocatedBytes is what one lane holds whatever the
+// context: a draft whose lane also holds global K/V that grows with the
+// context (DSpark's 4,096 bytes a token) leaves that out and gives its
+// bytes a token in draftContextTokenBytes, which the engine charges for the
+// capacity (draftContextCapacity) of the context it serves. Zero for a draft
+// with none (DFlash), whose lane is all in laneStatePlannedAllocatedBytes.
 struct ModelMemoryPlan final {
   uint64_t laneStatePlannedAllocatedBytes = 0;
   uint64_t sharedPrefillPlannedAllocatedBytes = 0;
   uint64_t sharedDecodePlannedAllocatedBytes = 0;
+  uint64_t draftContextTokenBytes = 0;
 };
 
 // Fixed reserves the memory plan carries beside the planned arenas: Metal

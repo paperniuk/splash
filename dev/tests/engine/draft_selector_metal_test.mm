@@ -1486,6 +1486,99 @@ void invalidRequests(MetalBackend &backend) {
   require(!encoded.empty(), "valid verify rows were not encoded");
 }
 
+// A proposal step's scan: the largest legal token of a base logit plus the folded correction (fold bias and
+// fold weight times the latent), cropped at the legal vocabulary, the lowest token on a tie.
+void dsparkChainAndSampling(MetalBackend &backend) {
+  constexpr uint32_t vocabulary = 201024, legal = 200058, position = 3;
+  const DSparkPartialBytes partial;
+  DSparkMarkovBuffers m;
+  m.baseLogits = allocate(backend, uint64_t{7} * vocabulary * sizeof(float));
+  m.foldWeight = allocate(backend, uint64_t{vocabulary} * SPLASH_DSPARK_RANK * sizeof(uint16_t));
+  m.foldBias = allocate(backend, uint64_t{vocabulary} * sizeof(float));
+  m.latent = allocate(backend, SPLASH_DSPARK_RANK * sizeof(uint16_t));
+  m.partialValues = allocate(backend, partial.values);
+  m.partialIds = allocate(backend, partial.ids);
+  m.tokens = allocate(backend, 7 * sizeof(uint32_t));
+  m.probabilities = allocate(backend, 7 * sizeof(float));
+  auto *base = static_cast<float *>(m.baseLogits.contents()) + uint64_t{position} * vocabulary;
+  auto *weight = static_cast<uint16_t *>(m.foldWeight.contents());
+  auto *bias = static_cast<float *>(m.foldBias.contents());
+  static_cast<uint16_t *>(m.latent.contents())[0] = floatToBf16(1.0F);
+  const auto proposal = [&] {
+    CommandGraph graph;
+    DraftSelector::addDSparkSelect(graph, m, position, vocabulary, legal);
+    (void)backend.submitCommandAsync(graph.dispatches()).wait();
+    return static_cast<const uint32_t *>(m.tokens.contents())[position];
+  };
+  // Without a correction, the base logits' largest legal token.
+  base[2] = 10.0F;
+  base[200059] = 30.0F;
+  require(proposal() == 2, "DSpark crops and greedily samples");
+  const float probability = static_cast<const float *>(m.probabilities.contents())[position];
+  const float capped = bf16ToFloat(floatToBf16(30.0F * std::tanh(10.0F / 30.0F)));
+  const float expected = 1.0F / (1.0F + 200057.0F * std::exp(-capped));
+  require(std::fabs(probability - expected) < 0.002F, "DSpark proposal probability");
+  // A fold weight times the latent lifts a token past the base logits' leader.
+  weight[uint64_t{150000} * SPLASH_DSPARK_RANK] = floatToBf16(12.0F);
+  require(proposal() == 150000, "DSpark's folded correction lifts a token");
+  // A fold bias lifts another, and an illegal token's cannot propose.
+  bias[199999] = 20.0F;
+  bias[200100] = 100.0F;
+  require(proposal() == 199999, "DSpark's fold bias lifts a token, the illegal ones none");
+  // Equal logits propose the lowest token.
+  bias[199999] = 0.0F;
+  weight[uint64_t{150000} * SPLASH_DSPARK_RANK] = floatToBf16(0.0F);
+  base[2] = base[77777] = base[3333] = 10.0F;
+  require(proposal() == 2, "DSpark's tie is not the lowest token");
+
+  DraftSelectorBuffers b;
+  b.chainTokens = allocate(backend, 2 * kChain * sizeof(uint32_t));
+  b.treeTokens = allocate(backend, 2 * kBlock * sizeof(uint32_t));
+  b.trees = allocate(backend, 2 * kBlock * sizeof(TreeRow));
+  b.treeScores = allocate(backend, 2 * kBlock * 2 * sizeof(float));
+  b.treeSizes = allocate(backend, 2 * sizeof(uint32_t));
+  b.treeDraws = allocate(backend, 2 * kBlock * kChildren);
+  b.treeNext = allocate(backend, 2 * kBlock * kCandidates * sizeof(float));
+  b.treeCaps = allocate(backend, 2 * kBlock * sizeof(float));
+  auto probabilities = allocate(backend, 2 * 7 * sizeof(float));
+  auto *q = static_cast<float *>(probabilities.contents());
+  for (uint32_t i = 0; i < 14; ++i) q[i] = 0.25F + 0.05F * i;
+  auto *chain = static_cast<uint32_t *>(b.chainTokens.contents());
+  for (uint32_t lane = 0; lane < 2; ++lane)
+    for (uint32_t i = 0; i < 7; ++i) chain[lane * kChain + i] = 10 * lane + i;
+  std::array lanes{DraftTreeLane{100, 3}, DraftTreeLane{200, 7}};
+  lanes[0].children = 0;
+  lanes[1].calibration.slope = 0.7F;
+  lanes[1].calibration.intercepts.fill(-0.3F);
+  CommandGraph tree;
+  DraftSelector::addDSparkChain(tree, b, probabilities, lanes);
+  (void)backend.submitCommandAsync(tree.dispatches()).wait();
+  const auto *sizes = static_cast<const uint32_t *>(b.treeSizes.contents());
+  const auto *tokens = static_cast<const uint32_t *>(b.treeTokens.contents());
+  const auto *rows = static_cast<const TreeRow *>(b.trees.contents());
+  const auto *scores = static_cast<const float *>(b.treeScores.contents());
+  for (uint32_t lane = 0; lane < 2; ++lane) {
+    float chance = 1.0F;
+    require(sizes[lane] == lanes[lane].depth + 1, "DSpark chain depth");
+    for (uint32_t i = 0; i < sizes[lane]; ++i) {
+      const uint32_t at = lane * kBlock + i;
+      require(tokens[at] == (i ? 10 * lane + i - 1 : lanes[lane].anchor), "DSpark chain token");
+      require(rows[at].ancestors == (1U << (i + 1)) - 1 &&
+              rows[at].parent == (i ? i - 1 : SPLASH_TREE_ROOT) && rows[at].depth == i,
+              "DSpark chain parent and ancestors");
+      if (i && lane == 1) {
+        const float p = q[lane * 7 + i - 1];
+        const float z = 0.7F * std::log(p / (1.0F - p)) - 0.3F;
+        chance *= 1.0F / (1.0F + std::exp(-z));
+      }
+      require(std::fabs(scores[2 * at] - (i ? (lane ? q[lane * 7 + i - 1] : -1.0F) : 1.0F)) < 1e-6F,
+              "DSpark chain proposal probability");
+      require(std::fabs(scores[2 * at + 1] - chance) < 1e-5F, "DSpark cumulative acceptance");
+      require(static_cast<const float *>(b.treeCaps.contents())[at] == 1.0F, "DSpark chain cap");
+    }
+  }
+}
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -1493,6 +1586,7 @@ int main(int argc, char **argv) {
     if (argc != 2)
       throw std::invalid_argument("usage: draft-selector METALLIB");
     MetalBackend backend(argv[1]);
+    dsparkChainAndSampling(backend);
     invalidRequests(backend);
     bufferExtents(backend);
     for (const uint32_t vocabulary : {248320U, 1003U, 270005U})
