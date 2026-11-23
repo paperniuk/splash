@@ -28,17 +28,13 @@ image_patches_rounded | --max-image-pixels 1000000 | auto auto --max-image-patch
 image_patches_default | --max-image-pixels 4194304 | auto auto
 idle_sleep | --allow-idle-sleep | auto auto --idle-sleep allow
 disable_ane | --disable-ane | auto auto --ane off
-ane_ffn_share | --ane-ffn-share 0.35 | auto auto --ane-ffn-share 0.35
-ane_ffn_rows | --ane-ffn-share 0.35 --ane-ffn-minimum-rows 520 | auto auto --ane-ffn-share 0.35 --ane-ffn-minimum-rows 520
-ane_ffn_gpu | --ane-ffn-share 0 | auto auto --ane-ffn-share 0.0
-ane_ffn_disabled | --disable-ane --ane-ffn-share 0.35 --ane-ffn-minimum-rows 520 | auto auto --ane off
-prefill_full | --prefill-mode full | auto auto --prefill-mode full
-prefill_bound | --prefill-bound-ms 3000 | auto auto --prefill-bound-ms 3000
-prefill_bound_command | --prefill-bound-scope command | auto auto --prefill-bound-scope command
+recalibrate_ane | --recalibrate-ane | auto auto --ane-calibration again
 activations_bf16 | --activations bf16 | auto auto --activations bf16
 activations_auto | --activations auto | auto auto
 verify_rows_all | --verify-rows all | auto auto --verify-rows all
 verify_rows_auto | --verify-rows auto | auto auto
+max_concurrent_requests | --max-concurrent-requests 8 | auto auto --max-concurrent-requests 8
+max_concurrent_requests_default | --max-concurrent-requests 4 | auto auto
 kv_format_default | --kv-format int8 | auto auto
 state_format_default | --state-format fp32 | auto auto
 cached_states_exact | --cached-states exact | auto auto --cached-states exact
@@ -53,3 +49,11 @@ expert_memory | --expert-memory 16G | auto auto --expert-memory 17179869184
 expert_memory_off | --expert-memory off | auto auto --expert-memory off
 expert_memory_auto | --expert-memory auto --ple-memory auto | auto auto
 sparse_kv_memory | --sparse-kv-memory 1200M | auto auto --sparse-kv-memory 1258291200
+ane_ffn_share | --ane-ffn-share 0.35 | auto auto --ane-ffn-share 0.35
+ane_ffn_rows | --ane-ffn-share 0.35 --ane-ffn-minimum-rows 520 | auto auto --ane-ffn-share 0.35 --ane-ffn-minimum-rows 520
+ane_ffn_gpu | --ane-ffn-share 0 | auto auto --ane-ffn-share 0.0
+ane_ffn_disabled | --disable-ane --ane-ffn-share 0.35 --ane-ffn-minimum-rows 520 | auto auto --ane off
+prefill_full | --prefill-mode full | auto auto --prefill-mode full
+prefill_bound | --prefill-bound-ms 3000 | auto auto --prefill-bound-ms 3000
+prefill_bound_command | --prefill-bound-scope command | auto auto --prefill-bound-scope command
+contended_prefill_rows | --contended-prefill-rows 128 | auto auto --contended-prefill-rows 128

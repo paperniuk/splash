@@ -152,11 +152,13 @@ void printUsage(std::string_view executable) {
       " [--max-image-patches PATCHES] [--persistent-cache on|off] [--cache-dir DIRECTORY]"
       " [--max-cache-disk-writes BYTES]"
       " [--idle-release SECONDS|off] [--idle-sleep prevent|allow] [--ane on|off]"
+      " [--ane-ffn-share SHARE] [--ane-ffn-minimum-rows ROWS] [--ane-calibration again]"
       " [--activations auto|bf16] [--relaunch-context TOKENS] [--ple-memory BYTES|auto|off]"
       " [--expert-memory BYTES|auto|off] [--sparse-kv-memory BYTES|auto]"
       " [--kv-spill always] [--kv-window-trim on|off] [--verify-rows auto|all]"
       " [--prefill-mode bounded|full] [--prefill-bound-ms MILLISECONDS]"
-      " [--prefill-bound-scope buffer|command] [--contended-prefill-rows ROWS]");
+      " [--prefill-bound-scope buffer|command] [--contended-prefill-rows ROWS]"
+      " [--max-concurrent-requests REQUESTS]");
   writeStderrLine("       " + command + " model-check mlx-affine none|safetensors CONFIG [DRAFT_CONFIG]");
   writeStderrLine("       " + command + " model-check gguf none|gguf CONFIG GGUF_HEADERS [DRAFT_CONFIG]");
   writeStderrLine("       " + command + " device-check");
@@ -236,6 +238,7 @@ bootstrapConfig(const engine::NativeArguments &arguments) {
       arguments.neuralEngine
           ? engine::AneFfnSetting::fromGiven(arguments.aneFfnShare, arguments.aneFfnMinimumRows)
           : engine::AneFfnSetting{.enabled = false};
+  config.resources.aneFfn.recalibrate = arguments.recalibrateAne;
   config.resources.relaunchContext = arguments.relaunchContext;
   config.resources.pleMemory = arguments.pleMemory;
   config.resources.expertMemory = arguments.expertMemory;
@@ -243,6 +246,7 @@ bootstrapConfig(const engine::NativeArguments &arguments) {
   config.resources.kvSpillAlways = arguments.kvSpillAlways;
   config.resources.kvWindowTrim = arguments.kvWindowTrim;
   config.resources.verifyRows = arguments.verifyRows;
+  config.resources.lanes = arguments.lanes;
   config.resources.int8Activations = arguments.int8Activations;
   config.nativeLoop.engine.maxContext = arguments.maxContext;
   config.nativeLoop.engine.decodeShare = arguments.decodeShare;

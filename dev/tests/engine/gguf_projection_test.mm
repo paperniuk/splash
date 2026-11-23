@@ -325,10 +325,12 @@ struct Scratch {
            std::all_of(count, count + counters.bytes / 4, [](uint32_t c) { return c == 0; });
   }
 };
-// The scratch of `plan` over `p`: the plan's, and a rotated projection's rotated rows (Linear::scratchSize).
+// The scratch of `plan` over `p`: the plan's, and a rotated projection's rotated rows of at least the decode
+// tiles' rows and the plan's (Linear::scratchSize).
 LinearScratchSize scratchSize(const Linear &linear, const LinearPlan &plan, const Projection &p) {
   LinearScratchSize size = plan.scratchSize();
-  if (p.rotation) size.rotated = linear.scratchSize(p.shape(), kMaximumDecodeTileRows).rotated;
+  if (p.rotation)
+    size.rotated = linear.scratchSize(p.shape(), std::max(kMaximumDecodeTileRows, plan.storageRows())).rotated;
   return size;
 }
 // One projection's buffers for a plan: its input and auxiliary rows (the residual, or the gate an up-with-gate
@@ -449,7 +451,8 @@ void floatOutput(MetalBackend &backend, const Linear &linear, const LinearPlan &
   const LinearWorkload w = plan.workload();
   const uint64_t active = uint64_t{w.rows} * columns;
   uint64_t wrong = 0;
-  for (uint64_t i = 0; i < uint64_t{w.rows} * columns; ++i) {
+  const uint64_t written = uint64_t{plan.configuration().mmaPrefill ? plan.storageRows() : w.rows} * columns;
+  for (uint64_t i = 0; i < written; ++i) {
     const float value = std::bit_cast<float>(values[i]);
     if (i % columns >= covered || i >= active) {
       wrong += values[i] != 0xFFFFFFFFu;
@@ -775,6 +778,40 @@ void policyGateUp(MetalBackend &backend, const Linear &linear) {
   section("gate/up of 33-64 rows on the policy's tile, within fp64");
 }
 
+// Plain fp32 destination (the logits head) of 33 to 64 rows on the tile the policy picks (Linear::plan), as three or
+// four lanes' 16-row decode steps run it: on Apple7/8 the 64-row MMA prefill tile, both split (narrow grid) and
+// unsplit (wide grid, as the 248320-column vocabulary head runs).
+void policyFloatOutput(MetalBackend &backend, const Linear &linear) {
+  const auto check = [&](Fmt f, uint32_t N, uint32_t K, std::span<const uint32_t> rowCounts, bool expectUnsplit) {
+    const uint32_t columns = N + kPadding;
+    const Tensor w = tensor(backend, f, N, K);
+    Projection p = projection({&w}, columns);
+    p.destination = FloatOutput::Float32;
+    for (const uint32_t rows : rowCounts) {
+      const LinearPlan f32Plan = linear.plan(p, rows);
+      if (expectUnsplit && f32Plan.configuration().splits != 1)
+        fail("policy fp32 " + std::string(fmtName(f)) + " " + std::to_string(N) + "x" + std::to_string(K) +
+             " unexpectedly split");
+      const LinearPlan bf16Plan = Linear::plan(f32Plan.workload(), f32Plan.configuration(), FloatOutput::BFloat16);
+      const std::vector<float> x = activations(Inputs::Dense, rows, K);
+      const std::vector<uint16_t> stored = storageRows(x, K, rows, bf16Plan.storageRows());
+      const std::string label = "policy fp32 " + std::string(fmtName(f)) + " " + std::to_string(N) + "x" +
+                                std::to_string(K) + " " + std::to_string(rows) + " rows S=" +
+                                std::to_string(f32Plan.configuration().splits);
+      const Outcome bf16 = run(backend, linear, bf16Plan, p, nullptr, stored, {}, kPoisonNaN, N, label + " bf16");
+      floatOutput(backend, linear, f32Plan, p, stored, bf16, within(products({&w}, columns, x, rows), true), N, label);
+    }
+  };
+  constexpr uint32_t rows[] = {33u, 48u, 64u};
+  // Narrow grid (splits > 1 on Apple7/8) in both head formats (27B Q6_K, Flash-Next Q5_K).
+  check(Q6K, 256, 1024, rows, false);
+  check(Q5K, 256, 1024, rows, false);
+  // Wide grid (splits == 1 on Apple7/8, as the vocabulary head runs).
+  check(Q6K, 20480, 256, rows, true);
+  check(Q5K, 20480, 256, rows, true);
+  section("fp32 destination of 33-64 rows on the policy's tile (split and unsplit), within fp64");
+}
+
 // Gate/up in one pass (LinearConfig::oneGateUpPass) on the staged tile, gate and up in each format ([768, K]), and in
 // Q4_K and MLX 4-bit at the 27B's [17408, 5120]: at every lane count, K split the tile takes and walk, and for one
 // lane on the 16-row tile too, bitwise the output of the gate and up passes, whatever the partials held before.
@@ -860,7 +897,8 @@ void registerOneGateUpPass(MetalBackend &backend, const Linear &linear) {
 // simdgroups skip their matmuls, though not the barriers of the stage they share, and leave the rows from 192 or 160
 // unwritten. Chunks of up to 32 rows run the decode tiles, whose rows equal the 128-row tiles' bitwise without K
 // splits and lie within fp64 with them; chunks of 33-64 rows run the 48- and 64-row tiles, alike, and also at eight
-// partitions, which the split law takes for some shapes, where K takes them. Every chunk's last 1 and 4 rows, on its
+// partitions, which the split law takes for some shapes, where K takes them, and chunks of 65-128 rows the tiles' two
+// row groups of 48 or 64 rows (65 and 97 rows with a padded second group), alike. Every chunk's last 1 and 4 rows, on its
 // tile and splits at their own height, equal its rows bitwise. Each of `formats` ([1024, K]) at each epilogue, and a
 // fused projection at its segments' column offsets.
 void prefill(MetalBackend &backend, const Linear &linear, uint32_t K, const std::vector<Fmt> &formats) {
@@ -921,7 +959,7 @@ void prefill(MetalBackend &backend, const Linear &linear, uint32_t K, const std:
     // Apple7/8's staged MMA tiles stop at 32 rows (kMaximumMmaStagedRows), a
     // chunk of 17 to 24 rows on the 24-row tile.
     const bool apple7 = backend.capabilities().appleGpuFamily < 9;
-    for (const uint32_t rows : {8u, 16u, 24u, 32u, 33u, 40u, 48u, 57u, 64u})
+    for (const uint32_t rows : {8u, 16u, 24u, 32u, 33u, 40u, 48u, 57u, 64u, 65u, 96u, 97u, 128u})
       for (const uint32_t splits : {1u, splitChunk, 8u}) {
         if ((apple7 && rows > splash::ops::kMaximumMmaStagedRows) || (splits == 8 && (rows <= 32 || (K / 32) % 8)))
           continue;
@@ -937,11 +975,13 @@ void prefill(MetalBackend &backend, const Linear &linear, uint32_t K, const std:
         lastRows(plan, out, name);
         if (splits == 1 && !sameRows(out.output, 0, tileOutput, 0, rows, columns))
           fail(name + ": differs from the 128-row tiles");
-        // A fused chunk runs its segments in one dispatch, each segment's columns bitwise its own chunk's at the
-        // same split.
+        // A fused chunk runs its segments in one dispatch up to one tile's rows and in one each on the row groups
+        // past them, each segment's columns bitwise its own chunk's at the same split.
         if (parts.size() > 1) {
-          if (out.pipelines.size() != 1)
-            fail(name + ": ran " + std::to_string(out.pipelines.size()) + " dispatches, not one");
+          const size_t dispatches = rows <= kMaximumDecodeTileRows ? 1 : parts.size();
+          if (out.pipelines.size() != dispatches)
+            fail(name + ": ran " + std::to_string(out.pipelines.size()) + " dispatches, not " +
+                 std::to_string(dispatches));
           uint32_t offset = 0;
           for (const Tensor *t : parts) {
             const LinearWorkload alone{{t->N, K}, rows, epilogue};
@@ -973,8 +1013,8 @@ void prefill(MetalBackend &backend, const Linear &linear, uint32_t K, const std:
   }
   section("prefill: " + std::to_string(formats.size()) + " formats, K " + std::to_string(K) +
           ", plain/residual/up-with-gate and fused segments, 128-row tiles over 168- and 136-row chunks and chunks of "
-          "8-64 rows (S 1 and " + std::to_string(splitChunk) + (K / 32 % 8 ? "" : ", and 8 past 32 rows") +
-          ") within fp64, equal to the 128-row tiles; a fused chunk in one dispatch, bitwise its segments' own; a "
+          "8-128 rows (S 1 and " + std::to_string(splitChunk) + (K / 32 % 8 ? "" : ", and 8 past 32 rows") +
+          ") within fp64, equal to the 128-row tiles; a fused chunk in one dispatch up to 64 rows, bitwise its segments' own; a "
           "chunk's last rows alone bitwise the chunk's");
 }
 
@@ -1080,6 +1120,31 @@ void prefillSplit(MetalBackend &backend, const Linear &linear) {
   section("prefill split-K (Apple7/8): Q8_0 320x10240 at 128/136/168/384 rows and Q8_0/Q4_K/AF4G64 1024x1024 at "
           "plain/residual/up-with-gate + 3-segment chunk, S 2-16, last 1/4 rows bitwise, NaN and finite poison, "
           "unwritten tail rows, counters reset to 0");
+}
+
+// The vocabulary head runs on the MMA prefill tiles past 32 rows. Check
+// both stores through the production planner with a segmented projection.
+void mmaFloatOutput(MetalBackend &backend) {
+  const Linear linear(backend.capabilities(), Int8Activations::Off, StepKind::Decode);
+  constexpr uint32_t kInputs = 4096, kRows = 48;
+  const Tensor a = tensor(backend, Q4K, 256, kInputs), b = tensor(backend, Fmt(GGUF_FMT_AF4G64), 256, kInputs);
+  const std::vector<const Tensor *> parts{&a, &b};
+  const uint32_t covered = segmentColumns(parts);
+  Projection p = projection(parts, covered + kPadding);
+  const auto x = activations(Inputs::Dense, kRows, kInputs);
+  const auto inputs = storageRows(x, kInputs, kRows, kRows);
+  const auto dots = products(parts, p.outputSize, x, kRows);
+  p.destination = FloatOutput::Float32;
+  const LinearPlan policy = linear.plan(p, kRows);
+  for (const uint32_t splits : {1U, 4U}) {
+    LinearConfig config = policy.configuration();
+    config.splits = splits;
+    const LinearPlan bf16 = Linear::plan(policy.workload(), config, FloatOutput::BFloat16);
+    const LinearPlan fp32 = Linear::plan(policy.workload(), config, p.destination);
+    const std::string label = "MMA vocabulary head, S " + std::to_string(splits);
+    const Outcome out = run(backend, linear, bf16, p, nullptr, inputs, {}, kPoisonNaN, covered, label);
+    floatOutput(backend, linear, fp32, p, inputs, out, within(dots, true), covered, label);
+  }
 }
 
 // ---------------------------------------------------------------- int8 decode
@@ -1304,16 +1369,20 @@ void decodeInt8(MetalBackend &backend, const Linear &linear) {
     const MetalBuffer signBuffer = signsOf(K, signs);
     const Tensor t = tensor(backend, PQ20, N, K);
     const Projection p = rotatedProjection({&t}, N, signBuffer), plain = projection({&t}, N);
-    const std::vector<float> x = int8Inputs(kMaximumDecodeTileRows, K, signs);
-    const std::vector<float> residual = residuals(kMaximumDecodeTileRows, N);
-    const Int8Products d = int8Tiles ? int8Products({&t}, N, x, kMaximumDecodeTileRows, signs) : Int8Products{};
-    // The production plans of 8 to 64 rows: in int8 activations up to the int8 tiles' 32, bf16 past them.
-    for (uint32_t lanes = 1; lanes <= kMaximumStagedLanes; ++lanes) {
+    const std::vector<float> x = int8Inputs(kMaximumStagedRows, K, signs);
+    const std::vector<float> residual = residuals(kMaximumStagedRows, N);
+    const Int8Products d = int8Tiles ? int8Products({&t}, N, x, kMaximumStagedRows, signs) : Int8Products{};
+    // A decode step's production plans of 8 to 128 rows: in int8 activations from the device's decodeInt8FromRows
+    // (16), past the int8 tiles' 32 rows in row groups of them (int8RowGroups).
+    const Linear steps(backend.capabilities(), Int8Activations::On, StepKind::Decode);
+    for (uint32_t lanes = 1; lanes <= kMaximumStagedRows / kLaneRows; ++lanes) {
       const LinearWorkload w = decode({N, K}, lanes, epilogue);
-      if (linear.plan(w, plain).configuration().decodeInt8)
+      if (steps.plan(w, plain).configuration().decodeInt8)
         fail("an unrotated PQ2_0 projection takes int8 activations");
-      const LinearPlan plan = linear.plan(w, p);
+      const LinearPlan plan = steps.plan(w, p);
       const LinearConfig c = plan.configuration();
+      if (int8Tiles && w.rows >= steps.calibration().projection.decodeInt8FromRows && !c.decodeInt8)
+        fail("a rotated PQ2_0 production plan of " + std::to_string(w.rows) + " rows keeps bf16 activations");
       if (!c.decodeInt8) continue;
       const std::string label = "int8 production " + std::to_string(N) + "x" + std::to_string(K) + " lanes " +
                                 std::to_string(lanes) + " S" + std::to_string(c.splits);
@@ -1325,6 +1394,17 @@ void decodeInt8(MetalBackend &backend, const Linear &linear) {
       const std::vector<uint16_t> aux = storageRows(residual, N, w.rows, storage);
       const Outcome out = runInt8(plan, p, nullptr, storageRows(x, K, w.rows, storage), aux, kPoisonNaN, N, label);
       checkValues(out, int8Bound(d, K, c.splits), {}, aux, w, w.rows, N, label);
+      // A row group's rows are the bits of the same rows on one tile at the plan's splits: the last 16 rows alone.
+      if (w.rows > kMaximumInt8Rows) {
+        const LinearWorkload lastWorkload{w.matrix, 16, epilogue};
+        const LinearPlan last = Linear::plan(lastWorkload, c, FloatOutput::BFloat16);
+        const auto tail = [&](const std::vector<float> &values, uint32_t width) {
+          const auto end = values.begin() + uint64_t{w.rows} * width;
+          return storageRows(std::vector<float>(end - 16u * width, end), width, 16, last.storageRows());
+        };
+        const Outcome alone = runInt8(last, p, nullptr, tail(x, K), tail(residual, N), kPoisonNaN, N, label + " last 16");
+        if (!sameRows(alone.output, 0, out.output, w.rows - 16, 16, N)) fail(label + ": its last 16 rows differ alone");
+      }
       ++production;
     }
   }
@@ -1764,7 +1844,7 @@ void splitVisibility(MetalBackend &backend, const Linear &linear, LinearTile til
     DeviceCapabilities device;
     device.appleGpuFamily = family;
     device.gpuCoreCount = cores;
-    const Linear policy(device, Int8Activations::On);
+    const Linear policy(device, Int8Activations::On, StepKind::Prefill);
     const LinearConfig a = policy.plan(workloads[0], weights[0][0]).configuration();
     const LinearConfig b = policy.plan(workloads[1], weights[1][0]).configuration();
     if (a.tile == tile && b.tile == tile && std::max(a.splits, b.splits) > 1) splitPairs.insert({a.splits, b.splits});
@@ -2016,7 +2096,7 @@ int main(int argc, char **argv) {
     }
     try {
       MetalBackend backend(argv[1]);
-      const Linear linear(backend.capabilities(), Int8Activations::On);
+      const Linear linear(backend.capabilities(), Int8Activations::On, StepKind::Prefill);
       fp32RegisterTable = backend.capabilities().appleGpuFamily < 9;
       if (fp32RegisterTable) stagedLanes = splash::ops::kMaximumMmaStagedRows / kLaneRows;
       // Apple7/8 run the staged tiles' dispatches on their MMA kernels and the register tile's on its F32 instances.
@@ -2037,7 +2117,11 @@ int main(int argc, char **argv) {
         registerOneGateUpPass(backend, linear);
       prefill(backend, linear, 1024, tileFormats(LinearTile::GgufStaged));
       policyGateUp(backend, linear);
-      if (backend.capabilities().appleGpuFamily < 9) prefillSplit(backend, linear);
+      policyFloatOutput(backend, linear);
+      if (backend.capabilities().appleGpuFamily < 9) {
+        prefillSplit(backend, linear);
+        mmaFloatOutput(backend);
+      }
       decodeInt8(backend, linear);
       prefillInt8(backend, linear);
       leadingInputs(backend, linear);
@@ -2047,7 +2131,7 @@ int main(int argc, char **argv) {
         // on any later GPU too.
         DeviceCapabilities apple7 = backend.capabilities();
         apple7.appleGpuFamily = 7;
-        const Linear m1(apple7, Int8Activations::On);
+        const Linear m1(apple7, Int8Activations::On, StepKind::Prefill);
         fp32RegisterTable = true;
         decodeTile(backend, m1, LinearTile::GgufRegister, false, decodeInputs(false),
                    tileFormats(LinearTile::GgufRegister));

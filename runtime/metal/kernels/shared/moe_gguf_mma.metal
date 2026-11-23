@@ -31,12 +31,15 @@ template <uint Count> struct moe_mma_formats {
 
 // Writes the elements of `acc` through write(row, column, v), the tile's `live` rows alone: a tile's grouped rows
 // start at its first_row and the next tile's follow its live rows (moe_expert_slab.h), so a partial tile's padding
-// rows are the next tile's. A full tile writes every row without the guard.
-template <uint FM, class Write>
+// rows are the next tile's. When FullFastPath is true (the down pass's plain store), a full tile writes every row
+// without the guard; gate/up keeps one guarded path so the SiLU epilogue is not duplicated across FM = 1, 2, 4.
+template <uint FM, bool FullFastPath = true, class Write>
 inline void moe_mma_store(thread float2 (&acc)[FN][FM], sgmatrix::Lane l, uint live, Write write) {
-  if (live == FM * 8) {
-    elements(acc, l, write);
-    return;
+  if constexpr (FullFastPath) {
+    if (live == FM * 8) {
+      elements(acc, l, write);
+      return;
+    }
   }
   elements(acc, l, [&](uint row, uint column, float v) {
     if (row < live) write(row, column, v);
@@ -131,8 +134,12 @@ kernel void moe_expert_gguf_mma_down(device bfloat *input [[buffer(0)]], device 
       accumulate<F, FM>(x, s.w0, s.w1, s.meta, p.input_size, origin, stage + simd_group * kSimdgroupStage, tl,
                         simd_lane, 0, p.input_size / kStep, acc);
     });
-    moe_mma_store(acc, sgmatrix::lane_map(simd_lane), tile.rows, [&](uint row, uint column, float v) {
-      output[out + ulong(row) * p.output_size + origin + column] = bfloat(v);
+    // Reload the tile descriptor after the K loop so the 64-bit output offset and live row count are not held live
+    // across accumulate.
+    const MoeTileDescriptor dst = tiles[t];
+    const ulong dst_out = ulong(dst.first_row) * p.output_size;
+    moe_mma_store(acc, sgmatrix::lane_map(simd_lane), dst.rows, [&](uint row, uint column, float v) {
+      output[dst_out + ulong(row) * p.output_size + origin + column] = bfloat(v);
     });
   });
 }
@@ -260,7 +267,7 @@ kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
       for (uint row = 0; row < tile.rows; ++row)
         output[out + ulong(row) * N + origin + simd_lane] = product(sums[row], gate[row * kColumns + simd_lane]);
     else
-      moe_mma_store(acc, l, tile.rows, [&](uint row, uint column, float v) {
+      moe_mma_store<1, false>(acc, l, tile.rows, [&](uint row, uint column, float v) {
         output[out + ulong(row) * N + origin + column] = product(v, gate[row * kColumns + column]);
       });
     return;
@@ -275,10 +282,15 @@ kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
     });
     if (!up) elements(acc, l, [&](uint row, uint column, float v) { gate[row * kColumns + column] = bfloat(v); });
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (up)
-      moe_mma_store(acc, l, tile.rows, [&](uint row, uint column, float v) {
-        output[out + ulong(row) * N + origin + column] = product(v, gate[row * kColumns + column]);
+    if (up) {
+      // Reload the tile descriptor after the K loop so the 64-bit output offset and live row count are not held live
+      // across accumulate; single guarded store path avoids duplicating the SiLU epilogue across FM = 1, 2, 4.
+      const MoeTileDescriptor dst = tiles[t];
+      const ulong dst_out = ulong(dst.first_row) * N;
+      moe_mma_store<FM, false>(acc, l, dst.rows, [&](uint row, uint column, float v) {
+        output[dst_out + ulong(row) * N + origin + column] = product(v, gate[row * kColumns + column]);
       });
+    }
   });
 }
 using MoeExpertGgufMmaGateUpKernel = void(device bfloat *, device const MoeTileDescriptor *, device const uint *,
