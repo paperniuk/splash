@@ -287,13 +287,15 @@ int main(int argc, char **argv) {
       for (const uint32_t rows : prefillRows) {
         const LinearWorkload w{{N, K}, rows, epilogue};
         const LinearConfig policy = linear.plan(w, ring.front()).configuration();
-        const LinearConfig config{.tile = LinearTile::GgufPrefill};
-        cases.push_back({"R" + std::to_string(rows), "prefill128", Linear::plan(w, config, FloatOutput::BFloat16),
-                         config == policy, {}});
-        if (backend.capabilities().appleGpuFamily < 9) {
+        // Apple7/8 plan their prefill on the 64-row MMA tile (mmaPrefill), as the policy does, so its choice is marked.
+        const bool mma = backend.capabilities().appleGpuFamily < 9;
+        const LinearConfig config{.tile = LinearTile::GgufPrefill, .mmaPrefill = mma};
+        cases.push_back({"R" + std::to_string(rows), mma ? "prefill64 S1" : "prefill128",
+                         Linear::plan(w, config, FloatOutput::BFloat16), config == policy, {}});
+        if (mma) {
           for (uint32_t splits = 2; splits <= LinearConfig::kMaximumSplits; splits *= 2) {
             if ((K / 32) % splits) continue;
-            const LinearConfig splitCfg{.tile = LinearTile::GgufPrefill, .splits = splits};
+            const LinearConfig splitCfg{.tile = LinearTile::GgufPrefill, .splits = splits, .mmaPrefill = true};
             cases.push_back({"R" + std::to_string(rows), "prefill64 S" + std::to_string(splits),
                              Linear::plan(w, splitCfg, FloatOutput::BFloat16), splitCfg == policy, {}});
           }
@@ -326,6 +328,17 @@ int main(int argc, char **argv) {
         if (rows <= GGUF_COLUMN_ROWS) {
           const LinearConfig column{.tile = LinearTile::GgufColumn, .oneGateUpPass = pairGate != nullptr};
           cases.push_back({line, "column", Linear::plan(w, column, FloatOutput::BFloat16), column == policy, {}});
+          continue;
+        }
+        // Apple7/8 run a plan of more rows than their staged MMA and register tiles hold on the 64-row MMA tile
+        // (ops::bf16Projection), at every split it takes; their library has no staged tile past 32 rows.
+        if (backend.capabilities().appleGpuFamily < 9 && rows > std::max(kMaximumMmaStagedRows, kMaximumRegisterRows)) {
+          for (uint32_t splits = 1; splits <= LinearConfig::kMaximumSplits; splits *= 2) {
+            if ((K / 32) % splits) continue;
+            const LinearConfig mma64{.tile = LinearTile::GgufPrefill, .splits = splits, .mmaPrefill = true};
+            cases.push_back({line, "mma64 S" + std::to_string(splits), Linear::plan(w, mma64, FloatOutput::BFloat16),
+                             mma64 == policy, {}});
+          }
           continue;
         }
         // The staged tile walks K as the policy's staged plans do (where the device registers a plan, those it
