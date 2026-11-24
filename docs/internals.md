@@ -1784,6 +1784,12 @@ stands on its own: two steps are asked whatever one step's fit chose, and
 where one step splits no chunk below two steps' 1,024 rows they serve alone
 from 1,024 where they gain (the record keeps the units that name the program,
 one step's, or two steps' where one step's fit chose none, and no least rows).
+Where the Neural Engine refuses the program of both kinds (`ane::Refused`, as
+`ANECCompile() FAILED` for Qwen3.8-27B UD-Q4_K_M on a 14-core M1 Pro with
+two steps at 0.97 beside one step at 0.74, where 0.94 builds), two steps'
+units give way one at a time, down to one step's, and then one step serves
+alone; the log names each share refused. A refusal with one step's units at
+stake ends the calibration as above.
 Where neither kind gains the GPU alone serves, and nothing is remembered: the
 next start calibrates again. Six calibrations of
 Qwen3.8-27B MLX 4-bit on an M5 Max timed each function's split layer
