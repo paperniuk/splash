@@ -354,6 +354,13 @@ void InklingTarget::addStateCommit(metal::CommandGraph &graph, QwenTargetCommitB
       buffers.retainedRows, buffers.laneRows, {step.lanes, step.rows, step.laneCap});
 }
 
+// Its head's 200,058 tokens of 201,024 rows, softcapped at 30.
+ops::LogitFinishValues InklingTarget::headFinish() const noexcept {
+  return {Layout::logitSoftcap, Layout::unpaddedVocabulary};
+}
+
+const ops::NormWeights *InklingTarget::draftEmbeddingNorm() const noexcept { return &weights_.embeddingNorm; }
+
 // A reply's state at a page boundary: one lane's histories after the first
 // `rows` rows of its accepted path, from the same tape as its commit.
 void InklingTarget::addAuxiliaryCapture(metal::CommandGraph &graph, QwenTargetCaptureBuffers buffers, uint32_t rows,

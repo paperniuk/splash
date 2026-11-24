@@ -1671,9 +1671,14 @@ kernel void draft_select_tree(
           ulong(params.lanes) * Positions * Shards * Candidates +
           ((ulong(lane) * Positions + position) * Candidates + predecessor) *
               Candidates;
+      // A softcapped head's draft takes the softcap on each sum, its tanh the
+      // precise one (DraftTreeParams).
+      const float softcap = params.softcap;
       float score[Candidates];
-      for (uint i = 0; i < Candidates; ++i)
-        score[i] = unary[origin + position * Candidates + i] + edges[i];
+      for (uint i = 0; i < Candidates; ++i) {
+        const float sum = unary[origin + position * Candidates + i] + edges[i];
+        score[i] = softcap > 0.0f ? softcap * precise::tanh(sum / softcap) : sum;
+      }
       float best = score[0];
       for (uint i = 1; i < Candidates; ++i)
         best = max(best, score[i]);

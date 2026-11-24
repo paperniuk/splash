@@ -297,14 +297,17 @@ struct DraftTreeParams {
   uint32_t chain[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t children[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t lanes;
+  // The draft head's softcap on each candidate's score, unary plus edge, as
+  // DFlash2 trains a draft of a softcapped head; 0 for none.
+  float softcap;
   float slope[SPLASH_MAXIMUM_BATCH_WIDTH];
   float intercept[SPLASH_MAXIMUM_BATCH_WIDTH][SPLASH_DRAFT_PROPOSAL_TOKENS];
   float temperature[SPLASH_MAXIMUM_BATCH_WIDTH];
   uint32_t noise[SPLASH_MAXIMUM_BATCH_WIDTH][2];
 };
 
-static_assert(sizeof(DraftTreeParams) == 244,
-              "Draft tree parameters are 244 bytes on both sides");
+static_assert(sizeof(DraftTreeParams) == 248,
+              "Draft tree parameters are 248 bytes on both sides");
 
 // The rows of a decode cycle (draft_verify_rows): the `rows` rows of its
 // step's plan (ops::StepRows), laid out over its lanes' trees

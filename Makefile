@@ -262,6 +262,7 @@ ENGINE_CPP_SOURCES := \
 	runtime/ops/ExecutionPlans.cpp \
 	runtime/ops/GDN.cpp \
 	runtime/ops/Inkling.cpp \
+	runtime/ops/LogitFinish.cpp \
 	runtime/ops/Linear.cpp \
 	runtime/ops/LinearGguf.cpp \
 	runtime/ops/KernelSelection.cpp \

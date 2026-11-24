@@ -86,6 +86,11 @@ struct QwenTargetDimensions {
   // maskToken is then its draft's (ModelDescriptor.mm describeSourceModel),
   // zero before a draft names one.
   uint32_t maskToken = 0;
+  // Whether a DFlash2 draft's target_layer_ids name the rows a layer reads,
+  // its input, where they otherwise name a layer's output: id L is then the
+  // output of layer L - 1, and id `layers` the final norm's rows (Inkling 2's
+  // released draft reads 5, 23, 41 and 48).
+  bool draftReadsLayerInputs = false;
   uint32_t firstDraftMaskToken = 0;
   uint32_t lastDraftMaskToken = 0;
   ops::StopTokens stopTokens{};

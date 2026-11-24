@@ -790,10 +790,14 @@ DFlashDraftLayout readDraftLayout(NSDictionary *draft, const QwenTargetDimension
   NSArray *ids = requireArray(flash, @"target_layer_ids", "draft config target_layer_ids");
   std::vector<uint32_t> targetLayers;
   for (id value : ids) {
-    targetLayers.push_back(
-        requireWhole(value, "draft config target_layer_ids " + std::to_string(targetLayers.size())));
-    if (targetLayers.back() >= target.layers)
+    const uint32_t id = requireWhole(value, "draft config target_layer_ids " + std::to_string(targetLayers.size()));
+    // An id of a target whose drafts read layer inputs names the output of
+    // the layer before it, and id `layers` the final norm's rows, which its
+    // last layer's capture slot takes (QwenTargetDimensions::
+    // draftReadsLayerInputs).
+    if (target.draftReadsLayerInputs ? (id == 0 || id > target.layers) : id >= target.layers)
       throw std::invalid_argument("draft config target_layer_ids names a layer past the target's");
+    targetLayers.push_back(target.draftReadsLayerInputs ? id - 1 : id);
   }
   const DFlashDraftLayout layout =
       draftLayout(target.hiddenSize, target.vocabularySize,

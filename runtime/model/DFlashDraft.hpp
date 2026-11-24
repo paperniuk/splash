@@ -7,6 +7,7 @@
 #include "ops/DraftSelector.hpp"
 #include "ops/ExecutionPlans.hpp"
 #include "ops/Linear.hpp"
+#include "ops/LogitFinish.hpp"
 #include "ops/Normalization.hpp"
 
 #include <cstdint>
@@ -282,7 +283,7 @@ class DFlashDraft final {
 public:
   DFlashDraft(const DFlashDraftWeights &weights, metal::MetalBackend &backend,
                const ops::ExecutionPlans &operators, const ops::Projection &head,
-               ops::DraftVocabulary subset);
+               ops::DraftVocabulary subset, ops::LogitFinishValues finish);
 
   // A lane's tokens that choose the vocabulary of its steps: the last of the
   // tokens it read and its anchor (vocabulary).
@@ -366,6 +367,11 @@ private:
   ops::DraftSelector selector_;
   const ops::Projection &head_;
   ops::DraftVocabulary subset_;
+  // The head's finish (ops::LogitFinish): its tokens, past which a padded
+  // head's rows take no candidate, and its softcap, which the selector takes
+  // on each candidate's score after its edge, as DFlash2 trains a draft of a
+  // softcapped head.
+  ops::LogitFinishValues finish_;
   // The head's rows of the subset's tokens.
   ops::Projection subsetHead_;
   // Each layer's key and value rows of its QKV projection, views of its

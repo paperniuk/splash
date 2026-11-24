@@ -715,12 +715,13 @@ struct Runtime::Impl {
   static std::variant<DFlashDraft, DSparkDraft> makeDraft(const LoadedModel &model, metal::MetalBackend &backend,
                                                           const ops::ExecutionPlans &operators,
                                                           const ops::Projection &head,
-                                                          ops::DraftVocabulary vocabulary) {
+                                                          ops::DraftVocabulary vocabulary,
+                                                          ops::LogitFinishValues finish) {
     return std::visit([&](const auto &weights) -> std::variant<DFlashDraft, DSparkDraft> {
       using T = std::decay_t<decltype(weights)>;
       if constexpr (std::is_same_v<T, DFlashDraftWeights>)
         return std::variant<DFlashDraft, DSparkDraft>(std::in_place_type<DFlashDraft>, weights, backend, operators,
-                                                     head, vocabulary);
+                                                     head, vocabulary, finish);
       else
         return std::variant<DFlashDraft, DSparkDraft>(std::in_place_type<DSparkDraft>, weights, backend, operators);
     }, model.draft);
@@ -742,7 +743,7 @@ struct Runtime::Impl {
                         },
                         value.model.target)),
         draftModel(makeDraft(value.model, value.backend, operators, targetModel->vocabularyProjection(),
-                             geometry.target.draftVocabulary)),
+                             geometry.target.draftVocabulary, targetModel->headFinish())),
         aneFfn(value.aneFfn), aneFfnPair(value.aneFfnPair), blockCache(value.blockCache), historyStream(value.historyStream),
         limits(splash::model::commandLimits(geometry, aneFfn ? aneFfn->minimumRows() : 0)) {
     if (states.layout() != model.stateLayout(states.layout().target.format, states.layout().target.cachedCodes) ||
@@ -4215,10 +4216,18 @@ Runtime::decodeAsync(const BatchPlan &plan,
                        width * kDecodeRows, {}, {}, impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeCos, width),
                        impl_->decodeArena->batchSlice(DecodeTensor::DraftRopeSin, width));
   if (const auto *dflash = std::get_if<DFlashDraft>(&impl_->draftModel)) {
-    impl_->encodeBatchEmbedding(draft, DecodeTensor::DraftInputTokens,
-                                impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width), width,
-                                width * kDraftRows);
-    dflash->addMaskRows(draft, impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width), width);
+    // A family whose first layer reads its table's rows through a norm
+    // gathers them into the second hidden rows and normalizes them into the
+    // first, which the draft's first layer reads (QwenTarget::
+    // draftEmbeddingNorm).
+    const ops::NormWeights *norm = impl_->targetModel->draftEmbeddingNorm();
+    const MetalBuffer first = impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden0, width);
+    const MetalBuffer gathered = norm ? impl_->decodeArena->batchSlice(DecodeTensor::DraftHidden1, width) : first;
+    impl_->encodeBatchEmbedding(draft, DecodeTensor::DraftInputTokens, gathered, width, width * kDraftRows);
+    dflash->addMaskRows(draft, gathered, width);
+    if (norm)
+      ops::Normalization::addRms(draft, gathered, *norm, first, impl_->geometry.target.hiddenSize,
+                                 width * kDraftRows);
   } else {
     for (uint32_t lane = 0; lane < width; ++lane)
       impl_->targetModel->addEmbedding(draft, impl_->decodeArena->get(lane, DecodeTensor::DraftInputTokens),

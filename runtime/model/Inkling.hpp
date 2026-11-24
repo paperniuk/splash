@@ -62,6 +62,10 @@ constexpr InklingLayout::InklingLayout()
                         .slidingLayers = slidingMask(),
                         .unrotatedLayers = (uint64_t{1} << 48) - 1,
                         .fullAttentionPeriod = 1,
+                        // Its last unused special token, <|unused_200056|>:
+                        // its vocabulary keeps no mask token of its own.
+                        .maskToken = 200056,
+                        .draftReadsLayerInputs = true,
                         .stopTokens = {200006},
                         .ffnKind = QwenFfnKind::SparseMoe,
                         .experts = 128,

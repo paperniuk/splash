@@ -36,6 +36,9 @@ public:
   void addStateCommit(metal::CommandGraph &graph, QwenTargetCommitBuffers buffers,
                       const ops::StepRows &step) const override;
   [[nodiscard]] bool capturesAuxiliary() const noexcept override { return true; }
+  [[nodiscard]] ops::LogitFinishValues headFinish() const noexcept override;
+  // Its embedding norm, which its prompt's rows take first (addPrefillBegin).
+  [[nodiscard]] const ops::NormWeights *draftEmbeddingNorm() const noexcept override;
   void addAuxiliaryCapture(metal::CommandGraph &graph, QwenTargetCaptureBuffers buffers, uint32_t rows,
                            const ops::StepRows &step) const override;
   void addInsideCapture(metal::CommandGraph &graph, metal::MetalBuffer auxiliaryIn,

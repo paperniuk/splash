@@ -161,7 +161,7 @@ public:
   // Proposals from `vocabulary`'s tokens, whose logits rows buffers.logits
   // holds.
   void add(metal::CommandGraph &graph, const DraftSelectorBuffers &buffers, const DraftCodebooks &codebooks,
-           DraftVocabulary vocabulary, std::span<const DraftTreeLane> lanes) const;
+           DraftVocabulary vocabulary, std::span<const DraftTreeLane> lanes, float softcap) const;
   // After add: the rows of a decode step of `step.lanes` lanes
   // (VerifyRowsParams), the trees' best rows that the step's rows and its
   // lane cap hold, none past an anchor estimated below `floor`, each lane's

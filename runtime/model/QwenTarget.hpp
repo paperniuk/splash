@@ -6,6 +6,7 @@
 #include "SpilledKvReads.hpp"
 #include "StateLayout.hpp"
 #include "WeightStore.hpp"
+#include "ops/LogitFinish.hpp"
 #include "ops/GDN.hpp"
 #include "ops/ExecutionPlans.hpp"
 #include "ops/LaneRows.hpp"
@@ -463,6 +464,12 @@ public:
 
   [[nodiscard]] const ops::Projection &
   vocabularyProjection() const noexcept;
+  // The head's finish its draft takes (DFlashDraft): its tokens, of the
+  // vocabulary rows it projects, and its softcap; a head that is neither
+  // padded nor softcapped finishes none.
+  [[nodiscard]] virtual ops::LogitFinishValues headFinish() const noexcept {
+    return {0.0F, geometry_.vocabularySize};
+  }
   // Lanes of storage, a draft's block of rows each, the vocabulary
   // projection binds over a draft step of `lanes` lanes, which runs the
   // target's head: its tile may hold more rows than the step's
@@ -523,6 +530,10 @@ public:
   virtual void addVerifyInput(metal::CommandGraph &graph, const QwenVerifyInput &input) const;
   void addEmbedding(metal::CommandGraph &graph, metal::MetalBuffer tokens,
                     metal::MetalBuffer hidden, uint32_t rows) const;
+  // The norm of its token table's rows as its first layer reads them, which a
+  // DFlash2 draft's own rows (its anchor's and its mask's) then take as
+  // well; none for a family whose layers read the table's rows as they are.
+  [[nodiscard]] virtual const ops::NormWeights *draftEmbeddingNorm() const noexcept { return nullptr; }
   // The commit after acceptance of a decode step (`step`, whose lanes' rows
   // the layout places, QwenTargetCommitBuffers::laneRows): in the step's
   // command after its forward, or for constrained decoding in the next

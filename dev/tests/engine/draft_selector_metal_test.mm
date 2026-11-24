@@ -257,7 +257,7 @@ Fixture makeFixture(MetalBackend &backend, uint32_t vocabulary, uint32_t lanes, 
 
 void run(MetalBackend &backend, const DraftSelector &selector, const Fixture &f, std::span<const DraftTreeLane> lanes) {
   CommandGraph graph;
-  selector.add(graph, f.buffers, f.codebooks, f.subset, lanes);
+  selector.add(graph, f.buffers, f.codebooks, f.subset, lanes, 0.0F);
   require(graph.dispatches().size() == 3, "draft selector dispatch count changed");
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
 }
@@ -1400,7 +1400,7 @@ void bufferExtents(MetalBackend &backend) {
     requireExtent(backend, f.buffers.*member, bytes, element, what, [&](CommandGraph &graph, const MetalBuffer &buffer) {
       DraftSelectorBuffers changed = f.buffers;
       changed.*member = buffer;
-      selector.add(graph, changed, f.codebooks, {}, trees);
+      selector.add(graph, changed, f.codebooks, {}, trees, 0.0F);
     });
   // Over a subset, a logits row holds its columns.
   constexpr DraftVocabulary subset{512, 960};
@@ -1408,7 +1408,7 @@ void bufferExtents(MetalBackend &backend) {
                 [&](CommandGraph &graph, const MetalBuffer &buffer) {
                   DraftSelectorBuffers changed = f.buffers;
                   changed.logits = buffer;
-                  selector.add(graph, changed, f.codebooks, subset, trees);
+                  selector.add(graph, changed, f.codebooks, subset, trees, 0.0F);
                 });
   for (const auto &[member, what] :
        {std::pair{&DraftCodebooks::predecessor, "draft predecessor codebook"},
@@ -1417,7 +1417,7 @@ void bufferExtents(MetalBackend &backend) {
                   [&](CommandGraph &graph, const MetalBuffer &buffer) {
                     DraftCodebooks changed = f.codebooks;
                     changed.*member = buffer;
-                    selector.add(graph, f.buffers, changed, {}, trees);
+                    selector.add(graph, f.buffers, changed, {}, trees, 0.0F);
                   });
   // draft_verify_rows reads every lane's tree and writes the step's rows.
   const StepRows step{lanes, 2 * lanes + 1, 3};
@@ -1449,14 +1449,14 @@ void invalidRequests(MetalBackend &backend) {
   const DraftSelector selector(vocabulary);
   CommandGraph graph;
   const auto add = [&](std::span<const DraftTreeLane> lanes) {
-    selector.add(graph, f.buffers, f.codebooks, {}, lanes);
+    selector.add(graph, f.buffers, f.codebooks, {}, lanes, 0.0F);
   };
   rejects([&] { add({}); }, "invalid draft selector batch", "a selection of no lane was accepted");
   const std::array<DraftTreeLane, 5> five{};
   rejects([&] { add(five); }, "invalid draft selector batch", "a selection of five lanes was accepted");
   // Tokens past the vocabulary, a trailing part before the leading one's end, and no tokens.
   for (const DraftVocabulary tokens : {DraftVocabulary{0, 1025}, DraftVocabulary{600, 500}, DraftVocabulary{0, 1024}})
-    rejects([&] { selector.add(graph, f.buffers, f.codebooks, tokens, std::array{DraftTreeLane{1, 3, 0, 1}}); },
+    rejects([&] { selector.add(graph, f.buffers, f.codebooks, tokens, std::array{DraftTreeLane{1, 3, 0, 1}}, 0.0F); },
             "a draft's tokens lie in its vocabulary", "a draft vocabulary outside the selector's was accepted");
   // A tree deeper than a block's rows, a chain past a block's rows after its
   // anchor and more children than the kernel ranks.
