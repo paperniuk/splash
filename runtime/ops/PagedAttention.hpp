@@ -92,6 +92,26 @@ struct AttentionWorkspace final {
 // sequence's partials.
 inline constexpr uint32_t kAttentionSequenceSplits = 2 * kv::kAttentionMaximumSplits;
 
+// The GPU finishes a dispatch before it serves the display, and macOS aborts
+// a command that keeps the display waiting too long (Apple7/8 Macs at long
+// context). There a prompt chunk's attention runs in pieces of rows of at
+// most about this many row-history pairs, each its own split and reduce
+// (PagedAttention::plan's `pieceWork`): a whole 2048-row chunk ran ~490 ms
+// on an M2 Pro after 32K tokens, 64-row pieces ~65 ms at 82K.
+inline constexpr uint64_t kApple7PrefillAttentionPieceWork = uint64_t{1} << 23;
+
+// The tiles of each piece of a sequence of `rows` rows whose rows attend
+// `history` tokens before them, at most about `work` row-history pairs: all
+// of them without a work or while they fit, else rows halved from a full
+// chunk's down to one tile.
+[[nodiscard]] constexpr uint32_t prefillAttentionPieceTiles(uint32_t history, uint32_t rows, uint64_t work) noexcept {
+  const uint32_t tiles = kv::attentionTiles(rows);
+  if (!work) return tiles;
+  uint32_t piece = kv::kChunkedPrefillMaximumRows;
+  while (piece > kv::kAttentionTileRows && uint64_t{piece} * (uint64_t{history} + piece) > work) piece /= 2;
+  return std::min(tiles, piece / kv::kAttentionTileRows);
+}
+
 // Mpp is the shipped tensor-operation tile. Register is the Apple7/8 tile
 // (exact half INT8 or exact fp32 BF16 cache, fp32 queries and probabilities,
 // one simdgroup per eight fused rows). The device policy (ExecutionPlans)
@@ -181,7 +201,8 @@ struct AttentionOutputRows final {
 // variant, planned once a step: each sequence's history splits and the tiles
 // of it that run, the plan's kernels, and the dispatches of a split and a
 // reduce its sequences share. A dispatch holds sequences while their tiles'
-// splits fit the workspace, so no sequence's partition depends on another's.
+// splits fit the workspace, so no sequence's partition depends on another's,
+// or one sequence in pieces (plan's `pieceWork`), a split and reduce each.
 class AttentionPlan final {
 public:
   struct Sequence final {
@@ -191,6 +212,9 @@ public:
     // last row (PagedAttention::lastTiles).
     uint32_t firstTile = 0;
     uint32_t splits = 0;
+    // Its tiles run in pieces of this many, a split and reduce each
+    // (prefillAttentionPieceTiles); at once where they are no more.
+    uint32_t pieceTiles = 0;
     [[nodiscard]] uint32_t tiles() const noexcept { return kv::attentionTiles(rows); }
   };
   struct Dispatch final {
@@ -201,6 +225,9 @@ public:
     // The most splits of its sequences' tiles, and their splits all told.
     uint32_t splits = 0;
     uint32_t slots = 0;
+    // A sequence in pieces is a dispatch's alone, which runs its `pieces`
+    // in turn on its slots, `tiles` (its last the rest) each.
+    uint32_t pieces = 1;
   };
 
   const kv::Layout layout;
@@ -278,12 +305,16 @@ public:
   // device's `int8QueriesFromPages` pages each: a command's sequences share
   // the choice, as a decode step's lanes do. Apple7/8 run the register
   // `tile`, whose sequences of more than one tile split their history at
-  // least until their threadgroups fill the device's `gpuCores`.
+  // least until their threadgroups fill the device's `gpuCores`. With a
+  // `pieceWork` (kApple7PrefillAttentionPieceWork, a prompt chunk's on
+  // Apple7/8) a dense sequence attends in pieces of at most about that many
+  // pairs of its rows and the history they attend, a window's at most, each
+  // piece's tiles split as a sequence of that many.
   [[nodiscard]] static AttentionPlan plan(std::span<const kv::ChunkedPrefillParams> sequences, uint32_t queryHeads,
                                           kv::Layout layout, const AttentionCalibration &calibration,
                                           Int8Activations int8Activations, AttentionWorkspace capacity,
                                           AttentionVariant variant = {}, AttentionTile tile = AttentionTile::Mpp,
-                                          uint32_t gpuCores = 0);
+                                          uint32_t gpuCores = 0, uint64_t pieceWork = 0);
   // `plan`'s sequences from the tile that holds each one's last row: their
   // kernels and splits, so each tile computes what it does in `plan`.
   [[nodiscard]] static AttentionPlan lastTiles(const AttentionPlan &plan);

@@ -170,11 +170,15 @@ QwenTarget::PrefillStep QwenTarget::prefillStep(metal::CommandGraph &graph, cons
   }
   const ops::AttentionWorkspace workspace{chunk.buffers.attentionPartials.sizeBytes(),
                                           chunk.buffers.attentionStatistics.sizeBytes()};
+  // A prompt chunk's attention goes in the device's pieces; a decode step's
+  // lanes, whose few rows a tree may hold, at once.
+  const uint64_t pieceWork = step.decode ? 0 : operators_.prefillAttentionPieceWork();
   step.attention.emplace(operators_.attention(step.attentionSequences(), geometry_.attentionQueryHeads,
-                                              geometry_.kvLayout, workspace));
+                                              geometry_.kvLayout, workspace, {}, pieceWork));
   if (const uint32_t window = geometry_.kvLayout.windowTokens)
     step.windowedAttention.emplace(operators_.attention(step.attentionSequences(), geometry_.attentionQueryHeads,
-                                                        geometry_.kvLayout, workspace, {.windowTokens = window}));
+                                                        geometry_.kvLayout, workspace, {.windowTokens = window},
+                                                        pieceWork));
   if (geometry_.ffnKind == QwenFfnKind::SparseMoe)
     step.moe = operators_.moe(geometry_.moeShape(), geometry_.moeRouterFormat, chunk.rows,
                               chunk.decode ? ops::StepKind::Decode : ops::StepKind::Prefill);

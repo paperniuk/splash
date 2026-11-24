@@ -79,9 +79,9 @@ std::vector<uint32_t> ExecutionPlans::decodeRowClasses(uint32_t mostRows,
 
 AttentionPlan ExecutionPlans::attention(std::span<const kv::ChunkedPrefillParams> sequences, uint32_t queryHeads,
                                         kv::Layout layout, AttentionWorkspace capacity,
-                                        AttentionVariant variant) const {
+                                        AttentionVariant variant, uint64_t pieceWork) const {
   return PagedAttention::plan(sequences, queryHeads, layout, calibration().attention, linear_.int8Activations(),
-                              capacity, variant, attentionTile_, calibration().cores);
+                              capacity, variant, attentionTile_, calibration().cores, pieceWork);
 }
 
 DraftAttentionPlan ExecutionPlans::draftAttention(DraftAttentionShape shape,

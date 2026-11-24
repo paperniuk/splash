@@ -696,6 +696,12 @@ The rules:
    from `AttentionCalibration::int8QueriesFromPages` pages a split of the
    command's longest tile reads (8 on Apple10; never on Apple9, whose matrix
    operations share the FP32 pipe); a command's sequences share the choice.
+   On Apple7/8 a prompt chunk's dense sequence attends in pieces of rows
+   halved from 2048 while rows x (history + rows) passes 2^23 pairs (a
+   window's history at most its window), down to one tile
+   (`ops::prefillAttentionPieceTiles`): a split and a reduce a piece, each
+   piece's tiles split as a sequence of that many, so no dispatch keeps the
+   display waiting (a whole chunk ran ~490 ms after 32K tokens on an M2 Pro).
 
 The register-against-staged boundaries are measured table entries, not a
 cost model: the wave law, which describes the Apple10 staged tiles, does not
@@ -1149,7 +1155,8 @@ Target attention runs once a layer for every sequence of a command, a decode ste
 prompt chunk's sequences (`ops::PagedAttention`, `SplashAttentionSequence`): one q/k projection
 over all their rows, each sequence's queries staged after the one before it, and a split and a
 reduce for each run of sequences whose tiles' splits fit the workspace (`ops::AttentionPlan`),
-each sequence's split count its own bound's and history's. Every kernel
+each sequence's split count its own bound's and history's; on Apple7/8 a deep prompt sequence's
+split and reduce for each of its pieces (kernel-selection rule 5). Every kernel
 reads a sequence's rows from the command's layout (`ops::AttentionRows`, a `SplashLaneRows` a
 sequence): a prompt chunk's as its host writes them (`PrefillTensor::LaneLayout`), a decode step's
 as its selector writes them on the device (`DecodeTensor::LaneLayout`), each within its bound, its
