@@ -213,10 +213,15 @@ LinearConfig bf16Projection(const KernelCalibration &calibration, StepKind step,
   if (calibration.simdgroupMma && unit.registerTakes && w.rows <= kMaximumRegisterRows) {
     const bool onePassPair = gateUp && unit.oneFormat && (!unit.affine || tiles <= 2);
     // MLX affine units split by kApple7AffineRegisterLaw at one table tile's
-    // eight rows, so that every width takes the same split.
+    // eight rows in two passes, a pair in one pass too, so that every width
+    // takes the same split and adds its K partials in one order (one pass is
+    // bitwise two at one split). On a 16-core M2 Pro the 27B pair's S2 takes
+    // 1% more time a B1 cycle than the one-pass law's S1, but S1 at four
+    // table tiles leaves a branched B2 lane's logits at cosine 0.9989 of its
+    // chain's (model-runtime-oracle), S2 within 0.999.
     const uint32_t splits =
         unit.affine ? splitsFor(kApple7AffineRegisterLaw, n, k, GGUF_TABLE16_ROWS, unit.weightBits16, cores,
-                                onePassPair ? Passes::One : Passes::Two)
+                                Passes::Two)
                           .splits
                     : splitsFor(p.registerSplits, n, k, w.rows, unit.weightBits16, cores).splits;
     return {.tile = LinearTile::GgufRegister, .splits = splits, .oneGateUpPass = onePassPair, .fp32Table = true};

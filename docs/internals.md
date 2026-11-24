@@ -702,7 +702,11 @@ The rules:
    IQ2 formats and IQ1; `GridLookupOrQ2K`; `UnderFourBits`; `FourBitsOrMore`)
    is below its `RegisterBoundary`: 4 x column tiles x table tiles <
    belowQuarters x cores, a one-pass-eligible gate/up pair's column tiles
-   counting both tensors'. It splits by `registerSplits`. Otherwise the staged
+   counting both tensors'. It splits by `registerSplits`; on Apple7/8 (M1,
+   M2) an MLX affine unit splits instead by `kApple7AffineRegisterLaw` at one
+   table tile's rows in two passes, a one-pass gate/up pair's too, so every
+   width takes the same split and a row's sums do not change with the rows
+   batched beside it. Otherwise the staged
    tile runs at the fewest of 8, 16, 32, 48 or 64 rows that hold the plan's, split by
    `stagedSplits` (the Apple10 wave law also picks one or two passes for a
    pair of one format from `onePassFromCores`), its walks spread from
