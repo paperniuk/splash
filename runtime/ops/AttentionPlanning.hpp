@@ -147,15 +147,21 @@ inline uint32_t groupDispatches(std::span<const AttentionPlan::Sequence> sequenc
   uint32_t count = 0;
   for (uint32_t s = 0; s < sequences.size(); ++s) {
     const AttentionPlan::Sequence &sequence = sequences[s];
-    const uint32_t tiles = kv::attentionTiles(sequence.rows) - sequence.firstTile;
+    const uint32_t remaining = kv::attentionTiles(sequence.rows) - sequence.firstTile;
+    const uint32_t pieceTiles = sequence.pieceTiles ? sequence.pieceTiles : remaining;
+    const uint32_t pieces = (remaining + pieceTiles - 1) / pieceTiles;
+    const uint32_t tiles = std::min(remaining, pieceTiles);
     const uint32_t slots = tiles * sequence.splits * splitSlots;
     if (slots > workspaceSlots)
       throw std::invalid_argument("the attention workspace holds no sequence's splits");
-    // A sequence that does not fit the last dispatch starts the next.
-    if (!count || dispatches[count - 1].slots + slots > workspaceSlots)
+    // A sequence that does not fit the last dispatch starts the next, as do
+    // a sequence in pieces and the one after it.
+    if (!count || pieces > 1 || dispatches[count - 1].pieces > 1 ||
+        dispatches[count - 1].slots + slots > workspaceSlots)
       dispatches[count++] = {};
     AttentionPlan::Dispatch *dispatch = &dispatches[count - 1];
     dispatch->sequence[dispatch->sequences++] = s;
+    dispatch->pieces = pieces;
     dispatch->tiles += tiles;
     dispatch->splits = std::max(dispatch->splits, sequence.splits);
     dispatch->slots += slots;

@@ -90,9 +90,9 @@ ops::AttentionTile gTile = ops::AttentionTile::Mpp;
 // The plan of `sequences` in a workspace of `slots` tile splits.
 ops::AttentionPlan planOf(std::span<const kv::ChunkedPrefillParams> sequences, uint32_t queryHeads, kv::Layout layout,
                           ops::Int8Activations int8 = kBf16, uint32_t slots = 4 * ops::kAttentionSequenceSplits,
-                          ops::AttentionCalibration calibration = kApple10Row) {
+                          ops::AttentionCalibration calibration = kApple10Row, uint64_t pieceWork = 0) {
   return ops::PagedAttention::plan(sequences, queryHeads, layout, calibration, int8,
-                                   ops::PagedAttention::workspace(slots, queryHeads, layout), {}, gTile);
+                                   ops::PagedAttention::workspace(slots, queryHeads, layout), {}, gTile, 0, pieceWork);
 }
 ops::AttentionPlan planOf(kv::ChunkedPrefillParams sequence, uint32_t queryHeads, kv::Layout layout,
                           ops::Int8Activations int8 = kBf16, ops::AttentionCalibration calibration = kApple10Row) {
@@ -255,6 +255,84 @@ void checkGrouping(uint32_t queryHeads, kv::Layout layout) {
   rejects([&] { (void)planOf(sequences[0], queryHeads + 1, layout); },
           selectsBlocks(layout) ? "no sparse attention kernel for layout" : "no paged-attention kernel for layout",
           "a query head count without a kernel was accepted");
+}
+
+// Apple7/8's piece work (kApple7PrefillAttentionPieceWork) cuts a dense
+// sequence's tiles into pieces of rows halved from a full chunk's while rows
+// x (history + rows) passes it, down to one tile: 64-row pieces at 82K. A
+// sequence in pieces is a dispatch's alone, of a piece's tiles and slots
+// within a prompt chunk's workspace, and the sequences beside it take
+// dispatches of their own; its last tiles' plan attends at once on its
+// splits; and without a work, or sparse, a sequence attends at once on the
+// splits it always took.
+void checkPieces(uint32_t queryHeads, kv::Layout layout) {
+  using ops::prefillAttentionPieceTiles;
+  constexpr uint64_t work = ops::kApple7PrefillAttentionPieceWork;
+  static_assert(work == uint64_t{1} << 23);
+  static_assert(prefillAttentionPieceTiles(0, 2048, work) == 256 && prefillAttentionPieceTiles(14336, 2048, work) == 64 &&
+                prefillAttentionPieceTiles(30000, 2048, work) == 32 &&
+                prefillAttentionPieceTiles(82000, 2048, work) == 8 &&
+                prefillAttentionPieceTiles(124000, 2048, work) == 8 &&
+                prefillAttentionPieceTiles(124000, 100, work) == 8 && prefillAttentionPieceTiles(124000, 5, work) == 1 &&
+                prefillAttentionPieceTiles(82000, 2048, 0) == 256 &&
+                prefillAttentionPieceTiles(kv::kMaximumLogicalTokens - 2048, 2048, work) >= 1);
+  const bool sparse = selectsBlocks(layout);
+  for (const uint32_t history : {0U, 4000U, 32768U, 82000U, 131072U, kv::kMaximumLogicalTokens - 2048})
+    for (const uint32_t rows : {1U, 77U, 2048U}) {
+      const kv::ChunkedPrefillParams sequence = sequenceOf(history, rows);
+      const auto pieced = planOf(std::span(&sequence, 1), queryHeads, layout, kBf16, ops::kAttentionSequenceSplits,
+                                 kApple10Row, work);
+      const auto whole = planOf(sequence, queryHeads, layout);
+      const uint32_t tiles = kv::attentionTiles(rows);
+      const uint32_t pieceTiles = sparse ? tiles : prefillAttentionPieceTiles(history, rows, work);
+      const uint32_t pieces = (tiles + pieceTiles - 1) / pieceTiles;
+      const ops::AttentionPlan::Sequence &planned = pieced.sequences()[0];
+      require(whole.sequences()[0].pieceTiles == tiles && whole.dispatches()[0].pieces == 1,
+              "a sequence without a piece work did not attend at once");
+      require(planned.pieceTiles == pieceTiles && pieced.dispatches().size() == 1 &&
+                  pieced.dispatches()[0].pieces == pieces &&
+                  pieced.dispatches()[0].tiles == (pieces > 1 ? pieceTiles : tiles) &&
+                  pieced.dispatches()[0].slots == pieced.dispatches()[0].tiles * planned.splits &&
+                  pieced.dispatches()[0].slots <= ops::kAttentionSequenceSplits,
+              "a sequence in pieces is not a dispatch of its pieces: " + std::to_string(rows) + " rows after " +
+                  std::to_string(history));
+      require(pieceTiles == 1 || pieceTiles == tiles ||
+                  uint64_t{pieceTiles} * 8 * (uint64_t{history} + pieceTiles * 8) <= work,
+              "a piece holds more than its work");
+      require(pieces > 1 || planned.splits == whole.sequences()[0].splits,
+              "a sequence attended at once changed its splits");
+      const auto tails = ops::PagedAttention::lastTiles(pieced);
+      require(tails.dispatches().size() == 1 && tails.dispatches()[0].pieces == 1 &&
+                  tails.dispatches()[0].tiles == 1 && tails.sequences()[0].splits == planned.splits,
+              "a sequence in pieces' last tile does not attend at once on its splits");
+    }
+  if (sparse) return;
+  const std::array deepFirst{sequenceOf(82000, 2048), sequenceOf(0, 13), sequenceOf(300, 5)};
+  const auto apart = planOf(deepFirst, queryHeads, layout, kBf16, 4 * ops::kAttentionSequenceSplits, kApple10Row, work);
+  require(apart.dispatches().size() == 2 && apart.dispatches()[0].sequences == 1 &&
+              apart.dispatches()[0].pieces == 32 && apart.dispatches()[1].sequences == 2 &&
+              apart.dispatches()[1].sequence[0] == 1 && apart.dispatches()[1].pieces == 1,
+          "a sequence in pieces shared a dispatch, or the sequences after it did not");
+  const std::array deepBetween{sequenceOf(0, 13), sequenceOf(82000, 2048), sequenceOf(300, 5)};
+  const auto between =
+      planOf(deepBetween, queryHeads, layout, kBf16, 4 * ops::kAttentionSequenceSplits, kApple10Row, work);
+  require(between.dispatches().size() == 3 && between.dispatches()[1].pieces == 32 &&
+              between.dispatches()[2].sequence[0] == 2,
+          "a sequence in pieces between two others did not take a dispatch of its own");
+}
+
+// A window's rows attend at most its keys, so its plan cuts a sequence by
+// the window, not its history: a full chunk after 82K attends at once.
+void checkWindowPieces() {
+  const kv::Layout layout{.attentionLayers = 1, .kvHeads = 4, .headDimension = 128};
+  const kv::ChunkedPrefillParams sequence = sequenceOf(82000, 2048);
+  for (const uint32_t window : {0U, 512U}) {
+    const auto plan = ops::PagedAttention::plan(
+        std::span(&sequence, 1), 32, layout, kApple10Row, kBf16,
+        ops::PagedAttention::workspace(ops::kAttentionSequenceSplits, 32, layout), {.windowTokens = window}, gTile, 0,
+        ops::kApple7PrefillAttentionPieceWork);
+    require(plan.dispatches()[0].pieces == (window ? 1U : 32U), "a window's sequence was cut by its history");
+  }
 }
 
 // With int8 activations on, INT8 pages score against INT8 queries (the q8q
@@ -701,6 +779,8 @@ struct Run final {
   ops::Int8Activations int8 = kInt8;
   bool lastTiles = false;
   bool testBounds = false;
+  // The plan's piece work (ops::PagedAttention::plan's `pieceWork`).
+  uint64_t pieceWork = 0;
   // The out-projection's table the reduce writes beside its rows, and the
   // scratch that takes it (AttentionOutputRows).
   ops::LinearInput input = ops::LinearInput::Plain;
@@ -713,7 +793,8 @@ struct Run final {
 // command's sequences, each dispatch checked against its plan; its output,
 // the out-projection's input rows (Case::outputIndex).
 std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, const Run &how = {}) {
-  const ops::AttentionPlan whole = planOf(data.sequences(), data.queryHeads, data.layout, how.int8, how.slots);
+  const ops::AttentionPlan whole =
+      planOf(data.sequences(), data.queryHeads, data.layout, how.int8, how.slots, kApple10Row, how.pieceWork);
   const ops::AttentionPlan plan = how.lastTiles ? ops::PagedAttention::lastTiles(whole) : whole;
   constexpr uint64_t guardBytes = 256;
   const uint64_t written = how.lastTiles ? data.lanes : data.rowBegin(data.lanes);
@@ -781,10 +862,74 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, const Run &h
   require(how.stage || attention == first + 1, "the case's store should encode one dispatch before the attention");
   // Each planned dispatch runs as a dispatch per run of its sequences that
   // read their layer in one placement (SplashAttentionParams::kv): a split and
-  // a reduce each, on the planned dispatch's partial slots.
+  // a reduce each, on the planned dispatch's partial slots; a sequence in
+  // pieces, a dispatch's alone, a split and a reduce per piece, each on the
+  // dispatch's slots from the first.
   const auto &dispatches = graph.dispatches();
   size_t encoded = attention;
+  // The split and reduce of `run` on slots from `slot`, whose sequences'
+  // tiles from `firstTile(lane)` on it attends.
+  const auto checkRun = [&](const ops::AttentionPlan::Dispatch &run, SplashKvLayer layer, uint32_t slot,
+                            const std::function<uint32_t(uint32_t)> &firstTile) {
+    const auto checkDispatch = [&](const metal::ComputeDispatch &dispatch, metal::DispatchSize groups,
+                                   std::string_view pipeline) {
+      require(dispatch.pipelineName == pipeline && dispatch.threadgroups.x == groups.x &&
+                  dispatch.threadgroups.y == groups.y && dispatch.threadgroups.z == groups.z &&
+                  dispatch.bytes.size() == 1 && dispatch.bytes[0].sizeBytes == sizeof(kv::AttentionParams),
+              "production attention dispatch departed from its plan");
+      kv::AttentionParams params;
+      std::memcpy(&params, dispatch.bytes[0].data, sizeof(params));
+      require(params.sequences == run.sequences && params.first_sequence == run.sequence[0] &&
+                  params.rows == command.rows && params.tiles == run.tiles &&
+                  params.kv.extent_pages == layer.extent_pages && params.kv.offset == layer.offset,
+              "a dispatch's parameters do not hold its sequences");
+      uint32_t tile = 0, next = slot;
+      for (uint32_t s = 0; s < run.sequences; ++s) {
+        const uint32_t lane = run.sequence[s], skipped = firstTile(lane) * 8;
+        const SplashAttentionSequence &sequence = params.sequence[s];
+        require(sequence.committed_tokens == data.stores[lane].committed_tokens + skipped &&
+                    sequence.row_bound == data.stores[lane].chunk_tokens - skipped &&
+                    sequence.layout_row == skipped &&
+                    sequence.stage_row == data.stageRow(lane) + skipped &&
+                    sequence.chunk_stride == data.stores[lane].chunk_stride &&
+                    sequence.page_table_entries == data.stores[lane].page_table_entries &&
+                    sequence.split_count == plan.sequences()[lane].splits && sequence.first_tile == tile &&
+                    sequence.first_slot == next && sequence.block_stride == blocks.stride &&
+                    sequence.block_list == (blocks.stride ? data.firstList(lane) + firstTile(lane) : 0),
+                "recorded attention ABI does not describe the actual plan");
+        const uint32_t tiles = kv::attentionTiles(sequence.row_bound);
+        tile += tiles;
+        next += tiles * data.layout.kvHeads * sequence.split_count;
+      }
+      return next;
+    };
+    require(dispatches.size() >= encoded + 2, "production attention encoded fewer dispatches than its runs");
+    const uint32_t next = checkDispatch(dispatches[encoded], plan.splitGroups(run),
+                                        plan.splitPipeline(static_cast<bool>(blocks.locations)));
+    checkDispatch(dispatches[encoded + 1], plan.reduceGroups(run),
+                  std::string(plan.reducePipeline()) + ops::tableSuffix(how.input));
+    encoded += 2;
+    return next;
+  };
+  const auto plannedFirstTile = [&](uint32_t lane) { return plan.sequences()[lane].firstTile; };
   for (const ops::AttentionPlan::Dispatch &planned : plan.dispatches()) {
+    if (planned.pieces > 1) {
+      const uint32_t lane = planned.sequence[0];
+      const ops::AttentionPlan::Sequence &sequence = plan.sequences()[lane];
+      const uint32_t end = kv::attentionTiles(sequence.rows);
+      require(planned.sequences == 1 && planned.tiles == sequence.pieceTiles &&
+                  planned.slots == sequence.pieceTiles * sequence.splits &&
+                  planned.pieces == (end - sequence.firstTile + sequence.pieceTiles - 1) / sequence.pieceTiles,
+              "a sequence in pieces is not a dispatch of its pieces alone");
+      for (uint32_t first = sequence.firstTile; first < end; first += sequence.pieceTiles) {
+        ops::AttentionPlan::Dispatch piece{};
+        piece.sequence[piece.sequences++] = lane;
+        piece.tiles = std::min(sequence.pieceTiles, end - first);
+        piece.splits = sequence.splits;
+        static_cast<void>(checkRun(piece, histories[lane].kv, 0, [&](uint32_t) { return first; }));
+      }
+      continue;
+    }
     uint32_t slot = 0;
     for (uint32_t first = 0, end = 0; first < planned.sequences; first = end) {
       const SplashKvLayer layer = histories[planned.sequence[first]].kv;
@@ -798,46 +943,7 @@ std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, const Run &h
         run.tiles += tiles;
         run.splits = std::max(run.splits, sequence.splits);
       }
-      const auto checkDispatch = [&](const metal::ComputeDispatch &dispatch, metal::DispatchSize groups,
-                                     std::string_view pipeline) {
-        require(dispatch.pipelineName == pipeline && dispatch.threadgroups.x == groups.x &&
-                    dispatch.threadgroups.y == groups.y && dispatch.threadgroups.z == groups.z &&
-                    dispatch.bytes.size() == 1 && dispatch.bytes[0].sizeBytes == sizeof(kv::AttentionParams),
-                "production attention dispatch departed from its plan");
-        kv::AttentionParams params;
-        std::memcpy(&params, dispatch.bytes[0].data, sizeof(params));
-        require(params.sequences == run.sequences && params.first_sequence == run.sequence[0] &&
-                    params.rows == command.rows && params.tiles == run.tiles &&
-                    params.kv.extent_pages == layer.extent_pages && params.kv.offset == layer.offset,
-                "a dispatch's parameters do not hold its sequences");
-        uint32_t tile = 0, next = slot;
-        for (uint32_t s = 0; s < run.sequences; ++s) {
-          const uint32_t lane = run.sequence[s], skipped = plan.sequences()[lane].firstTile * 8;
-          const SplashAttentionSequence &sequence = params.sequence[s];
-          require(sequence.committed_tokens == data.stores[lane].committed_tokens + skipped &&
-                      sequence.row_bound == data.stores[lane].chunk_tokens - skipped &&
-                      sequence.layout_row == skipped &&
-                      sequence.stage_row == data.stageRow(lane) + skipped &&
-                      sequence.chunk_stride == data.stores[lane].chunk_stride &&
-                      sequence.page_table_entries == data.stores[lane].page_table_entries &&
-                      sequence.split_count == plan.sequences()[lane].splits && sequence.first_tile == tile &&
-                      sequence.first_slot == next && sequence.block_stride == blocks.stride &&
-                      sequence.block_list ==
-                          (blocks.stride ? data.firstList(lane) + plan.sequences()[lane].firstTile : 0),
-                  "recorded attention ABI does not describe the actual plan");
-          const uint32_t tiles = kv::attentionTiles(sequence.row_bound);
-          tile += tiles;
-          next += tiles * data.layout.kvHeads * sequence.split_count;
-        }
-        return next;
-      };
-      require(dispatches.size() >= encoded + 2, "production attention encoded fewer dispatches than its runs");
-      const uint32_t next = checkDispatch(dispatches[encoded], plan.splitGroups(run),
-                                          plan.splitPipeline(static_cast<bool>(blocks.locations)));
-      checkDispatch(dispatches[encoded + 1], plan.reduceGroups(run),
-                    std::string(plan.reducePipeline()) + ops::tableSuffix(how.input));
-      slot = next;
-      encoded += 2;
+      slot = checkRun(run, layer, slot, plannedFirstTile);
     }
   }
   require(dispatches.size() == encoded, "production attention encoded other dispatches than its runs'");
@@ -936,11 +1042,11 @@ void checkLastTiles(metal::MetalBackend &backend, uint32_t heads, kv::Layout lay
 // pool beside it, in a dispatch of its own (its layer placed apart), with
 // the bits it has in one dispatch with the first.
 void checkStagedPrefill(metal::MetalBackend &backend, uint32_t heads, kv::Layout layout, uint32_t history,
-                        uint32_t rows, bool masks) {
+                        uint32_t rows, bool masks, uint64_t pieceWork = 0) {
   const std::array lanes{Lane{rows, history, 0}, Lane{13, history / 2 + 5, 1}};
   auto data = makeCase(backend, heads, layout, lanes);
   if (masks) setQsaMasks(data);
-  const std::vector<uint16_t> baseline = run(backend, data);
+  const std::vector<uint16_t> baseline = run(backend, data, {.pieceWork = pieceWork});
   const uint32_t pages = data.stores[0].page_table_entries, chunkFirst = history / kv::kPageTokens;
   kv::Layout stagingLayout = layout;
   stagingLayout.attentionLayers = 1;
@@ -961,7 +1067,7 @@ void checkStagedPrefill(metal::MetalBackend &backend, uint32_t heads, kv::Layout
     const auto to = staging.layerSpans(stagedPages[page], 0);
     for (size_t tensor = 0; tensor < from.size(); ++tensor) std::ranges::copy(from[tensor], to[tensor].begin());
   }
-  const std::vector<uint16_t> output = run(backend, data, {.stage = [&](metal::CommandGraph &graph) {
+  const std::vector<uint16_t> output = run(backend, data, {.pieceWork = pieceWork, .stage = [&](metal::CommandGraph &graph) {
                                                              const SplashKvLayer layer = staging.layer(0);
                                                              if (chunkFirst)
                                                                ops::PagedAttention::addStageLayer(
@@ -985,7 +1091,27 @@ void checkStagedPrefill(metal::MetalBackend &backend, uint32_t heads, kv::Layout
     }
   }
   std::cout << "staged prefill: format=" << kv::formatName(layout.format) << " q=" << heads << " history=" << history
-            << " rows=" << rows << (masks ? " lists" : "") << " PASS\n";
+            << " rows=" << rows << (masks ? " lists" : "") << (pieceWork ? " pieces" : "") << " PASS\n";
+}
+
+// A chunk attended in pieces of at most about `pieceWork` row-history pairs
+// (ops::PagedAttention::plan) matches the oracle like a whole chunk, and its
+// last tile attended alone on the pieces' splits writes the bits its pieces
+// write for its last row.
+void checkPiecedPrefill(metal::MetalBackend &backend, uint32_t heads, kv::Layout layout, uint32_t history,
+                        uint32_t rows, uint64_t pieceWork) {
+  const std::array lane{Lane{rows, history, 0}};
+  auto data = makeCase(backend, heads, layout, lane);
+  const std::vector<uint16_t> pieced = run(backend, data, {.testBounds = true, .pieceWork = pieceWork});
+  checkReference(data, pieced);
+  const std::vector<uint16_t> tail = run(backend, data, {.lastTiles = true, .pieceWork = pieceWork});
+  const uint64_t rowValues = uint64_t{heads} * layout.headDimension;
+  const uint64_t at = data.outputIndex(0, 0, 0, 0, true), from = data.outputIndex(0, 0, rows - 1, 0);
+  require(std::equal(tail.begin() + std::ptrdiff_t(at), tail.begin() + std::ptrdiff_t(at + rowValues),
+                     pieced.begin() + std::ptrdiff_t(from)),
+          "a pieced chunk's last tile differs from its pieces' last row");
+  std::cout << "paged attention pieces: format=" << kv::formatName(layout.format) << " q=" << heads
+            << " history=" << history << " rows=" << rows << " work=" << pieceWork << " PASS\n";
 }
 
 // Lanes through block locations (ops::AttentionBlocks::locations, as the hot
@@ -2188,7 +2314,9 @@ int main(int argc, char **argv) {
         checkSplitRule(geometry.queryHeads, geometry.layout(format));
         checkGrouping(geometry.queryHeads, geometry.layout(format));
         checkInt8Queries(geometry.queryHeads, geometry.layout(format));
+        checkPieces(geometry.queryHeads, geometry.layout(format));
       }
+    checkWindowPieces();
     if (argc == 1) {
       std::cout << "paged attention plans: CPU PASS\n";
       return 0;
@@ -2247,6 +2375,8 @@ int main(int argc, char **argv) {
             const std::array lane{Lane{2048, history, 0}};
             auto chunkCase = makeCase(backend, geometry.queryHeads, layout, lane);
             checkReference(chunkCase, run(backend, chunkCase, {.testBounds = true}));
+            if (!selectsBlocks(layout))
+              checkReference(chunkCase, run(backend, chunkCase, {.pieceWork = ops::kApple7PrefillAttentionPieceWork}));
             auto lanesCase = makeCase(backend, geometry.queryHeads, layout, lanesOf(4, kLaneRows, history));
             checkReference(lanesCase, run(backend, lanesCase, {.testBounds = true}));
             std::cout << "long attention: format=" << kv::formatName(format) << " q=" << geometry.queryHeads
@@ -2293,6 +2423,16 @@ int main(int argc, char **argv) {
           checkReference(lanesCase, run(backend, lanesCase));
           std::cout << "paged sparse attention: format=" << kv::formatName(format) << " PASS\n";
           checkLocations(backend, heads, layout);
+        }
+        // Pieces: Apple7/8's two of 1024 rows of a full chunk after 6145
+        // tokens; forced small, a ragged last piece (77 rows after 700 in
+        // 32-row pieces) and one-tile pieces (1057 rows after 4093); and a
+        // chunk in pieces through staged history.
+        if (!selectsBlocks(layout)) {
+          checkPiecedPrefill(backend, heads, layout, 6145, 2048, ops::kApple7PrefillAttentionPieceWork);
+          checkPiecedPrefill(backend, heads, layout, 700, 77, uint64_t{1} << 15);
+          checkPiecedPrefill(backend, heads, layout, 4093, 1057, uint64_t{1} << 16);
+          checkStagedPrefill(backend, heads, layout, 4096, 130, false, uint64_t{1} << 16);
         }
         for (const auto [history, rows] : std::array<std::array<uint32_t, 2>, 2>{{{6145, 77}, {4096, 130}}}) {
           checkStagedPrefill(backend, heads, layout, history, rows, false);

@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -270,7 +271,8 @@ metal::DispatchSize AttentionPlan::reduceGroups(const Dispatch &dispatch) const 
 AttentionPlan PagedAttention::plan(std::span<const kv::ChunkedPrefillParams> sequences, uint32_t queryHeads,
                                    kv::Layout layout, const AttentionCalibration &calibration,
                                    Int8Activations int8Activations, AttentionWorkspace capacity,
-                                   AttentionVariant variant, AttentionTile tile, uint32_t gpuCores) {
+                                   AttentionVariant variant, AttentionTile tile, uint32_t gpuCores,
+                                   uint64_t pieceWork) {
   const CompiledAttention &kernel = compiledAttention(queryHeads, layout, variant);
   static_cast<void>(commandRows(sequences, layout));
   const AttentionWorkspace slot = attentionWorkspace(slotRows(queryHeads), layout.headDimension);
@@ -291,10 +293,16 @@ AttentionPlan PagedAttention::plan(std::span<const kv::ChunkedPrefillParams> seq
                                ? 0
                                : readPages(uint64_t{chunk.committed_tokens} + chunk.chunk_tokens,
                                            variant.windowTokens);
-    const uint32_t splits = attentionSplits(tiles, pages, variant.windowTokens, calibration.pagesPerSplit,
+    // Sparse tiles' block lists follow the whole sequence's tiles, so it
+    // attends at once.
+    const uint32_t attended =
+        variant.windowTokens ? std::min(chunk.committed_tokens, variant.windowTokens) : chunk.committed_tokens;
+    const uint32_t pieceTiles =
+        sparse ? tiles : prefillAttentionPieceTiles(attended, chunk.chunk_tokens, pieceWork);
+    const uint32_t splits = attentionSplits(pieceTiles, pages, variant.windowTokens, calibration.pagesPerSplit,
                                             layout.kvHeads, tile, gpuCores);
     splitReads = std::max(splitReads, (pages + splits - 1) / splits);
-    plan.sequences_[plan.sequenceCount_++] = {chunk.chunk_tokens, chunk.committed_tokens, 0, splits};
+    plan.sequences_[plan.sequenceCount_++] = {chunk.chunk_tokens, chunk.committed_tokens, 0, splits, pieceTiles};
   }
   const std::string suffix = splitSuffix(kernel, variant);
   // The register tile has no INT8 query codes: it reads INT8 keys as exact half.
@@ -393,7 +401,8 @@ PreparedInput PagedAttention::addAttention(metal::CommandGraph &graph, const Att
     requireBlocks(histories[s].blocks, plan.sparse, kv::attentionTiles(planned[s].rows));
     // A tree's rows are a block's from its anchor, a bit of a row's
     // ancestors each, and through lists their row masks too.
-    if (rows.tree && (planned[s].firstTile || planned[s].rows > 32))
+    if (rows.tree && (planned[s].firstTile || planned[s].rows > 32 ||
+                      planned[s].pieceTiles < kv::attentionTiles(planned[s].rows)))
       throw std::invalid_argument("attention tree rows take whole blocks of at most 32 rows");
     if (rows.tree && histories[s].blocks.stride)
       requireBytes(histories[s].blocks.rowMasks, uint64_t{rows.rows} * sizeof(uint32_t), "attention row masks");
@@ -433,8 +442,10 @@ PreparedInput PagedAttention::addAttention(metal::CommandGraph &graph, const Att
   // two placements (a spilled history staged apart from the pool), each run of
   // them that reads one is a dispatch of its own, on the planned dispatch's
   // partial slots.
-  // A dispatch's sequences are the plan's from its first on (group).
-  const auto encode = [&](const AttentionPlan::Dispatch &dispatch, SplashKvLayer layer, uint32_t firstSlot) {
+  // A dispatch's sequences are the plan's from its first on (group). A piece
+  // of a sequence's tiles, from `pieceTile` on, is a dispatch's alone.
+  const auto encode = [&](const AttentionPlan::Dispatch &dispatch, SplashKvLayer layer, uint32_t firstSlot,
+                          std::optional<uint32_t> pieceTile = std::nullopt) {
     kv::AttentionParams params{.sequences = dispatch.sequences,
                                .first_sequence = dispatch.sequence[0],
                                .rows = rows.rows,
@@ -463,13 +474,14 @@ PreparedInput PagedAttention::addAttention(metal::CommandGraph &graph, const Att
       if (blocks.locations && !history.blocks.stride)
         throw std::invalid_argument("a located attention dispatch's sequences all read block lists");
       SplashAttentionSequence &entry = params.sequence[d];
-      entry = sequenceRows(sequences[s], command, s, sequence.firstTile * kv::kAttentionTileRows);
+      const uint32_t firstTile = pieceTile.value_or(sequence.firstTile);
+      entry = sequenceRows(sequences[s], command, s, firstTile * kv::kAttentionTileRows);
       entry.split_count = sequence.splits;
       entry.first_tile = tile;
       entry.first_slot = slot;
       entry.block_stride = history.blocks.stride;
-      entry.block_list = history.blocks.stride ? history.blocks.list + sequence.firstTile : 0;
-      const uint32_t tiles = kv::attentionTiles(sequence.rows) - sequence.firstTile;
+      entry.block_list = history.blocks.stride ? history.blocks.list + firstTile : 0;
+      const uint32_t tiles = pieceTile ? dispatch.tiles : kv::attentionTiles(sequence.rows) - firstTile;
       tile += tiles;
       slot += tiles * plan.layout.kvHeads * sequence.splits;
       tables[d] = history.pageTable;
@@ -500,6 +512,20 @@ PreparedInput PagedAttention::addAttention(metal::CommandGraph &graph, const Att
     return slot;
   };
   for (const AttentionPlan::Dispatch &dispatch : plan.dispatches()) {
+    if (dispatch.pieces > 1) {
+      // Each piece runs on the dispatch's slots after the one before it.
+      const uint32_t s = dispatch.sequence[0];
+      const AttentionPlan::Sequence &sequence = planned[s];
+      const uint32_t end = kv::attentionTiles(sequence.rows);
+      for (uint32_t first = sequence.firstTile; first < end; first += sequence.pieceTiles) {
+        AttentionPlan::Dispatch piece = dispatch;
+        piece.tiles = std::min(sequence.pieceTiles, end - first);
+        piece.slots = piece.tiles * sequence.splits;
+        piece.pieces = 1;
+        static_cast<void>(encode(piece, histories[s].kv, 0, first));
+      }
+      continue;
+    }
     uint32_t slot = 0;
     for (uint32_t first = 0, end = 0; first < dispatch.sequences; first = end) {
       const SplashKvLayer layer = histories[dispatch.sequence[first]].kv;

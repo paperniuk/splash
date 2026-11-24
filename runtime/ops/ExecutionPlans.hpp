@@ -72,10 +72,16 @@ public:
                                                        std::optional<std::pair<MoeShape, uint32_t>> moe) const;
 
   // The attention of a command's sequences (PagedAttention::plan) whose
-  // dispatches fit `capacity`, the workspace bound to it.
+  // dispatches fit `capacity`, the workspace bound to it, in pieces of at
+  // most about `pieceWork` row-history pairs where one is given.
   [[nodiscard]] AttentionPlan attention(std::span<const kv::ChunkedPrefillParams> sequences, uint32_t queryHeads,
                                         kv::Layout layout, AttentionWorkspace capacity,
-                                        AttentionVariant variant = {}) const;
+                                        AttentionVariant variant = {}, uint64_t pieceWork = 0) const;
+  // The piece work of a prompt chunk's attention: Apple7/8's, whose register
+  // tile it runs, bounds each dispatch for the display; none elsewhere.
+  [[nodiscard]] uint64_t prefillAttentionPieceWork() const noexcept {
+    return attentionTile_ == AttentionTile::Register ? kApple7PrefillAttentionPieceWork : 0;
+  }
   [[nodiscard]] DraftAttentionPlan draftAttention(
       DraftAttentionShape shape, uint32_t lanes) const;
   // The plan of `rows` rows of `step`'s work through a MoE target's blocks,

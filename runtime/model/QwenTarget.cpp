@@ -195,11 +195,13 @@ QwenTarget::PrefillStep QwenTarget::prefillStep(metal::CommandGraph &graph, cons
 void QwenTarget::planAttention(PrefillStep &step) const {
   const ops::AttentionWorkspace workspace{step.buffers.attentionPartials.sizeBytes(),
                                           step.buffers.attentionStatistics.sizeBytes()};
+  const uint64_t pieceWork = step.decode ? 0 : operators_.prefillAttentionPieceWork();
   step.attention.emplace(operators_.attention(step.attentionSequences(), geometry_.attentionQueryHeads,
-                                              geometry_.kvLayout, workspace));
+                                              geometry_.kvLayout, workspace, {}, pieceWork));
   if (const uint32_t window = geometry_.kvLayout.windowTokens)
     step.windowedAttention.emplace(operators_.attention(step.attentionSequences(), geometry_.attentionQueryHeads,
-                                                        geometry_.kvLayout, workspace, {.windowTokens = window}));
+                                                        geometry_.kvLayout, workspace, {.windowTokens = window},
+                                                        pieceWork));
 }
 
 void QwenTarget::addKvPathCommit(metal::CommandGraph &graph, kv::Layout layout, uint32_t extentPages,
