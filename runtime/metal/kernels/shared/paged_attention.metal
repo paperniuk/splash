@@ -430,6 +430,11 @@ inline void inkling_split_phase(device const bfloat *queries, device const bfloa
   for (uint page = begin; page < end; ++page) {
     const SplashKvPageTensors<CacheElement> tensors = addressing.page(page_table[page]);
     const bool near = page * 32 + 31 + 1024 > nearest_row;
+    // A prompt chunk's page wholly before its first row, of a layer without a window, and past the bias's
+    // reach: every key is visible to every row and takes no bias, so its scores take no mask. Only the prompt
+    // tile (TileRows 16) compiles it; in a verify kernel the branch alone cost 2.4% at a 32K history. Skipping
+    // the mask took a 512-row chunk's full-layer attention from 36.2 to 32.3 ms at 32K on an M1 Max.
+    const bool interior = TileRows == 16 && !params.trees && !params.last_rows && page * 32 + 31 < first_pos;
     // The span's first distance: the lowest row's from the page's last key (negative distances are masked).
     const int first_distance = int(pos_lo) - int(page * 32 + 31);
     if (!CachedBias && matrix_bias && near) {
@@ -463,6 +468,16 @@ inline void inkling_split_phase(device const bfloat *queries, device const bfloa
       }
     bool2 seen[4];
     float2 local_max(-INFINITY);
+    if (interior && !near) {
+#pragma unroll
+      for (uint s = 0; s < 4; ++s) {
+        seen[s] = bool2(true);
+        if constexpr (is_same<CacheElement, int8_t>::value)
+          scores[s] *= tensors.key_scales[q8sgf::page_token(fm, s)];
+        scores[s] = scores[s] * 0.08838834764831845f;
+        local_max = max(local_max, scores[s]);
+      }
+    } else
 #pragma unroll
     for (uint s = 0; s < 4; ++s) {
       const uint token = page * 32 + q8sgf::page_token(fm, s);
