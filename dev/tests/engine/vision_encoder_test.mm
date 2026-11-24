@@ -10,8 +10,9 @@
 // numpy reference. It then verifies determinism, a second grid through the
 // same scratch arena, and reports the encode time of a 64x64-patch image.
 // The embeddings' SHA-256 of the fixture and of synthetic grids must equal
-// those FIXTURE_DIR/embedding_digests.txt pins (embedding_digests.apple9.txt
-// on Apple9), a line `GRID SHA-256` each, where it pins them: a change that
+// those FIXTURE_DIR/embedding_digests.txt pins (embedding_digests.appleN.txt
+// on AppleN up to Apple9), a line `GRID SHA-256` each, where it pins them;
+// a family whose file pins none compares none and says so. A change that
 // keeps the tower's arithmetic keeps its bits. A family's vision weights,
 // GGUF or MLX, are its upstream bf16 values, so one family's pins hold for
 // each. Under MTL_SHADER_VALIDATION the shaders compile to other bits, so a
@@ -20,7 +21,9 @@
 // without validation on Apple10 GPUs of 16, 20 and 32 cores and on Apple11.
 // Apple9 rounds the same kernels otherwise and has pins of its own, taken on
 // a 10-core M4 for Qwen3.6-35B-A3B, the one family whose tower a Mac of that
-// family here holds.
+// family here holds. Apple8 runs the simdgroup MMA kernels of every Apple7/8
+// GPU, whatever its core count; its pins were taken on a 16-core M2 Pro for
+// Qwen3.8-27B. Apple7 has none yet.
 
 #include "LinearNumerics.hpp"
 #include "TestChecks.hpp"
@@ -151,10 +154,18 @@ std::string embeddingDigest(const std::vector<float> &embeddings) {
       {reinterpret_cast<const uint8_t *>(embeddings.data()), embeddings.size() * sizeof(float)});
 }
 
-// The digests the GPU family's file pins, by grid name; none without it.
-std::map<std::string, std::string> pinnedDigests(const std::string &fixture, uint32_t appleGpuFamily) {
+// The file that pins a GPU family's digests: Apple9 and the Apple7/8 MMA
+// kernels round the tower otherwise than Apple10 and later, so each family
+// up to Apple9 has a file of its own.
+std::string digestFile(const std::string &fixture, uint32_t appleGpuFamily) {
+  return fixture + (appleGpuFamily <= 9 ? "/embedding_digests.apple" + std::to_string(appleGpuFamily) + ".txt"
+                                        : std::string("/embedding_digests.txt"));
+}
+
+// The digests a digest file pins, by grid name; none without it.
+std::map<std::string, std::string> pinnedDigests(const std::string &path) {
   std::map<std::string, std::string> pinned;
-  std::ifstream file(fixture + (appleGpuFamily == 9 ? "/embedding_digests.apple9.txt" : "/embedding_digests.txt"));
+  std::ifstream file(path);
   std::string grid, digest;
   while (file >> grid >> digest) pinned[grid] = digest;
   return pinned;
@@ -259,9 +270,12 @@ int main(int argc, char **argv) {
       // at most 0.018 for the 27B, against 0.15; a corrupted row is off by
       // about its whole norm.
       bool pass = parity.relativeError < 0.03 && parity.worstRowError < 0.15;
-      const std::map<std::string, std::string> pinned = pinnedDigests(fixture, backend.capabilities().appleGpuFamily);
+      const std::string pinFile = digestFile(fixture, backend.capabilities().appleGpuFamily);
+      const std::map<std::string, std::string> pinned = pinnedDigests(pinFile);
       const bool validation = shaderValidation();
-      if (validation && !pinned.empty())
+      if (pinned.empty())
+        std::printf("embedding digests: not compared, no pins in %s for this GPU family\n", pinFile.c_str());
+      else if (validation)
         std::printf("embedding digests: not compared with the pins under MTL_SHADER_VALIDATION\n");
       for (const auto &[name, digest] : digests) {
         const auto found = pinned.find(name);

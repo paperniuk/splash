@@ -112,9 +112,20 @@ inline void gemm(device const bfloat *input, device const bfloat *weights,
 // softmax runs in registers; P is rounded to bf16 as the MPP kernel rounds
 // its probabilities, and the row sums keep the unrounded exponents.
 constexpr constant uint kRows = SPLASH_DENSE_ATTENTION_MMA_ROWS, kKeys = 32, kHeadDim = 72, kQkDim = 80;
-constexpr constant uint kKeyStride = 84, kValueStride = 76;  // bank-spread rows
+constexpr constant uint kKeyStride = 84;  // bank-spread rows
+// Values stage as pairs of rows interleaved, row 2 i + r of dimension c at
+// i kPairStride + 2 c + r: the two rows of a dimension PV takes are one
+// float2, half the threadgroup loads (and validated checks) of two scalars.
+constexpr constant uint kPairStride = 2 * kHeadDim;
 constexpr constant uint kThreads = SPLASH_DENSE_ATTENTION_MMA_THREADS;
 static_assert(kThreads / 32 * 8 == kRows, "eight rows per simdgroup");
+// Keys and values stage as 16-byte runs of eight bf16, 320 runs of keys and
+// 144 pairs of runs of values a block: a run never crosses a row, and lands
+// on 16-byte aligned threadgroup floats. DenseAttention::add refuses key and
+// value strides that are not whole runs.
+constexpr constant uint kKeyRuns = kKeys * kQkDim / 8, kValuePairRuns = kKeys / 2 * kHeadDim / 8;
+static_assert(kQkDim % 8 == 0 && kHeadDim % 8 == 0, "rows of whole runs");
+static_assert(kKeyStride % 4 == 0 && kPairStride % 4 == 0, "float4-aligned staged rows");
 
 inline void attention(device const bfloat *queries, device const bfloat *keys,
                       device const bfloat *values, device bfloat *output,
@@ -141,17 +152,28 @@ inline void attention(device const bfloat *queries, device const bfloat *keys,
   const uint context = p.rows;
   for (uint base = 0; base < context; base += kKeys) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    // 32 x 80 keys and 32 x 72 values: 320 and 288 runs of eight bf16.
-    for (uint u = thread_index; u < kKeys * (kQkDim + kHeadDim) / 8; u += kThreads) {
-      const bool key = u < kKeys * kQkDim / 8;
-      const uint e = 8 * (key ? u : u - kKeys * kQkDim / 8);
-      const uint dim = key ? kQkDim : kHeadDim;
-      const uint stride = key ? p.key_row_stride : p.value_row_stride;
-      device const bfloat *src = (key ? k : v) + ulong(base + e / dim) * stride + e % dim;
-      threadgroup float *dst = key ? stage_k + (e / dim) * kKeyStride + e % dim
-                                   : stage_v + (e / dim) * kValueStride + e % dim;
-#pragma unroll
-      for (uint i = 0; i < 8; ++i) dst[i] = float(src[i]);
+    // One 16-byte load a run: eight scalar loads cost validated runs past
+    // the 120 s command limit at the largest grid.
+    for (uint u = thread_index; u < kKeyRuns + kValuePairRuns; u += kThreads) {
+      if (u < kKeyRuns) {
+        const uint row = 8 * u / kQkDim, column = 8 * u % kQkDim;
+        const uint4 w = *reinterpret_cast<device const uint4 *>(k + ulong(base + row) * p.key_row_stride + column);
+        threadgroup float *dst = stage_k + row * kKeyStride + column;
+        *reinterpret_cast<threadgroup float4 *>(dst) =
+            float4(widen(w.xy, 0), widen(w.xy, 1), widen(w.xy, 2), widen(w.xy, 3));
+        *reinterpret_cast<threadgroup float4 *>(dst + 4) =
+            float4(widen(w.zw, 0), widen(w.zw, 1), widen(w.zw, 2), widen(w.zw, 3));
+      } else {
+        const uint pair = 8 * (u - kKeyRuns) / kHeadDim, column = 8 * (u - kKeyRuns) % kHeadDim;
+        device const bfloat *src = v + ulong(base + 2 * pair) * p.value_row_stride + column;
+        const uint4 a = *reinterpret_cast<device const uint4 *>(src);
+        const uint4 b = *reinterpret_cast<device const uint4 *>(src + p.value_row_stride);
+        threadgroup float4 *dst = reinterpret_cast<threadgroup float4 *>(stage_v + pair * kPairStride + 2 * column);
+        dst[0] = float4(widen(a.xy, 0), widen(b.xy, 0), widen(a.xy, 1), widen(b.xy, 1));
+        dst[1] = float4(widen(a.xy, 2), widen(b.xy, 2), widen(a.xy, 3), widen(b.xy, 3));
+        dst[2] = float4(widen(a.zw, 0), widen(b.zw, 0), widen(a.zw, 1), widen(b.zw, 1));
+        dst[3] = float4(widen(a.zw, 2), widen(b.zw, 2), widen(a.zw, 3), widen(b.zw, 3));
+      }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -197,10 +219,12 @@ inline void attention(device const bfloat *queries, device const bfloat *keys,
 #pragma unroll
     for (uint d = 0; d < kHeadDim / 8; ++d) {
       float2 partial(0.0f);
-      threadgroup const float *vr = stage_v + fn * kValueStride + 8 * d + fm;
+      // Rows fn + 8 s and fn + 8 s + 1, the pair fn / 2 + 4 s, of dimension 8 d + fm.
+      threadgroup const float2 *vr =
+          reinterpret_cast<threadgroup const float2 *>(stage_v + (fn / 2) * kPairStride) + 8 * d + fm;
 #pragma unroll
       for (uint s = 0; s < kKeys / 8; ++s)
-        mma(partial, float2(vr[8 * s * kValueStride], vr[(8 * s + 1) * kValueStride]), score[s]);
+        mma(partial, vr[4 * s * kHeadDim], score[s]);
       out[d] = out[d] * scale + partial;
     }
   }
@@ -247,6 +271,6 @@ kernel void dense_attention_mma_72(device bfloat *queries [[buffer(0)]],
                                  uint sg [[simdgroup_index_in_threadgroup]],
                                  uint lane [[thread_index_in_simdgroup]]) {
   threadgroup float stage_k[vision_mma::kKeys * vision_mma::kKeyStride];
-  threadgroup float stage_v[vision_mma::kKeys * vision_mma::kValueStride];
+  threadgroup float stage_v[vision_mma::kKeys / 2 * vision_mma::kPairStride];
   vision_mma::attention(queries, keys, values, output, params, tg, sg, lane, stage_k, stage_v);
 }
