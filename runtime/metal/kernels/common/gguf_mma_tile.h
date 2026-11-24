@@ -134,19 +134,19 @@ inline void accumulate(device const bfloat *x, device uchar *w0, device uchar *w
   device uchar *cm = meta + (ulong(plane_tile) * units * QUANT_TILE_ROWS + plane_row) * F::MetaBytes;
   typename F::Payload packed = F::load(c0 + ulong(step_begin) * QUANT_TILE_ROWS * F::P0,
                                        c1 + ulong(step_begin) * QUANT_TILE_ROWS * F::P1);
-  uint unit = step_begin / F::MetaGroups;
-  typename F::Meta hdr = F::loadMeta(cm + ulong(unit) * QUANT_TILE_ROWS * F::MetaBytes);
+  typename F::Meta hdr = F::loadMeta(cm + ulong(step_begin / F::MetaGroups) * QUANT_TILE_ROWS * F::MetaBytes);
   for (uint step = step_begin; step < step_end; ++step) {
-    const uint u = step / F::MetaGroups;
-    if (u != unit) {
-      hdr = F::loadMeta(cm + ulong(u) * QUANT_TILE_ROWS * F::MetaBytes);
-      unit = u;
-    }
-    stage_group<F>(packed, hdr, ushort(step % F::MetaGroups), tl, stage + lane * kStride);
-    if (step + 1 < step_end)
-      packed = F::load(c0 + ulong(step + 1) * QUANT_TILE_ROWS * F::P0, c1 + ulong(step + 1) * QUANT_TILE_ROWS * F::P1);
+    // The step's activations and the next step's weights and coefficients load before this step's group decodes,
+    // so their latency overlaps it.
     uint2 v[FM][2];
     load_inputs<FM>(x, input_size, step * kStep, l, v);
+    const typename F::Payload current = packed;
+    const typename F::Meta coefficients = hdr;
+    if (step + 1 < step_end) {
+      packed = F::load(c0 + ulong(step + 1) * QUANT_TILE_ROWS * F::P0, c1 + ulong(step + 1) * QUANT_TILE_ROWS * F::P1);
+      hdr = F::loadMeta(cm + ulong((step + 1) / F::MetaGroups) * QUANT_TILE_ROWS * F::MetaBytes);
+    }
+    stage_group<F>(current, coefficients, ushort(step % F::MetaGroups), tl, stage + lane * kStride);
     simdgroup_barrier(mem_flags::mem_threadgroup);
     mma_group<FM>(v, [&](uint i, uint j) {
       return *reinterpret_cast<threadgroup const half2 *>(stage + (8 * i + l.fm) * kStride + 8 * j + l.fn);
