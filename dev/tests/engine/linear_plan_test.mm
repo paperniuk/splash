@@ -1870,6 +1870,115 @@ void apple7PrefillSplits() {
   }
 }
 
+// Decode steps on Apple7/8's MMA prefill tile (> 32 rows) use the deeper
+// decodePrefillSplits tier when K >= 8192 and grid <= 6 * cores; prefill chunks
+// keep kMmaPrefillTiers, and K <= 6144 keeps the base splits everywhere.
+void apple7DecodePrefillSplits() {
+  const Projection down = blockProjection(5120, 17408, 1);
+  for (const uint32_t family : {7U, 8U}) {
+    for (const auto [cores, wantR64, wantR128, baseR64, baseR128] :
+         {std::tuple{8U, 1U, 1U, 1U, 1U},
+          {10U, 1U, 1U, 1U, 1U},
+          {14U, 4U, 1U, 2U, 1U},
+          {16U, 4U, 1U, 2U, 1U},
+          {19U, 4U, 1U, 2U, 1U},
+          {24U, 8U, 2U, 4U, 2U},
+          {30U, 8U, 4U, 4U, 2U},
+          {32U, 8U, 4U, 4U, 2U},
+          {38U, 8U, 4U, 4U, 2U}}) {
+      const Linear prefill = gpu(family, cores, StepKind::Prefill);
+      const Linear decode = gpu(family, cores, StepKind::Decode);
+      for (const uint32_t rows : {40U, 48U, 57U, 64U}) {
+        const LinearPlan dPlan = decode.plan(down, rows, LinearEpilogue::Residual);
+        // With PR A merged, 33-56 rows run register passes instead of the MMA prefill tile.
+        if (rows < 57U && dPlan.configuration().tile != LinearTile::GgufPrefill) continue;
+        require(dPlan.configuration().tile == LinearTile::GgufPrefill &&
+                    dPlan.configuration().splits == wantR64 &&
+                    prefill.plan(down, rows, LinearEpilogue::Residual).configuration().splits == baseR64,
+                "Apple7/8 27B down decode vs prefill split at " + std::to_string(rows) + " rows on " +
+                    std::to_string(cores) + " cores");
+      }
+      for (const uint32_t rows : {80U, 96U, 112U, 128U}) {
+        require(decode.plan(down, rows, LinearEpilogue::Residual).configuration().splits == wantR128 &&
+                    prefill.plan(down, rows, LinearEpilogue::Residual).configuration().splits == baseR128,
+                "Apple7/8 27B down decode vs prefill split at " + std::to_string(rows) + " rows on " +
+                    std::to_string(cores) + " cores");
+      }
+      if (cores == 14U || cores == 32U || cores == 38U) {
+        const LinearScratchSize bound = decode.scratchSize({5120, 17408}, kMaximumStagedRows);
+        for (uint32_t rows = 1; rows <= kMaximumStagedRows; ++rows) {
+          const LinearScratchSize need = decode.plan(down, rows, LinearEpilogue::Residual).scratchSize();
+          require(bound.partials >= need.partials && bound.counters >= need.counters,
+                  "Apple7/8 decode down scratchSize bound at " + std::to_string(rows) + " rows on " +
+                      std::to_string(cores) + " cores");
+        }
+      }
+    }
+    const Projection gdn122b = blockProjection(3072, 8192, 1);
+    for (const auto [cores, wantR64, wantR128, baseR64, baseR128] :
+         {std::tuple{8U, 4U, 1U, 2U, 1U},
+          {10U, 4U, 1U, 2U, 1U},
+          {14U, 8U, 2U, 4U, 2U},
+          {16U, 8U, 4U, 4U, 2U},
+          {19U, 8U, 4U, 4U, 2U},
+          {24U, 8U, 4U, 4U, 2U},
+          {30U, 8U, 8U, 8U, 4U},
+          {32U, 8U, 8U, 8U, 4U},
+          {38U, 8U, 8U, 8U, 4U}}) {
+      const Linear prefill = gpu(family, cores, StepKind::Prefill);
+      const Linear decode = gpu(family, cores, StepKind::Decode);
+      for (const uint32_t rows : {40U, 57U, 64U}) {
+        const LinearPlan dPlan = decode.plan(gdn122b, rows, LinearEpilogue::Residual);
+        if (rows < 57U && dPlan.configuration().tile != LinearTile::GgufPrefill) continue;
+        require(dPlan.configuration().tile == LinearTile::GgufPrefill &&
+                    dPlan.configuration().splits == wantR64 &&
+                    prefill.plan(gdn122b, rows, LinearEpilogue::Residual).configuration().splits == baseR64,
+                "Apple7/8 122B gdn-output decode vs prefill split at " + std::to_string(rows) + " rows on " +
+                    std::to_string(cores) + " cores");
+      }
+      for (const uint32_t rows : {80U, 128U}) {
+        require(decode.plan(gdn122b, rows, LinearEpilogue::Residual).configuration().splits == wantR128 &&
+                    prefill.plan(gdn122b, rows, LinearEpilogue::Residual).configuration().splits == baseR128,
+                "Apple7/8 122B gdn-output decode vs prefill split at " + std::to_string(rows) + " rows on " +
+                    std::to_string(cores) + " cores");
+      }
+    }
+    // Carlo's 14-core K <= 6144 shapes keep the base splits at both 64 and 128 rows.
+    const Linear prefill14 = gpu(family, 14U, StepKind::Prefill);
+    const Linear decode14 = gpu(family, 14U, StepKind::Decode);
+    for (const auto [n, k, epilogue, wantR64, wantR128] :
+         {std::tuple{5120U, 6144U, LinearEpilogue::Residual, 2U, 1U},
+          {6144U, 5120U, LinearEpilogue::None, 2U, 1U},
+          {17408U, 5120U, LinearEpilogue::None, 1U, 1U},
+          {4096U, 2048U, LinearEpilogue::None, 2U, 1U}}) {
+      const Projection p = blockProjection(n, k, 1);
+      for (const uint32_t rows : {40U, 57U, 64U}) {
+        const LinearPlan dPlan = decode14.plan(p, rows, epilogue);
+        if (rows < 57U && dPlan.configuration().tile != LinearTile::GgufPrefill) continue;
+        require(dPlan.configuration().tile == LinearTile::GgufPrefill &&
+                    dPlan.configuration().splits == wantR64 &&
+                    prefill14.plan(p, rows, epilogue).configuration().splits == wantR64,
+                "14-core K <= 6144 decode stays on base split at " + std::to_string(rows) + " rows");
+      }
+      for (const uint32_t rows : {80U, 128U}) {
+        require(decode14.plan(p, rows, epilogue).configuration().splits == wantR128 &&
+                    prefill14.plan(p, rows, epilogue).configuration().splits == wantR128,
+                "14-core K <= 6144 decode stays on base split at " + std::to_string(rows) + " rows");
+      }
+    }
+  }
+  for (const uint32_t family : {9U, 10U, 11U}) {
+    for (const uint32_t cores : {10U, 16U, 32U, 40U}) {
+      const Linear decode = gpu(family, cores, StepKind::Decode);
+      for (const uint32_t rows : {40U, 64U, 80U, 128U}) {
+        const LinearPlan plan = decode.plan(down, rows, LinearEpilogue::Residual);
+        require(plan.configuration().tile != LinearTile::GgufPrefill || plan.configuration().splits == 1,
+                "Apple9+ decode ignores Apple7/8 decodePrefillSplits");
+      }
+    }
+  }
+}
+
 // Leading-input views and non-Apple7/8 devices refuse split GgufPrefill dispatches; Apple7/8 encodes
 // gguf_prefill_mma_split_* with its 3D grid.
 void apple7PrefillSplitDispatch(metal::MetalBackend &backend) {
@@ -1930,6 +2039,7 @@ int main(int argc, char **argv) {
     chunkRowPlans();
     prefillInt8Rule();
     apple7PrefillSplits();
+    apple7DecodePrefillSplits();
     if (std::string_view(argv[1]) == "--cpu") {
       std::cout << "Linear CPU plans: PASS\n";
       return 0;

@@ -185,8 +185,11 @@ LinearConfig bf16Projection(const KernelCalibration &calibration, StepKind step,
   if (calibration.simdgroupMma && w.rows > kMaximumMmaStagedRows) {
     // Apple7/8 split K where the grid of 64-by-64 tiles is too small for the cores.
     const uint64_t grid = uint64_t{(w.rows + 63) / 64} * (n / GGUF_TILE_COLUMNS);
+    const ProjectionCalibration::DecodePrefillSplits &decode = p.decodePrefillSplits;
+    const bool decodeDeep = step == StepKind::Decode && !decode.tiers.empty() && k >= decode.minInputs &&
+                            grid <= uint64_t{decode.maxGridPerCore} * cores;
     return {.tile = LinearTile::GgufPrefill,
-            .splits = gridTierSplits(grid, k, cores, p.prefillSplits),
+            .splits = gridTierSplits(grid, k, cores, decodeDeep ? decode.tiers : p.prefillSplits),
             .mmaPrefill = true};
   }
   if (w.rows > decodeTileRows(step)) return {.tile = LinearTile::GgufPrefill};
