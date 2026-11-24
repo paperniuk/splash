@@ -7,6 +7,7 @@
 #include "metal/kernels/common/gguf_column_tile.h"
 #include "metal/kernels/common/gguf_tile.h"
 #include "metal/kernels/common/moe_expert_slab.h"
+#include "metal/kernels/common/softcapped_swiglu.h"
 
 using namespace gguf_mma;
 
@@ -82,7 +83,8 @@ kernel void moe_expert_gguf_mma_down(device bfloat *input [[buffer(0)]], device 
                                      device const uint *tile_count [[buffer(2)]], device uchar *sw0 [[buffer(3)]],
                                      device uchar *sw1 [[buffer(4)]], device uchar *smeta [[buffer(5)]],
                                      device bfloat *output [[buffer(6)]], device const uint *slots [[buffer(7)]],
-                                     constant MoeGgufExpertParams &p [[buffer(8)]], constant ulong *chunks [[buffer(9)]],
+                                     device const float *expert_scales [[buffer(8)]],
+                                     constant MoeGgufExpertParams &p [[buffer(9)]], constant ulong *chunks [[buffer(10)]],
                                      uint2 group [[threadgroup_position_in_grid]],
                                      uint simd_lane [[thread_index_in_simdgroup]],
                                      uint simd_group [[simdgroup_index_in_threadgroup]]) {
@@ -94,6 +96,7 @@ kernel void moe_expert_gguf_mma_down(device bfloat *input [[buffer(0)]], device 
   const MoeGgufSegment s =
       moe_gguf_segment<Shared>(tile.expert, p.experts, p.input_size, p.output_size, p.routed_format, p.shared_format,
                                slots, chunks, p.floor_slots, p.chunk_slots, 2, sw0, sw1, smeta);
+  const float scale = moe_expert_scale(expert_scales, tile.expert, p.experts, 2);
   device bfloat *x = input + ulong(tile.first_row) * p.input_size;
   const ulong out = ulong(tile.first_row) * p.output_size;
   const uint origin = group.x * GGUF_TILE_COLUMNS + simd_group * kColumns, thread_index = simd_group * 32 + simd_lane;
@@ -109,7 +112,7 @@ kernel void moe_expert_gguf_mma_down(device bfloat *input [[buffer(0)]], device 
     column_dot<FmtQ20, GGUF_COLUMN_ROWS>(x, tile.rows, p.input_size, s.w0, s.w1, s.meta, origin + simd_lane, 0,
                                              p.input_size / 32, tl, sums);
     for (uint row = 0; row < tile.rows; ++row)
-      output[out + ulong(row) * p.output_size + origin + simd_lane] = bfloat(sums[row]);
+      output[out + ulong(row) * p.output_size + origin + simd_lane] = bfloat(sums[row] * scale);
     return;
   }
   if (moe_mma_grid_column_pass<Rows, 2>() && moe_column_tile(tiles, t) &&
@@ -121,7 +124,7 @@ kernel void moe_expert_gguf_mma_down(device bfloat *input [[buffer(0)]], device 
                                                     origin + simd_lane, 0, p.input_size / 32, tl, sums);
     });
     for (uint row = 0; row < tile.rows; ++row)
-      output[out + ulong(row) * p.output_size + origin + simd_lane] = bfloat(sums[row]);
+      output[out + ulong(row) * p.output_size + origin + simd_lane] = bfloat(sums[row] * scale);
     return;
   }
   moe_mma_live_rows<Rows>(tile.rows, [&](auto fragments) {
@@ -139,19 +142,22 @@ kernel void moe_expert_gguf_mma_down(device bfloat *input [[buffer(0)]], device 
     const MoeTileDescriptor dst = tiles[t];
     const ulong dst_out = ulong(dst.first_row) * p.output_size;
     moe_mma_store(acc, sgmatrix::lane_map(simd_lane), dst.rows, [&](uint row, uint column, float v) {
-      output[dst_out + ulong(row) * p.output_size + origin + column] = bfloat(v);
+      output[dst_out + ulong(row) * p.output_size + origin + column] = bfloat(v * scale);
     });
   });
 }
 using MoeExpertGgufMmaDownKernel = void(device bfloat *, device const MoeTileDescriptor *, device const uint *,
                                         device uchar *, device uchar *, device uchar *, device bfloat *,
-                                        device const uint *, constant MoeGgufExpertParams &, constant ulong *, uint2,
+                                        device const uint *, device const float *, constant MoeGgufExpertParams &, constant ulong *, uint2,
                                         uint, uint);
 template [[host_name("moe_expert_gguf_mma_m8_down")]] kernel MoeExpertGgufMmaDownKernel moe_expert_gguf_mma_down<8, 1>;
 template [[host_name("moe_expert_gguf_mma_m32_down")]] kernel MoeExpertGgufMmaDownKernel moe_expert_gguf_mma_down<32, 1>;
 // Flint's shared expert of two slices (CompiledMoeRouting "_s2").
 template [[host_name("moe_expert_gguf_mma_m8_down_s2")]] kernel MoeExpertGgufMmaDownKernel moe_expert_gguf_mma_down<8, 2>;
 template [[host_name("moe_expert_gguf_mma_m32_down_s2")]] kernel MoeExpertGgufMmaDownKernel moe_expert_gguf_mma_down<32, 2>;
+
+template [[host_name("moe_expert_gguf_mma_m8_down_s0")]] kernel MoeExpertGgufMmaDownKernel moe_expert_gguf_mma_down<8, 0>;
+template [[host_name("moe_expert_gguf_mma_m32_down_s0")]] kernel MoeExpertGgufMmaDownKernel moe_expert_gguf_mma_down<32, 0>;
 
 // Gate and up in one pass: the bindings and grid of moe_expert_gguf_m<rows>_gate_up (kernels/shared/moe_gguf.metal),
 // threadgroup (x, y) a gate and an up simdgroup on the same 32 columns of tile y of the pass's range. The gate
@@ -168,7 +174,7 @@ template [[host_name("moe_expert_gguf_mma_m32_down_s2")]] kernel MoeExpertGgufMm
 // lanes. IQ2_XXS and IQ2_S gate and up run column_dot on their own simdgroups, which beat their pair at pooled routing
 // (a verify's rows sharing their experts) on an M2 Max; their decode layer runs 8 to 32 rows 16-19% faster at random
 // routing and 1-4% at pooled than on the 8-row MMA. Other tiles run the MMAs that hold their live rows.
-template <ushort Rows, ushort Tables, uint Shared>
+template <ushort Rows, ushort Tables, uint Shared, bool Softcap = false>
 kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
                                         device const MoeTileDescriptor *tiles [[buffer(1)]],
                                         device const uint *tile_count [[buffer(2)]], device uchar *gsw0 [[buffer(3)]],
@@ -176,8 +182,9 @@ kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
                                         device uchar *usw0 [[buffer(6)]], device uchar *usw1 [[buffer(7)]],
                                         device uchar *usmeta [[buffer(8)]], device bfloat *output [[buffer(9)]],
                                         device const uint *slots [[buffer(10)]],
-                                        constant MoeGgufGateUpParams &p [[buffer(11)]],
-                                        constant ulong *chunks [[buffer(12)]],
+                                        device const float *expert_scales [[buffer(11)]],
+                                        constant MoeGgufGateUpParams &p [[buffer(12)]],
+                                        constant ulong *chunks [[buffer(13)]],
                                         uint2 group [[threadgroup_position_in_grid]],
                                         uint simd_lane [[thread_index_in_simdgroup]],
                                         uint simd_group [[simdgroup_index_in_threadgroup]]) {
@@ -203,7 +210,12 @@ kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
   const bool grid = moe_mma_grid_column_pass<Rows, 4>() && column;
   const bool gate_grid = grid && moe_mma_grid_column_format<Rows>(gs.format);
   const bool up_grid = grid && moe_mma_grid_column_format<Rows>(us.format);
-  const auto product = [](float v, bfloat g) { return bfloat(float(bfloat(v)) * splash_silu(float(g))); };
+  const float scale = moe_expert_scale(expert_scales, tile.expert, p.experts, up ? 1 : 0);
+  const auto product = [](float v, bfloat g) {
+    const float u = float(bfloat(v));
+    if constexpr (Softcap) return bfloat(SoftcappedSwiglu<4, 25>::value(u, float(g)));
+    return bfloat(u * splash_silu(float(g)));
+  };
   if (gate_column && up_column) {
     // As many simdgroups as the two passes' column tiles run: the even threadgroup's two take the odd one's columns
     // (N is a multiple of the passes' 64 columns, so every odd threadgroup has an even one).
@@ -213,8 +225,10 @@ kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
     float g[GGUF_COLUMN_ROWS], u[GGUF_COLUMN_ROWS];
     column_dot_pair<FmtQ20, GGUF_COLUMN_ROWS>(x, tile.rows, K, gs.w0, gs.w1, gs.meta, us.w0, us.w1, us.meta,
                                                   pair_column, tl, g, u);
+    const float gate_scale = moe_expert_scale(expert_scales, tile.expert, p.experts, 0);
+    const float up_scale = moe_expert_scale(expert_scales, tile.expert, p.experts, 1);
     for (uint row = 0; row < tile.rows; ++row)
-      output[out + ulong(row) * N + pair_column] = product(u[row], bfloat(g[row]));
+      output[out + ulong(row) * N + pair_column] = product(u[row] * up_scale, bfloat(g[row] * gate_scale));
     return;
   }
   // Every thread fills the pair tables before one barrier, the up's in the second table where the formats differ.
@@ -257,18 +271,18 @@ kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
     }
     if (!up) {
       if (on_dot)
-        for (uint row = 0; row < tile.rows; ++row) gate[row * kColumns + simd_lane] = bfloat(sums[row]);
+        for (uint row = 0; row < tile.rows; ++row) gate[row * kColumns + simd_lane] = bfloat(sums[row] * scale);
       else
-        elements(acc, l, [&](uint row, uint column, float v) { gate[row * kColumns + column] = bfloat(v); });
+        elements(acc, l, [&](uint row, uint column, float v) { gate[row * kColumns + column] = bfloat(v * scale); });
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (!up) return;
     if (on_dot)
       for (uint row = 0; row < tile.rows; ++row)
-        output[out + ulong(row) * N + origin + simd_lane] = product(sums[row], gate[row * kColumns + simd_lane]);
+        output[out + ulong(row) * N + origin + simd_lane] = product(sums[row] * scale, gate[row * kColumns + simd_lane]);
     else
       moe_mma_store<1, false>(acc, l, tile.rows, [&](uint row, uint column, float v) {
-        output[out + ulong(row) * N + origin + column] = product(v, gate[row * kColumns + column]);
+        output[out + ulong(row) * N + origin + column] = product(v * scale, gate[row * kColumns + column]);
       });
     return;
   }
@@ -280,7 +294,7 @@ kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
     moe_mma_formats<4>()(s.format, [&](auto f) {
       accumulate<decltype(f), FM>(x, s.w0, s.w1, s.meta, K, origin, my, table, simd_lane, 0, K / kStep, acc);
     });
-    if (!up) elements(acc, l, [&](uint row, uint column, float v) { gate[row * kColumns + column] = bfloat(v); });
+    if (!up) elements(acc, l, [&](uint row, uint column, float v) { gate[row * kColumns + column] = bfloat(v * scale); });
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (up) {
       // Reload the tile descriptor after the K loop so the 64-bit output offset and live row count are not held live
@@ -288,7 +302,7 @@ kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
       const MoeTileDescriptor dst = tiles[t];
       const ulong dst_out = ulong(dst.first_row) * N;
       moe_mma_store<FM, false>(acc, l, dst.rows, [&](uint row, uint column, float v) {
-        output[dst_out + ulong(row) * N + origin + column] = product(v, gate[row * kColumns + column]);
+        output[dst_out + ulong(row) * N + origin + column] = product(v * scale, gate[row * kColumns + column]);
       });
     }
   });
@@ -296,7 +310,7 @@ kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
 using MoeExpertGgufMmaGateUpKernel = void(device bfloat *, device const MoeTileDescriptor *, device const uint *,
                                           device uchar *, device uchar *, device uchar *, device uchar *,
                                           device uchar *, device uchar *, device bfloat *, device const uint *,
-                                          constant MoeGgufGateUpParams &, constant ulong *, uint2, uint, uint);
+                                          device const float *, constant MoeGgufGateUpParams &, constant ulong *, uint2, uint, uint);
 #define MOE_MMA_GATE_UP(R)                                                                                      \
   template [[host_name("moe_expert_gguf_mma_m" #R "_gate_up")]] kernel MoeExpertGgufMmaGateUpKernel            \
       moe_expert_gguf_mma_gate_up<R, 1, 1>;                                                                     \
@@ -309,3 +323,12 @@ using MoeExpertGgufMmaGateUpKernel = void(device bfloat *, device const MoeTileD
 MOE_MMA_GATE_UP(8)
 MOE_MMA_GATE_UP(32)
 #undef MOE_MMA_GATE_UP
+
+template [[host_name("moe_expert_gguf_mma_m8_gate_up_s0_softcap4_25")]] kernel MoeExpertGgufMmaGateUpKernel
+    moe_expert_gguf_mma_gate_up<8, 1, 0, true>;
+template [[host_name("moe_expert_gguf_mma_m32_gate_up_s0_softcap4_25")]] kernel MoeExpertGgufMmaGateUpKernel
+    moe_expert_gguf_mma_gate_up<32, 1, 0, true>;
+template [[host_name("moe_expert_gguf_mma_m8_gate_up_mixed_s0_softcap4_25")]] kernel MoeExpertGgufMmaGateUpKernel
+    moe_expert_gguf_mma_gate_up<8, 2, 0, true>;
+template [[host_name("moe_expert_gguf_mma_m32_gate_up_mixed_s0_softcap4_25")]] kernel MoeExpertGgufMmaGateUpKernel
+    moe_expert_gguf_mma_gate_up<32, 2, 0, true>;

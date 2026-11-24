@@ -136,6 +136,7 @@ __attribute__((noinline)) void block_residual_mix_norm_outputs(BlockResidualMixR
 // Each query's output as fp32 rows [rows][queries][hidden]: the message
 // gate's input and the loop's messages. Grid: (rows, queries).
 template <class Current>
+[[max_total_threads_per_threadgroup(BLOCK_RESIDUAL_MIX_THREADS)]]
 kernel void block_residual_mix(device const bfloat *stack [[buffer(0)]], device const Current *current [[buffer(1)]],
                                device const float *queries [[buffer(2)]], device float *output [[buffer(3)]],
                                constant BlockResidualMixParams &p [[buffer(4)]],
@@ -157,6 +158,7 @@ kernel void block_residual_mix(device const bfloat *stack [[buffer(0)]], device 
 // hyper-connection mix (shared/hyper_connection.metal). Unused norm and
 // output slots bind the first. Grid: (rows, queries).
 template <class Current>
+[[max_total_threads_per_threadgroup(BLOCK_RESIDUAL_MIX_THREADS)]]
 kernel void block_residual_mix_norm(device const bfloat *stack [[buffer(0)]],
                                     device const Current *current [[buffer(1)]],
                                     device const float *queries [[buffer(2)]], device const float *norm0 [[buffer(3)]],

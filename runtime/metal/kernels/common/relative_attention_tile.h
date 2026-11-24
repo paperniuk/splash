@@ -590,7 +590,7 @@ inline bfloat relative_attention_combine_splits(
 // query head's gate in its projection row (RelativeAttentionRow's gate
 // block), at row `output` of `hidden` and, with Table, of the
 // out-projection's Table16 input and its sums.
-template <uint QHeads, uint HeadDim, bool Table>
+template <uint QHeads, uint HeadDim, class Table>
 inline void relative_attention_output_row(bfloat value, device const bfloat *projection, device bfloat *hidden,
                                           device bfloat *table, device float *sums, ulong packed, ulong output,
                                           uint query_head, uint dimension, bool writes, threadgroup bfloat *pairs) {
@@ -603,13 +603,13 @@ inline void relative_attention_output_row(bfloat value, device const bfloat *pro
     element = relative_attention_gated(float(value), gate);
     hidden[output * Width + query_head * HeadDim + dimension] = element;
   }
-  if constexpr (Table) {
+  if constexpr (!is_same<Table, void>::value) {
     pairs[dimension] = element;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (writes && dimension < HeadDim / 2) {
       const uint first = query_head * HeadDim + 2 * dimension;
-      gguf_sg::Table16::write(table + output / 8 * Width * 8,
-                              sums + output / 8 * gguf_sg::Table16::sums_per_tile(Width), Width, first / 64,
+      Table::write(reinterpret_cast<device typename Table::Elem *>(table) + output / 8 * Width * 8,
+                              sums + output / 8 * Table::sums_per_tile(Width), Width, first / 64,
                               output % 8, dimension % 32, pairs[2 * dimension], pairs[2 * dimension + 1]);
     }
   }
@@ -793,7 +793,7 @@ inline float4 relative_attention_combine_row(device coherent(device) const float
 // out-projection's Table16 input, which the simdgroup writes a span of 64 at
 // a time, lane l the span's elements 2l and 2l + 1, from the lanes that hold
 // them.
-template <uint QHeads, uint HeadDim, bool Table>
+template <uint QHeads, uint HeadDim, class Table>
 inline void relative_attention_output_quad(float4 value, device const bfloat *projection, device bfloat *hidden,
                                            device bfloat *table, device float *sums, SplashAttentionOutput place,
                                            uint query_head, uint dimension, uint lane) {
@@ -809,12 +809,12 @@ inline void relative_attention_output_quad(float4 value, device const bfloat *pr
                         relative_attention_gated(float(bfloat(value.z)), float(gates.z)),
                         relative_attention_gated(float(bfloat(value.w)), float(gates.w)));
   *reinterpret_cast<device bfloat4 *>(hidden + place.output * Width + query_head * HeadDim + dimension) = element;
-  if constexpr (Table)
+  if constexpr (!is_same<Table, void>::value)
 #pragma unroll
     for (uint span = 0; span < 2; ++span) {
       const bfloat4 held = as_type<bfloat4>(simd_shuffle(as_type<uint2>(element), ushort(span * 16 + lane / 2)));
-      gguf_sg::Table16::write(table + place.output / 8 * Width * 8,
-                              sums + place.output / 8 * gguf_sg::Table16::sums_per_tile(Width), Width,
+      Table::write(reinterpret_cast<device typename Table::Elem *>(table) + place.output / 8 * Width * 8,
+                              sums + place.output / 8 * Table::sums_per_tile(Width), Width,
                               (query_head * HeadDim) / 64 + span, place.output % 8, lane,
                               lane % 2 ? held.z : held.x, lane % 2 ? held.w : held.y);
     }

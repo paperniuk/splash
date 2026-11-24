@@ -479,6 +479,7 @@ kernel void moe_combine(
 // its row's path from those rows (and before the lane's anchor its state,
 // state_in lane) onto the residual. No combined row reaches memory but the
 // tape. A lane whose rows run past the step's writes nothing.
+[[max_total_threads_per_threadgroup(MOE_COMBINE_CONVOLUTION_ROWS * MOE_COMBINE_CONVOLUTION_CHANNELS)]]
 kernel void moe_combine_convolution(
     device const bfloat *expert_output [[buffer(0)]], device const uint *route_rows [[buffer(1)]],
     device const float *routing_weights [[buffer(2)]], device const bfloat *combine_residual [[buffer(3)]],

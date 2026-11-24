@@ -172,7 +172,7 @@ RELATIVE_ATTENTION_SPLITS(_w1023, 1023)
 // (relative_attention_output_row) at its output row. The splits that wrote
 // are those splash_attention_reduce_row recomputes: the partition of the same
 // Window from the same first page.
-template <uint KVHeads, uint QueryHeadsPerKVHead, uint HeadDim, uint Window, bool Table>
+template <uint KVHeads, uint QueryHeadsPerKVHead, uint HeadDim, uint Window, class Table>
 inline void relative_attention_reduce_phase(
     device const float *partials, device const float *statistics, device const bfloat *projection,
     device bfloat *hidden, device bfloat *table, device float *sums, device const SplashLaneRows *layout,
@@ -230,8 +230,9 @@ inline void relative_attention_reduce_phase(
         weights, group_values, pairs);                                                                        \
   }
 #define RELATIVE_ATTENTION_REDUCE(Name, Window)                                                               \
-  RELATIVE_ATTENTION_REDUCE_KERNEL(Name, 8, 3, 128, Window, false)                                            \
-  RELATIVE_ATTENTION_REDUCE_KERNEL(Name##_table16, 8, 3, 128, Window, true)
+  RELATIVE_ATTENTION_REDUCE_KERNEL(Name, 8, 3, 128, Window, void)                                             \
+  RELATIVE_ATTENTION_REDUCE_KERNEL(Name##_table16, 8, 3, 128, Window, gguf_sg::Table16)                        \
+  RELATIVE_ATTENTION_REDUCE_KERNEL(Name##_table16f, 8, 3, 128, Window, gguf_sg::Table16F)
 RELATIVE_ATTENTION_REDUCE(relative_attention_reduce, 0)
 RELATIVE_ATTENTION_REDUCE(relative_attention_reduce_w1023, 1023)
 #undef RELATIVE_ATTENTION_REDUCE
@@ -413,7 +414,7 @@ RELATIVE_ATTENTION_DIRECTS(_w1023, 1023)
 // head's splits' staging: the INT8 query codes, the relative states and the
 // bf16 queries, in that order.
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint RowsPerTile, uint HeadDim, uint Window, bool PositionScaled,
-          typename CacheElement, bool Int8Queries, bool Table>
+          typename CacheElement, bool Int8Queries, class Table>
 inline void relative_attention_decode_phase(
     device const bfloat *projection, device const bfloat *keys, device const bfloat *values,
     device const float *query_scale, device const float *relative_scale, device const float *relative_bias,
@@ -569,9 +570,11 @@ inline void relative_attention_decode_phase(
         group, thread_index, lane, simd_group);                                                               \
   }
 #define RELATIVE_ATTENTION_DECODE_OUTPUTS(Name, RowsPerTile, Window, PositionScaled, CacheElement, Int8Queries)  \
-  RELATIVE_ATTENTION_DECODE_KERNEL(Name, RowsPerTile, Window, PositionScaled, CacheElement, Int8Queries, false) \
+  RELATIVE_ATTENTION_DECODE_KERNEL(Name, RowsPerTile, Window, PositionScaled, CacheElement, Int8Queries, void)  \
   RELATIVE_ATTENTION_DECODE_KERNEL(Name##_table16, RowsPerTile, Window, PositionScaled, CacheElement, Int8Queries, \
-                                   true)
+                                  gguf_sg::Table16)                                                          \
+  RELATIVE_ATTENTION_DECODE_KERNEL(Name##_table16f, RowsPerTile, Window, PositionScaled, CacheElement, Int8Queries, \
+                                  gguf_sg::Table16F)
 #define RELATIVE_ATTENTION_DECODE_FORMATS(Suffix, RowsPerTile, Window, PositionScaled)                         \
   RELATIVE_ATTENTION_DECODE_OUTPUTS(relative_attention_q8_decode##Suffix, RowsPerTile, Window, PositionScaled,  \
                                     int8_t, false)                                                            \
