@@ -944,8 +944,8 @@ void ggufPlans() {
       }
   }
   // Apple7/8's register tile splits an MLX affine pair by kApple7AffineRegisterLaw at one table tile's rows in two
-  // passes, so the 27B's af4g64 pairs take one split at one to four table tiles, in one pass up to two and in two
-  // past: each output's K partials add in one order at every width (model-runtime-oracle's rows of no lane).
+  // passes. The 27B's af4g64 pairs keep the same split count at one to four table tiles. They use one pass up to two
+  // tiles and two passes past that, keeping the order of K partials at every register width.
   for (const uint32_t family : {7U, 8U})
     for (const uint32_t cores : {16U, 32U}) {
       const Linear device = gpu(family, cores);
@@ -955,7 +955,7 @@ void ggufPlans() {
         const auto pair = [&](uint32_t rows) {
           return device.plan({{n, 5120}, rows, LinearEpilogue::GateUp}, up, &gate).configuration();
         };
-        const uint32_t splits = pair(GGUF_TABLE16_ROWS).splits;
+        const uint32_t splits = cores == 16 ? 2 : 4;
         for (uint32_t rows = GGUF_COLUMN_ROWS + 1; rows <= kMaximumRegisterRows; ++rows) {
           const LinearConfig c = pair(rows);
           if (c.tile != LinearTile::GgufRegister || c.oneGateUpPass != (rows <= 2 * GGUF_TABLE16_ROWS) ||

@@ -92,7 +92,8 @@ ops::AttentionPlan planOf(std::span<const kv::ChunkedPrefillParams> sequences, u
                           ops::Int8Activations int8 = kBf16, uint32_t slots = 4 * ops::kAttentionSequenceSplits,
                           ops::AttentionCalibration calibration = kApple10Row, uint64_t pieceWork = 0) {
   return ops::PagedAttention::plan(sequences, queryHeads, layout, calibration, int8,
-                                   ops::PagedAttention::workspace(slots, queryHeads, layout), {}, gTile, 0, pieceWork);
+                                   ops::PagedAttention::workspace(slots, queryHeads, layout), {}, gTile,
+                                   calibration.cores, pieceWork);
 }
 ops::AttentionPlan planOf(kv::ChunkedPrefillParams sequence, uint32_t queryHeads, kv::Layout layout,
                           ops::Int8Activations int8 = kBf16, ops::AttentionCalibration calibration = kApple10Row) {
@@ -781,6 +782,7 @@ struct Run final {
   bool testBounds = false;
   // The plan's piece work (ops::PagedAttention::plan's `pieceWork`).
   uint64_t pieceWork = 0;
+  ops::AttentionCalibration calibration = kApple10Row;
   // The out-projection's table the reduce writes beside its rows, and the
   // scratch that takes it (AttentionOutputRows).
   ops::LinearInput input = ops::LinearInput::Plain;
@@ -794,7 +796,7 @@ struct Run final {
 // the out-projection's input rows (Case::outputIndex).
 std::vector<uint16_t> run(metal::MetalBackend &backend, Case &data, const Run &how = {}) {
   const ops::AttentionPlan whole =
-      planOf(data.sequences(), data.queryHeads, data.layout, how.int8, how.slots, kApple10Row, how.pieceWork);
+      planOf(data.sequences(), data.queryHeads, data.layout, how.int8, how.slots, how.calibration, how.pieceWork);
   const ops::AttentionPlan plan = how.lastTiles ? ops::PagedAttention::lastTiles(whole) : whole;
   constexpr uint64_t guardBytes = 256;
   const uint64_t written = how.lastTiles ? data.lanes : data.rowBegin(data.lanes);
@@ -1099,12 +1101,16 @@ void checkStagedPrefill(metal::MetalBackend &backend, uint32_t heads, kv::Layout
 // last tile attended alone on the pieces' splits writes the bits its pieces
 // write for its last row.
 void checkPiecedPrefill(metal::MetalBackend &backend, uint32_t heads, kv::Layout layout, uint32_t history,
-                        uint32_t rows, uint64_t pieceWork) {
+                        uint32_t rows, uint64_t pieceWork, ops::AttentionCalibration calibration = kApple10Row) {
   const std::array lane{Lane{rows, history, 0}};
   auto data = makeCase(backend, heads, layout, lane);
-  const std::vector<uint16_t> pieced = run(backend, data, {.testBounds = true, .pieceWork = pieceWork});
+  // Compare the device-calibrated whole and pieced plans to the same oracle.
+  if (calibration.cores) checkReference(data, run(backend, data, {.testBounds = true, .calibration = calibration}));
+  const std::vector<uint16_t> pieced =
+      run(backend, data, {.testBounds = true, .pieceWork = pieceWork, .calibration = calibration});
   checkReference(data, pieced);
-  const std::vector<uint16_t> tail = run(backend, data, {.lastTiles = true, .pieceWork = pieceWork});
+  const std::vector<uint16_t> tail =
+      run(backend, data, {.lastTiles = true, .pieceWork = pieceWork, .calibration = calibration});
   const uint64_t rowValues = uint64_t{heads} * layout.headDimension;
   const uint64_t at = data.outputIndex(0, 0, 0, 0, true), from = data.outputIndex(0, 0, rows - 1, 0);
   require(std::equal(tail.begin() + std::ptrdiff_t(at), tail.begin() + std::ptrdiff_t(at + rowValues),
@@ -2432,6 +2438,11 @@ int main(int argc, char **argv) {
           checkPiecedPrefill(backend, heads, layout, 6145, 2048, ops::kApple7PrefillAttentionPieceWork);
           checkPiecedPrefill(backend, heads, layout, 700, 77, uint64_t{1} << 15);
           checkPiecedPrefill(backend, heads, layout, 4093, 1057, uint64_t{1} << 16);
+          // Use a short history so the register occupancy floor can raise
+          // splits on the 32-row pieces, with a 21-row tail.
+          if (gTile == ops::AttentionTile::Register)
+            checkPiecedPrefill(backend, heads, layout, 639, 85, uint64_t{1} << 15,
+                               ops::KernelCalibration::of(backend.capabilities()).attention);
           checkStagedPrefill(backend, heads, layout, 4096, 130, false, uint64_t{1} << 16);
         }
         for (const auto [history, rows] : std::array<std::array<uint32_t, 2>, 2>{{{6145, 77}, {4096, 130}}}) {

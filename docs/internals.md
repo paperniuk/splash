@@ -704,9 +704,9 @@ The rules:
    belowQuarters x cores, a one-pass-eligible gate/up pair's column tiles
    counting both tensors'. It splits by `registerSplits`; on Apple7/8 (M1,
    M2) an MLX affine unit splits instead by `kApple7AffineRegisterLaw` at one
-   table tile's rows in two passes, a one-pass gate/up pair's too, so every
-   width takes the same split and a row's sums do not change with the rows
-   batched beside it. Otherwise the staged
+   table tile's rows in two passes. An MLX affine gate/up pair keeps that split
+   count across register-tile widths of 3 to 32 rows, so a row's sums do not
+   change across those widths. Otherwise the staged
    tile runs at the fewest of 8, 16, 32, 48 or 64 rows that hold the plan's, split by
    `stagedSplits` (the Apple10 wave law also picks one or two passes for a
    pair of one format from `onePassFromCores`), its walks spread from
@@ -776,12 +776,14 @@ The rules:
    from `AttentionCalibration::int8QueriesFromPages` pages a split of the
    command's longest tile reads (8 on Apple10; never on Apple9, whose matrix
    operations share the FP32 pipe); a command's sequences share the choice.
-   On Apple7/8 a prompt chunk's dense sequence attends in pieces of rows
-   halved from 2048 while rows x (history + rows) passes 2^23 pairs (a
-   window's history at most its window), down to one tile
-   (`ops::prefillAttentionPieceTiles`): a split and a reduce a piece, each
-   piece's tiles split as a sequence of that many, so no dispatch keeps the
-   display waiting (a whole chunk ran ~490 ms after 32K tokens on an M2 Pro).
+   On Apple7/8 each dense prefill sequence uses 2^23 row-history pairs as a
+   heuristic for its piece size. The planner halves the size from 2048 rows
+   down to one tile while rows x (history + rows) exceeds that threshold,
+   capping history at the window size for a windowed layer
+   (`ops::prefillAttentionPieceTiles`). Each piece runs its own split and
+   reduce, with the split count planned for the piece size. On an M2 Pro
+   running Qwen3.8-27B, the maximum dispatch time at 32K fell from 489.5 ms
+   to 64.4 ms. The 82K run with pieces measured a maximum of 64.5 ms.
 
 The register-against-staged boundaries are measured table entries, not a
 cost model: the wave law, which describes the Apple10 staged tiles, does not
@@ -1791,12 +1793,13 @@ stands on its own: two steps are asked whatever one step's fit chose, and
 where one step splits no chunk below two steps' 1,024 rows they serve alone
 from 1,024 where they gain (the record keeps the units that name the program,
 one step's, or two steps' where one step's fit chose none, and no least rows).
-Where the Neural Engine refuses the program of both kinds (`ane::Refused`, as
-`ANECCompile() FAILED` for Qwen3.8-27B UD-Q4_K_M on a 14-core M1 Pro with
-two steps at 0.97 beside one step at 0.74, where 0.94 builds), two steps'
-units give way one at a time, down to one step's, and then one step serves
-alone; the log names each share refused. A refusal with one step's units at
-stake ends the calibration as above.
+On Apple7/8, if calibration finds a one-step share and preparation of the
+combined split throws `ane::Refused`, it tries smaller two-step shares down to
+the one-step share, skipping any with less than a 5% predicted gain over the
+GPU alone. When no smaller share qualifies, it tries one step alone.
+`ane::Refused` covers compilation, loading, execution and FFN verification
+failures. On a 14-core M1 Pro running Qwen3.8-27B UD-Q4_K_M, the program at
+0.97 in two steps beside 0.74 in one step was refused and 0.94 prepared.
 Where neither kind gains the GPU alone serves, and nothing is remembered: the
 next start calibrates again. Six calibrations of
 Qwen3.8-27B MLX 4-bit on an M5 Max timed each function's split layer
