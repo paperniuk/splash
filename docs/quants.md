@@ -87,6 +87,12 @@ weights in GB (10^9 bytes).
 - The MLX 4-bit and the GSQ IQ3_S score below bf16's chat perplexity.
 - On 1.5.0-m1 the GSQ IQ3_S's top-512 log-probabilities came out bit-identical
   to 1.4.0-m1 on 6 windows; the MLX 4-bit's KL to bf16 matched to 4 decimals.
+- On 1.7.1-m1 the MLX 4-bit and the GPTQ were re-run on all 60 windows. The
+  log-probabilities are no longer bit-identical, but KL to bf16 stays within
+  3% of 1.4.0-m1 on both texts (95% paired bootstrap intervals include no
+  change) and EAR@10 within 0.1: MLX 4-bit KL 0.0554 wiki, 0.1927 chat; GPTQ
+  0.0403 and 0.0971. GPTQ against the MLX 4-bit: 27% lower on wiki, 50% on
+  chat. The other rows are not re-measured on 1.7.1-m1 yet.
 - Independent agent check: Alexander Fedora replayed 78 recorded agent turns
   against Q8_0 on an M2 Max; the share of turns with the same tool call was
   MLX 4-bit 31%, GPTQ 44%, Q4_0 44%, UD-Q4_K_M 51%, UD-Q5_K_M 56%, GSQ IQ3_S
@@ -138,6 +144,9 @@ short context, 1.4.0-m1, a separate session per quant.
 - The GSQ IQ3_S and MLX 4-bit were re-measured on 1.5.0-m1 in one session,
   alternating, 6 windows: the GSQ decoded 8% faster than on 1.4.0-m1 (+27.5%
   there), the MLX 4-bit stayed within noise. The other rows are 1.4.0-m1.
+- On 1.7.1-m1 the MLX 4-bit decodes the windows 6% faster than on 1.4.0-m1
+  (median 21.6 s against 23.1 s) and the GPTQ is still level with it (+0.5%).
+  Prefill is unchanged. The GGUF rows are not re-measured on 1.7.1-m1 yet.
 
 ### Speed: M2 Max, 64 GB
 
