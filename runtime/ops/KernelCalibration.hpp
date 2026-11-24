@@ -144,6 +144,7 @@ struct MoeCalibration final {
   // this many an expert runs 64-row expert tiles (MoeExpertTile::M64); kNever
   // never.
   uint32_t wideTileRoutes;
+  uint32_t softcapPrefillSmallTileRoutes = 1;
 };
 
 // Every measured constant of kernel selection for one device.
@@ -495,6 +496,7 @@ inline constexpr uint32_t kApple10ProMoeFromCores = 20;
 inline constexpr MoeCalibration kApple10ProMoe{.wideTileRoutes = 64};
 inline constexpr MoeCalibration kApple10SixteenCoreMoe{.wideTileRoutes = 128};
 inline constexpr MoeCalibration kThirtyTwoRowMoe{.wideTileRoutes = kNever};
+inline constexpr MoeCalibration kApple7Moe{.wideTileRoutes = kNever, .softcapPrefillSmallTileRoutes = 4};
 
 // ---- The device's row ------------------------------------------------------
 
@@ -512,7 +514,8 @@ inline KernelCalibration KernelCalibration::of(const DeviceCapabilities &device)
   if (gpu == GpuClass::Apple7) {
     attention = kApple9Attention;
     attention.cores = cores;
-    return {cores, kApple7Projection, kApple9FloatTile, kApple9DenseTile, attention, moe, true};
+    return {cores, kApple7Projection, kApple9FloatTile, kApple9DenseTile, attention,
+            device.appleGpuFamily == 7 ? kApple7Moe : moe, true};
   }
   if (gpu != GpuClass::Apple9)
     return {cores,

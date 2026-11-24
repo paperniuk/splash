@@ -1,6 +1,6 @@
 // GGUF MoE experts for Apple7/8 (M1/M2) on the simdgroup MMA tile (kernels/common/gguf_mma_tile.h): the bindings,
 // grids and outputs of moe_expert_gguf_m<rows>_gate_up[_mixed] and _down (kernels/shared/moe_gguf.metal), whose MPP
-// matmul2d runs far below the MMA rate there. A tile runs the 8-, 16- or 32-row MMAs that hold its live rows, over the
+// matmul2d runs far below the MMA rate there. A tile runs the 8-, 16-, 24- or 32-row MMAs that hold its live rows, over the
 // tiles of its pass's range (MOE_TILES_*, metal/abi/MoE.h).
 #pragma clang fp reassociate(off)
 #include "metal/kernels/common/gguf_mma_tile.h"
@@ -10,6 +10,34 @@
 #include "metal/kernels/common/softcapped_swiglu.h"
 
 using namespace gguf_mma;
+
+namespace gguf_mma {
+struct RoutedInputPair {
+  device const bfloat *first;
+  device const bfloat *second;
+};
+
+template <uint FM>
+inline void load_inputs(RoutedInputPair pair, uint, uint k0, sgmatrix::Lane lane, thread uint2 (&v)[FM][2]) {
+  static_assert(FM == 1, "the routed pair serves one row fragment");
+  const uint column = k0 + 4 * (lane.fm >> 1) + 16 * (lane.fm & 1);
+  v[0][0] = *reinterpret_cast<device const uint2 *>(pair.first + column);
+  v[0][1] = *reinterpret_cast<device const uint2 *>(pair.second + column);
+}
+}
+
+template <uint Routes>
+inline auto moe_mma_inputs(device bfloat *input, device const uchar *routes, MoeTileDescriptor tile,
+                           uint width, sgmatrix::Lane lane) {
+  if constexpr (Routes) {
+    device const uint *grouped = reinterpret_cast<device const uint *>(routes) + tile.first_row;
+    const uint last = tile.rows - 1;
+    return RoutedInputPair{input + ulong(grouped[min(uint(lane.fn), last)] / Routes) * width,
+                           input + ulong(grouped[min(uint(lane.fn) + 1, last)] / Routes) * width};
+  } else {
+    return input + ulong(tile.first_row) * width;
+  }
+}
 
 // A pass decodes its tensors' formats alone, as moe_gguf.metal's do: function constants 0 and 1 for the down pass
 // (routed, shared) and 0-3 for the gate/up pass (ops/MoE.cpp passFormats: each once in ascending order, the last
@@ -33,7 +61,7 @@ template <uint Count> struct moe_mma_formats {
 // Writes the elements of `acc` through write(row, column, v), the tile's `live` rows alone: a tile's grouped rows
 // start at its first_row and the next tile's follow its live rows (moe_expert_slab.h), so a partial tile's padding
 // rows are the next tile's. When FullFastPath is true (the down pass's plain store), a full tile writes every row
-// without the guard; gate/up keeps one guarded path so the SiLU epilogue is not duplicated across FM = 1, 2, 4.
+// without the guard; gate/up keeps one guarded path so the SiLU epilogue is not duplicated across fragment counts.
 template <uint FM, bool FullFastPath = true, class Write>
 inline void moe_mma_store(thread float2 (&acc)[FN][FM], sgmatrix::Lane l, uint live, Write write) {
   if constexpr (FullFastPath) {
@@ -73,6 +101,7 @@ template <ushort Rows, class Body> inline void moe_mma_live_rows(uint rows, Body
   if constexpr (Rows == 8) body(integral_constant<uint, 1>{});
   else if (rows <= 8) body(integral_constant<uint, 1>{});
   else if (rows <= 16) body(integral_constant<uint, 2>{});
+  else if (rows <= 24) body(integral_constant<uint, 3>{});
   else body(integral_constant<uint, 4>{});
 }
 
@@ -174,7 +203,7 @@ template [[host_name("moe_expert_gguf_mma_m32_down_s0")]] kernel MoeExpertGgufMm
 // lanes. IQ2_XXS and IQ2_S gate and up run column_dot on their own simdgroups, which beat their pair at pooled routing
 // (a verify's rows sharing their experts) on an M2 Max; their decode layer runs 8 to 32 rows 16-19% faster at random
 // routing and 1-4% at pooled than on the 8-row MMA. Other tiles run the MMAs that hold their live rows.
-template <ushort Rows, ushort Tables, uint Shared, bool Softcap = false>
+template <ushort Rows, ushort Tables, uint Shared, bool Softcap = false, uint Routes = 0>
 kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
                                         device const MoeTileDescriptor *tiles [[buffer(1)]],
                                         device const uint *tile_count [[buffer(2)]], device uchar *gsw0 [[buffer(3)]],
@@ -200,12 +229,13 @@ kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
                                                      p.up_routed_format, p.up_shared_format, slots, chunks,
                                                      p.floor_slots, p.chunk_slots, 1, usw0, usw1, usmeta);
   const uint K = p.input_size, N = p.output_size;
-  device bfloat *x = input + ulong(tile.first_row) * K;
+  static_assert(!Routes || (Rows == 8 && Shared == 0), "direct input uses one routed fragment");
+  device bfloat *x = Routes ? input : input + ulong(tile.first_row) * K;
   const ulong out = ulong(tile.first_row) * N;
   const uint origin = group.x * kColumns, thread_index = simd_group * 32 + simd_lane;
   const bool up = simd_group == 1;
   threadgroup bfloat *gate = reinterpret_cast<threadgroup bfloat *>(stage);
-  const bool column = moe_column_tile(tiles, t);
+  const bool column = !Routes && moe_column_tile(tiles, t);
   const bool gate_column = column && gs.format == FmtQ20::Id, up_column = column && us.format == FmtQ20::Id;
   const bool grid = moe_mma_grid_column_pass<Rows, 4>() && column;
   const bool gate_grid = grid && moe_mma_grid_column_format<Rows>(gs.format);
@@ -287,18 +317,19 @@ kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
     return;
   }
   // Both simdgroups run the MMAs of the tile's live rows, which the tile gives them alike.
+  const auto inputs = moe_mma_inputs<Routes>(input, gsw0, tile, K, l);
   moe_mma_live_rows<Rows>(tile.rows, [&](auto fragments) {
     constexpr uint FM = decltype(fragments)::value;
     float2 acc[FN][FM];
     zero(acc);
     moe_mma_formats<4>()(s.format, [&](auto f) {
-      accumulate<decltype(f), FM>(x, s.w0, s.w1, s.meta, K, origin, my, table, simd_lane, 0, K / kStep, acc);
+      accumulate<decltype(f), FM>(inputs, s.w0, s.w1, s.meta, K, origin, my, table, simd_lane, 0, K / kStep, acc);
     });
     if (!up) elements(acc, l, [&](uint row, uint column, float v) { gate[row * kColumns + column] = bfloat(v * scale); });
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (up) {
       // Reload the tile descriptor after the K loop so the 64-bit output offset and live row count are not held live
-      // across accumulate; single guarded store path avoids duplicating the SiLU epilogue across FM = 1, 2, 4.
+      // across accumulate; single guarded store path avoids duplicating the SiLU epilogue across fragment counts.
       const MoeTileDescriptor dst = tiles[t];
       const ulong dst_out = ulong(dst.first_row) * N;
       moe_mma_store<FM, false>(acc, l, dst.rows, [&](uint row, uint column, float v) {
@@ -326,6 +357,8 @@ MOE_MMA_GATE_UP(32)
 
 template [[host_name("moe_expert_gguf_mma_m8_gate_up_s0_softcap4_25")]] kernel MoeExpertGgufMmaGateUpKernel
     moe_expert_gguf_mma_gate_up<8, 1, 0, true>;
+template [[host_name("moe_expert_gguf_mma_m8_gate_up_s0_softcap4_25_routed8")]] kernel MoeExpertGgufMmaGateUpKernel
+    moe_expert_gguf_mma_gate_up<8, 1, 0, true, 8>;
 template [[host_name("moe_expert_gguf_mma_m32_gate_up_s0_softcap4_25")]] kernel MoeExpertGgufMmaGateUpKernel
     moe_expert_gguf_mma_gate_up<32, 1, 0, true>;
 template [[host_name("moe_expert_gguf_mma_m8_gate_up_mixed_s0_softcap4_25")]] kernel MoeExpertGgufMmaGateUpKernel

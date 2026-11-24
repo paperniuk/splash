@@ -135,7 +135,8 @@ std::array<uint32_t, Count> passFormats(std::array<uint32_t, Count> formats) {
 // (moe_expert_gguf_m<rows>_down), each times its experts' scales
 // (BlockMoeWeights::expertScales).
 void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const BlockMoeWeights &weights,
-                const metal::MetalBuffer &slots, const MoePlan &plan, const MoeGroupParams &group, uint32_t range) {
+                const metal::MetalBuffer &slots, const MoePlan &plan, const MoeGroupParams &group, uint32_t range,
+                const metal::MetalBuffer &ungroupedInput = {}) {
   const MoeShape shape = plan.shape();
   const uint32_t tiles = plan.maximumTiles();
   // Apple7/8 run the staged tiles' grids on simdgroup MMA kernels (MoeGgufTile::Mma).
@@ -165,9 +166,9 @@ void addExperts(metal::CommandGraph &graph, const MoeScratch &scratch, const Blo
   // One pair table where gate and up share their formats, one each otherwise.
   const bool mixed = gate.routed.formatId != up.routed.formatId || gate.shared.formatId != up.shared.formatId;
   const std::string activation(compiledRouting(shape).activationSuffix);
-  graph.add(kernel + (mixed ? "_gate_up_mixed" : "_gate_up") + slices + activation,
-            {scratch.groupedInput, scratch.tileDescriptors, scratch.tileCount,
-             gate.shared.plane0, gate.shared.plane1Slot(), gate.shared.meta,
+  graph.add(kernel + (mixed ? "_gate_up_mixed" : "_gate_up") + slices + activation + (ungroupedInput ? "_routed8" : ""),
+            {ungroupedInput ? ungroupedInput : scratch.groupedInput, scratch.tileDescriptors, scratch.tileCount,
+             ungroupedInput ? scratch.groupedRoutes : gate.shared.plane0, gate.shared.plane1Slot(), gate.shared.meta,
              up.shared.plane0, up.shared.plane1Slot(), up.shared.meta,
              scratch.expertIntermediate, slots, weights.expertScales},
             MoeGgufGateUpParams{hidden, intermediate, shape.experts, gate.routed.formatId, gate.shared.formatId,
@@ -352,8 +353,13 @@ void MoE::addRouted(metal::CommandGraph &graph, const MoeBuffers &buffers,
   } else if (plan.configuration().int8Passes) {
     addInt8Experts(graph, buffers, weights, plan);
   } else {
-    addGather(graph, buffers, plan);
-    addExperts(graph, buffers.scratch, weights, weights.slotTable, plan, group, MOE_TILES_ALL);
+    const MoeShape shape = plan.shape();
+    const bool direct = plan.configuration().ggufTile == MoeGgufTile::Mma && plan.tileRows() == 8 &&
+                        shape.gateSoftcap && !shape.sharedSlices && shape.routesPerToken() == 8 &&
+                        weights.gate.routed.formatId == GGUF_FMT_NVFP4 && weights.up.routed.formatId == GGUF_FMT_NVFP4;
+    if (!direct) addGather(graph, buffers, plan);
+    addExperts(graph, buffers.scratch, weights, weights.slotTable, plan, group, MOE_TILES_ALL,
+               direct ? buffers.input : metal::MetalBuffer{});
   }
   addCombine(graph, buffers, plan, convolution);
 }
