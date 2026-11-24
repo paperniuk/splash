@@ -27,14 +27,15 @@ KvPool::KvPool(kv::ExtentStorage &storage, uint32_t runwayPages)
   if (runwayPages > pages_.size())
     throw std::invalid_argument("the KV runway exceeds the page pool");
   extents_.resize(pages_.size() / extentPages_);
-  for (uint32_t extent = 0; firstPage(extent) < runwayPages; ++extent) {
-    if (const metal::AllocationResult allocated = allocateExtent(extent, kv::PageForm::Full);
-        !allocated) {
-      throw metal::MetalAllocationError(
-          std::string("unable to allocate the KV runway: ") +
-              metal::allocationFailureName(allocated.failure),
-          allocated.failure);
-    }
+  for (uint32_t extent = 0; firstPage(extent) < runwayPages; ++extent)
+    allocateRunwayExtent(extent);
+}
+
+void KvPool::allocateRunwayExtent(uint32_t extent) {
+  if (const metal::AllocationResult allocated = allocateExtent(extent, kv::PageForm::Full); !allocated) {
+    throw metal::MetalAllocationError(
+        std::string("unable to allocate the KV runway: ") + metal::allocationFailureName(allocated.failure),
+        allocated.failure);
   }
 }
 
@@ -45,15 +46,8 @@ KvPool::RunwayHold::RunwayHold(KvPool &pool, std::optional<uint32_t> prefillPage
   for (uint32_t page = 0; page < pageCount_; ++page) {
     try {
       const uint32_t extent = pool_.extentOf(page);
-      if (prefillPages && page == pool_.firstPage(extent) && !pool_.extents_[extent].allocated) {
-        if (const metal::AllocationResult allocated = pool_.allocateExtent(extent, kv::PageForm::Full);
-            !allocated) {
-          throw metal::MetalAllocationError(
-              std::string("unable to restore the KV runway: ") +
-                  metal::allocationFailureName(allocated.failure),
-              allocated.failure);
-        }
-      }
+      if (prefillPages && !pool_.extents_[extent].allocated)
+        pool_.allocateRunwayExtent(extent);
       pool_.retainPage(page, false);
     } catch (...) {
       while (page)

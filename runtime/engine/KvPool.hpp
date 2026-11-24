@@ -341,6 +341,7 @@ private:
   // Every allocation and release of an extent, timed and counted; the
   // extent's record follows the storage.
   [[nodiscard]] metal::AllocationResult allocateExtent(uint32_t extent, kv::PageForm form);
+  void allocateRunwayExtent(uint32_t extent);
   void releaseExtent(uint32_t extent);
 
   kv::ExtentStorage &storage_;
