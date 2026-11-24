@@ -6254,8 +6254,8 @@ public:
     // Every row verified: the two runs of one schedule that
     // requireSpilledKvMatchesResident compares must verify the same rows.
     const metal::AllocationResult arenas = admission(arenaBytes, [&] {
-      runtime_.emplace(model::RuntimeContext{backend, model, kv_, states_, operators, nullptr, nullptr, &cache_,
-                                             &stream_, model::VerifyRows::All});
+      runtime_.emplace(model::RuntimeContext{backend, model, kv_, states_, operators, nullptr, &cache_, &stream_,
+                                             model::VerifyRows::All});
     });
     require(static_cast<bool>(arenas),
             "the spill runtime's arenas exceed the oracle Metal budget" + refused(arenas.failure));
