@@ -360,7 +360,15 @@ inline constexpr SplitTier kMmaPrefillTiers[] = {{8, 512, 8}};
 // 4-bit projections' fastest splits at one to four lanes on a 32-core M1 Max, weighted by their calls a decode step.
 // Summed over one to four lanes it leaves 1.2 ms a step from the fastest splits, where kRegisterTiers leave 7.6.
 inline constexpr WaveLaw kApple7AffineRegisterLaw{
-    .tile = {12, 10, 6}, .gateUpPair = {1, 0, 1}, .sixteenRowResident = 0, .partitionInputs = 1024, .maximumSplits = 16};
+    .tile = {12, 10, 6},
+    .gateUpPair = {1, 0, 1},
+    // Fitted before 1.7.2's wide units: no unit is wide, so the first wave
+    // keeps the tile's floor.
+    .wideBits16 = kNever,
+    .wideSaturating = 10,
+    .sixteenRowResident = 0,
+    .partitionInputs = 1024,
+    .maximumSplits = 16};
 
 // Apple7/8 decode on the register tile's F32 instances wherever every format
 // takes it: the MMA tile's per-element dequantization through threadgroup
