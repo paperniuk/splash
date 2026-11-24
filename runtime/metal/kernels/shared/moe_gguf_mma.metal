@@ -141,9 +141,11 @@ kernel void moe_expert_gguf_mma_down(device bfloat *input [[buffer(0)]], device 
   }
   if (moe_mma_grid_column_pass<Rows, 2>() && moe_column_tile(tiles, t) &&
       moe_mma_grid_column_format<Rows>(s.format)) {
-    // The grid formats (moe_mma_grid_column_pass), whose grids are constant tables.
+    // The column formats but Q2_0 (moe_mma_grid_column_pass): the grids' constant tables, or NVFP4's pair table,
+    // which every thread fills first.
     float sums[GGUF_COLUMN_ROWS];
     moe_mma_grid_column<Rows, 2>(s.format, [&](auto f) {
+      quant_pair_table<decltype(f)>(tl, thread_index, GGUF_STAGED_THREADS);
       column_dot_rows<decltype(f), GGUF_COLUMN_ROWS>(x, tile.rows, p.input_size, s.w0, s.w1, s.meta,
                                                     origin + simd_lane, 0, p.input_size / 32, tl, sums);
     });

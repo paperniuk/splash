@@ -1706,7 +1706,10 @@ int laneRowsRoute(MetalBackend &backend, const std::string &name, uint32_t rows,
   return failures;
 }
 
-int inklingMoe(MetalBackend &backend) {
+// Inkling 2 Mini's routing and softcapped experts, of MLX affine 4-bit experts or of NVFP4 ones as unsloth's GGUF
+// holds them (gate and up NVFP4, down of 64-element blocks: its intermediate is not whole 256-element blocks), on
+// every tile of 1 to 64 rows.
+int inklingMoe(MetalBackend &backend, Fmt gateUpFormat, Fmt downFormat) {
   constexpr uint32_t H = 256, I = 64, E = 16, K = 8;
   constexpr MoeShape shape{.hiddenSize = H, .experts = E, .expertsPerToken = K,
                            .expertIntermediateSize = I, .router = splash::ops::MoeRouter::SigmoidCorrected,
@@ -1719,10 +1722,9 @@ int inklingMoe(MetalBackend &backend) {
                           .activation = splash::ops::MoeActivation::SoftcappedSwiGlu,
                           .gateSoftcap = 4.0F, .upSoftcap = 25.0F};
   static_assert(shape.valid() && full.valid());
-  const auto fmt = Fmt(GGUF_FMT_AF4G64);
-  const Tensor gate = quantized(backend, fmt, E * I, H);
-  const Tensor up = quantized(backend, fmt, E * I, H);
-  const Tensor down = quantized(backend, fmt, E * H, I);
+  const Tensor gate = quantized(backend, gateUpFormat, E * I, H);
+  const Tensor up = quantized(backend, gateUpFormat, E * I, H);
+  const Tensor down = quantized(backend, downFormat, E * H, I);
   std::vector<float> router(E * H, 0.0F);
   std::vector<float> bias(E, 0.0F), score(E);
   for (uint32_t e = 0; e < E; ++e) {
@@ -1757,6 +1759,11 @@ int inklingMoe(MetalBackend &backend) {
     for (uint32_t c = 0; c < H; ++c)
       expected[c] += bf16(dot(intermediate.data(), down.row(e * H + c), I).value) * (8.0F * score[e] / denominator);
   }
+  // Within the half and bf16 roundings of the column tile's and the MMA's sums: 2% of the output's scale and 4% of the
+  // value, which a tile reading the wrong weights or scaling a sum misses (the experts' outputs here are a few
+  // hundredths, below any fixed bound).
+  float scale = 0.0F;
+  for (const float v : expected) scale = std::max(scale, std::fabs(v));
   for (const auto tile : {MoeGgufTile::Staged, MoeGgufTile::Mma})
     for (const uint32_t rows : {1u, 8u, 16u, 64u}) {
       Buffers b;
@@ -1781,9 +1788,11 @@ int inklingMoe(MetalBackend &backend) {
         }
         for (uint32_t c = 0; c < H; ++c)
           require(std::fabs(float(output[r * H + c]) - bf16(expected[c])) <=
-                      0.1F + 0.04F * std::fabs(expected[c]), "softcapped affine expert output");
+                      0.02F * scale + 0.04F * std::fabs(expected[c]), "softcapped expert output");
       }
     }
+  printf("inkling %s/%s experts on every tile: ok\n", gguf_reference::fmtName(gateUpFormat),
+         gguf_reference::fmtName(downFormat));
   return 0;
 }
 
@@ -1797,7 +1806,9 @@ int main(int argc, const char *argv[]) {
     }
     try {
       MetalBackend backend(argv[1]);
-      if (inkling) return inklingMoe(backend);
+      if (inkling)
+        return inklingMoe(backend, Fmt(GGUF_FMT_AF4G64), Fmt(GGUF_FMT_AF4G64)) +
+               inklingMoe(backend, Fmt(GGUF_FMT_NVFP4), Fmt(GGUF_FMT_NVFP464));
       if (stress) {
         const int iterations = std::atoi(argv[3]);
         int failed = 0;
@@ -1809,7 +1820,9 @@ int main(int argc, const char *argv[]) {
       const int failures = floatProjection(backend) + bfloat16Weights(backend) + nativeRowWeights(backend) +
                            nativePairs(backend) + floatPairs(backend) +
                            floatSegments(backend, 64) + floatSegments(backend, 96) + floatOnlyChain(backend) +
-                           moe(backend) + routingLoads(backend) + nativeRouter(backend) + permutedSlots(backend) + inklingMoe(backend) +
+                           moe(backend) + routingLoads(backend) + nativeRouter(backend) + permutedSlots(backend) +
+                           inklingMoe(backend, Fmt(GGUF_FMT_AF4G64), Fmt(GGUF_FMT_AF4G64)) +
+                           inklingMoe(backend, Fmt(GGUF_FMT_NVFP4), Fmt(GGUF_FMT_NVFP464)) +
                            laneRowsRoute(backend, "lanes of 8/5/2/1 rows, 16 of no lane", 32,
                                          {{0, 8}, {8, 5}, {13, 2}, {15, 1}}) +
                            laneRowsRoute(backend, "rows of no lane around lanes of 6/2/3/1", 26,

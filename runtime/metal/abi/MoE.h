@@ -67,23 +67,27 @@ inline bool moe_column_tile(Tiles tiles, uint32_t t) {
 
 // Whether Apple7/8's MMA expert passes (kernels/shared/moe_gguf_mma.metal) of `tile_rows`-row tiles run a projection
 // in `format` on the column tile of a moe_column_tile tile, rather than the 8-row MMA: Q2_0 in every pass, IQ2_XXS,
-// IQ2_S and MLX affine 4-bit (group 64) in the 8-row (decode) passes only. The kernels and the MoE test's expected
-// tile kinds ask this. Affine 4-bit: Inkling 2 Mini's one-row decode experts on M1 Max ran at ~120 GB/s on the
-// staged 8-row MMA, whose 8-row step and stage barrier bound a one-row tile.
+// IQ2_S, MLX affine 4-bit (group 64) and NVFP4 (either block size) in the 8-row (decode) passes only. The kernels and
+// the MoE test's expected tile kinds ask this. Affine 4-bit: Inkling 2 Mini's one-row decode experts on M1 Max ran at
+// ~120 GB/s on the staged 8-row MMA, whose 8-row step and stage barrier bound a one-row tile; NVFP4 (unsloth's GGUF of
+// it) the same, a one-row layer's gate/up 0.208 ms against affine 4-bit's 0.093 on the column tile.
+constexpr inline bool moe_mma_nvfp4_format(uint32_t format) {
+  return format == GGUF_FMT_NVFP4 || format == GGUF_FMT_NVFP464;
+}
 constexpr inline bool moe_mma_column_format(uint32_t format, uint32_t tile_rows) {
   return format == GGUF_FMT_Q20 || (tile_rows == 8 && (format == GGUF_FMT_IQ2XXS || format == GGUF_FMT_IQ2S ||
-                                                       format == GGUF_FMT_AF4G64));
+                                                       format == GGUF_FMT_AF4G64 || moe_mma_nvfp4_format(format)));
 }
 
 // Whether an Apple7/8 MMA gate/up pass of `tile_rows`-row tiles whose formats are all `format` runs its grid at
 // MOE_MMA_SPLIT times its column tiles (MoeGroupParams): the first of a tile's threadgroups runs its MMAs as before and
 // the others return, while a column tile's threadgroups take a part of its columns each, a lane's column over a part
-// of K beside the lanes that sum the other parts: MLX affine 4-bit in the 8-row passes, whose decode gate/up tiles
-// summing a column's rows one at a time ran 11.39 ms a 3-row cycle at 4 parts, 11.16 at 2, 12.04 at 8 on a 32-core
-// M1 Max (Inkling 2 Mini); its down pass, at ~200 GB/s, took no gain.
+// of K beside the lanes that sum the other parts: MLX affine 4-bit and NVFP4 in the 8-row passes, whose decode
+// gate/up tiles summing a column's rows one at a time ran 11.39 ms a 3-row cycle at 4 parts, 11.16 at 2, 12.04 at 8 on
+// a 32-core M1 Max (Inkling 2 Mini, affine 4-bit); its down pass, at ~200 GB/s, took no gain.
 #define MOE_MMA_SPLIT 2u
 constexpr inline bool moe_mma_split_format(uint32_t format, uint32_t tile_rows) {
-  return tile_rows == 8 && format == GGUF_FMT_AF4G64;
+  return tile_rows == 8 && (format == GGUF_FMT_AF4G64 || moe_mma_nvfp4_format(format));
 }
 
 // The column tiles of the gate/up and down passes, whose grids the grouping
