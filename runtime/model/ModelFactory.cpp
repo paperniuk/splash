@@ -103,9 +103,7 @@ TargetWeights loadTarget(metal::MetalBackend &backend, WeightImages &images, con
       [&](const auto &layout) -> TargetWeights {
         const std::filesystem::path directory = root / "target";
         if constexpr (std::is_same_v<std::decay_t<decltype(layout)>, InklingLayout>) {
-          if (descriptor.targetSource != TargetSource::Safetensors)
-            throw std::invalid_argument("Inkling loads from safetensors only");
-          return loadInklingWeights(backend, layout, images, directory, experts);
+          return loadInklingWeights(backend, layout, images, directory, descriptor.targetSource, experts);
         } else {
         switch (descriptor.targetSource) {
         case TargetSource::Safetensors: {

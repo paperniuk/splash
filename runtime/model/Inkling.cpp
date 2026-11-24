@@ -2,21 +2,39 @@
 #include "metal/abi/PagedAttention.h"
 
 #include "model/ExpertStore.hpp"
+#include "model/GgufImage.hpp"
 #include "model/GgufPreparation.hpp"
+#include "model/GgufTarget.hpp"
 #include "model/InklingImage.hpp"
+#include "model/ModelDescriptor.hpp"
 #include "model/QwenTargetLoader.hpp"
+
+#include <optional>
 
 namespace splash::model {
 namespace {
 
+// The planned images of the target's layers, head and embedding, of its
+// safetensors checkpoint or its GGUF, which stays open while they load.
 struct Images final {
-  explicit Images(const std::filesystem::path &directory) : checkpoint(directory) {
+  Images(const std::filesystem::path &directory, const InklingLayout &layout, TargetSource source) {
+    if (source == TargetSource::Gguf) {
+      gguf.emplace(findTargetGgufs(directory));
+      plans = gguf::planImages(gguf->file(), InklingLayout::ggufArchitecture, layout);
+      return;
+    }
+    checkpoint.emplace(directory);
     for (uint32_t layer = 0; layer < InklingLayout::storedLayers; ++layer)
-      plans.push_back(planInklingLayer(checkpoint, layer));
-    plans.push_back(planInklingHead(checkpoint));
-    plans.push_back(planInklingEmbedding(checkpoint));
+      plans.push_back(planInklingLayer(*checkpoint, layer));
+    plans.push_back(planInklingHead(*checkpoint));
+    plans.push_back(planInklingEmbedding(*checkpoint));
   }
-  SafetensorsCheckpoint checkpoint;
+  void checkUnchanged() const {
+    if (gguf) gguf->checkUnchanged();
+    else checkpoint->checkUnchanged();
+  }
+  std::optional<SafetensorsCheckpoint> checkpoint;
+  std::optional<OpenGguf> gguf;
   std::vector<gguf::Image> plans;
 };
 
@@ -38,13 +56,14 @@ QwenTargetGeometry qwenTargetGeometry(const InklingWeights &weights, std::span<c
 }
 
 InklingWeights loadInklingWeights(metal::MetalBackend &backend, InklingLayout layout, WeightImages &images,
-                                  const std::filesystem::path &directory, const ExpertStoreOptions &options) {
+                                  const std::filesystem::path &directory, TargetSource source,
+                                  const ExpertStoreOptions &options) {
   const uint64_t baseline = backend.memoryStats().allocatedBytes;
   if (options.memoryBytes) throw WeightStoreError("Inkling expert streaming is not supported");
-  auto planned = std::make_shared<Images>(directory);
+  auto planned = std::make_shared<Images>(directory, layout, source);
   const auto open = [&](uint32_t index) {
     return loadImage(backend, images, "target/", {planned, &planned->plans[index]},
-                     [planned] { planned->checkpoint.checkUnchanged(); });
+                     [planned] { planned->checkUnchanged(); });
   };
   InklingWeights result;
   result.layout = layout;

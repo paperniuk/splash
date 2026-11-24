@@ -588,7 +588,7 @@ void checkRepack(MetalBackend &backend, const std::filesystem::path &directory, 
   const uint32_t stride = rowBytes(f, windows * K), windowBytes = rowBytes(f, K);
   std::vector<uint8_t> native = fixture(f, shape.rows, windows * K, seed);
   // llama.cpp's NVFP4 without a .scale tensor: g is 1.
-  if (blockNvfp4) setTensorScales(native, NVFP4, windows * K, [](uint32_t) { return 1.0f; });
+  if (blockNvfp4) setTensorScales(native, f, windows * K, [](uint32_t) { return 1.0f; });
   const std::vector<uint8_t> ordered = orderedRows(native, stride, shape.order);
   std::vector<uint8_t> windowRows;
   for (uint32_t window = 0; window < windows; ++window)
@@ -607,7 +607,7 @@ void checkRepack(MetalBackend &backend, const std::filesystem::path &directory, 
   const auto inputPath = directory / "repack-source";
   try {
     std::vector<uint8_t> input(kSourceOffset, 0);
-    const std::vector<uint8_t> stored = blockNvfp4 ? blockNvfp4Rows(native) : native;
+    const std::vector<uint8_t> stored = blockNvfp4 ? blockNvfp4Rows(native, f) : native;
     input.insert(input.end(), stored.begin(), stored.end());
     splash::test::writeFile(inputPath, input);
     model::WeightSource source(inputPath);
@@ -678,6 +678,56 @@ void checkExecutor(MetalBackend &backend, const std::filesystem::path &directory
   checkRepack(backend, directory, Q80, {256, widerThanStaging(Q80), {}, 2}, 743);
   checkRepack(backend, directory, NVFP4, {2048, 512, {}, 2}, 744, true);
   checkRepack(backend, directory, NVFP4, {768, 512, {256, 16, 8, 4}, 3}, 745, true);
+  // llama.cpp's NVFP4 rows that are not whole 256-element blocks (an expert down projection of 1152
+  // inputs) as NVFP4's form of 64-element blocks.
+  checkRepack(backend, directory, NVFP464, {256, 1152, {}}, 746, true);
+}
+
+// F32 rows [R, C] copied transposed into bf16 [C, R] (Conversion::TransposeToBfloat16), or with the columns last
+// first (ReversedTransposeToBfloat16): an Inkling 2 GGUF's relative bias [1024, 16] and a full layer's static
+// convolution taps [1024, 4]. A value bf16 does not hold refuses the copy.
+void checkTransposes(MetalBackend &backend, const std::filesystem::path &directory) {
+  using model::gguf::Conversion;
+  for (const auto &[rows, columns] : {std::pair<uint32_t, uint32_t>{1024, 16}, {1024, 4}})
+    for (const Conversion conversion : {Conversion::TransposeToBfloat16, Conversion::ReversedTransposeToBfloat16}) {
+      const bool reversed = conversion == Conversion::ReversedTransposeToBfloat16;
+      std::vector<float> values(uint64_t{rows} * columns);
+      for (uint64_t i = 0; i < values.size(); ++i) values[i] = float(int(i % 509) - 254) / 64.0f;
+      std::vector<uint16_t> expected(values.size());
+      for (uint32_t r = 0; r < rows; ++r)
+        for (uint32_t c = 0; c < columns; ++c) {
+          uint32_t bits;
+          std::memcpy(&bits, &values[uint64_t{r} * columns + c], 4);
+          expected[uint64_t{reversed ? columns - 1 - c : c} * rows + r] = uint16_t(bits >> 16);
+        }
+      const std::string what = std::string(reversed ? "reversed " : "") + "transposed copy of " +
+                               std::to_string(rows) + "x" + std::to_string(columns);
+      for (const bool exact : {true, false}) {
+        if (!exact) values[7] = 1.0f + 0x1p-20f;
+        const auto inputPath = directory / "transpose-source";
+        std::vector<uint8_t> input(kSourceOffset, 0);
+        const auto *bytes = reinterpret_cast<const uint8_t *>(values.data());
+        input.insert(input.end(), bytes, bytes + values.size() * 4);
+        splash::test::writeFile(inputPath, input);
+        model::WeightSource source(inputPath);
+        source.setDataOffset(kSourceOffset);
+        model::gguf::Image plan;
+        plan.bytes = model::alignWeightOffset(model::kWeightFileAlignment + expected.size() * 2);
+        plan.copies.push_back({model::kWeightFileAlignment,
+                               {"fixture", model::ggml::kF32, 0, rows, uint64_t{columns} * 4, {}, &source},
+                               conversion});
+        const auto image = backend.allocateBuffer(plan.bytes, splash::metal::BufferStorage::Shared, "transpose-output");
+        try {
+          model::writeGgufImage(backend, image, plan);
+          const auto actual = model::contentsOf(image);
+          check(exact && std::memcmp(actual.data() + model::kWeightFileAlignment, expected.data(),
+                                     expected.size() * 2) == 0,
+                what + (exact ? "" : ": an inexact value is refused"));
+        } catch (const std::exception &error) {
+          check(!exact, what + ": " + error.what());
+        }
+      }
+    }
 }
 
 // Each MLX fixture tensor through the production writer, read from a
@@ -971,6 +1021,7 @@ int main(int argc, char **argv) {
     MetalBackend backend(argv[1]);
     // First, so that the peak allocation it checks against is its own.
     checkExecutor(backend, directory.path());
+    guarded("transposed copies", [&] { checkTransposes(backend, directory.path()); });
     guarded("preparation of the dense target", [&] { checkDense(backend, directory.path(), hashes); });
     guarded("preparation of the MoE target", [&] { checkMoe(backend, directory.path(), hashes); });
     guarded("preparation of BF16 and F16 alpha/beta", [&] { checkFloatAlphaBeta(backend, directory.path()); });

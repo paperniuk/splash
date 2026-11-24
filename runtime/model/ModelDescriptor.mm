@@ -277,8 +277,6 @@ std::optional<SizeDifference> sizeDifference(NSDictionary *text, const InklingLa
 }
 
 void validateTextConfig(NSDictionary *text, const InklingLayout &target, TargetSource source) {
-  if (source != TargetSource::Safetensors)
-    throw std::invalid_argument("Inkling loads from safetensors only");
   requireEqual(requireString(text, @"model_type", "text model type"), "inkling2_loop_text",
                sourceName(source), "text model type");
   if (const auto difference = sizeDifference(text, target, source)) throw unsupportedModel(difference->difference);

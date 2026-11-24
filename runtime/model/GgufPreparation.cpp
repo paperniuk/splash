@@ -294,7 +294,9 @@ void quantizeQ8_0Rows(const gguf::TensorRows &rows, uint64_t start, uint64_t cou
 // 16 in the low nibble of byte j and element j + 8 in its high one.
 void readGgufNvfp4Rows(const gguf::TensorRows &rows, uint64_t start, uint64_t count, uint64_t column, uint64_t span,
                        uint8_t *to) {
-  const QuantFormat &format = kQuantFormats[GGUF_FMT_NVFP4];
+  // NVFP4's native block or NVFP4_64's: the scales, g, then the codes from the meta unit's end.
+  const QuantFormat &format = nativeFormat(rows);
+  const uint64_t gAt = format.meta_bytes - sizeof(float), codesAt = format.meta_bytes;
   const GgmlTypeTraits &blocks = *ggmlTypeTraits(ggml::kNVFP4);
   const uint64_t perNative = format.block_elements / blocks.blockElements, nativeBlocks = span / format.block_bytes,
                  sourceSpan = nativeBlocks * perNative * blocks.blockBytes;
@@ -314,14 +316,14 @@ void readGgufNvfp4Rows(const gguf::TensorRows &rows, uint64_t start, uint64_t co
           const uint8_t *codes = in + 4 + 8 * s;
           out[4 * q + s] = in[s] == 0x7F ? 0 : in[s] & 0x7F;
           // Elements 2 i and 2 i + 1: the low nibbles of bytes 2 i and 2 i + 1 for i < 4, else their high ones.
-          uint8_t *pairs = out + QUANT_NVFP4_CODES + 32 * q + 8 * s;
+          uint8_t *pairs = out + codesAt + 32 * q + 8 * s;
           for (uint64_t i = 0; i < 4; ++i) {
             pairs[i] = uint8_t((codes[2 * i] & 15) | (codes[2 * i + 1] & 15) << 4);
             pairs[4 + i] = uint8_t(codes[2 * i] >> 4 | (codes[2 * i + 1] & 0xF0));
           }
         }
       }
-      std::memcpy(out + QUANT_NVFP4_G, &g[row + b / nativeBlocks], 4);
+      std::memcpy(out + gAt, &g[row + b / nativeBlocks], 4);
     }
   }
 }
@@ -364,6 +366,21 @@ void narrowToBfloat16(const uint8_t *values, uint64_t count, uint8_t *to, const 
   }
 }
 
+// Writes the bf16 values of `rows` rows of `columns` F32 values transposed,
+// each narrowed exactly: value c of row r at c * rows + r, or, `reversed`, at
+// (columns - 1 - c) * rows + r.
+void transposeToBfloat16(const uint8_t *values, uint64_t rows, uint64_t columns, bool reversed, uint8_t *to,
+                         const std::string &name) {
+  for (uint64_t r = 0; r < rows; ++r)
+    for (uint64_t c = 0; c < columns; ++c) {
+      float value;
+      std::memcpy(&value, values + 4 * (r * columns + c), 4);
+      const std::optional<uint16_t> narrowed = exactBfloat16(value);
+      if (!narrowed) throw GgufError(name + " is not bf16-exact; it needs an F32 path");
+      std::memcpy(to + 2 * ((reversed ? columns - 1 - c : c) * rows + r), &*narrowed, 2);
+    }
+}
+
 // Writes the F32 values `count` BF16 (or, with float16, F16) values equal.
 void widenToFloat32(const uint8_t *values, uint64_t count, bool float16, uint8_t *to) {
   for (uint64_t i = 0; i < count; ++i) {
@@ -400,6 +417,22 @@ uint64_t copyBytes(const gguf::Copy &copy) {
 void addCopyTasks(uint8_t *image, const gguf::Copy &copy,
                   std::vector<std::function<void(std::vector<uint8_t> &)>> &tasks) {
   const gguf::TensorRows &rows = copy.source;
+  // A transposed copy writes every row's values into each of its rows: one
+  // task of all its rows.
+  if (copy.conversion == gguf::Conversion::TransposeToBfloat16 ||
+      copy.conversion == gguf::Conversion::ReversedTransposeToBfloat16) {
+    if (rows.rows * rows.rowBytes > kLoadStepBytes || rows.type != ggml::kF32)
+      throw GgufError("a transposed copy is not F32 rows within one step: " + rows.name);
+    tasks.push_back([&copy, image](std::vector<uint8_t> &staging) {
+      const gguf::TensorRows &rows = copy.source;
+      if (staging.size() < rows.rows * rows.rowBytes) staging.resize(rows.rows * rows.rowBytes);
+      readRows(rows, 0, rows.rows, 0, rows.rowBytes, staging.data());
+      transposeToBfloat16(staging.data(), rows.rows, rows.rowBytes / 4,
+                          copy.conversion == gguf::Conversion::ReversedTransposeToBfloat16,
+                          image + copy.destination, rows.name);
+    });
+    return;
+  }
   const uint64_t unit = rowReader(rows) == RowReader::Stored ? 4 : nativeFormat(rows).block_bytes;
   const uint64_t span = std::min<uint64_t>(rows.rowBytes, kLoadStepBytes / unit * unit);
   const uint64_t batch = span == rows.rowBytes ? kLoadStepBytes / rows.rowBytes : 1;
@@ -430,6 +463,8 @@ void addCopyTasks(uint8_t *image, const gguf::Copy &copy,
           break;
         }
         case gguf::Conversion::DequantizeToFloat32: // decoded on the GPU (writeDecoded)
+        case gguf::Conversion::TransposeToBfloat16: // one task of their own (above)
+        case gguf::Conversion::ReversedTransposeToBfloat16:
         case gguf::Conversion::None: break;
         }
       });

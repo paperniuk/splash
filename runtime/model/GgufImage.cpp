@@ -3,6 +3,7 @@
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/QuantFormat.h"
 #include "model/GgufImageLayout.hpp"
+#include "model/Inkling.hpp"
 #include "model/StateLayout.hpp"
 #include "model/WeightLayout.hpp"
 
@@ -39,6 +40,14 @@ static_assert([] {
 // NVFP4's for llama.cpp's NVFP4, whose block_nvfp4 rows the writer builds
 // NVFP4's native rows from (TensorRows::ggufNvfp4RowBytes).
 uint32_t imageFormat(uint32_t type) { return type == ggml::kNVFP4 ? GGUF_FMT_NVFP4 : gguf_format_of(type); }
+// The format whose native rows hold `tensor`: its type's (imageFormat), but
+// NVFP4's form of 64-element blocks for an NVFP4 tensor whose rows are not
+// whole 256-element ones (llama.cpp's NVFP4 blocks are 64 elements).
+uint32_t imageFormat(const GgufTensor &tensor) {
+  const uint32_t format = imageFormat(tensor.type);
+  return format == GGUF_FMT_NVFP4 && tensor.columns() % kQuantFormats[format].block_elements ? GGUF_FMT_NVFP464
+                                                                                             : format;
+}
 
 // A type of a format, BF16 and F16 among them: repacked into the planes
 // projections multiply, or rows as stored (storedRowBytes), which the
@@ -65,7 +74,7 @@ bool floatProjectionType(uint32_t type) { return floatType(type) || type == ggml
 // for llama.cpp's NVFP4 (Builder::tensorRows); 0 for a width that holds none.
 uint64_t storedRowBytes(const GgufTensor &tensor) {
   return floatType(tensor.type) ? tensor.columns() * sizeof(float)
-                                : quant_stored_row_bytes(imageFormat(tensor.type), tensor.columns());
+                                : quant_stored_row_bytes(imageFormat(tensor), tensor.columns());
 }
 
 // A MoE router, which the float projection runs in fp32 as stored (router):
@@ -179,7 +188,7 @@ public:
     if (!tensor) return;
     if (tensor->rows() != rows || tensor->columns() != windows * columns)
       throw GgufError("unexpected shape for " + name);
-    const uint32_t format = imageFormat(tensor->type);
+    const uint32_t format = imageFormat(*tensor);
     Repack repack = image_.planes(format, windows * rows, columns, name);
     for (uint32_t window = 0; window < windows; ++window) {
       TensorRows source = tensorRows(*tensor, rows, ggufRowBytes(kQuantFormats[format], windows * columns), order);
@@ -213,7 +222,7 @@ public:
     const GgufTensor *tensor = find(name, quantizedType);
     if (!tensor) return;
     if (tensor->rows() != rows || tensor->columns() != columns) throw GgufError("unexpected shape for " + name);
-    const uint32_t format = imageFormat(tensor->type);
+    const uint32_t format = imageFormat(*tensor);
     Repack repack = image_.expertPlanes(format, rows, columns, name);
     repack.sources.push_back(tensorRows(*tensor, rows, ggufRowBytes(kQuantFormats[format], columns)));
     image_.expertRepack(std::move(repack));
@@ -232,7 +241,7 @@ public:
     } else if (const GgufTensor *fused = find(fusedName, quantizedType)) {
       if (fused->rows() != 2 * experts * width || fused->columns() != hidden)
         throw GgufError("unexpected shape for " + fusedName);
-      const uint32_t format = imageFormat(fused->type);
+      const uint32_t format = imageFormat(*fused);
       const TensorRows rows = tensorRows(*fused, 2 * experts * width, ggufRowBytes(kQuantFormats[format], hidden));
       // Expert e's gate rows are rows 2e width.. of the fused tensor, its up rows the next width.
       for (const uint64_t up : {0, 1}) {
@@ -321,6 +330,68 @@ public:
   // An F32 vector the kernels read as stored (Flint's attention sinks).
   void floatValues(const std::string &name, uint64_t elements) {
     if (const GgufTensor *tensor = floatVector(name, elements)) image_.copy(tensorRows(*tensor, 1, tensor->bytes));
+  }
+
+  // F32 vectors of `elements` values each, as stored, back to back in one
+  // section (Inkling 2's message queries, a loop layer's in its GGUF).
+  void floatValuesTogether(const std::vector<std::string> &names, uint64_t elements) {
+    uint64_t destination = image_.section(names.size() * elements * sizeof(float));
+    for (const std::string &name : names) {
+      if (const GgufTensor *tensor = floatVector(name, elements))
+        image_.copyAt(destination, tensorRows(*tensor, 1, tensor->bytes), Conversion::None);
+      destination += elements * sizeof(float);
+    }
+  }
+
+  // F32 or BF16 values the kernels read as bf16: BF16 as stored, F32
+  // narrowed exactly. `conversion` transposes F32 [rows, elements / rows]
+  // (Conversion::TransposeToBfloat16) or narrows it as stored.
+  void bfloat16Values(const std::string &name, uint64_t elements, uint64_t rows = 1,
+                      Conversion conversion = Conversion::NarrowToBfloat16) {
+    const GgufTensor *tensor = find(name, floatProjectionType);
+    if (!tensor) return;
+    if (tensor->elements() != elements || (rows != 1 && tensor->rows() != rows))
+      throw GgufError("unexpected shape for " + name);
+    if (tensor->type == ggml::kBF16 && conversion != Conversion::NarrowToBfloat16)
+      throw GgufError("expected F32 values to transpose: " + name);
+    image_.copy(tensorRows(*tensor, rows, tensor->bytes / rows),
+                tensor->type == ggml::kBF16 ? Conversion::None : conversion);
+  }
+
+  // A float projection's rows [rows, columns] as bf16 after their descriptor:
+  // BF16 as stored, F32 narrowed exactly (Inkling 2's router).
+  void bfloat16Rows(const std::string &name, uint64_t rows, uint64_t columns) {
+    const GgufTensor *tensor = find(name, floatProjectionType);
+    if (!tensor) return;
+    if (tensor->rows() != rows || tensor->columns() != columns)
+      throw GgufError("expected an F32 or BF16 [" + std::to_string(rows) + ", " + std::to_string(columns) +
+                      "] tensor: " + name);
+    image_.descriptor(ggml::kBF16, rows, columns, {}, {rows * columns * sizeof(uint16_t), 0, 0}, name);
+    image_.copy(tensorRows(*tensor, rows, tensor->bytes / rows),
+                tensor->type == ggml::kBF16 ? Conversion::None : Conversion::NarrowToBfloat16);
+  }
+
+  // Tensors [rows_i, columns] of one quantized type repacked as one, their
+  // rows in order.
+  void fusedQuantized(const std::string &name, std::initializer_list<std::pair<std::string, uint64_t>> tensors,
+                      uint64_t columns) {
+    std::vector<const GgufTensor *> found;
+    uint64_t rows = 0;
+    for (const auto &[tensorName, count] : tensors) {
+      const GgufTensor *tensor = find(tensorName, quantizedType);
+      if (!tensor) return;
+      if (tensor->rows() != count || tensor->columns() != columns)
+        throw GgufError("unexpected shape for " + tensorName);
+      if (!found.empty() && tensor->type != found.front()->type)
+        throw GgufError(name + " fuses tensors of one type: " + tensorName + " differs");
+      found.push_back(tensor);
+      rows += count;
+    }
+    const uint32_t format = imageFormat(*found.front());
+    Repack repack = image_.planes(format, rows, columns, name);
+    for (const GgufTensor *tensor : found)
+      repack.sources.push_back(tensorRows(*tensor, tensor->rows(), ggufRowBytes(kQuantFormats[format], columns)));
+    image_.repack(std::move(repack));
   }
 
   // Token rows as stored, gathered by the embedding kernel.
@@ -429,14 +500,14 @@ private:
       if (!count || count * rowBytes != tensor.bytes) throw GgufError("unexpected size for " + tensor.name);
       return {tensor.name, tensor.type, tensor.offset, count, rowBytes, order, &file_.source(tensor.file)};
     }
-    const QuantFormat &format = kQuantFormats[GGUF_FMT_NVFP4];
+    const QuantFormat &format = kQuantFormats[imageFormat(tensor)];
     const GgmlTypeTraits &blocks = *ggmlTypeTraits(ggml::kNVFP4);
     const uint64_t sourceRowBytes =
         rowBytes / format.block_bytes * (format.block_elements / blocks.blockElements) * blocks.blockBytes;
     if (!count || rowBytes % format.block_bytes || count * sourceRowBytes != tensor.bytes)
       throw GgufError(tensor.name + "'s rows are not whole nvfp4 blocks of " + std::to_string(format.block_elements) +
                       " elements");
-    TensorRows rows{tensor.name, QUANT_NVFP4_TYPE, tensor.offset, count, rowBytes, order, &file_.source(tensor.file)};
+    TensorRows rows{tensor.name, format.ggml_type, tensor.offset, count, rowBytes, order, &file_.source(tensor.file)};
     rows.ggufNvfp4RowBytes = sourceRowBytes;
     const std::string stem = tensor.name.ends_with(".weight") ? tensor.name.substr(0, tensor.name.size() - 7) : "";
     const uint64_t values = stem.ends_with("_exps") ? geometry_.experts : 1;
@@ -754,7 +825,9 @@ uint64_t loadedBytes(const Image &image) { return image.streamedRows ? 0 : image
 
 uint64_t convertedBytes(const TensorRows &source, Conversion conversion, uint64_t sourceBytes) {
   switch (conversion) {
-  case Conversion::NarrowToBfloat16: return sourceBytes / 2;
+  case Conversion::NarrowToBfloat16:
+  case Conversion::TransposeToBfloat16:
+  case Conversion::ReversedTransposeToBfloat16: return sourceBytes / 2;
   case Conversion::WidenToFloat32: case Conversion::CenteredNorm: return sourceBytes * 2;
   case Conversion::Decay: return source.type == ggml::kBF16 ? sourceBytes * 2 : sourceBytes;
   case Conversion::DequantizeToFloat32: {
@@ -935,10 +1008,157 @@ void requireMetadata(const GgufFile &file, std::string_view architecture, const 
   if (!mismatched.empty()) throw GgufError("GGUF metadata does not match the target: " + mismatched);
 }
 
+// What an Inkling 2 GGUF (llama.cpp's converter's, InklingLayout's
+// ggufArchitecture) states: its weight layers, sizes, sliding layers (a bool
+// a weight layer), loop, relative bias, clips, convolutions, softcaps and
+// experts, as InklingLayout and the target's kernels fix them; no RoPE and
+// the same passes for every token (loop.varying false). Every mismatch is
+// named at once.
+void requireInklingMetadata(const GgufFile &file, const QwenTargetDimensions &g) {
+  const GgufMetadata &metadata = file.metadata();
+  const std::string arch(InklingLayout::ggufArchitecture);
+  if (metadata.architecture() != arch)
+    throw GgufError("GGUF architecture is " + metadata.architecture() + ", but the model's target is " + arch);
+  std::string mismatched;
+  const auto note = [&](std::string_view key) { mismatched += (mismatched.empty() ? "" : ", ") + std::string(key); };
+  const auto expect = [&](std::string_view key, uint64_t value) {
+    if (metadata.unsignedValue(arch + "." + std::string(key)) != value) note(key);
+  };
+  const auto expectFloat = [&](std::string_view key, double value) {
+    const std::optional<double> found = metadata.floatValue(arch + "." + std::string(key));
+    if (!found || std::abs(*found - value) > std::abs(value) * 1e-6) note(key);
+  };
+  const auto expectArray = [&](std::string_view key, const auto &value) {
+    const std::optional<std::span<const double>> values = file.numericArray(arch + "." + std::string(key));
+    bool matches = values && values->size() == InklingLayout::storedLayers;
+    for (uint32_t layer = 0; matches && layer < InklingLayout::storedLayers; ++layer)
+      matches = (*values)[layer] == double(value(layer));
+    if (!matches) note(key);
+  };
+  expect("block_count", InklingLayout::storedLayers);
+  expect("embedding_length", g.hiddenSize);
+  expect("vocab_size", g.vocabularySize);
+  expectArray("attention.head_count", [&](uint32_t) { return g.attentionQueryHeads; });
+  expectArray("attention.head_count_kv", [&](uint32_t) { return g.attentionKvHeads; });
+  expectArray("attention.sliding_window_pattern", [](uint32_t layer) { return InklingLayout::isSlidingLayer(layer); });
+  for (const char *key : {"attention.key_length", "attention.value_length", "attention.key_length_swa",
+                          "attention.value_length_swa"})
+    expect(key, g.attentionHeadDimension);
+  expect("rope.dimension_count", 0);
+  expectFloat("attention.layer_norm_rms_epsilon", SPLASH_RMS_EPSILON);
+  expect("attention.sliding_window", 1024);
+  expect("attention.relative_length", InklingLayout::relativeDimension);
+  expect("attention.relative_extent", InklingLayout::relativeExtent);
+  expectFloat("attention.relative_clip", 8.0);
+  expectFloat("attention.qk_clip", 22.627416997969522);
+  expect("attention.log_scale_floor", 8192);
+  expectFloat("attention.log_scale_alpha", 0.1);
+  expect("shortconv.l_cache", 4);
+  expect("attn_res.block_size", InklingLayout::blockPeriod);
+  expect("loop.start", InklingLayout::coreBegin);
+  expect("loop.end", InklingLayout::coreEnd);
+  expect("loop.count", InklingLayout::passes);
+  expect("loop.gate_rank", 64);
+  expect("loop.varying", 0);
+  expectFloat("activation.situ_beta", 4.0);
+  expectFloat("activation.situ_linear_beta", 25.0);
+  expectFloat("final_logit_softcapping", 30.0);
+  expect("expert_count", g.experts);
+  expect("expert_used_count", g.expertsPerToken);
+  expect("expert_feed_forward_length", g.expertIntermediateSize);
+  expectFloat("expert_weights_scale", 8.0);
+  if (!mismatched.empty()) throw GgufError("GGUF metadata does not match the Inkling target: " + mismatched);
+}
+
+// An Inkling 2 GGUF's images, section for section those of its safetensors
+// plan (model/InklingImage.cpp), so one loader reads both
+// (model/Inkling.cpp): the norms, scales, convolutions, controllers and router
+// as the bf16 values the kernels read (exact: the converter widened them from
+// bf16), the relative bias and a full layer's static taps transposed back
+// (Conversion::TransposeToBfloat16), the block mix and message queries and the
+// router's bias as F32, and the projections, experts, head and token rows in
+// their GGUF formats; the message queries, a loop layer's in its GGUF, in the
+// head's image.
+std::vector<Image> inklingImages(const GgufFile &file, const QwenTargetDimensions &g) {
+  constexpr uint64_t hidden = 2304, heads = 24, kv = 1024, query = 3072, relative = 384, rank = 64, taps = 4;
+  Problems problems;
+  std::vector<Image> images;
+  for (uint32_t layer = 0; layer < InklingLayout::storedLayers; ++layer) {
+    const bool sliding = InklingLayout::isSlidingLayer(layer);
+    const std::string p = prefix(layer);
+    Builder b(file, g, problems, "layer-" + std::to_string(layer) + ".bin", layer, 1);
+    if (sliding) b.bfloat16Values(p + "attn_norm.weight", hidden);
+    else
+      for (const char *input : {"q", "k", "v"}) b.bfloat16Values(p + "attn_" + input + "_inp_norm.weight", hidden);
+    if (sliding) {
+      b.fusedQuantized(p + "attn_q_rel_gate_k_v", {{p + "attn_q.weight", query}, {p + "attn_rel.weight", relative},
+                                                   {p + "attn_gate.weight", query}, {p + "attn_k.weight", kv},
+                                                   {p + "attn_v.weight", kv}}, hidden);
+    } else {
+      b.fusedQuantized(p + "attn_q_rel_gate",
+                       {{p + "attn_q.weight", query}, {p + "attn_rel.weight", relative}, {p + "attn_gate.weight", query}},
+                       hidden);
+      b.quantized(p + "attn_k.weight", kv, hidden);
+      b.quantized(p + "attn_v.weight", kv, hidden);
+    }
+    b.quantized(p + "attn_output.weight", hidden, query);
+    b.bfloat16Rows(p + "attn_sink_proj.weight", heads, hidden);
+    b.bfloat16Values(p + "attn_q_clip.weight", heads * 128);
+    b.bfloat16Values(p + "attn_rel_clip.weight", heads * InklingLayout::relativeDimension);
+    b.bfloat16Values(p + "attn_rel_bias.weight", InklingLayout::relativeDimension * InklingLayout::relativeExtent,
+                     InklingLayout::relativeExtent, Conversion::TransposeToBfloat16);
+    for (const char *input : {"k", "v"}) {
+      const std::string conv = p + "attn_" + input + "_conv";
+      if (sliding) {
+        b.bfloat16Values(conv + ".weight", kv * taps);
+      } else {
+        b.bfloat16Values(conv + ".weight", kv * taps, kv, Conversion::ReversedTransposeToBfloat16);
+        b.bfloat16Rows(conv + "_proj.weight", 32, hidden);
+      }
+    }
+    b.bfloat16Values(p + "attn_post_conv.weight", hidden * taps);
+    b.bfloat16Values(p + "ffn_post_conv.weight", hidden * taps);
+    if (layer) b.floatValues(p + "attn_res_query.weight", (sliding ? 1 : 3) * hidden);
+    b.floatValues(p + "ffn_res_query.weight", hidden);
+    if (layer >= InklingLayout::coreBegin && layer < InklingLayout::coreEnd)
+      for (const char *input : {"q", "k", "v", "ffn"}) {
+        const std::string gate = p + "loop_" + input + "_ctrl_";
+        b.bfloat16Values(gate + "down.weight", rank * 2 * hidden);
+        b.bfloat16Values(gate + "forget.weight", hidden * rank);
+        b.bfloat16Values(gate + "gain.weight", hidden * rank);
+      }
+    b.bfloat16Values(p + "ffn_norm.weight", hidden);
+    b.bfloat16Rows(p + "ffn_gate_inp.weight", g.experts, hidden);
+    b.floatValues(p + "exp_probs_b.bias", g.experts);
+    b.routedExperts(p, g.experts, g.expertIntermediateSize, hidden);
+    images.push_back(b.finish());
+  }
+  Builder head(file, g, problems, "head.bin", InklingLayout::storedLayers, 2);
+  head.bfloat16Values("output_norm.weight", hidden);
+  head.floatValues("output_res_query.weight", hidden);
+  std::vector<std::string> messageQueries;
+  for (uint32_t layer = InklingLayout::coreBegin; layer < InklingLayout::coreEnd; ++layer)
+    messageQueries.push_back(prefix(layer) + "loop_msg_query.weight");
+  head.floatValuesTogether(messageQueries, 4 * hidden);
+  head.quantized("output.weight", g.vocabularySize, hidden);
+  images.push_back(head.finish());
+  Builder embedding(file, g, problems, "embedding.bin", g.vocabularySize, hidden);
+  embedding.bfloat16Values("token_embd_norm.weight", hidden);
+  embedding.embeddingRows("token_embd.weight");
+  images.push_back(embedding.finish());
+  problems.addUnread(file, InklingLayout::storedLayers, 0);
+  if (!problems.empty()) throw GgufError("GGUF tensors this build cannot load: " + problems.text());
+  return images;
+}
+
 } // namespace
 
 std::vector<Image> planImages(const GgufFile &file, std::string_view architecture,
                               const QwenTargetDimensions &geometry, PlanOptions options) {
+  if (architecture == InklingLayout::ggufArchitecture) {
+    requireInklingMetadata(file, geometry);
+    return inklingImages(file, geometry);
+  }
   requireMetadata(file, architecture, geometry);
   std::vector<Image> images = withFamily(
       architecture, [&](auto family) { return familyImages<decltype(family)>(file, geometry, options); });

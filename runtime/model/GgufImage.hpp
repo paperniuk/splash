@@ -116,10 +116,24 @@ struct Fill {
 // gather does (kernels/common/gguf_embedding_formats.h) and the kernels read
 // unquantized (a safetensors shared-expert gate, GDN alpha and beta of two
 // types or of F16, and a GGUF's Q8_0 hyper-connection injection weights and
-// shared-expert scalar gate), or as the F32 1 + w of a BF16 RMSNorm weight w,
+// shared-expert scalar gate), as the F32 1 + w of a BF16 RMSNorm weight w,
 // which a checkpoint stores 1 below the weight the norm multiplies by (exact
-// but where |w| < 2^-16 or |w| >= 2^24, which it may round once).
-enum class Conversion : uint8_t { None, NarrowToBfloat16, WidenToFloat32, Decay, DequantizeToFloat32, CenteredNorm };
+// but where |w| < 2^-16 or |w| >= 2^24, which it may round once), or as the
+// bf16 values of F32 rows transposed, narrowed exactly: value c of row r at
+// c * rows + r, or, reversed, at (columns - 1 - c) * rows + r (an Inkling 2
+// GGUF's relative bias and full layers' static convolution taps, which its
+// converter stores transposed of the checkpoint's, the taps last first), all
+// rows in one step.
+enum class Conversion : uint8_t {
+  None,
+  NarrowToBfloat16,
+  WidenToFloat32,
+  Decay,
+  DequantizeToFloat32,
+  CenteredNorm,
+  TransposeToBfloat16,
+  ReversedTransposeToBfloat16
+};
 // Rows written back to back, each value converted as `conversion` says.
 struct Copy {
   uint64_t destination = 0;

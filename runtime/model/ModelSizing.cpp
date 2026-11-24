@@ -84,14 +84,18 @@ StreamableWeights streamableWeights(const std::filesystem::path &root, const Mod
       [&](const auto &layout) {
         const std::filesystem::path directory = root / "target";
         if constexpr (std::is_same_v<std::decay_t<decltype(layout)>, InklingLayout>) {
-          if (descriptor.targetSource != TargetSource::Safetensors)
-            throw std::invalid_argument("Inkling loads from safetensors only");
-          const SafetensorsCheckpoint checkpoint(directory);
           StreamableWeights weights;
-          for (uint32_t layer = 0; layer < InklingLayout::storedLayers; ++layer)
-            weights.loadedBytes += gguf::loadedBytes(planInklingLayer(checkpoint, layer));
-          weights.loadedBytes += gguf::loadedBytes(planInklingHead(checkpoint));
-          weights.loadedBytes += gguf::loadedBytes(planInklingEmbedding(checkpoint));
+          if (descriptor.targetSource == TargetSource::Gguf) {
+            const OpenGguf target(findTargetGgufs(directory));
+            for (const gguf::Image &image : gguf::planImages(target.file(), layout.ggufArchitecture, layout))
+              weights.loadedBytes += gguf::loadedBytes(image);
+          } else {
+            const SafetensorsCheckpoint checkpoint(directory);
+            for (uint32_t layer = 0; layer < InklingLayout::storedLayers; ++layer)
+              weights.loadedBytes += gguf::loadedBytes(planInklingLayer(checkpoint, layer));
+            weights.loadedBytes += gguf::loadedBytes(planInklingHead(checkpoint));
+            weights.loadedBytes += gguf::loadedBytes(planInklingEmbedding(checkpoint));
+          }
           weights.loadedBytes += residentExpertSlotsBytes(layout.experts);
           return weights;
         } else {

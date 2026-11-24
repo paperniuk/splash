@@ -16,7 +16,7 @@ namespace splash::model {
 
 struct InklingLayout final : QwenHybridLayout {
   static constexpr std::string_view modelType = "inkling2_loop";
-  static constexpr std::string_view ggufArchitecture = "";
+  static constexpr std::string_view ggufArchitecture = "inkling2_loop";
   static constexpr bool loadsSafetensors = true;
   static constexpr uint32_t storedLayers = 24;
   static constexpr uint32_t coreBegin = 6, coreEnd = 18, passes = 3;
@@ -119,9 +119,12 @@ struct InklingWeights final : QwenTargetWeightsBase {
 
 struct ExpertStoreOptions;
 class WeightImages;
+enum class TargetSource : uint8_t;
+// The target's weights from its safetensors checkpoint or its GGUF (`source`)
+// in `directory`, whose images hold the same sections either way.
 [[nodiscard]] InklingWeights loadInklingWeights(metal::MetalBackend &backend, InklingLayout layout,
                                                 WeightImages &images, const std::filesystem::path &directory,
-                                                const ExpertStoreOptions &options);
+                                                TargetSource source, const ExpertStoreOptions &options);
 
 [[nodiscard]] inline const ops::BlockMoeWeights *qwenMoeBlock(const InklingLayerWeights &layer) noexcept {
   return &layer.moe;
