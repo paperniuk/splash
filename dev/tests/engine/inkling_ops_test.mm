@@ -430,7 +430,19 @@ uint32_t depthMixes(MetalBackend &backend) {
     }
   // Many rows of the head's four blocks and the partial.
   depthMix(backend, random, {kHidden, 33, 4, 1, false, false, 1.0, false});
-  return cases + 1;
+  ++cases;
+  // A prompt chunk's rows, a threadgroup a row (Inkling::addDepthMix): each
+  // kind of mix, a narrower row and every magnitude.
+  for (const uint32_t hidden : {kHidden, 512u})
+    for (const uint32_t states : {0u, 2u, 4u})
+      for (const uint32_t queries : {1u, 3u, 4u})
+        for (const bool partialFloat : {false, true}) {
+          depthMix(backend, random,
+                   {hidden, 65 + cases % 40, states, queries, partialFloat, cases % 2 == 1, magnitudes[cases % 3],
+                    cases % 5 == 2});
+          ++cases;
+        }
+  return cases;
 }
 
 // The message gate -------------------------------------------------------

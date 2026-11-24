@@ -120,6 +120,84 @@ kernel void inkling_depth_mix(device const bfloat *s0 [[buffer(0)]], device cons
     out[ulong(p.output.offset) + ulong(row) * p.output.stride + q * p.hidden + c] = value / denom;
   }
 }
+// A prompt chunk's depth mix: a threadgroup of inkThreads threads a row,
+// thread t holding channels t + inkThreads i in registers (inkRowSlots of
+// them), which sums each state's squares and each query's dots with each
+// state over its channels, then reduces each sum once for the row (a
+// simdgroup's simd_sum, then the simdgroups' partials in order), and writes
+// the queries' outputs from the states it holds. The chunked pair reduce
+// every 32 channels' sums and read each state twice: an 8,000-token
+// prompt's mixes took 765 ms that way on an M1 Max, 401 this way.
+kernel void inkling_depth_mix_rows(device const bfloat *s0 [[buffer(0)]], device const bfloat *s1 [[buffer(1)]],
+ device const bfloat *s2 [[buffer(2)]], device const bfloat *s3 [[buffer(3)]], device const bfloat *s4 [[buffer(4)]], device const bfloat *s5 [[buffer(5)]],
+ device const float *query [[buffer(6)]], device float *out [[buffer(7)]], constant InklingParams &p [[buffer(9)]],
+ uint2 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+ uint simd [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float partial[inkThreads / 32][inkDepthSums];
+  threadgroup float totals[inkDepthSums];
+  device const bfloat *states[6] = {s0, s1, s2, s3, s4, s5};
+  const uint row = group.y;
+  float v[inkRowSlots][6], sums[inkDepthSums];
+  for (uint i = 0; i < inkDepthSums; ++i) sums[i] = 0.0f;
+  // Every load first, at clamped places (inkling_norm_impl).
+#pragma unroll
+  for (uint k = 0; k < inkRowSlots; ++k) {
+    const uint cc = min(tid + k * inkThreads, p.hidden - 1);
+#pragma unroll
+    for (uint i = 0; i < 6; ++i) v[k][i] = ink_state(states[min(i, p.count - 1)], p, min(i, p.count - 1), row, cc);
+  }
+#pragma unroll
+  for (uint k = 0; k < inkRowSlots; ++k) {
+    const uint c = tid + k * inkThreads;
+    if (c >= p.hidden) break;
+    float qv[4];
+#pragma unroll
+    for (uint q = 0; q < 4; ++q) qv[q] = q < p.queries ? query[ulong(q) * p.hidden + c] : 0.0f;
+#pragma unroll
+    for (uint i = 0; i < 6; ++i) {
+      const float x = i < p.count ? v[k][i] : 0.0f;
+      sums[i] += x * x;
+#pragma unroll
+      for (uint q = 0; q < 4; ++q) sums[6 + 6 * q + i] += x * qv[q];
+    }
+  }
+#pragma unroll
+  for (uint i = 0; i < inkDepthSums; ++i) {
+    const float s = simd_sum(sums[i]);
+    if (lane == 0) partial[simd][i] = s;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid < inkDepthSums) {
+    float s = 0;
+    for (uint g = 0; g < inkThreads / 32; ++g) s += partial[g][tid];
+    totals[tid] = s;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float inv[6], scale[4][6];
+  for (uint i = 0; i < p.count; ++i) inv[i] = rsqrt(totals[i] / float(p.hidden) + 1e-6f);
+  for (uint q = 0; q < p.queries; ++q) {
+    float scores[6], maximum = -INFINITY, denom = 0;
+    for (uint i = 0; i < p.count; ++i) {
+      scores[i] = totals[6 + 6 * q + i] * inv[i] * rsqrt(float(p.hidden));
+      maximum = max(maximum, scores[i]);
+    }
+    for (uint i = 0; i < p.count; ++i) {
+      scale[q][i] = exp(scores[i] - maximum);
+      denom += scale[q][i];
+    }
+    for (uint i = 0; i < p.count; ++i) scale[q][i] *= inv[i] / denom;
+  }
+#pragma unroll
+  for (uint k = 0; k < inkRowSlots; ++k) {
+    const uint c = tid + k * inkThreads;
+    if (c >= p.hidden) break;
+    for (uint q = 0; q < p.queries; ++q) {
+      float value = 0;
+      for (uint i = 0; i < p.count; ++i) value += scale[q][i] * v[k][i];
+      out[ulong(p.output.offset) + ulong(row) * p.output.stride + q * p.hidden + c] = value;
+    }
+  }
+}
 // The bf16 pair (low half first) of a word as floats.
 inline float2 ink_bf16x2(uint word) { return float2(as_type<float>(word << 16), as_type<float>(word & 0xFFFF0000u)); }
 // A message gate's low-rank projection of a tile of 8 rows: h[row][k] =

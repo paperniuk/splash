@@ -55,6 +55,14 @@ void Inkling::addDepthMix(metal::CommandGraph &graph, std::span<const InklingRow
   requireRows(output,hidden*queryCount,rows,4); p.output=rowParams(output);
   requireBytes(sums,depthSumsBytes(hidden,rows),"Inkling depth sums");
   bindings.push_back(queries); bindings.push_back(output.buffer); bindings.push_back(std::move(sums));
+  // Steps of more than kDepthRowsFrom rows fill the GPU with a threadgroup a
+  // row (inkling_depth_mix_rows); a decode step's few rows spread over the
+  // chunks instead.
+  constexpr uint32_t kDepthRowsFrom = 64;
+  if (rows > kDepthRowsFrom && hidden <= INKLING_ROW_SLOTS * kDepthChunk) {
+    graph.add("inkling_depth_mix_rows",std::move(bindings),p,{1,rows,1},{kDepthChunk,1,1});
+    return;
+  }
   const uint32_t chunks = (hidden + kDepthChunk - 1) / kDepthChunk;
   graph.add("inkling_depth_sums",bindings,p,{chunks,rows,1},{kDepthChunk,1,1});
   graph.add("inkling_depth_mix",std::move(bindings),p,{chunks,rows,1},{kDepthChunk,1,1});
