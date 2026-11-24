@@ -356,13 +356,11 @@ AneFfnFinished finishAneFfn(const AneFfnModel &model, const AneFfnStart &start, 
   bool refusal = false;
   const auto failure = [&](const std::function<void()> &step) { return failed(model, cancelled, step, refusal); };
   try {
-    // The mixer: the rest of the prefill's layer of a full chunk on the GPU
-    // alone, beside its FFN layer `gpuAlone`.
+    // The mixer is the rest of the GPU's layer beside its FFN.
     const auto mixerBeside = [&](double gpuAlone) {
       return std::max(0.0, prefillMilliseconds / model.layers - gpuAlone);
     };
-    // A recalled calibration serves unless it was taken on a busier Mac than
-    // this one is now: a quieter one serves however busy this start is.
+    // A recalled calibration serves unless it was taken on a busier Mac.
     if (calibration && calibration->aneUnits) {
       const double now = mixerBeside(calibration->gpu[1].milliseconds);
       const std::string mixers = "its mixer " + fixed(calibration->mixer) + " ms a full chunk's layer, " +
@@ -388,8 +386,6 @@ AneFfnFinished finishAneFfn(const AneFfnModel &model, const AneFfnStart &start, 
       return ane_ffn::choose(fitted, alone, model.units, maxAneUnits);
     };
     const std::string layer = " ms per " + std::to_string(ops::AneFfn::kMaximumRows) + "-row FFN layer";
-    // No split gains enough: the start keeps nothing of it, so the next one
-    // calibrates again (ane_ffn::Calibration).
     const auto noGain = [&](std::string reason) {
       return finished(Kind::NoGain, std::move(reason) + " (calibrated in " + secondsSince(started) +
                                         "; the next start calibrates again)");
@@ -400,9 +396,10 @@ AneFfnFinished finishAneFfn(const AneFfnModel &model, const AneFfnStart &start, 
     // of a half beside the mixer of the other (ane_ffn::twoSteps), against
     // the GPU alone's whole layer.
     const ane_ffn::Model pipelined = ane_ffn::twoSteps(fitted, timings);
+    const double pipelinedAlone = timings.gpuAlone + timings.mixer;
+    const auto twoStepTime = [&](uint32_t share) { return pipelined(static_cast<double>(share) / model.units); };
     std::optional<uint32_t> two = ops::AneFfn::fits(model.layers, ops::AneFfn::Steps::Two)
-                                      ? choice(pipelined, timings.gpuAlone + timings.mixer)
-                                      : std::nullopt;
+                                      ? choice(pipelined, pipelinedAlone) : std::nullopt;
     if (!first && !two)
       return noGain("no Neural Engine split beats its " + fixed(timings.gpuAlone) + layer + " by enough");
     // One step's units name the program, two steps' where one step's fit
@@ -419,14 +416,9 @@ AneFfnFinished finishAneFfn(const AneFfnModel &model, const AneFfnStart &start, 
       if (split.chunks.functions.empty()) throw std::logic_error("the split's chunks were not timed");
       return split;
     };
-    // One step, as a split of one share calibrates. The split's full chunk at
-    // the first units, timed nearest T's least as the fit's were and on their
-    // layers, before their split is prepared, so no two splits are held at
-    // once, fits u again (ane_ffn::refit); the units that model chooses serve
-    // where their split is prepared and takes no chunk longer
-    // (ane_ffn::slowerNowhere), else the first ones, whose split prepared: a
-    // refit whose split cannot be timed or prepared, on a backend that serves
-    // and in a start that goes on, says nothing against them.
+    // Time the first share on the fit's layers to refit u before preparing
+    // the split. A refitted share serves if it prepares and costs no chunk
+    // more. Only one split is held at a time.
     const auto refitting = [&](const char *failed, const auto &step) {
       if (const std::optional<std::string> reason = failure(step))
         logLine("The Neural Engine FFN split's refitted share was not ", failed, " (", *reason,
@@ -438,27 +430,30 @@ AneFfnFinished finishAneFfn(const AneFfnModel &model, const AneFfnStart &start, 
         const ane_ffn::Timing at = model.timeAt(units);
         refitted = choice(ane_ffn::refit(fitted, at.share, at.split), at.alone);
       });
-    // Two steps' units whose program the Neural Engine refuses give way to
-    // fewer, down to one step's, then one step serves alone (Qwen3.8-27B on a
-    // 14-core M1 Pro: 0.97 refused, 0.94 builds beside one step at 0.74).
+    // On Apple7/8, a combined split refused by the ANE can retry smaller
+    // two-step shares that still gain, down to the fitted one-step share.
     const auto shareOf = [&](uint32_t aneUnits) {
       std::ostringstream text;
       text << std::fixed << std::setprecision(2) << static_cast<double>(aneUnits) / model.units;
       return text.str();
     };
     AneFfnPrepared prepared;
-    while (const std::optional<std::string> reason = failure([&] { prepared = timedSplit(units); })) {
-      if (!refusal) throw std::runtime_error(*reason);
-      if (!first || !two) throw ane::Refused(*reason);
-      refusal = false;
-      const std::string at = shareOf(*two);
-      if (*two > units)
-        --*two;
-      else
-        two.reset();
-      logLine("Neural Engine FFN split's program at share ", shareOf(units), " with two steps at ", at,
-              " did not build (", *reason, "); ",
-              two ? "two steps try " + shareOf(*two) : std::string("one step serves alone"), ".");
+    for (;;) {
+      try {
+        prepared = timedSplit(units);
+        break;
+      } catch (const ane::Refused &error) {
+        if (!mma || !first || !two || (cancelled && cancelled()) || !model.healthy()) throw;
+        const std::string at = shareOf(*two);
+        uint32_t lower = *two - 1;
+        while (lower >= units && !ane_ffn::gainsEnough(twoStepTime(lower), pipelinedAlone))
+          --lower;
+        if (lower >= units) two = lower;
+        else two.reset();
+        logLine("Neural Engine FFN split at share ", shareOf(units), " with two steps at ", at,
+                " was refused (", error.what(), "); ",
+                two ? "two steps try " + shareOf(*two) : std::string("one step tries alone"), ".");
+      }
     }
     uint32_t chosen = units;
     std::optional<std::string> unprepared;
@@ -499,9 +494,9 @@ AneFfnFinished finishAneFfn(const AneFfnModel &model, const AneFfnStart &start, 
                                              keep(refusal ? ane_ffn::refused(calibration, made) : made));
     take(prepared, made);
     const std::string pipelinedTimed =
-        two ? "; two steps " + fixed(pipelined(static_cast<double>(*two) / model.units)) + " ms per " +
+        two ? "; two steps " + fixed(twoStepTime(*two)) + " ms per " +
                   std::to_string(ops::AneFfn::kMaximumRows) + "-row layer by the fit against " +
-                  fixed(timings.gpuAlone + timings.mixer)
+                  fixed(pipelinedAlone)
             : std::string();
     AneFfnFinished result = serve(std::move(prepared), made, ": " + timed + pipelinedTimed, "calibrated");
     model.remember(maxAneUnits, made);

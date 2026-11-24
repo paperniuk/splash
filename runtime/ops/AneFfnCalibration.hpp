@@ -100,6 +100,9 @@ struct Model final {
 // nearest T's least.
 [[nodiscard]] Model refit(Model model, double share, double split);
 
+// Whether a predicted split saves enough time against the GPU alone.
+[[nodiscard]] bool gainsEnough(double split, double gpuAlone) noexcept;
+
 // The ANE's channel units, of the `units` the intermediate channels hold, at
 // which chunks split, at most `maxAneUnits` of them: those at which T, or T a
 // unit either way, is least at its longest (AneFfnCalibration.cpp); none if

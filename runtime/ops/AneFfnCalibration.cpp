@@ -130,6 +130,8 @@ Model refit(Model model, double share, double split) {
   return model;
 }
 
+bool gainsEnough(double split, double gpuAlone) noexcept { return split <= (1.0 - kMinimumGain) * gpuAlone; }
+
 // The units whose T, or T a unit either way, is least at its longest: the
 // timings can put T's least a unit off, and a unit past where the ANE's part
 // takes the longer costs the ANE's time per unit, a unit short of it the
@@ -152,7 +154,7 @@ std::optional<uint32_t> choose(const Model &model, double gpuAlone, uint32_t uni
   uint32_t chosen = 1;
   for (uint32_t aneUnits = 2; aneUnits <= maxAneUnits; ++aneUnits)
     if (longest(aneUnits) < longest(chosen)) chosen = aneUnits;
-  if (!(at[chosen] <= (1.0 - kMinimumGain) * gpuAlone)) return std::nullopt;
+  if (!gainsEnough(at[chosen], gpuAlone)) return std::nullopt;
   return chosen;
 }
 
