@@ -87,11 +87,14 @@ struct Tensor final {
 
 // One case: heads of `dimensions` in per-head planes, the output in planes
 // too or in rows of every head (the context rows the tower's projection
-// reads).
+// reads). Query, key and value rows lie `rowPadding` elements further apart
+// than their widths, the gaps left NaN: a kernel that steps rows by their
+// widths instead of their strides reads them.
 struct Case final {
   const char *name;
   uint32_t dimensions;
   bool outputRows;
+  uint32_t rowPadding = 0;
 };
 
 uint32_t paddedDimensions(const Case &c) { return (c.dimensions + 15) / 16 * 16; }
@@ -253,19 +256,20 @@ void runCase(MetalBackend &backend, const Case &c, Kind kind, uint32_t rows) {
   const uint32_t padded = DenseAttention::paddedKeys(rows);
   const uint32_t keyTile = backend.capabilities().appleGpuFamily < 9 ? kMmaKeyTile : SPLASH_DENSE_ATTENTION_KEYS;
   const uint32_t d = c.dimensions, qk = paddedDimensions(c);
+  const uint32_t qkStride = qk + c.rowPadding, dStride = d + c.rowPadding;
   const uint64_t tail = uint64_t{SPLASH_DENSE_ATTENTION_KEYS} * kHeads * qk;
   std::vector<Tensor> buffers;
   Inputs in;
-  buffers.emplace_back(backend, uint64_t{kHeads} * padded * qk, tail);
-  buffers.emplace_back(backend, uint64_t{kHeads} * padded * qk, tail);
-  buffers.emplace_back(backend, uint64_t{kHeads} * padded * d, tail);
+  buffers.emplace_back(backend, uint64_t{kHeads} * padded * qkStride, tail);
+  buffers.emplace_back(backend, uint64_t{kHeads} * padded * qkStride, tail);
+  buffers.emplace_back(backend, uint64_t{kHeads} * padded * dStride, tail);
   if (c.outputRows)
     buffers.emplace_back(backend, uint64_t{rows} * kHeads * d, tail);
   else
     buffers.emplace_back(backend, uint64_t{kHeads} * padded * d, tail);
-  in.tensors = {{buffers[0].view, padded * qk, qk},
-                {buffers[1].view, padded * qk, qk},
-                {buffers[2].view, padded * d, d},
+  in.tensors = {{buffers[0].view, padded * qkStride, qkStride},
+                {buffers[1].view, padded * qkStride, qkStride},
+                {buffers[2].view, padded * dStride, dStride},
                 c.outputRows ? HeadTensor{buffers[3].view, d, kHeads * d} : HeadTensor{buffers[3].view, padded * d, d}};
   in.queries = buffers[0].data();
   in.keys = buffers[1].data();
@@ -305,7 +309,8 @@ void runCase(MetalBackend &backend, const Case &c, Kind kind, uint32_t rows) {
 }
 
 // The operator's checks of what it reads: each tensor at its extent, the
-// output in rows of every head, refused one element short.
+// output in rows of every head, refused one element short; on Apple7/8, key
+// and value strides that split a 16-byte run.
 void requireExtents(MetalBackend &backend) {
   constexpr uint32_t rows = 45, d = 72, qk = 80;
   const uint32_t padded = DenseAttention::paddedKeys(rows);
@@ -333,6 +338,18 @@ void requireExtents(MetalBackend &backend) {
                 [&](CommandGraph &g, const MetalBuffer &view) { encode(g, q, k, view, out); });
   requireExtent(backend, out, out.sizeBytes(), 2, "dense attention output",
                 [&](CommandGraph &g, const MetalBuffer &view) { encode(g, q, k, v, view); });
+
+  if (backend.capabilities().appleGpuFamily < 9) {
+    const MetalBuffer wide = splash::test::sharedBuffer(backend, uint64_t{kHeads} * padded * (d + 4) * 2);
+    CommandGraph graph;
+    splash::test::rejects(
+        [&] {
+          attention.add(graph, {{q, padded * qk, qk}, {k, padded * qk, qk}, {wide, padded * (d + 4), d + 4},
+                                {out, d, kHeads * d}},
+                        kHeads, d, rows, 0.125F);
+        },
+        "dense attention value strides", "a value row stride of 76 was not refused");
+  }
 }
 
 } // namespace
@@ -343,7 +360,8 @@ int main(int argc, char **argv) {
       require(argc == 2, "usage: dense-attention METALLIB");
       MetalBackend backend(argv[1]);
       requireExtents(backend);
-      const Case cases[] = {{"output planes", 72, false}, {"output rows", 72, true}};
+      const Case cases[] = {
+          {"output planes", 72, false}, {"output rows", 72, true}, {"padded input rows", 72, true, 8}};
       for (const Case &c : cases)
         for (const uint32_t rows : {4U, 24U, 36U, 124U, 128U, 132U, 144U, 260U, 4100U})
           for (const Kind kind : {Kind::Random, Kind::Rising, Kind::Wide})

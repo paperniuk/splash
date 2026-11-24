@@ -35,7 +35,9 @@ public:
   // softmax(q k^T scale) v of `rows` rows of `heads` heads of `dimensions`,
   // every row over all `rows` keys, written for the rows alone. The kernel
   // takes heads of 72, the vision tower's. Throws unless every tensor holds
-  // what the kernel reaches.
+  // what the kernel reaches. Apple7/8 reads keys and values 16 bytes at a
+  // time: their buffers must start 16-byte aligned, and it throws unless
+  // their strides are multiples of eight elements.
   void add(metal::CommandGraph &graph, const DenseAttentionTensors &tensors, uint32_t heads,
                   uint32_t dimensions, uint32_t rows, float scale) const;
 
