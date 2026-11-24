@@ -310,7 +310,7 @@ void runCase(MetalBackend &backend, const Case &c, Kind kind, uint32_t rows) {
 
 // The operator's checks of what it reads: each tensor at its extent, the
 // output in rows of every head, refused one element short; on Apple7/8, key
-// and value strides that split a 16-byte run.
+// and value views and strides that break 16-byte alignment.
 void requireExtents(MetalBackend &backend) {
   constexpr uint32_t rows = 45, d = 72, qk = 80;
   const uint32_t padded = DenseAttention::paddedKeys(rows);
@@ -349,6 +349,15 @@ void requireExtents(MetalBackend &backend) {
                         kHeads, d, rows, 0.125F);
         },
         "dense attention value strides", "a value row stride of 76 was not refused");
+    const MetalBuffer backing =
+        backend.allocateBuffer(k.sizeBytes() + 20, splash::metal::BufferStorage::Private, {});
+    const MetalBuffer parent = backend.view(backing, 4, k.sizeBytes() + 16);
+    const MetalBuffer key = backend.view(parent, 16, k.sizeBytes());
+    const MetalBuffer value = backend.view(parent, 16, v.sizeBytes());
+    splash::test::rejects([&] { encode(graph, q, key, v, out); }, "dense attention key view offset",
+                          "a nested private key view misaligned by four bytes was not refused");
+    splash::test::rejects([&] { encode(graph, q, k, value, out); }, "dense attention value view offset",
+                          "a nested private value view misaligned by four bytes was not refused");
   }
 }
 

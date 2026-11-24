@@ -52,6 +52,8 @@ public:
 
   [[nodiscard]] explicit operator bool() const noexcept;
   [[nodiscard]] uint64_t sizeBytes() const noexcept;
+  // This view's byte offset into its base allocation, including Private storage.
+  [[nodiscard]] uint64_t offsetBytes() const noexcept;
   // The base allocation's MTLResource.allocatedSize, as memoryStats() counts
   // it; views of one allocation all report it.
   [[nodiscard]] uint64_t allocatedBytes() const noexcept;

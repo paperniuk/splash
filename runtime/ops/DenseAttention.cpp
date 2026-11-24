@@ -19,10 +19,12 @@ void requireTensor(const HeadTensor &tensor, uint32_t heads, uint32_t rows, uint
 }
 
 // The Apple7/8 kernel (shared/vision_mma.metal) stages keys and values in
-// 16-byte runs of eight bf16, so their strides must be whole runs.
+// 16-byte runs of eight bf16, so their view offsets and strides must align.
 constexpr uint32_t kMmaRunElements = 8;
 
 void requireRuns(const HeadTensor &tensor, const char *what) {
+  if (tensor.buffer.offsetBytes() % (kMmaRunElements * sizeof(uint16_t)))
+    throw std::invalid_argument(std::string(what) + " view offset must be a multiple of 16 bytes");
   if (tensor.headStride % kMmaRunElements || tensor.rowStride % kMmaRunElements)
     throw std::invalid_argument(std::string(what) + " strides must be multiples of " +
                                 std::to_string(kMmaRunElements) + " elements");

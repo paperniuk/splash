@@ -121,8 +121,8 @@ constexpr constant uint kThreads = SPLASH_DENSE_ATTENTION_MMA_THREADS;
 static_assert(kThreads / 32 * 8 == kRows, "eight rows per simdgroup");
 // Keys and values stage as 16-byte runs of eight bf16, 320 runs of keys and
 // 144 pairs of runs of values a block: a run never crosses a row, and lands
-// on 16-byte aligned threadgroup floats. DenseAttention::add refuses key and
-// value strides that are not whole runs.
+// on 16-byte aligned threadgroup floats. DenseAttention::add checks the key
+// and value view offsets and strides for run alignment.
 constexpr constant uint kKeyRuns = kKeys * kQkDim / 8, kValuePairRuns = kKeys / 2 * kHeadDim / 8;
 static_assert(kQkDim % 8 == 0 && kHeadDim % 8 == 0, "rows of whole runs");
 static_assert(kKeyStride % 4 == 0 && kPairStride % 4 == 0, "float4-aligned staged rows");
@@ -270,7 +270,7 @@ kernel void dense_attention_mma_72(device bfloat *queries [[buffer(0)]],
                                  uint2 tg [[threadgroup_position_in_grid]],
                                  uint sg [[simdgroup_index_in_threadgroup]],
                                  uint lane [[thread_index_in_simdgroup]]) {
-  threadgroup float stage_k[vision_mma::kKeys * vision_mma::kKeyStride];
-  threadgroup float stage_v[vision_mma::kKeys / 2 * vision_mma::kPairStride];
+  alignas(16) threadgroup float stage_k[vision_mma::kKeys * vision_mma::kKeyStride];
+  alignas(16) threadgroup float stage_v[vision_mma::kKeys / 2 * vision_mma::kPairStride];
   vision_mma::attention(queries, keys, values, output, params, tg, sg, lane, stage_k, stage_v);
 }
