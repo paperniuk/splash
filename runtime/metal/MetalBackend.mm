@@ -339,15 +339,33 @@ id<MTLLibrary> loadLibrary(id<MTLDevice> device, const std::string &metallibPath
 // BackendInstrumentation::stageExpertTiles) kMoeStagedOnly true where the
 // function declares it. It touches no backend state, and Metal's device and
 // library are thread-safe, so any thread may create one.
+//
+// The constants must set exactly the function's required ones, all uint, at
+// indices 0 up: Metal runs a function with a constant left unset, reading it
+// as zero, so a format-switch kernel short of one would decode the wrong
+// format without an error. Optional constants (is_function_constant_defined,
+// as kMoeStagedOnly) are not counted. The check reads the function's
+// declarations once per pipeline created, never per dispatch.
 id<MTLComputePipelineState> createPipeline(id<MTLDevice> device, id<MTLLibrary> source,
                                            std::string_view name, std::span<const uint32_t> constants,
                                            [[maybe_unused]] bool stagedExpertTiles) {
     NSString *key = checkedNSString(name, "pipeline name");
+    id<MTLFunction> function = [source newFunctionWithName:key];
+    if (!function) throw MetalBackendError("missing Metal function: " + std::string(name));
+    NSDictionary<NSString *, MTLFunctionConstant *> *declared = function.functionConstantsDictionary;
+    size_t required = 0;
+    bool covered = true;
+    for (MTLFunctionConstant *constant in declared.allValues) {
+        if (!constant.required) continue;
+        ++required;
+        covered = covered && constant.index < constants.size() && constant.type == MTLDataTypeUInt;
+    }
+    if (!covered || required != constants.size()) {
+        throw MetalBackendError("pipeline " + std::string(name) + " sets " + std::to_string(constants.size()) +
+                                " uint function constants of the function's " + std::to_string(required));
+    }
     NSError *error = nil;
-    id<MTLFunction> function = nil;
-    if (constants.empty()) {
-        function = [source newFunctionWithName:key];
-    } else {
+    if (!constants.empty()) {
         MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
         [values setConstantValues:constants.data() type:MTLDataTypeUInt
                         withRange:NSMakeRange(0, constants.size())];
@@ -358,11 +376,10 @@ id<MTLComputePipelineState> createPipeline(id<MTLDevice> device, id<MTLLibrary> 
         }
 #endif
         function = [source newFunctionWithName:key constantValues:values error:&error];
-    }
-    if (!function) {
-        throw MetalBackendError(
-            "missing Metal function: " + std::string(name) +
-            (error ? ": " + errorDescription(error) : ""));
+        if (!function) {
+            throw MetalBackendError("unable to specialize Metal function " + std::string(name) + ": " +
+                                    errorDescription(error));
+        }
     }
     id<MTLComputePipelineState> result =
         [device newComputePipelineStateWithFunction:function error:&error];

@@ -758,6 +758,40 @@ void functionConstantsSpecializePipelines(const std::string &metallibPath) {
     std::cout << "PASS function constants specialize pipelines\n";
 }
 
+// A pipeline sets exactly its function's function constants: Metal would
+// run one left unset as zero. One short of them, past them, or for a function
+// of none is refused with nothing cached or run.
+void pipelinesSetEveryFunctionConstant(const std::string &metallibPath) {
+    MetalBackend backend(metallibPath);
+    auto buffer = sharedBuffer(backend, sizeof(uint32_t));
+    auto *value = static_cast<uint32_t *>(buffer.contents());
+    *value = 0;
+    const auto dispatch = [&](std::string name, std::vector<uint32_t> constants) {
+        ComputeDispatch result{std::move(name), {{0, buffer}}, {}, {1, 1, 1}, {1, 1, 1}};
+        result.constants = std::move(constants);
+        return result;
+    };
+    const ComputeDispatch none = dispatch("test_add_constant_u32", {});
+    rejects([&] { (void)backend.submit(none); },
+            "pipeline test_add_constant_u32 sets 0 uint function constants of the function's 1",
+            "a pipeline short of its function's constants was created");
+    const ComputeDispatch extra = dispatch("test_add_constant_u32", {3, 4});
+    rejects([&] { backend.preparePipelines({&extra, 1}); },
+            "pipeline test_add_constant_u32 sets 2 uint function constants of the function's 1",
+            "a pipeline past its function's constants was created");
+    const uint32_t count = 1, one = 1;
+    ComputeDispatch unspecialized = addition(buffer, count, one);
+    unspecialized.constants = {3};
+    rejects([&] { backend.preparePipelines({&unspecialized, 1}); },
+            "pipeline test_add_u32 sets 1 uint function constants of the function's 0",
+            "a function of no constants took one");
+    require(*value == 0 && backend.healthy() && BackendInstrumentation::cachedPipelines(backend) == 0,
+            "a refused pipeline ran, poisoned the backend or was cached");
+    (void)backend.submit(dispatch("test_add_constant_u32", {3}));
+    require(*value == 3, "a pipeline setting its function's constants did not run");
+    std::cout << "PASS pipelines set every function constant\n";
+}
+
 // The pipelines a command names that the backend has not created are created
 // together: each once, as many as creating them a dispatch at a time makes,
 // running as those do; a failure throws as one alone does, the first in
@@ -3613,6 +3647,7 @@ std::span<const splash::test::TestCase> behaviourTests() {
         {"breakAfterAHostStepWaitsForIt", [] { breakAfterAHostStepWaitsForIt(metallib); }},
         {"preparedPipelinesCompileAhead", [] { preparedPipelinesCompileAhead(metallib); }},
         {"functionConstantsSpecializePipelines", [] { functionConstantsSpecializePipelines(metallib); }},
+        {"pipelinesSetEveryFunctionConstant", [] { pipelinesSetEveryFunctionConstant(metallib); }},
         {"pipelinesCreatedTogether", [] { pipelinesCreatedTogether(metallib); }},
         {"buffersStayResident", [] { buffersStayResident(metallib); }},
         {"infiniteKeepAliveHoldsResidency", [] { infiniteKeepAliveHoldsResidency(metallib); }},
