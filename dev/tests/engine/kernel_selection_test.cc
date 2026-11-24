@@ -173,7 +173,8 @@ public:
   void attention(const std::string &where, const RelativeAttentionPlan &plan) {
     const std::string &output = plan.step == StepKind::Decode ? plan.decodePipeline() : plan.reducePipeline();
     for (const std::string &name :
-         {plan.splitPipeline(), output, output + tableSuffix(LinearInput::Table16), plan.directPipeline()})
+         {plan.splitPipeline(), output, output + tableSuffix(LinearInput::Table16),
+          output + tableSuffix(LinearInput::Table16F), plan.directPipeline()})
       if (!name.empty()) names_.try_emplace(name, where);
   }
   void relativePrepare(const std::string &where, kv::Layout layout, RelativeAttentionVariant variant) {

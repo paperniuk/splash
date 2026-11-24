@@ -193,6 +193,8 @@ MoePlan::MoePlan(MoeShape shape, uint32_t rows, MoeConfig config)
   // The int8 passes run an expert tile's rows in one int8 tile (moe_expert_int8).
   if (config.int8Passes && tileRows() > GGUF_PREFILL_INT8_ROWS)
     throw std::invalid_argument("invalid MoE int8 passes: expert tiles past the int8 tile's rows");
+  if (config.expertTile == MoeExpertTile::M64 && config.ggufTile == MoeGgufTile::Mma)
+    throw std::invalid_argument("invalid MoE expert tiles: no 64-row MMA passes");
   // The 64-row passes are compiled for a routing of one shared slice or none
   // (moe_gguf.metal): two slices' (Flint's) chunks never average the routes
   // an expert that select them (selectMoe).

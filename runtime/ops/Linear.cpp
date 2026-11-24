@@ -301,8 +301,9 @@ LinearScratchSize Linear::prefillSplitScratchSize(ProjectionShape shape, uint32_
   const LinearMatrix matrix{shape.outputSize, shape.inputSize};
   for (uint32_t tiled = kMmaPrefillTileRows; tiled < rows + kMmaPrefillTileRows; tiled += kMmaPrefillTileRows) {
     const LinearWorkload chunk{matrix, std::min(tiled, rows), LinearEpilogue::None};
-    bound.include(
-        LinearPlan(chunk, selectProjection(calibration_, int8Activations_, step_, chunk, unitFormats(shape))).scratchSize());
+    const LinearWorkload selected = selectedWorkload(chunk, shape.planOutputs);
+    bound.include(LinearPlan(chunk, selectProjection(calibration_, int8Activations_, step_, selected, unitFormats(shape)))
+                      .scratchSize());
   }
   return bound;
 }

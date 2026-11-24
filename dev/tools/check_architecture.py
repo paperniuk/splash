@@ -255,7 +255,7 @@ NOTE_ALLOWANCE: dict[str, int] = {
 # conversation went on. 31,103 adds 7 for the split's warmup, which holds only
 # the pages its rows use and allocates again an extent the first audit
 # released.
-# The M1/M2 port adds 227 lines for prefill bounds, the serve overrides
+# The M1/M2 port adds 231 lines for prefill bounds, the serve overrides
 # and the Apple7/8 Neural Engine startup policy.
 ENGINE_LINE_BUDGET = 31_334
 C_LIKE_SUFFIXES = SOURCE_SUFFIXES | {".swift"}

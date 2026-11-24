@@ -362,7 +362,8 @@ ops::RelativeAttentionPlan planOf(const Case &data, const Step &step) {
 
 // The prepare and the attention of a step, as the runtime encodes them.
 metal::CommandGraph encode(const Case &data, const Step &step, const ops::RelativeAttentionPlan &plan,
-                           const metal::MetalBuffer &partials, const metal::MetalBuffer &statistics) {
+                           const metal::MetalBuffer &partials, const metal::MetalBuffer &statistics,
+                           const ops::LinearScratch &scratch = {}, ops::LinearInput input = ops::LinearInput::Plain) {
   metal::CommandGraph graph;
   const std::vector<kv::ChunkedPrefillParams> sequences = sequencesOf(data, step);
   const ops::AttentionRows rows{step.layout, data.lanes * step.rows, step.tree};
@@ -372,7 +373,7 @@ metal::CommandGraph encode(const Case &data, const Step &step, const ops::Relati
   std::vector<ops::AttentionHistory> histories;
   for (uint32_t lane = 0; lane < data.lanes; ++lane) histories.push_back({data.layer, data.tables[lane]});
   RelativeAttention::addAttention(graph, plan, step.staging, data.weights, partials, statistics, sequences, histories,
-                                  rows, {step.inputs.projection, step.output});
+                                  rows, {step.inputs.projection, step.output, ops::AttentionOutput::Every, scratch, input});
   return graph;
 }
 
@@ -425,7 +426,8 @@ uint32_t decodeLaneSplits(const Case &data, const Step &step, uint32_t lane) {
 // the runtime encodes it: one dispatch of the plan's kernel, which leaves
 // its counters zero.
 void runDecode(metal::MetalBackend &backend, const Case &data, const Step &step,
-               const ops::RelativeAttentionPlan &plan) {
+               const ops::RelativeAttentionPlan &plan, const ops::LinearScratch &scratch = {},
+               ops::LinearInput input = ops::LinearInput::Plain) {
   const ops::AttentionWorkspace bytes = plan.workspace();
   const ops::RelativeAttentionWorkspace workspace{poisoned(backend, bytes.partialsBytes),
                                                   poisoned(backend, bytes.statisticsBytes),
@@ -434,8 +436,9 @@ void runDecode(metal::MetalBackend &backend, const Case &data, const Step &step,
   RelativeAttention::addDecode(graph, plan, step.inputs, data.weights, data.layer,
                                std::span(data.tables).first(data.lanes), sequencesOf(data, step),
                                {step.layout, data.lanes * step.rows, step.tree}, workspace,
-                               {step.inputs.projection, step.output});
-  require(graph.dispatches().size() == 1 && graph.dispatches()[0].pipelineName == plan.decodePipeline(),
+                               {step.inputs.projection, step.output, ops::AttentionOutput::Every, scratch, input});
+  require(graph.dispatches().size() == 1 &&
+              graph.dispatches()[0].pipelineName == plan.decodePipeline() + ops::tableSuffix(input),
           "a single pass runs another kernel than its plan's");
   for (uint32_t lane = 0; lane < data.lanes; ++lane)
     require(plan.sequences()[lane].splits == decodeLaneSplits(data, step, lane), "a lane's splits are not its own");
@@ -443,6 +446,40 @@ void runDecode(metal::MetalBackend &backend, const Case &data, const Step &step,
   const auto *counters = contents<uint32_t>(workspace.counters);
   require(std::all_of(counters, counters + RelativeAttention::kCountersBytes / 4, [](uint32_t c) { return !c; }),
           "a single pass left a counter it arrived at");
+}
+
+// Both output kernels write the same FP32 table and sums as the standalone
+// prepare of their gated BF16 rows.
+void checkFloatTable(metal::MetalBackend &backend) {
+  constexpr uint32_t width = kQueryHeads * kHeadDimension, rows = GGUF_TABLE16_ROWS;
+  constexpr auto input = ops::LinearInput::Table16F;
+  const Case data = makeCase(backend, kv::Format::BFloat16, false, kFull, 1, rows, {4103, 0, 0, 0});
+  const Step step = makeStep(backend, data, 0, rows, kPageTokens);
+  const auto scratch = [&] {
+    return ops::LinearScratch{poisoned(backend, ops::tableBytes(width, rows, input)),
+                              poisoned(backend, ops::tableSumsBytes(input, width, rows)), {}, {}};
+  };
+  const auto compare = [&](const ops::LinearScratch &actual, const std::string &what) {
+    const ops::LinearScratch expected = scratch();
+    metal::CommandGraph graph;
+    graph.add("decode_linear_gguf_prepare_f", {step.output, expected.input, expected.sums}, width,
+              {width / 32, 1, 1}, {128, 1, 1});
+    static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+    require(!std::memcmp(actual.input.contents(), expected.input.contents(), actual.input.sizeBytes()),
+            what + " wrote other FP32 table bits than the standalone prepare");
+    require(!std::memcmp(actual.sums.contents(), expected.sums.contents(), actual.sums.sizeBytes()),
+            what + " wrote other FP32 table sums than the standalone prepare");
+  };
+  const ops::RelativeAttentionPlan prefill = planOf(data, step);
+  const ops::AttentionWorkspace bytes = prefill.workspace();
+  const ops::LinearScratch reduce = scratch();
+  const metal::CommandGraph graph = encode(data, step, prefill, poisoned(backend, bytes.partialsBytes),
+                                            poisoned(backend, bytes.statisticsBytes), reduce, input);
+  static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
+  compare(reduce, "relative attention reduce");
+  const ops::LinearScratch decode = scratch();
+  runDecode(backend, data, step, decodePlanOf(data, step), decode, input);
+  compare(decode, "relative attention decode");
 }
 
 // ---- The prepare -----------------------------------------------------------
@@ -1287,6 +1324,7 @@ int main(int argc, char **argv) {
     require(argc == 2, "usage: relative-attention METALLIB");
     metal::MetalBackend backend(argv[1]);
     checkPlans();
+    checkFloatTable(backend);
     for (const auto &[format, int8Queries] : {std::pair{kv::Format::Int8, false}, std::pair{kv::Format::Int8, true},
                                               std::pair{kv::Format::BFloat16, false}}) {
       // Sliding layers: prompt chunks from position 0 and after cached

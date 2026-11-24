@@ -1915,6 +1915,15 @@ void apple7PrefillSplits() {
       }
     }
   }
+  const Projection tensor = blockProjection(1024, 2304, 1, GGUF_FMT_Q80);
+  const std::array<const Projection *, 2> tensors{&tensor, &tensor};
+  const auto fused = Projection::sideBySide(tensors);
+  require(fused.has_value(), "Q8_0 tensors did not fuse side by side");
+  const Linear linear = gpu(8, 38);
+  const LinearScratchSize bound = linear.scratchSize(fused->shape(), 700);
+  const LinearScratchSize need = linear.plan(*fused, 321, LinearEpilogue::None).scratchSize();
+  require(need.partials > 0 && bound.partials >= need.partials && bound.counters >= need.counters,
+          "Apple8 side-by-side prefill scratch does not cover a 321-row plan in a 700-row arena");
 }
 
 // Leading-input views and non-Apple7/8 devices refuse split GgufPrefill dispatches; Apple7/8 encodes

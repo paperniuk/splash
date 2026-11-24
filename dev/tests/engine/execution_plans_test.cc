@@ -359,6 +359,8 @@ void ggufMoePlans() {
   }
   rejects([&] { (void)MoE::plan(flint, 2048, MoeConfig{MoeExpertTile::M64}); },
           "no 64-row passes for two shared slices", "a MoE plan of two shared slices on 64-row tiles was accepted");
+  rejects([&] { (void)MoE::plan(shape, 2048, {.expertTile = MoeExpertTile::M64, .ggufTile = MoeGgufTile::Mma}); },
+          "no 64-row MMA passes", "a MoE plan on 64-row MMA tiles was accepted");
 }
 
 // A dense tile of a sequence of more than one tile takes a history split per
