@@ -1,6 +1,6 @@
 // GGUF MoE experts for Apple7/8 (M1/M2) on the simdgroup MMA tile (kernels/common/gguf_mma_tile.h): the bindings,
 // grids and outputs of moe_expert_gguf_m<rows>_gate_up[_mixed] and _down (kernels/shared/moe_gguf.metal), whose MPP
-// matmul2d runs far below the MMA rate there. A tile runs the 8-, 16- or 32-row MMAs that hold its live rows, over the
+// matmul2d runs far below the MMA rate there. A tile runs the 8-, 16-, 24- or 32-row MMAs that hold its live rows, over the
 // tiles of its pass's range (MOE_TILES_*, metal/abi/MoE.h).
 #pragma clang fp reassociate(off)
 #include "metal/kernels/common/gguf_mma_tile.h"
@@ -91,11 +91,14 @@ inline void moe_mma_split_column(uint format, device bfloat *x, uint rows, uint 
     for (uint width = 16; width >= kSplitWidth; width /= 2) sums[r] += simd_shuffle_down(sums[r], width);
 }
 
-// Runs body(integral_constant<uint, FM>) with the fewest 8-row fragments that hold a tile's live rows.
+// Runs body(integral_constant<uint, FM>) with the fewest 8-row fragments that hold a tile's live rows. A prompt of a
+// few hundred rows routes some 18 to 33 rows an expert, whose tiles of 17 to 24 rows the three-fragment step serves:
+// on an M1 Max it took Inkling-2-Mini's 285-row prefill from 591 to 581 ms and its 633-row one from 1,105 to 1,093.
 template <ushort Rows, class Body> inline void moe_mma_live_rows(uint rows, Body body) {
   if constexpr (Rows == 8) body(integral_constant<uint, 1>{});
   else if (rows <= 8) body(integral_constant<uint, 1>{});
   else if (rows <= 16) body(integral_constant<uint, 2>{});
+  else if (rows <= 24) body(integral_constant<uint, 3>{});
   else body(integral_constant<uint, 4>{});
 }
 
