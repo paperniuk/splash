@@ -896,6 +896,28 @@ void ggufPlans() {
                 "Apple7/8 one-pass gate/up scratch");
       }
   }
+  // Apple7/8's register tile splits an MLX affine pair by kApple7AffineRegisterLaw at one table tile's rows in two
+  // passes, so the 27B's af4g64 pairs take one split at one to four table tiles, in one pass up to two and in two
+  // past: each output's K partials add in one order at every width (model-runtime-oracle's rows of no lane).
+  for (const uint32_t family : {7U, 8U})
+    for (const uint32_t cores : {16U, 32U}) {
+      const Linear device = gpu(family, cores);
+      for (const uint32_t n : {17408U, 6144U}) {
+        const Projection up = blockProjection(n, 5120, 1, GGUF_FMT_AF4G64),
+                         gate = blockProjection(n, 5120, 1, GGUF_FMT_AF4G64);
+        const auto pair = [&](uint32_t rows) {
+          return device.plan({{n, 5120}, rows, LinearEpilogue::GateUp}, up, &gate).configuration();
+        };
+        const uint32_t splits = pair(GGUF_TABLE16_ROWS).splits;
+        for (uint32_t rows = GGUF_COLUMN_ROWS + 1; rows <= kMaximumRegisterRows; ++rows) {
+          const LinearConfig c = pair(rows);
+          if (c.tile != LinearTile::GgufRegister || c.oneGateUpPass != (rows <= 2 * GGUF_TABLE16_ROWS) ||
+              c.splits != splits)
+            broke("Apple7/8 MLX affine gate/up split at every width", family, cores,
+                  {{n, 5120}, rows, LinearEpilogue::GateUp});
+        }
+      }
+    }
   // Apple7/8's staged MMA tile holds a plan of 17 to 24 rows in 24 rows (LinearConfig::twentyFourRows); other
   // devices' tiles hold 8, 16, 32, 48 or 64. Apple7/8 run a plan of up to 32 rows the register tile takes on its F32
   // instances, and one of 33 to 64 rows on the MMA prefill tile, their staged MMA tile holding at most 32.
