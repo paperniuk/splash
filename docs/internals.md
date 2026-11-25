@@ -1654,7 +1654,8 @@ Where the Neural Engine refuses the program of both kinds (`ane::Refused`, as
 `ANECCompile() FAILED` for Qwen3.8-27B UD-Q4_K_M on a 14-core M1 Pro with
 two steps at 0.97 beside one step at 0.74, where 0.94 builds), two steps'
 units give way one at a time, down to one step's, and then one step serves
-alone; the log names each share refused. A refusal with one step's units at
+alone; the log names each share refused, and then how many gave way, from
+which share to which, and in how long. A refusal with one step's units at
 stake ends the calibration as above.
 Where neither kind gains the GPU alone serves, and nothing is remembered: the
 next start calibrates again. Six calibrations of

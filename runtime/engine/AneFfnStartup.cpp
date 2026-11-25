@@ -447,10 +447,16 @@ AneFfnFinished finishAneFfn(const AneFfnModel &model, const AneFfnStart &start, 
       return text.str();
     };
     AneFfnPrepared prepared;
+    const std::string fittedTwo = two ? shareOf(*two) : std::string();
+    const auto givingWay = AwakeClock::now();
+    unsigned gaveWay = 0;
+    std::string refusedFor;
     while (const std::optional<std::string> reason = failure([&] { prepared = timedSplit(units); })) {
       if (!refusal) throw std::runtime_error(*reason);
       if (!first || !two) throw ane::Refused(*reason);
       refusal = false;
+      ++gaveWay;
+      refusedFor = secondsSince(givingWay);
       const std::string at = shareOf(*two);
       if (*two > units)
         --*two;
@@ -460,6 +466,10 @@ AneFfnFinished finishAneFfn(const AneFfnModel &model, const AneFfnStart &start, 
               " did not build (", *reason, "); ",
               two ? "two steps try " + shareOf(*two) : std::string("one step serves alone"), ".");
     }
+    if (gaveWay)
+      logLine("Neural Engine FFN split's two steps gave way ", gaveWay, gaveWay == 1 ? " time" : " times", ", ",
+              fittedTwo, " to ", two ? shareOf(*two) : std::string("one step alone"), ", refused for ",
+              refusedFor, ".");
     uint32_t chosen = units;
     std::optional<std::string> unprepared;
     if (refitted && *refitted != units) {
