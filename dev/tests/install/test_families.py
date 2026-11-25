@@ -63,6 +63,8 @@ UNUSABLE = {
         "--ple-memory",
         "--sparse-kv-memory",
         "--disable-ane",
+        "--ane-ffn-share",
+        "--ane-ffn-minimum-rows",
         "--recalibrate-ane",
         "--thinking-token-budget",
         "--thinking-end-text",

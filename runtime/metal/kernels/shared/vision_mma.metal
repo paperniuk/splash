@@ -39,11 +39,11 @@ __attribute__((always_inline)) inline float widen(uint2 w, uint e) {
 // is input 4 fm + j, so lane (fm, fn) reads one 8-byte run of each of its two
 // rows; A column fn at step j is input 4 fn + j, one 16-byte run of its
 // weight row for both columns fn and fn + 1.
-template <ushort TileM, ushort TileN, Activation Act, bool AddResidual, typename Output>
+template <ushort TileM, ushort TileN, Activation Act, bool AddResidual, typename Output, bool Scaled = false>
 inline void gemm(device const bfloat *input, device const bfloat *weights,
                  device const bfloat *bias, device Output *output,
                  constant DenseLinearParams &p, uint2 tg,
-                 uint sg, uint lane) {
+                 uint sg, uint lane, device const bfloat *scale = nullptr) {
   const uint N = p.output_size, K = p.input_size;
   constexpr uint FM = 4, FN = 4, SGN = TileN / (FN * 8);
   static_assert((TileM / (FM * 8)) * SGN == 8, "eight simdgroups per tile");
@@ -99,6 +99,7 @@ inline void gemm(device const bfloat *input, device const bfloat *weights,
         float value = acc[i][j][e] + b;
         if constexpr (Act == GeluTanh) value = splash_gelu_tanh(value);
         if constexpr (Act == GeluErf) value = splash_gelu_erf(value);
+        if constexpr (Scaled) value *= float(scale[n]);
         if constexpr (AddResidual) value += float(output[o]);
         output[o] = Output(value);
       }
@@ -111,15 +112,17 @@ inline void gemm(device const bfloat *input, device const bfloat *weights,
 // in the fragment layout PV = V^T P^T takes as its B operand, so the online
 // softmax runs in registers; P is rounded to bf16 as the MPP kernel rounds
 // its probabilities, and the row sums keep the unrounded exponents.
-constexpr constant uint kRows = SPLASH_DENSE_ATTENTION_MMA_ROWS, kKeys = 32, kHeadDim = 72, kQkDim = 80;
-constexpr constant uint kKeyStride = 84, kValueStride = 76;  // bank-spread rows
+constexpr constant uint kRows = SPLASH_DENSE_ATTENTION_MMA_ROWS, kKeys = 32;
 constexpr constant uint kThreads = SPLASH_DENSE_ATTENTION_MMA_THREADS;
 static_assert(kThreads / 32 * 8 == kRows, "eight rows per simdgroup");
 
+template <uint kHeadDim>
 inline void attention(device const bfloat *queries, device const bfloat *keys,
                       device const bfloat *values, device bfloat *output,
                       constant DenseAttentionParams &p, uint2 tg, uint sg, uint lane,
                       threadgroup float *stage_k, threadgroup float *stage_v) {
+  constexpr uint kQkDim = splash_dense_attention_padded(kHeadDim);
+  constexpr uint kKeyStride = kQkDim + 4, kValueStride = kHeadDim + 4;
   const Lane l = lane_map(lane);
   const uint fm = l.fm, fn = l.fn;
   const uint thread_index = sg * 32 + lane;
@@ -141,7 +144,6 @@ inline void attention(device const bfloat *queries, device const bfloat *keys,
   const uint context = p.rows;
   for (uint base = 0; base < context; base += kKeys) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    // 32 x 80 keys and 32 x 72 values: 320 and 288 runs of eight bf16.
     for (uint u = thread_index; u < kKeys * (kQkDim + kHeadDim) / 8; u += kThreads) {
       const bool key = u < kKeys * kQkDim / 8;
       const uint e = 8 * (key ? u : u - kKeys * kQkDim / 8);
@@ -227,7 +229,21 @@ inline void attention(device const bfloat *queries, device const bfloat *keys,
         input, weights, bias, output, params, tg, sg, lane); \
   }
 
+template <ushort Rows, ushort Columns>
+kernel void dense_mma_scaled_residual(device bfloat *input [[buffer(0)]], device bfloat *weights [[buffer(1)]],
+                                      device bfloat *bias [[buffer(2)]], device float *output [[buffer(3)]],
+                                      device bfloat *scale [[buffer(4)]], constant DenseLinearParams &params [[buffer(5)]],
+                                      uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
+                                      uint lane [[thread_index_in_simdgroup]]) {
+  vision_mma::gemm<Rows, Columns, vision_mma::None, true, float, true>(input, weights, bias, output, params,
+                                                                      tg, sg, lane, scale);
+}
+
+using DenseScaledKernel = void(device bfloat *, device bfloat *, device bfloat *, device float *, device bfloat *,
+                               constant DenseLinearParams &, uint2, uint, uint);
+
 #define DENSE_MMA_TILE(name, rows, columns) \
+  template [[host_name(#name "_scaled_residual")]] kernel DenseScaledKernel dense_mma_scaled_residual<rows, columns>; \
   DENSE_MMA_GEMM(name, rows, columns, None, false, bfloat) \
   DENSE_MMA_GEMM(name##_residual, rows, columns, None, true, float) \
   DENSE_MMA_GEMM(name##_gelu_tanh, rows, columns, GeluTanh, false, bfloat) \
@@ -238,7 +254,8 @@ DENSE_MMA_TILE(dense_linear_mma_m32n256, 32, 256)
 #undef DENSE_MMA_TILE
 #undef DENSE_MMA_GEMM
 
-kernel void dense_attention_mma_72(device bfloat *queries [[buffer(0)]],
+template <uint Dimensions>
+kernel void dense_attention_mma(device bfloat *queries [[buffer(0)]],
                                  device bfloat *keys [[buffer(1)]],
                                  device bfloat *values [[buffer(2)]],
                                  device bfloat *output [[buffer(3)]],
@@ -246,7 +263,12 @@ kernel void dense_attention_mma_72(device bfloat *queries [[buffer(0)]],
                                  uint2 tg [[threadgroup_position_in_grid]],
                                  uint sg [[simdgroup_index_in_threadgroup]],
                                  uint lane [[thread_index_in_simdgroup]]) {
-  threadgroup float stage_k[vision_mma::kKeys * vision_mma::kKeyStride];
-  threadgroup float stage_v[vision_mma::kKeys * vision_mma::kValueStride];
-  vision_mma::attention(queries, keys, values, output, params, tg, sg, lane, stage_k, stage_v);
+  threadgroup float stage_k[vision_mma::kKeys * (splash_dense_attention_padded(Dimensions) + 4)];
+  threadgroup float stage_v[vision_mma::kKeys * (Dimensions + 4)];
+  vision_mma::attention<Dimensions>(queries, keys, values, output, params, tg, sg, lane, stage_k, stage_v);
 }
+
+using DenseAttentionKernel = void(device bfloat *, device bfloat *, device bfloat *, device bfloat *,
+                                  constant DenseAttentionParams &, uint2, uint, uint);
+template [[host_name("dense_attention_mma_64")]] kernel DenseAttentionKernel dense_attention_mma<64>;
+template [[host_name("dense_attention_mma_72")]] kernel DenseAttentionKernel dense_attention_mma<72>;

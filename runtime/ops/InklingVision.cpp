@@ -110,7 +110,8 @@ uint64_t InklingVision::scratchBytes(const VisionLayout &layout, uint32_t maximu
 }
 
 InklingVision::InklingVision(metal::MetalBackend &backend, const VisionWeights &model, uint32_t maximumPatches)
-    : model_(model), maximumPatches_(maximumPatches), dense_(backend.capabilities()) {
+    : model_(model), maximumPatches_(maximumPatches), dense_(backend.capabilities()),
+      attention_(backend.capabilities()) {
   const uint64_t total = scratchBytes(model.layout, maximumPatches);
   requireWeights(model);
   // New backend buffers are zero-filled, so padding rows read by whole tiles
@@ -183,7 +184,7 @@ void InklingVision::encode(CommandGraph &graph, ImageGrid grid, const MetalBuffe
                scratch(Scratch::Keys), scratch(Scratch::Values)},
               qkvParams, {padded, 1, 1});
     // Every token attends every token of the image, the class token's too.
-    DenseAttention::add(graph, attention, layout.heads, layout.headDimension, tokens, scale);
+    attention_.add(graph, attention, layout.heads, layout.headDimension, tokens, scale);
     dense_.add(graph, block.projection, hiddenSize, hiddenSize, context, hidden, tokens,
                DenseEpilogue::ScaledResidual);
     Normalization::addLayer(graph, hidden, block.norm2, normalized, hiddenSize, tokens, epsilon);

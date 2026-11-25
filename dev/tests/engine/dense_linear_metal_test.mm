@@ -373,8 +373,7 @@ int main(int argc, char **argv) {
       if (backend.capabilities().appleGpuFamily >= 9)
         testTiles(backend);
       else
-        for (const DenseEpilogue epilogue :
-             {DenseEpilogue::None, DenseEpilogue::GeluTanh, DenseEpilogue::GeluErf, DenseEpilogue::Residual})
+        for (const DenseEpilogue epilogue : kEpilogues)
           (void)testProjection(backend, dense, 35, 256, 4096, epilogue);
       testOffsets(backend, dense);
       testProjectionExtents(backend, dense);

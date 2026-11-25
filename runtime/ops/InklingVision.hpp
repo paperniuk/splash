@@ -63,6 +63,7 @@ private:
   const VisionWeights &model_;
   uint32_t maximumPatches_ = 0;
   DenseLinear dense_;
+  DenseAttention attention_;
   metal::MetalBuffer arena_;
   metal::MetalBuffer scratch_[static_cast<uint32_t>(Scratch::Count)];
 };
