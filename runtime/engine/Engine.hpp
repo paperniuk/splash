@@ -68,7 +68,7 @@ struct EngineConfig final {
   // Keep isolated prefill commands short enough that macOS does not abort
   // them for starving the display (SchedulerConfig::isolatedBoundMilliseconds);
   // kUnboundedPrefillCommand runs whole chunks.
-  double prefillCommandMilliseconds = kDefaultPrefillCommandMilliseconds;
+  double prefillCommandMilliseconds = kUnboundedPrefillCommand;
   // Whether that bound holds each command buffer of a prefill command
   // (model::Model::prefillCommandBuffers()) or the whole command. Some Macs
   // abort a long command for starving the display however it is split, and
@@ -301,6 +301,9 @@ public:
   [[nodiscard]] bool idle() const noexcept {
     return requests_.empty() && !pending_;
   }
+  // Before any request: the model's command limits changed, as the Neural
+  // Engine split joined its commands; the scheduler plans with them.
+  void refreshCommandLimits() noexcept { scheduler_.setLimits(model_.commandLimits()); }
   [[nodiscard]] std::optional<double> nextWakeupMilliseconds() const;
   [[nodiscard]] EngineSnapshot snapshot() const;
   [[nodiscard]] ResourceWaitSnapshot resourceWaitSnapshot(double nowMilliseconds) const;

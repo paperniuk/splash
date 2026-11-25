@@ -6,6 +6,7 @@
 #include "metal/MetalBackend.hpp"
 #include "model/ModelDescriptor.hpp"
 #include "TestModel.hpp"
+#include "ane/Program.hpp"
 
 #include <cstdlib>
 #include <functional>
@@ -80,7 +81,8 @@ EngineMemoryPlan memoryPlan() {
       device(), test::modelMemoryProfile(2 * kGiB, 1 * kGiB, 1 * kGiB));
 }
 
-ActualMemoryReport validActual(const EngineMemoryPlan &plan) {
+ActualMemoryReport validActual(const EngineMemoryPlan &plan,
+                               std::optional<uint64_t> kvBytes = std::nullopt) {
   const auto &budget = plan.breakdown();
   ActualMemoryReport actual;
   actual.targetWeightsBytes = budget.targetWeightsBytes;
@@ -89,7 +91,7 @@ ActualMemoryReport validActual(const EngineMemoryPlan &plan) {
   actual.stateAllocatedBytes = budget.laneStateBytes;
   actual.sharedPrefillBytes = budget.sharedPrefillBytes;
   actual.sharedDecodeBytes = budget.sharedDecodeBytes;
-  actual.kvAllocatedBytes = budget.kvExtentBytes;
+  actual.kvAllocatedBytes = kvBytes.value_or(budget.kvExtentBytes);
   actual.backendAllocatedBytes =
       actual.targetWeightsBytes + actual.draftWeightsBytes +
       actual.visionWeightsBytes +
@@ -147,6 +149,7 @@ public:
   }
   void end(uint64_t) override {}
 
+  std::vector<uint32_t> prefillRowClasses() const override { return {}; }
   model::WarmupStepResult warmupPrefill(uint32_t rows) override {
     if (!rows || rows > model::ExecutionLimits::prefillTokenBudget)
       throw std::invalid_argument("invalid prefill warmup rows");
@@ -318,7 +321,7 @@ void testBudgetLimitedWarmupTriesOnlyWidthsThatFit() {
     expected.push_back(5);
     require(harness.executor().calls == expected,
             "warmup attempted a decode width that cannot fit the plan");
-    for (uint32_t lane = 0; lane < report.warmup.decodeBatches.size(); ++lane) {
+    for (uint32_t lane = 0; lane < plan.breakdown().maximumBatchWidth; ++lane) {
       require(report.warmup.decodeBatches[lane] ==
                   (lane < width ? WarmupStepStatus::Complete
                                 : WarmupStepStatus::MemoryLimited),
@@ -348,7 +351,7 @@ void testOptionalAllocationFailuresAreMemoryLimited() {
       expected.push_back(5);
       require(harness.executor().calls == expected,
               "bootstrap retried wider batches after allocation denial");
-      for (uint32_t lane = 0; lane < report.warmup.decodeBatches.size(); ++lane) {
+      for (uint32_t lane = 0; lane < plan.breakdown().maximumBatchWidth; ++lane) {
         require(report.warmup.decodeBatches[lane] ==
                     (lane < completedWidth ? WarmupStepStatus::Complete
                                            : WarmupStepStatus::MemoryLimited),
@@ -525,6 +528,121 @@ void testExceptionsAndMemoryAreFailClosed() {
   }
 }
 
+// The split a start left to set up joins as the warmup's last step, counted
+// as one: after every other step and the audit that gives back what the
+// engine does not keep idle, with the prefill of the most rows' GPU time,
+// then a prefill of the rows it returns, none where no split joined, on the
+// runway; the audit then runs again. That prefill is skipped where memory is
+// refused it. A cancel or an interrupted wait for the Neural Engine fails the
+// start at the set-up's own stage with the runway released: serveNative ends
+// that as a stop where the stop was asked for (main.mm).
+void testTheSplitSetsUpLast() {
+  const EngineMemoryPlan plan = memoryPlan();
+  for (const uint32_t rows : {0u, 512u}) {
+    Harness harness;
+    std::vector<int> before;
+    uint32_t audits = 0, auditsBefore = 0;
+    std::optional<double> given;
+    const RuntimeBootstrapReport report = ServingRuntime::requireWarmup(
+        plan, {}, harness.executor(), harness.pool(), harness.recorder(),
+        [&] {
+          ++audits;
+          return validActual(plan);
+        },
+        [&](double gpuMilliseconds) {
+          before = harness.executor().calls;
+          auditsBefore = audits;
+          given = gpuMilliseconds;
+          return rows;
+        });
+    std::vector<int> calls{0, 1, 2, 3, 4, 5};
+    if (rows) calls.push_back(0);
+    require(report.stage == RuntimeBootstrapStage::Ready && before == std::vector<int>({0, 1, 2, 3, 4, 5}) &&
+                auditsBefore == 1 && audits == 2 && given && harness.executor().calls == calls &&
+                (!rows || harness.executor().prefillRows.back() == rows) && harness.progress == counted(7, 7) &&
+                harness.pool().snapshot().pagesActive == 0,
+            "the split did not set up last, between the audits, as a step of its own, with its prefill of " +
+                std::to_string(rows) + " rows");
+  }
+  {
+    Harness harness;
+    harness.executor().warmupHook = [&](int, model::WarmupStepResult &) {
+      if (harness.executor().prefillRows.size() == 2)
+        throw metal::MetalAllocationError("injected refusal of the kernels' prefill");
+    };
+    const RuntimeBootstrapReport report = ServingRuntime::requireWarmup(
+        plan, {}, harness.executor(), harness.pool(), harness.recorder(), [&] { return validActual(plan); },
+        [](double) { return 512u; });
+    require(report.stage == RuntimeBootstrapStage::Ready && harness.progress == counted(7, 7),
+            "a start whose split's kernel prefill memory refused did not go on without it");
+  }
+  Harness harness;
+  try {
+    static_cast<void>(ServingRuntime::requireWarmup(
+        plan, {}, harness.executor(), harness.pool(), harness.recorder(), [&] { return validActual(plan); },
+        [](double) -> uint32_t {
+          throw ane::Interrupted("the wait for the Neural Engine ended: the start was cancelled");
+        }));
+    throw std::runtime_error("a start cancelled while its split set up went on");
+  } catch (const RuntimeBootstrapError &error) {
+    require(error.report().stage == RuntimeBootstrapStage::AneFfnSetUp &&
+                error.report().message.find("start was cancelled") != std::string::npos &&
+                harness.pool().snapshot().pagesActive == 0,
+            "a start cancelled while its split set up did not fail at the set-up: " + error.report().message);
+  }
+}
+
+void testTheSplitRestoresItsRunwayPages() {
+  const EngineMemoryPlan plan = memoryPlan();
+  constexpr uint32_t extentPages = 48;
+  constexpr uint32_t runwayPages = model::ExecutionLimits::runwayPages(extentPages, 4);
+  constexpr uint32_t rows = 285;
+  constexpr uint32_t prefillPages = 9;
+  for (bool refuse : {false, true}) {
+    test::TestKvStorage backing(runwayPages, 4096, extentPages);
+    KvPool pool(backing, runwayPages);
+    Executor executor;
+    executor.warmupHook = [&](int step, model::WarmupStepResult &) {
+      if (step != 0 || executor.prefillRows.back() != rows)
+        return;
+      require(backing.allocated(0) && backing.form(0) == kv::PageForm::Full &&
+                  pool.snapshot().pagesActive == prefillPages,
+              "the split's prefill did not restore and hold only the pages it needed");
+      for (uint32_t page = 0; page < prefillPages; ++page)
+        require(pool.pageActive(page), "the split's prefill did not hold its page prefix");
+    };
+    uint32_t audits = 0;
+    std::vector<protocol::WarmingEvent> progress;
+    const auto report = ServingRuntime::requireWarmup(
+        plan, {}, executor, pool,
+        [&](const protocol::WarmingEvent &event) { progress.push_back(event); },
+        [&] {
+          const auto snapshot = pool.snapshot();
+          require(snapshot.pagesActive == 0 && snapshot.allocatedBytes == backing.allocatedBytes(),
+                  "warmup kept pages held at the audit or disagreed with storage");
+          const auto actual = validActual(plan, snapshot.allocatedBytes);
+          static_cast<void>(pool.reclaimEmptyExtents(true, std::numeric_limits<uint32_t>::max()));
+          ++audits;
+          return actual;
+        },
+        [&](double) {
+          require(audits == 1 && !backing.allocated(0) && backing.allocated(1),
+                  "the audit did not trim the first extent of the runway");
+          backing.growthBlocked = refuse;
+          return rows;
+        });
+    requireReady(report);
+    std::vector<uint32_t> prefills{model::ExecutionLimits::prefillTokenBudget};
+    if (!refuse)
+      prefills.push_back(rows);
+    require(executor.prefillRows == prefills && backing.allocationAttempts == 3,
+            "the split's prefill did not follow the runway allocation's result");
+    require(audits == 2 && progress == counted(7, 7) &&
+                pool.snapshot().pagesActive == 0 && pool.snapshot().pagesAllocated == extentPages,
+            "the split's prefill did not return the runway to the second audit");
+  }
+}
+
 void testStartupRetryWindowOpensAtFirstFailure() {
   using namespace std::chrono_literals;
   // A refusal of host memory before the weights load.
@@ -595,8 +713,8 @@ void testReadyEventForTheServedModel() {
   engine.maxContext = 73721;
   engine.maxImagePatches = 16384;
   const protocol::ReadyEvent vision =
-      readyEventFor(flint, engine, protocolLimitsFor(flint.capabilities, engine.maxContext));
-  require(vision == protocol::ReadyEvent{4, 73721, true, 150144, {150001, 150003, 150005, 150018}, 17},
+      readyEventFor(flint, engine, protocolLimitsFor(flint.capabilities, engine.maxContext), 8);
+  require(vision == protocol::ReadyEvent{8, 73721, true, 150144, {150001, 150003, 150005, 150018}, 17},
           "Ready did not announce what a start serving Flint with images serves");
   model::ModelDescriptor dense;
   dense.target = model::Qwen3_8Layout{};
@@ -604,7 +722,7 @@ void testReadyEventForTheServedModel() {
   engine.maxContext = 262144;
   engine.maxImagePatches = 0;
   const protocol::ReadyEvent text =
-      readyEventFor(dense, engine, protocolLimitsFor(dense.capabilities, engine.maxContext));
+      readyEventFor(dense, engine, protocolLimitsFor(dense.capabilities, engine.maxContext), 4);
   require(text == protocol::ReadyEvent{4, 262144, false, 248320, {248044, 248046}, 17},
           "Ready did not announce what a start serving a model without images serves");
 }
@@ -699,6 +817,8 @@ int main() {
     testFinalHostPressurePreventsReady();
     testWarmupErrorsCannotMasqueradeAsMemoryLimits();
     testExceptionsAndMemoryAreFailClosed();
+    testTheSplitSetsUpLast();
+    testTheSplitRestoresItsRunwayPages();
     testStartupRetryWindowOpensAtFirstFailure();
     testProtocolLimitsFollowTheModel();
     testReadyEventForTheServedModel();

@@ -1,10 +1,9 @@
-// Vision encoder GEMMs and attention for Apple7/8 (M1/M2) on simdgroup MMAs:
-// the bindings, grids and outputs of vision_gemm_* and vision_attention
-// (vision.metal), whose MPP matmul2d runs far below the MMA rate there. Both
-// operands are bf16 widened to exact fp32 and accumulate in fp32, so every
-// product is exact and only summation order differs from the MPP kernels.
+// Apple7/8 dense projections and attention on fp32 simdgroup matrices.
+// The bf16 operands widen exactly; the reduction order differs from MPP.
 
-#include "metal/abi/Vision.h"
+#include "metal/abi/DenseAttention.h"
+#include "metal/abi/DenseLinear.h"
+#include "metal/kernels/common/activation.h"
 #include "metal/kernels/common/sgmatrix.h"
 #include <metal_stdlib>
 
@@ -33,16 +32,6 @@ __attribute__((always_inline)) inline float widen(uint2 w, uint e) {
   return as_type<float>((e & 1) ? word & 0xFFFF0000u : word << 16);
 }
 
-// Abramowitz & Stegun 7.1.26, as vision_erf.
-inline float erf_approx(float x) {
-  float sign = x < 0.0f ? -1.0f : 1.0f;
-  x = fabs(x);
-  float t = 1.0f / (1.0f + 0.3275911f * x);
-  float polynomial = t * (0.254829592f + t * (-0.284496736f +
-      t * (1.421413741f + t * (-1.453152027f + t * 1.061405429f))));
-  return sign * (1.0f - polynomial * precise::exp(-x * x));
-}
-
 // output[M, N] = input[M, K] x weights[N, K]^T + bias with the MPP kernel's
 // epilogue. Eight simdgroups of 32 rows x 32 columns (SGM x SGN) cover the
 // TileM x TileN tile; each computes C^T fragments (A = weights, B = input^T)
@@ -53,8 +42,9 @@ inline float erf_approx(float x) {
 template <ushort TileM, ushort TileN, Activation Act, bool AddResidual, typename Output>
 inline void gemm(device const bfloat *input, device const bfloat *weights,
                  device const bfloat *bias, device Output *output,
-                 device const Output *residual, uint N, uint K, uint2 tg,
+                 constant DenseLinearParams &p, uint2 tg,
                  uint sg, uint lane) {
+  const uint N = p.output_size, K = p.input_size;
   constexpr uint FM = 4, FN = 4, SGN = TileN / (FN * 8);
   static_assert((TileM / (FM * 8)) * SGN == 8, "eight simdgroups per tile");
   const Lane l = lane_map(lane);
@@ -103,54 +93,52 @@ inline void gemm(device const bfloat *input, device const bfloat *weights,
     for (uint j = 0; j < FM; ++j)
 #pragma unroll
       for (uint e = 0; e < 2; ++e) {
-        const ulong o = ulong(row0 + 8 * j + e) * N + n;
+        const uint row = row0 + 8 * j + e;
+        if (row >= p.rows) continue;
+        const ulong o = ulong(row) * N + n;
         float value = acc[i][j][e] + b;
-        if (Act == GeluTanh)
-          value = 0.5f * value * (1.0f + precise::tanh(0.7978845608028654f *
-                                                        (value + 0.044715f * value * value * value)));
-        else if (Act == GeluErf)
-          value = 0.5f * value * (1.0f + erf_approx(value * 0.7071067811865476f));
-        if (AddResidual) value += float(residual[o]);
+        if constexpr (Act == GeluTanh) value = splash_gelu_tanh(value);
+        if constexpr (Act == GeluErf) value = splash_gelu_erf(value);
+        if constexpr (AddResidual) value += float(output[o]);
         output[o] = Output(value);
       }
   }
 }
 
 // Non-causal flash attention of 64 query rows of one head, as
-// vision_attention: eight simdgroups of eight rows, keys in blocks of 32
+// dense_attention: eight simdgroups of eight rows, keys in blocks of 32
 // staged in threadgroup memory as fp32. S^T = K Q^T leaves each lane's scores
 // in the fragment layout PV = V^T P^T takes as its B operand, so the online
 // softmax runs in registers; P is rounded to bf16 as the MPP kernel rounds
 // its probabilities, and the row sums keep the unrounded exponents.
-constexpr constant uint kRows = SPLASH_VISION_ATTENTION_MMA_ROWS, kKeys = 32, kHeadDim = 72, kQkDim = 80;
+constexpr constant uint kRows = SPLASH_DENSE_ATTENTION_MMA_ROWS, kKeys = 32, kHeadDim = 72, kQkDim = 80;
 constexpr constant uint kKeyStride = 84, kValueStride = 76;  // bank-spread rows
-constexpr constant uint kThreads = SPLASH_VISION_ATTENTION_MMA_THREADS;
+constexpr constant uint kThreads = SPLASH_DENSE_ATTENTION_MMA_THREADS;
 static_assert(kThreads / 32 * 8 == kRows, "eight rows per simdgroup");
 
 inline void attention(device const bfloat *queries, device const bfloat *keys,
                       device const bfloat *values, device bfloat *output,
-                      constant VisionAttentionParams &p, uint2 tg, uint sg, uint lane,
+                      constant DenseAttentionParams &p, uint2 tg, uint sg, uint lane,
                       threadgroup float *stage_k, threadgroup float *stage_v) {
   const Lane l = lane_map(lane);
   const uint fm = l.fm, fn = l.fn;
   const uint thread_index = sg * 32 + lane;
   const uint head = tg.y, row = tg.x * kRows + sg * 8 + fn;
-  const ulong plane = ulong(head) * p.padded_tokens;
-  device const bfloat *q = queries + (plane + row) * kQkDim + fm;
-  device const bfloat *k = keys + plane * kQkDim;
-  device const bfloat *v = values + plane * kHeadDim;
+  device const bfloat *q = queries + ulong(head) * p.query_head_stride + ulong(row) * p.query_row_stride + fm;
+  device const bfloat *k = keys + ulong(head) * p.key_head_stride;
+  device const bfloat *v = values + ulong(head) * p.value_head_stride;
 
   // Q^T fragments: dimension 8 t + fm of rows (row, row + 1).
   float2 query[kQkDim / 8];
 #pragma unroll
-  for (uint t = 0; t < kQkDim / 8; ++t) query[t] = float2(q[8 * t], q[kQkDim + 8 * t]);
+  for (uint t = 0; t < kQkDim / 8; ++t) query[t] = float2(q[8 * t], q[p.query_row_stride + 8 * t]);
   // O^T fragments: dimension 8 d + fm of rows (row, row + 1).
   float2 out[kHeadDim / 8];
 #pragma unroll
   for (uint d = 0; d < kHeadDim / 8; ++d) out[d] = float2(0.0f);
   float2 row_max(-INFINITY), row_sum(0.0f);
 
-  const uint context = p.tokens;
+  const uint context = p.rows;
   for (uint base = 0; base < context; base += kKeys) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // 32 x 80 keys and 32 x 72 values: 320 and 288 runs of eight bf16.
@@ -158,14 +146,12 @@ inline void attention(device const bfloat *queries, device const bfloat *keys,
       const bool key = u < kKeys * kQkDim / 8;
       const uint e = 8 * (key ? u : u - kKeys * kQkDim / 8);
       const uint dim = key ? kQkDim : kHeadDim;
-      const uint4 w = *reinterpret_cast<device const uint4 *>(
-          (key ? k + ulong(base) * kQkDim : v + ulong(base) * kHeadDim) + e);
+      const uint stride = key ? p.key_row_stride : p.value_row_stride;
+      device const bfloat *src = (key ? k : v) + ulong(base + e / dim) * stride + e % dim;
       threadgroup float *dst = key ? stage_k + (e / dim) * kKeyStride + e % dim
                                    : stage_v + (e / dim) * kValueStride + e % dim;
-      *reinterpret_cast<threadgroup float4 *>(dst) =
-          float4(widen(w.xy, 0), widen(w.xy, 1), widen(w.xy, 2), widen(w.xy, 3));
-      *reinterpret_cast<threadgroup float4 *>(dst + 4) =
-          float4(widen(w.zw, 0), widen(w.zw, 1), widen(w.zw, 2), widen(w.zw, 3));
+#pragma unroll
+      for (uint i = 0; i < 8; ++i) dst[i] = float(src[i]);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -219,42 +205,44 @@ inline void attention(device const bfloat *queries, device const bfloat *keys,
     }
   }
 
-  device bfloat *o = output + (plane + row) * kHeadDim + fm;
+  if (row >= p.rows) return;
+  device bfloat *o = output + ulong(head) * p.output_head_stride + ulong(row) * p.output_row_stride + fm;
 #pragma unroll
   for (uint d = 0; d < kHeadDim / 8; ++d) {
     o[8 * d] = bfloat(out[d].x / row_sum.x);
-    o[kHeadDim + 8 * d] = bfloat(out[d].y / row_sum.y);
+    if (row + 1 < p.rows) o[p.output_row_stride + 8 * d] = bfloat(out[d].y / row_sum.y);
   }
 }
 
 } // namespace vision_mma
 
-#define VISION_GEMM_MMA_KERNEL(name, tile_m, tile_n, activation, add_residual, output_type) \
+#define DENSE_MMA_GEMM(name, tile_m, tile_n, activation, add_residual, output_type) \
   kernel void name(device bfloat *input [[buffer(0)]], device bfloat *weights [[buffer(1)]], \
                    device bfloat *bias [[buffer(2)]], device output_type *output [[buffer(3)]], \
-                   device output_type *residual [[buffer(4)]],                              \
-                   constant VisionGemmParams &params [[buffer(5)]],                         \
-                   uint2 tg [[threadgroup_position_in_grid]],                               \
-                   uint sg [[simdgroup_index_in_threadgroup]],                              \
-                   uint lane [[thread_index_in_simdgroup]]) {                               \
-    vision_mma::gemm<tile_m, tile_n, vision_mma::activation, add_residual, output_type>(    \
-        input, weights, bias, output, residual, params.output_size, params.input_size, tg,  \
-        sg, lane);                                                                          \
+                   constant DenseLinearParams &params [[buffer(4)]], \
+                   uint2 tg [[threadgroup_position_in_grid]], \
+                   uint sg [[simdgroup_index_in_threadgroup]], \
+                   uint lane [[thread_index_in_simdgroup]]) { \
+    vision_mma::gemm<tile_m, tile_n, vision_mma::activation, add_residual, output_type>( \
+        input, weights, bias, output, params, tg, sg, lane); \
   }
 
-VISION_GEMM_MMA_KERNEL(vision_gemm_mma_m64n128, 64, 128, None, false, bfloat)
-// The fp32 residual stream of vision_gemm_m64n128_residual.
-VISION_GEMM_MMA_KERNEL(vision_gemm_mma_m64n128_residual, 64, 128, None, true, float)
-VISION_GEMM_MMA_KERNEL(vision_gemm_mma_m64n128_gelu_tanh, 64, 128, GeluTanh, false, bfloat)
-VISION_GEMM_MMA_KERNEL(vision_gemm_mma_m32n256, 32, 256, None, false, bfloat)
-VISION_GEMM_MMA_KERNEL(vision_gemm_mma_m32n256_gelu_erf, 32, 256, GeluErf, false, bfloat)
-#undef VISION_GEMM_MMA_KERNEL
+#define DENSE_MMA_TILE(name, rows, columns) \
+  DENSE_MMA_GEMM(name, rows, columns, None, false, bfloat) \
+  DENSE_MMA_GEMM(name##_residual, rows, columns, None, true, float) \
+  DENSE_MMA_GEMM(name##_gelu_tanh, rows, columns, GeluTanh, false, bfloat) \
+  DENSE_MMA_GEMM(name##_gelu_erf, rows, columns, GeluErf, false, bfloat)
 
-kernel void vision_attention_mma(device bfloat *queries [[buffer(0)]],
+DENSE_MMA_TILE(dense_linear_mma_m64n128, 64, 128)
+DENSE_MMA_TILE(dense_linear_mma_m32n256, 32, 256)
+#undef DENSE_MMA_TILE
+#undef DENSE_MMA_GEMM
+
+kernel void dense_attention_mma_72(device bfloat *queries [[buffer(0)]],
                                  device bfloat *keys [[buffer(1)]],
                                  device bfloat *values [[buffer(2)]],
                                  device bfloat *output [[buffer(3)]],
-                                 constant VisionAttentionParams &params [[buffer(4)]],
+                                 constant DenseAttentionParams &params [[buffer(4)]],
                                  uint2 tg [[threadgroup_position_in_grid]],
                                  uint sg [[simdgroup_index_in_threadgroup]],
                                  uint lane [[thread_index_in_simdgroup]]) {

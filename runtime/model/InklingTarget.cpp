@@ -1,6 +1,7 @@
 #include "model/InklingTarget.hpp"
 
 #include "model/Inkling.hpp"
+#include "ops/AneFfn.hpp"
 #include "ops/Linear.hpp"
 #include "ops/MoE.hpp"
 #include "ops/Normalization.hpp"

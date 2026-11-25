@@ -2619,13 +2619,14 @@ void unbuiltSecondPartLeavesTheFirstAlone(const std::string &metallibPath) {
 
 std::atomic<unsigned> encodersLeft{0};
 IMP originalEncoderAfterCommit = nullptr;
-// Hands out encoders until encodersLeft runs out, then none.
-id encoderUntilExhausted(id command, SEL selector) {
+// Hands out the concurrent encoders a command's dispatches run in until
+// encodersLeft runs out, then none.
+id concurrentEncoderUntilExhausted(id command, SEL selector, MTLDispatchType type) {
     if (encodersLeft.fetch_sub(1) == 0) {
         encodersLeft = 0;
         return nil;
     }
-    return reinterpret_cast<id (*)(id, SEL)>(originalEncoderAfterCommit)(command, selector);
+    return reinterpret_cast<id (*)(id, SEL, MTLDispatchType)>(originalEncoderAfterCommit)(command, selector, type);
 }
 
 // The command queue gives this many more Metal command buffers, then none.
@@ -2658,8 +2659,8 @@ void encodingFailureAfterACommit(const std::string &metallibPath) {
         id<MTLCommandBuffer> command = [[MTLCreateSystemDefaultDevice() newCommandQueue] commandBuffer];
         {
             encodersLeft = 1;
-            MethodReplacement encoders(command, @selector(computeCommandEncoder),
-                                       reinterpret_cast<IMP>(encoderUntilExhausted));
+            MethodReplacement encoders(command, @selector(computeCommandEncoderWithDispatchType:),
+                                       reinterpret_cast<IMP>(concurrentEncoderUntilExhausted));
             originalEncoderAfterCommit = encoders.original;
             rejects([&] { (void)backend.submitCommandAsync(Command{dispatches, steps}); },
                     "unable to create Metal compute encoder", "a command Metal gave no encoder was submitted");

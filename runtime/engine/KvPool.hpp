@@ -125,17 +125,19 @@ public:
 
   // Holds the runway's pages, as a request holds its own, while it lives:
   // startup warmup runs on them without acquiring them, so the pool neither
-  // hands them out nor releases their extents meanwhile. Rethrows, holding
-  // none, when the pool refuses one.
+  // hands them out nor releases their extents meanwhile. With prefillPages,
+  // holds just that prefix and allocates any missing Full extents it needs.
+  // Rethrows, holding none, when the pool refuses one.
   class RunwayHold final {
   public:
-    explicit RunwayHold(KvPool &pool);
+    explicit RunwayHold(KvPool &pool, std::optional<uint32_t> prefillPages = std::nullopt);
     ~RunwayHold();
     RunwayHold(const RunwayHold &) = delete;
     RunwayHold &operator=(const RunwayHold &) = delete;
 
   private:
     KvPool &pool_;
+    uint32_t pageCount_;
   };
 
   // The pages, of the form, come with one active reference each, the

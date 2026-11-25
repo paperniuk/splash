@@ -105,17 +105,17 @@ TargetWeights loadTarget(metal::MetalBackend &backend, WeightImages &images, con
         if constexpr (std::is_same_v<std::decay_t<decltype(layout)>, InklingLayout>) {
           return loadInklingWeights(backend, layout, images, directory, descriptor.targetSource, experts);
         } else {
+        // A streamed table's store: its memory and readers here, the rows a
+        // step stages and prefetches from the family.
+        SparseRowStoreOptions table = streamedTableRows(layout);
+        table.cacheBytes = options.streamedTableBytes;
+        table.readers = options.readers;
         switch (descriptor.targetSource) {
         case TargetSource::Safetensors: {
-          SafetensorsTargetLoader loader(backend, images, directory, layout, experts);
+          SafetensorsTargetLoader loader(backend, images, directory, layout, table, experts);
           return readTarget(backend, layout, std::ref(loader));
         }
         case TargetSource::Gguf: {
-          // A streamed table's store: its memory and readers here, the rows
-          // a step stages and prefetches from the family.
-          SparseRowStoreOptions table = streamedTableRows(layout);
-          table.cacheBytes = options.streamedTableBytes;
-          table.readers = options.readers;
           GgufTargetLoader loader(backend, images, findTargetGgufs(directory), layout.ggufArchitecture, layout, table,
                                   experts);
           return readTarget(backend, layout, std::ref(loader));
@@ -169,7 +169,7 @@ LoadedModel loadModel(metal::MetalBackend &backend,
       // draft's proposals then add to the head's logits a token at a time
       // (a hidden correction's logits are the head's rows times it). The
       // fold runs bf16 activations: it projects weights, not activations.
-      const ops::Linear linear(backend.capabilities(), ops::Int8Activations::Off);
+      const ops::Linear linear(backend.capabilities(), ops::Int8Activations::Off, ops::StepKind::Prefill);
       foldDSparkCorrection(backend, linear, std::get<InklingWeights>(result.target).logitsProjection,
                            std::get<DSparkDraftWeights>(result.draft));
     }

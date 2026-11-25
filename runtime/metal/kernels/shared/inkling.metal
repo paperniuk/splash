@@ -444,15 +444,15 @@ template [[host_name("inkling_norm")]] kernel void inkling_norm_impl<bfloat>(dev
 template [[host_name("inkling_norm_f32")]] kernel void inkling_norm_impl<float>(device const float *, device const float *, device const float *, device const float *, device bfloat *, constant InklingParams &, uint2, uint);
 
 kernel void inkling_conv(device const bfloat *input [[buffer(0)]],
- device const bfloat *h0 [[buffer(1)]], device const bfloat *h1 [[buffer(2)]], device const bfloat *h2 [[buffer(3)]], device const bfloat *h3 [[buffer(4)]],
- device bfloat *o0 [[buffer(5)]], device bfloat *o1 [[buffer(6)]], device bfloat *o2 [[buffer(7)]], device bfloat *o3 [[buffer(8)]],
- device const bfloat *weights [[buffer(9)]], device const float *dt [[buffer(10)]], device uchar *out [[buffer(11)]],
- device const SplashLaneRows *layout [[buffer(12)]], device const SplashTreeRow *tree [[buffer(13)]], device bfloat *tape [[buffer(14)]],
- device const uchar *addend [[buffer(15)]], constant InklingParams &p [[buffer(16)]],
+ device const bfloat *h0 [[buffer(1)]], device const bfloat *h1 [[buffer(2)]], device const bfloat *h2 [[buffer(3)]], device const bfloat *h3 [[buffer(4)]], device const bfloat *h4 [[buffer(5)]], device const bfloat *h5 [[buffer(6)]], device const bfloat *h6 [[buffer(7)]], device const bfloat *h7 [[buffer(8)]],
+ device bfloat *o0 [[buffer(9)]], device bfloat *o1 [[buffer(10)]], device bfloat *o2 [[buffer(11)]], device bfloat *o3 [[buffer(12)]], device bfloat *o4 [[buffer(13)]], device bfloat *o5 [[buffer(14)]], device bfloat *o6 [[buffer(15)]], device bfloat *o7 [[buffer(16)]],
+ device const bfloat *weights [[buffer(17)]], device const float *dt [[buffer(18)]], device uchar *out [[buffer(19)]],
+ device const SplashLaneRows *layout [[buffer(20)]], device const SplashTreeRow *tree [[buffer(21)]], device bfloat *tape [[buffer(22)]],
+ device const uchar *addend [[buffer(23)]], constant InklingParams &p [[buffer(24)]],
  uint3 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
   uint c=group.y*inkThreads+tid, r=group.x, s=group.z; if(c>=p.hidden || s>=p.sequences) return;
   SplashLaneRows lr=layout[s]; if(ulong(lr.first)+lr.rows>p.rows) return;
-  device const bfloat *hist=SPLASH_LANE_BINDING(s,h0,h1,h2,h3);
+  device const bfloat *hist=SPLASH_LANE_BINDING(s,h0,h1,h2,h3,h4,h5,h6,h7);
   if(r<lr.rows) {
     uint packed=lr.first+r, path=p.tree?tree[packed].ancestors:0; int depth=p.tree?int(tree[packed].depth):int(r);
     float sum=0;
@@ -477,19 +477,21 @@ kernel void inkling_conv(device const bfloat *input [[buffer(0)]],
   } else if(p.writeHistory && r-lr.rows<p.taps-1) {
     uint j=r-lr.rows; int pos=int(lr.rows)-int(p.taps-1)+int(j);
     bfloat v=pos<0?hist[ulong(p.historyOffset)+ulong(int(p.taps-1)+pos)*p.historyStride+c]:input[ulong(p.source[0].offset)+ulong(lr.first+uint(pos))*p.source[0].stride+c];
-    device bfloat *dst=SPLASH_LANE_BINDING(s,o0,o1,o2,o3); dst[ulong(p.historyOffset)+ulong(j)*p.historyStride+c]=v;
+    device bfloat *dst=SPLASH_LANE_BINDING(s,o0,o1,o2,o3,o4,o5,o6,o7); dst[ulong(p.historyOffset)+ulong(j)*p.historyStride+c]=v;
   }
 }
 kernel void inkling_history(device const bfloat *input [[buffer(0)]], device const bfloat *history [[buffer(1)]], device bfloat *out [[buffer(2)]], constant InklingParams &p [[buffer(3)]], uint2 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
  uint j=group.x,c=group.y*inkThreads+tid; if(c>=p.hidden)return; int pos=int(p.rows)-int(p.taps-1)+int(j);
  out[ulong(p.historyOffset)+ulong(j)*p.historyStride+c]=pos<0?history[ulong(p.historyOffset)+ulong(int(p.taps-1)+pos)*p.historyStride+c]:input[ulong(p.source[0].offset)+ulong(pos)*p.source[0].stride+c];
 }
-kernel void inkling_commit(device const bfloat *input [[buffer(0)]], device const bfloat *h0 [[buffer(1)]], device const bfloat *h1 [[buffer(2)]], device const bfloat *h2 [[buffer(3)]], device const bfloat *h3 [[buffer(4)]], device bfloat *o0 [[buffer(5)]], device bfloat *o1 [[buffer(6)]], device bfloat *o2 [[buffer(7)]], device bfloat *o3 [[buffer(8)]], device const uint *paths [[buffer(9)]], device const SplashLaneRows *layout [[buffer(10)]], constant InklingParams &p [[buffer(11)]], uint3 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+kernel void inkling_commit(device const bfloat *input [[buffer(0)]], device const bfloat *h0 [[buffer(1)]], device const bfloat *h1 [[buffer(2)]], device const bfloat *h2 [[buffer(3)]], device const bfloat *h3 [[buffer(4)]], device const bfloat *h4 [[buffer(5)]], device const bfloat *h5 [[buffer(6)]], device const bfloat *h6 [[buffer(7)]], device const bfloat *h7 [[buffer(8)]],
+ device bfloat *o0 [[buffer(9)]], device bfloat *o1 [[buffer(10)]], device bfloat *o2 [[buffer(11)]], device bfloat *o3 [[buffer(12)]], device bfloat *o4 [[buffer(13)]], device bfloat *o5 [[buffer(14)]], device bfloat *o6 [[buffer(15)]], device bfloat *o7 [[buffer(16)]],
+ device const uint *paths [[buffer(17)]], device const SplashLaneRows *layout [[buffer(18)]], constant InklingParams &p [[buffer(19)]], uint3 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
  uint j=group.x,c=group.y*inkThreads+tid,s=group.z; if(c>=p.hidden*p.blocks||s>=p.sequences)return;
  SplashLaneRows lr=layout[s]; if(ulong(lr.first)+lr.rows>p.rows)return;
  uint b=c/p.hidden, ch=c%p.hidden, path=paths[s], taken=popcount(path); if(p.count) taken=min(taken,p.count);
  int pos=int(taken)-int(p.taps-1)+int(j);
- device const bfloat *hist=SPLASH_LANE_BINDING(s,h0,h1,h2,h3); device bfloat *out=SPLASH_LANE_BINDING(s,o0,o1,o2,o3);
+ device const bfloat *hist=SPLASH_LANE_BINDING(s,h0,h1,h2,h3,h4,h5,h6,h7); device bfloat *out=SPLASH_LANE_BINDING(s,o0,o1,o2,o3,o4,o5,o6,o7);
  bfloat v=pos<0?hist[ulong(b)*p.historyBlockStride+ulong(int(p.taps-1)+pos)*p.historyStride+ch]:input[ulong(p.source[0].offset)+ulong(lr.first+splash_path_row(path,uint(pos)))*p.source[0].stride+ulong(b)*p.blockStride+ch];
  out[ulong(b)*p.historyBlockStride+ulong(j)*p.historyStride+ch]=v;
 }

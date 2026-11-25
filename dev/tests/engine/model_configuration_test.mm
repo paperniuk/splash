@@ -104,7 +104,7 @@ void testFamilies(const std::filesystem::path &fixtures) {
   require(denseDescriptor.name == "community/fine-tune" &&
               std::holds_alternative<model::Qwen3_8Layout>(denseDescriptor.target) &&
               denseDescriptor.targetSource == model::TargetSource::Safetensors && !denseDescriptor.hasVision() &&
-              denseDescriptor.draft == test::qwen3_8Draft(),
+              denseDescriptor.draft == model::DraftLayout{test::qwen3_8Draft()},
           "an MLX Qwen3.8-27B made another descriptor");
   // The sources' identity is the digest of the record naming them.
   require(denseDescriptor.sourceIdentity == model::weightDigest(dense.record) &&
@@ -119,7 +119,7 @@ void testFamilies(const std::filesystem::path &fixtures) {
       inspect(moe.with(&SourceModel::record, R"("none")", R"("safetensors")"));
   require(std::holds_alternative<model::Qwen3_6MoeLayout>(moeDescriptor.target) &&
               moeDescriptor.visionSource == model::VisionSource::Safetensors &&
-              moeDescriptor.draft == test::qwen3_6MoeDraft(),
+              moeDescriptor.draft == model::DraftLayout{test::qwen3_6MoeDraft()},
           "an MLX Qwen3.6-35B-A3B made another descriptor");
   // Qwen3.5-122B-A10B's model type is the Qwen3.6-35B-A3B's: its sizes
   // name its family (describeSourceModel).
@@ -128,14 +128,14 @@ void testFamilies(const std::filesystem::path &fixtures) {
   require(largeMoeDescriptor.target == model::TargetLayout{model::kQwen3_5_122BLayout} &&
               largeMoeDescriptor.visionSource == model::VisionSource::Safetensors &&
               largeMoeDescriptor.vision.outputHiddenSize == 3072 &&
-              largeMoeDescriptor.draft == test::qwen3_5_122BDraft(),
+              largeMoeDescriptor.draft == model::DraftLayout{test::qwen3_5_122BDraft()},
           "an MLX Qwen3.5-122B-A10B made another descriptor");
   // Qwen3.8-Flash-Next's GGUF config, with its draft's.
   const model::ModelDescriptor flashDescriptor =
       inspect(mlxModel(fixtures, "qwen3.8-flash-next").with(&SourceModel::record, R"("mlx-affine")", R"("gguf")"));
   require(std::holds_alternative<model::Qwen4ExpLayout>(flashDescriptor.target) &&
               flashDescriptor.targetSource == model::TargetSource::Gguf &&
-              flashDescriptor.draft == test::flashNextDraft(),
+              flashDescriptor.draft == model::DraftLayout{test::flashNextDraft()},
           "a GGUF Qwen3.8-Flash-Next made another descriptor");
   // Its KV pages also hold the QSA indexer's pooled keys and its states the
   // PLE convolution's history and the indexer's pending keys, which another
@@ -174,7 +174,7 @@ void testFamilies(const std::filesystem::path &fixtures) {
                       .with(&SourceModel::draft, R"("intermediate_size": 17408)", R"("intermediate_size": 8192)")
                       .with(&SourceModel::draft, R"("rope_theta": 10000000)", R"("rope_theta": 1000000)")
                       .with(&SourceModel::draft, "61\n", "61,\n      63\n"))
-                  .draft == model::draftLayout(5120, 248320, 3, 8192, 1e6F, ownLayers),
+                  .draft == model::DraftLayout{model::draftLayout(5120, 248320, 3, 8192, 1e6F, ownLayers)},
           "a draft's own sizes were not its descriptor's");
   // The model type names the family; the sizes every source's config states
   // tell its target from other models of the architecture, which Splash does
@@ -422,6 +422,9 @@ void testQuantization(const std::filesystem::path &fixtures) {
            {dense, "language_model.model.layers.0.linear_attn.in_proj_qkv"},
            {dense, "language_model.model.layers.0.mlp.up_proj"},
            {dense, "language_model.lm_head"},
+           // By mlx-lm's names, which a config does not tell from mlx-vlm's.
+           {dense, "model.layers.3.self_attn.q_proj"},
+           {dense, "lm_head"},
            {moe, "language_model.model.layers.0.mlp.switch_mlp.down_proj"},
            {moe, "language_model.model.layers.0.mlp.shared_expert.gate_proj"},
        })
@@ -599,7 +602,7 @@ void testPrunedExperts(const std::filesystem::path &fixtures) {
   };
   const model::ModelDescriptor pruned = inspect(flashWith(256));
   require(pruned.valid() && pruned.target == withExperts(model::Qwen4ExpLayout{}, 256) &&
-              pruned.draft == test::flashNextDraft(),
+              pruned.draft == model::DraftLayout{test::flashNextDraft()},
           "a pruned Qwen3.8-Flash-Next GGUF was not described as its family with its experts");
   for (const uint32_t experts : {16U, 512U})
     require(inspect(flashWith(experts)).target == withExperts(model::Qwen4ExpLayout{}, experts),
@@ -779,7 +782,7 @@ void testConfigurationCheck(const std::filesystem::path &fixtures) {
     require(at != std::string::npos, "the config has no " + std::string(from));
     return json.replace(at, from.size(), to);
   };
-  // Qwen3.8-Flash-Next loads from a GGUF only; its metadata also states the
+  // Qwen3.8-Flash-Next from a GGUF: its metadata also states the
   // hyper-connections, the QSA indexer and the PLE n-gram embedding.
   const std::string flashConfig = text(fixtures / "qwen3.8-flash-next" / "config.json");
   const GgufHeaders flashHeaders = ggufHeaders(model::Qwen4ExpLayout{});
@@ -802,8 +805,15 @@ void testConfigurationCheck(const std::filesystem::path &fixtures) {
   rejects([&] { static_cast<void>(check("gguf", "none", flashConfig, flashHeaders, otherReduction)); },
           "draft config dflash_config target_hidden_reduction mismatch: checkpoint none, runtime stream_mean",
           "a draft of another reduction was accepted");
+  // mlx-community's MLX checkpoint (its quantization trimmed to a few
+  // layers' entries) is the family too, with its vision tower; the GGUF's
+  // config, which holds the sizes alone, is no MLX checkpoint's.
+  const std::string flashMlxConfig = text(fixtures / "qwen3.8-flash-next" / "mlx-config.json");
+  require(check("mlx-affine", "safetensors", flashMlxConfig, std::nullopt, flashDraft) == "Qwen3.8-Flash-Next" &&
+              check("mlx-affine", "none", flashMlxConfig, std::nullopt, std::nullopt) == "Qwen3.8-Flash-Next",
+          "Qwen3.8-Flash-Next's MLX config was not found to be its family");
   rejects([&] { static_cast<void>(check("mlx-affine", "none", flashConfig, std::nullopt, std::nullopt)); },
-          "Qwen3.8-Flash-Next loads from a GGUF only", "Qwen3.8-Flash-Next was accepted from MLX");
+          "text config", "Qwen3.8-Flash-Next's GGUF config was accepted as an MLX checkpoint's");
   // Its scalars and its arrays, each layer's QSA compress ratio and the PLE
   // layer, are the planner's.
   std::vector<int32_t> ratios(48, 0);
@@ -986,7 +996,7 @@ void testFlint(const std::filesystem::path &fixtures) {
   const model::ModelDescriptor descriptor = inspect(flint);
   const auto *layout = std::get_if<model::FlintLayout>(&descriptor.target);
   require(layout && descriptor.targetSource == model::TargetSource::Gguf && descriptor.family() == "Flint" &&
-              layout->maskToken == 150019 && descriptor.draft == test::flintDraft() && descriptor.valid(),
+              layout->maskToken == 150019 && descriptor.draft == model::DraftLayout{test::flintDraft()} && descriptor.valid(),
           "a GGUF Flint made another descriptor");
   // Its 35 sliding layers read a window of the 512 keys before a row's, its
   // 14 others every key, the 49 attention layers' K/V in one page.
@@ -1002,8 +1012,16 @@ void testFlint(const std::filesystem::path &fixtures) {
   for (const uint32_t token : {150018u, 150144u, 248077u})
     refuses(masked(token), "is not one of the target's reserved tokens 150019 to 150143",
             "a Flint draft's mask token outside the reserved tokens was accepted");
-  refuses(flint.with(&SourceModel::record, R"("gguf")", R"("mlx-affine")"), "Flint loads from a GGUF only",
-          "an MLX Flint was accepted");
+  // mlx-community's MLX Flint (its quantization trimmed to a few layers'
+  // entries) makes the same layout from safetensors; the release's
+  // config.json, which states no quantization, is no MLX checkpoint.
+  SourceModel mlx = flint.with(&SourceModel::record, R"("gguf")", R"("mlx-affine")");
+  refuses(mlx, "this model requires an MLX checkpoint", "an MLX Flint without its quantization was accepted");
+  mlx.config = text(fixtures / "flint" / "mlx-config.json");
+  const model::ModelDescriptor mlxDescriptor = inspect(mlx);
+  require(mlxDescriptor.targetSource == model::TargetSource::Safetensors && mlxDescriptor.family() == "Flint" &&
+              mlxDescriptor.target == descriptor.target && mlxDescriptor.valid(),
+          "an MLX Flint made another descriptor than its GGUF");
   // Each key Flint's values make is held to them by name.
   struct Refused final {
     std::string_view from, to, error;

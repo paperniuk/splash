@@ -42,6 +42,8 @@ struct RotaryLayout final {
 std::vector<RotaryLayout> rotaryLayouts() {
   std::vector<RotaryLayout> layouts;
   model::forEachFamily([&](const auto &family) {
+    // A family that rotates no pair (Inkling 2) has no tables.
+    if (!family.rotaryPairs) return;
     layouts.push_back({std::string(family.family), family.rotaryPairs, family.rotaryTheta, {}});
     if (family.yarnContextTokens > family.nativeContextTokens)
       layouts.push_back({std::string(family.family) + " YaRN", family.rotaryPairs, family.rotaryTheta,

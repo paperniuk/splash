@@ -179,21 +179,6 @@ void reportDiskTier(const DiskSpace &space, const model::DiskBudget &budget, uin
   logLine(line.str());
 }
 
-// The splits' part of what the engine gives back while idle, if it runs one:
-// `split`'s, and `pair`'s if it has that too.
-std::optional<ReleasableMemory::Split> idleSplit(ops::AneFfn *split, ops::AneFfn *pair) {
-  if (!split)
-    return std::nullopt;
-  return ReleasableMemory::Split{[split, pair] {
-                                   const bool released = split->release();
-                                   return (pair && pair->release()) || released;
-                                 },
-                                 [split, pair] {
-                                   split->restore();
-                                   if (pair) pair->restore();
-                                 }};
-}
-
 // The SSD cache tier as a start opens its files (openDiskTier): its budget,
 // its state and KV files, a persistent tier's directory, and its volume's
 // measure; none of them when it is off, and no KV file when that alone
@@ -204,6 +189,8 @@ struct DiskTier final {
   std::shared_ptr<model::SlotFile> kv;
   PersistentCacheFiles persistent;
   std::unique_ptr<DiskSpace> space;
+  // Why it is off though it had a quota (its "SSD cache off" line).
+  std::string offReason;
 };
 
 // Opens the tier's files where the disk takes them, with `quotaBytes` (none
@@ -256,23 +243,22 @@ DiskTier openDiskTier(const RuntimeResourcesConfig &config, const std::string &c
                                             config.cancelled);
       tier.states = tier.persistent.states;
     }
-    std::optional<std::string> off;
     if (!tier.states && temporaryRefusal) {
       if (rootRefusal)
-        off = "for its root, " + *rootRefusal + "; for temporary files, " + *temporaryRefusal;
+        tier.offReason = "for its root, " + *rootRefusal + "; for temporary files, " + *temporaryRefusal;
       else
-        off = config.persistentCache ? "for temporary files, " + *temporaryRefusal : *temporaryRefusal;
+        tier.offReason = config.persistentCache ? "for temporary files, " + *temporaryRefusal : *temporaryRefusal;
     } else if (!tier.states) {
       if (rootRefusal)
         logLine("Persistent cache off: ", *rootRefusal, "; the SSD cache keeps temporary files.");
       try {
         tier.states = std::make_shared<model::SlotFile>(stateSlotBytes, tier.budget, stateOptions);
       } catch (const std::exception &error) {
-        off = error.what();
+        tier.offReason = error.what();
       }
     }
-    if (off) {
-      logLine("SSD cache off: ", *off, "; the state staging the plan set aside stays unused.");
+    if (!tier.offReason.empty()) {
+      logLine("SSD cache off: ", tier.offReason, "; the state staging the plan set aside stays unused.");
       tier.budget.reset();
     }
   }
@@ -328,10 +314,14 @@ DiskTier openDiskTier(const RuntimeResourcesConfig &config, const std::string &c
 // cache.
 RuntimeResourcesError planRefusal(const StreamedMemoryResult &result, uint64_t configuredLimitBytes,
                                   uint64_t hardBudgetBytes, const model::StreamableWeights &streamable,
-                                  const model::ModelDescriptor &model) {
+                                  const model::ModelDescriptor &model, uint32_t lanes) {
   if (!result.requiredBytes)
     return RuntimeResourcesError(RuntimeResourceStage::Configuration, result.error);
-  std::string floors = "model weights and their arenas with the runtime reserves, one lane's state, the KV runway";
+  std::string floors = "model weights and their arenas" +
+                       (lanes > model::ExecutionLimits::defaultLanes
+                            ? " of " + std::to_string(lanes) + " lanes (--max-concurrent-requests; fewer take less)"
+                            : std::string()) +
+                       " with the runtime reserves, one lane's state, the KV runway";
   if (streamable.expertBytes || streamable.tableBytes)
     floors += ", the streamed stores at their smallest or at the size --expert-memory or --ple-memory sets";
   if (model.capabilities.sparseKv)
@@ -655,7 +645,7 @@ RuntimeResources::RuntimeResources(
     std::unique_ptr<model::QwenStateStorage> stateStorage,
     std::unique_ptr<KvPageTier> kvTier, std::unique_ptr<DiskSpace> diskSpace,
     std::unique_ptr<KvPool> kvPool, std::unique_ptr<engine::Cache> cache,
-    std::unique_ptr<ops::AneFfn> aneFfn, std::unique_ptr<ops::AneFfn> aneFfnPair, AneFfnOutcome aneFfnOutcome,
+    AneFfnStart aneFfn, kv::Format kvFormat, std::string buildId, std::function<bool()> cancelled,
     std::unique_ptr<model::KvBlockCache> blockCache,
     std::unique_ptr<model::KvHistoryStream> historyStream, bool spillAlways,
     model::VerifyRows verifyRows)
@@ -668,11 +658,33 @@ RuntimeResources::RuntimeResources(
       kvPages_(std::move(kvPages)),
       stateStorage_(std::move(stateStorage)), kvTier_(std::move(kvTier)),
       diskSpace_(std::move(diskSpace)), kvPool_(std::move(kvPool)),
-      cache_(std::move(cache)), aneFfn_(std::move(aneFfn)), aneFfnPair_(std::move(aneFfnPair)),
-      servingPair_(aneFfnPair_.get()),
+      cache_(std::move(cache)), aneFfn_(std::move(aneFfn.split)),
       blockCache_(std::move(blockCache)), historyStream_(std::move(historyStream)),
-      releasableMemory_({model_.images.get(), model_.expertStore()}, idleSplit(aneFfn_.get(), aneFfnPair_.get())),
-      aneFfnOutcome_(std::move(aneFfnOutcome)), spillAlways_(spillAlways), verifyRows_(verifyRows) {}
+      // The split serves from the start or once set up (finishAneFfn), until
+      // the engine ends.
+      releasableMemory_({model_.images.get(), model_.expertStore()},
+                        ReleasableMemory::Split{[this] { return aneFfn_ && aneFfn_->release(); },
+                                                [this] {
+                                                  if (aneFfn_) aneFfn_->restore();
+                                                }}),
+      aneFfnOutcome_(aneFfn.outcome), kvFormat_(kvFormat), buildId_(std::move(buildId)),
+      cancelled_(std::move(cancelled)), spillAlways_(spillAlways), verifyRows_(verifyRows) {
+  if (aneFfn.outcome.kind == AneFfnOutcome::Kind::Pending) aneFfnPending_ = std::move(aneFfn);
+}
+
+void RuntimeResources::finishAneFfn(double prefillMilliseconds, model::RuntimeModel &runtime) {
+  if (!aneFfnPending_) throw std::logic_error("the Neural Engine split was not left to set up");
+  AneFfnTiming timing;
+  timing.cancelled = cancelled_;
+  timing.buffers = [&runtime](const AneFfnTiming::Use &use) { runtime.withPrefillFfn(use); };
+  AneFfnFinished finished =
+      engine::finishAneFfn(aneFfnModel(*backend_, model_, operators_, kvFormat_, buildId_, std::move(timing)),
+                           *aneFfnPending_, prefillMilliseconds, cancelled_);
+  aneFfnPending_.reset();
+  aneFfn_ = std::move(finished.split);
+  aneFfnOutcome_ = std::move(finished.outcome);
+  runtime.setAneFfn(aneFfn_.get());
+}
 
 std::unique_ptr<RuntimeResources>
 RuntimeResources::create(const RuntimeResourcesConfig &config,
@@ -763,16 +775,17 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // size. It is the backend's like every other, so the governor charges it
   // beside the weights and the plan sets it aside before it sizes KV.
   uint64_t stateStagingBytes = 0;
+  // The tier turns off before the engine's plan is made with it, saying why.
+  std::string diskOffReason;
+  const auto diskOff = [&](std::string_view reason) {
+    logLine("SSD cache off: ", reason, "; no state staging is set aside.");
+    diskOffReason = reason;
+    stateStagingBytes = 0;
+  };
   if (cacheDiskBytes >= model::SlotFile::slotBytesFor(stateBytes))
     stateStagingBytes = stateBytes;
   else if (cacheDiskBytes)
-    logLine("SSD cache off: its quota holds no state of ", mebibytes(stateBytes),
-            " MiB; no state staging is set aside.");
-  // The automatic tier turns off before the engine's plan is made with it.
-  const auto diskOff = [&](std::string_view reason) {
-    logLine("SSD cache off: ", reason, "; no state staging is set aside.");
-    stateStagingBytes = 0;
-  };
+    diskOff("its quota holds no state of " + std::to_string(mebibytes(stateBytes)) + " MiB");
   // The one pool of SSD readers, which the model's streamed weights and the
   // reads of the KV the tier holds share. It goes after the model and the
   // tier, which read on it.
@@ -793,16 +806,20 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   const kv::SlotFormat kvFormat(kvLayout);
   const uint64_t kvSlotBytes = model::SlotFile::slotBytesFor(kvFormat.payloadBytes());
   const uint64_t hardBudgetBytes = EngineMemoryPolicy::hardBudgetBytes(
-      device.recommendedMaxWorkingSetBytes, config.maximumMemoryBytes);
+      device.recommendedMaxWorkingSetBytes, config.maximumMemoryBytes, device.physicalMemoryBytes);
   if (config.maximumMemoryBytes > hardBudgetBytes)
-    logLine("--max-memory ignored: its ", gibibytes(config.maximumMemoryBytes), " exceed this Mac's Metal budget of ",
-            gibibytes(hardBudgetBytes), ", which it can only lower.");
+    logLine("--max-memory capped: its ", gibibytes(config.maximumMemoryBytes), " exceed the most it can set on this Mac, ",
+            gibibytes(hardBudgetBytes), ", Metal's recommended working set less its margin.");
   model::StreamableWeights streamable;
   // The arenas of the model by what streams of it, and those of a runtime
   // whose K/V spills, which only a block-sparse target with a spillable
   // layout may have.
   const bool kvMaySpill = config.model.capabilities.sparseKv && kvLayout.spillable();
   std::array<std::array<uint64_t, 2>, 2> arenaBytes{}, spillArenaBytes{};
+  // The arenas' lanes, the start's (the default's where a start compares what
+  // its lanes cost, below), and the target's geometry that plans them.
+  uint32_t lanes = config.lanes;
+  model::QwenTargetGeometry plannedTarget;
   // The room for active KV, which only a target whose KV may spill plans
   // with: until the tier's files open, what the volume they will take
   // leaves now, a persistent tier's root, whose caches nobody holds count as
@@ -854,7 +871,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
          .kvSlotBytes = kvSlotBytes,
          .stateSlotBytes = model::SlotFile::slotBytesFor(stateBytes),
          .activeLimitBytes = activeLimitBytes,
-         .groupPages = groupPages});
+         .groupPages = groupPages,
+         .lanes = lanes});
   };
   // The plan of the parts as configured, which sizes their stores.
   const auto sizingPlan = [&](uint64_t stagingBytes) {
@@ -894,7 +912,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     try {
       const auto arenas = [&](model::StreamedParts parts) {
         const model::ModelMemoryPlan streamed = model::plannedRuntimeMemory(
-            config.model, target, operators, config.kvFormat, config.stateFormat, parts);
+            config.model, target, operators, config.kvFormat, config.stateFormat, parts, lanes);
         return streamed.sharedPrefillPlannedAllocatedBytes + streamed.sharedDecodePlannedAllocatedBytes;
       };
       for (const bool table : {false, true}) {
@@ -940,8 +958,9 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
                          "routed experts", "load with their layers");
     // A table that may stream streams through its smallest row cache while
     // the target's files give its geometry.
-    planArenas(model::plannedTargetGeometry(*backend, config.modelRoot, config.model,
-                                            streamable.tableBytes ? streamable.tableMinimumBytes : 0, readers));
+    plannedTarget = model::plannedTargetGeometry(*backend, config.modelRoot, config.model,
+                                                 streamable.tableBytes ? streamable.tableMinimumBytes : 0, readers);
+    planArenas(plannedTarget);
     // Refuse a model that cannot fit before loading its weights: beside them
     // the plan needs at least their arenas, the runtime reserves, one lane's
     // state, the KV runway, the streamed stores at their smallest or at the
@@ -949,7 +968,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     // cache and any SSD cache state staging.
     const StreamedMemoryResult planned = storesPlan();
     if (!planned.plan)
-      throw planRefusal(planned, config.maximumMemoryBytes, hardBudgetBytes, streamable, config.model);
+      throw planRefusal(planned, config.maximumMemoryBytes, hardBudgetBytes, streamable, config.model, lanes);
     loadOptions = storesOf(*planned.plan);
     // Fail before loading the model when the machine has no headroom at
     // all; the guard installed above keeps checking as residency grows.
@@ -969,6 +988,19 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
   // The runtime's lane state and arenas as the model loaded, with its K/V in
   // memory and where it spills.
   model::ModelMemoryPlan modelMemoryPlan, spillModelMemoryPlan;
+  // A lane's draft global K/V (DSpark's) is charged apart, for the context
+  // served (withFixedLane).
+  const auto planRuntime = [&] {
+    const model::DraftStateLayout &nativeDraft = loaded.descriptor.stateLayout.draft;
+    modelMemoryPlan = withFixedLane(model::plannedRuntimeMemory(loaded, operators, config.kvFormat, config.stateFormat,
+                                                                model::StreamedParts::loaded(loaded), lanes),
+                                    nativeDraft);
+    if (kvMaySpill)
+      spillModelMemoryPlan =
+          withFixedLane(model::plannedRuntimeMemory(loaded, operators, config.kvFormat, config.stateFormat,
+                                                    model::StreamedParts::loaded(loaded, true), lanes),
+                        nativeDraft);
+  };
   // Loads the model as loadOptions says, `again` where a store the plan sized
   // is laid out again (below), and plans its runtime memory as it loaded.
   const auto load = [&](bool again) {
@@ -997,15 +1029,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     }
     try {
       requireDraftGeometry(loaded.descriptor);
-      const model::DraftStateLayout &nativeDraft = loaded.descriptor.stateLayout.draft;
-      modelMemoryPlan = withFixedLane(model::plannedRuntimeMemory(loaded, operators, config.kvFormat, config.stateFormat,
-                                                                  model::StreamedParts::loaded(loaded)),
-                                      nativeDraft);
-      if (kvMaySpill)
-        spillModelMemoryPlan =
-            withFixedLane(model::plannedRuntimeMemory(loaded, operators, config.kvFormat, config.stateFormat,
-                                                      model::StreamedParts::loaded(loaded, true)),
-                          nativeDraft);
+      planRuntime();
     } catch (const std::exception &error) {
       throw RuntimeResourcesError(
           RuntimeResourceStage::MemoryPlanning,
@@ -1098,7 +1122,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     }
     if (model::SparseRowStore *table = loaded.streamedTable())
       table->commit();
-    splitModel = aneFfnModel(*backend, loaded, operators, config.kvFormat, config.buildId, config.cancelled);
+    splitModel = aneFfnModel(*backend, loaded, operators, config.kvFormat, config.buildId, {config.cancelled, {}});
   };
 
   ready();
@@ -1244,6 +1268,43 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     AneFfnStart aneFfn = startAneFfn(splitModel, config.aneFfn, splitContext, planMemory, config.cancelled);
     if (aneFfn.plan)
       memoryPlan = std::move(*aneFfn.plan);
+    // What lanes past the default's cost against a start of the default's
+    // lanes with the same staging and split: the stores the parts stream
+    // through where those differ, else the context this start serves and the
+    // one a first start of four would, capped by --max-context.
+    if (lanes > model::ExecutionLimits::defaultLanes) {
+      const uint64_t staging = memoryPlan.breakdown().stateStagingBytes;
+      // The split the context served rests on: the one that runs where a
+      // context is asked for, else the automatic context's.
+      const uint64_t split =
+          requestedContextTokens ? memoryPlan.breakdown().aneFfnBytes : aneFfn.outcome.contextSplitBytes;
+      const auto planLanes = [&](uint32_t count) {
+        lanes = count;
+        planArenas(plannedTarget);
+        planRuntime();
+        return std::pair(sizingPlan(staging).plan, planWith(staging, split).plan);
+      };
+      const auto [fewerStores, fewer] = planLanes(model::ExecutionLimits::defaultLanes);
+      const std::optional<StreamedMemoryPlan> stores = planLanes(config.lanes).first;
+      const auto storeCosts = [&](const char *part, uint64_t StreamedMemoryPlan::*bytes) {
+        const uint64_t these = (*stores).*bytes, fewerBytes = (*fewerStores).*bytes;
+        if (these != fewerBytes)
+          logLine("A concurrency limit of ", config.lanes, " (--max-concurrent-requests) streams the ", part, " through ",
+                  gibibytes(these), "; ", model::ExecutionLimits::defaultLanes, " would ",
+                  fewerBytes ? "stream it through " + gibibytes(fewerBytes) : std::string("load it whole"), ".");
+        return these != fewerBytes;
+      };
+      const bool expertsCost = stores && fewerStores && storeCosts("routed experts", &StreamedMemoryPlan::expertBytes);
+      const bool tableCosts = stores && fewerStores && storeCosts("PLE table", &StreamedMemoryPlan::tableBytes);
+      // What this start serves (Bootstrap): a relaunch's or the asked
+      // context where the plan holds it, else the automatic context.
+      const uint32_t asked = config.relaunchContext ? config.relaunchContext : requestedContextTokens;
+      const uint32_t served = asked ? std::min(asked, memoryPlan.maximumContextTokens()) : aneFfn.outcome.context;
+      if (!expertsCost && !tableCosts && fewer)
+        if (const uint32_t more = memoryPlan.compareDefaultLanes(*fewer, served, requestedContextTokens))
+          logLine("A concurrency limit of ", config.lanes, " (--max-concurrent-requests) leaves ", served,
+                  " tokens of context; ", model::ExecutionLimits::defaultLanes, " would leave ", more, ".");
+    }
     // The draft's context capacity is now the context this start serves: the
     // one asked for (--max-context), the one a relaunch keeps where the plan
     // holds it, or the automatic one, with the speculative scratch and at
@@ -1292,7 +1353,7 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     auto kvPages = std::make_unique<kv::PageStorage>(
         *backend, memoryGovernor->allocationAdmission(), kvLayout,
         static_cast<uint32_t>(poolExtents * budget.kvExtentPages), budget.kvExtentPages);
-    auto kvPool = std::make_unique<KvPool>(*kvPages, model::ExecutionLimits::warmupKvPages);
+    auto kvPool = std::make_unique<KvPool>(*kvPages, model::ExecutionLimits::runwayPages(budget.kvExtentPages, budget.maximumBatchWidth));
     auto stateStorage = std::make_unique<model::QwenStateStorage>(
         *backend, memoryGovernor->allocationAdmission(),
         loaded.stateLayout(config.stateFormat, !config.exactCachedStates), disk.states);
@@ -1312,6 +1373,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
     auto cache = std::make_unique<engine::Cache>(*kvPool, kvTier.get(), disk.budget, spillPolicy, windowPolicy);
     if (disk.space)
       cache->setDiskMeasure([space = disk.space.get()] { space->measure(); });
+    if (!disk.budget && cacheDiskBytes)
+      cache->setDiskOff(disk.offReason.empty() ? diskOffReason : disk.offReason);
     // A target that can spill holds one empty Index extent from the start
     // (the plan's indexRunwayBytes, one extent): a lane's first conversion
     // lands its pages there at the memory wall, where no allocation is
@@ -1337,7 +1400,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
           model::KvBlockCacheOptions{.shape = *config.model.capabilities.sparseKv,
                                      .targetBytes = spill.hotTargetBytes,
                                      .readers = readers,
-                                     .format = kvFormat});
+                                     .format = kvFormat,
+                                     .lanes = budget.maximumBatchWidth});
       historyStream = std::make_unique<model::KvHistoryStream>(
           *backend, memoryGovernor->allocationAdmission(), kvLayout, budget.kvExtentPages, readers, kvFormat,
           spill.stagingBuffers);
@@ -1363,15 +1427,8 @@ RuntimeResources::create(const RuntimeResourcesConfig &config,
         std::move(operators), std::move(memoryPlan), std::move(cacheIdentity),
         std::move(memoryGovernor), startClaim, std::move(startScope), std::move(kvPages), std::move(stateStorage),
         std::move(kvTier), std::move(disk.space), std::move(kvPool), std::move(cache),
-        std::move(aneFfn.split), std::move(aneFfn.pair), std::move(aneFfn.outcome), std::move(blockCache),
+        std::move(aneFfn), config.kvFormat, config.buildId, config.cancelled, std::move(blockCache),
         std::move(historyStream), config.kvSpillAlways, config.verifyRows));
-    // The model's side of the split over what the resources hold: this
-    // function's own go with it.
-    if (aneFfn.timePairs)
-      result->timeAneFfnPairs_ = [time = std::move(aneFfn.timePairs),
-                                  model = aneFfnModel(*result->backend_, result->model_, result->operators_,
-                                                      config.kvFormat, config.buildId, config.cancelled)](
-                                     const AneFfnPairPrefill &prefill) { time(model, prefill); };
     result->adoptPersistentCache();
     return result;
   } catch (const RuntimeResourcesError &) {
@@ -1499,9 +1556,11 @@ model::RuntimeContext RuntimeResources::modelContext() {
   // A start's measured step costs stay beside the split's calibrations.
   const std::string key =
       model::stepCostsKey(model_, *kvPages_, *stateStorage_, operators_, *backend_, cacheIdentity_.buildId);
-  return {*backend_, model_, *kvPages_, *stateStorage_, operators_, aneFfn_.get(), &servingPair_, blockCache_.get(),
+  return {*backend_, model_, *kvPages_, *stateStorage_, operators_, aneFfn_.get(), blockCache_.get(),
           historyStream_.get(), verifyRows_, [key](uint32_t lanes) { return ane::recall(key + std::to_string(lanes)); },
-          [key](uint32_t lanes, std::string_view line) { ane::remember(key + std::to_string(lanes), line); }};
+          [key](uint32_t lanes, std::string_view line) { ane::remember(key + std::to_string(lanes), line); },
+          [key](uint32_t lanes) { ane::forget(key + std::to_string(lanes)); },
+          memoryPlan_.breakdown().maximumBatchWidth};
 }
 
 EngineSpillConfig RuntimeResources::spillConfig() const noexcept {
@@ -1542,34 +1601,14 @@ AneFfnSnapshot RuntimeResources::aneFfnSnapshot() const {
   if (!aneFfn_)
     return {.reason = aneFfnOutcome_.reason};
   const bool stopped = aneFfn_->retired();
-  ops::AneFfn::Served served = aneFfn_->served();
-  if (aneFfnPair_) {
-    const ops::AneFfn::Served &pair = aneFfnPair_->served();
-    served.commands += pair.commands;
-    served.evaluations += pair.evaluations;
-    served.milliseconds += pair.milliseconds;
-  }
+  const ops::AneFfn::Served &served = aneFfn_->served();
   return {stopped ? AneFfnSnapshot::State::Stopped : AneFfnSnapshot::State::Split,
           stopped ? aneFfn_->reason() : aneFfnOutcome_.reason,
-          aneFfn_->share(),
+          aneFfnShare(),
           aneFfn_->minimumRows(),
           served.commands,
           served.evaluations,
           served.milliseconds};
-}
-
-void RuntimeResources::timeAneFfnPairs(const std::function<double()> &prefill) {
-  if (!timeAneFfnPairs_) return;
-  // The runtime's commands take the split being timed, and none once its
-  // command ends, whatever ends it: a start that times pairs serves none.
-  struct Serving final {
-    ops::AneFfn *&slot;
-    ~Serving() { slot = nullptr; }
-  };
-  std::exchange(timeAneFfnPairs_, {})([&](uint32_t, ops::AneFfn *pair) {
-    const Serving serving{servingPair_ = pair};
-    return prefill();
-  });
 }
 
 ActualMemoryReport RuntimeResources::actualMemoryReport(
@@ -1596,8 +1635,7 @@ ActualMemoryReport RuntimeResources::actualMemoryReport(
     report.spilledKvTableBytes += staging.tableBytes;
   }
   report.stateStagingBytes = modelMemory.stateStagingBytes;
-  report.aneFfnBytes =
-      (aneFfn_ ? aneFfn_->allocatedBytes() : 0) + (aneFfnPair_ ? aneFfnPair_->allocatedBytes() : 0);
+  report.aneFfnBytes = aneFfn_ ? aneFfn_->allocatedBytes() : 0;
   if (const auto table = streamedTableStats()) report.streamedTableBytes = table->cacheBytes;
   // Optional warmup may end with a rolled-back allocation and no subsequent
   // command. Refresh the current counts after that rollback; peaks stay intact.
@@ -1613,7 +1651,7 @@ ActualMemoryReport RuntimeResources::actualMemoryReport(
 
 AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &loaded,
                         const ops::ExecutionPlans &operators, kv::Format format, std::string_view buildId,
-                        std::function<bool()> cancelled) {
+                        AneFfnTiming timing) {
   auto layers = std::make_shared<const std::vector<ops::SwiGluProjections>>(model::aneFfnLayers(loaded));
   AneFfnModel model;
   model.dense = !layers->empty();
@@ -1624,42 +1662,49 @@ AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &
   }
   model.unavailable = [] { return ane::unavailable(); };
   model.units = ops::AneFfn::units(*layers);
-  model.plannedBytes = [layers](uint32_t aneUnits, bool pairs) {
-    return ops::AneFfn::plannedBytes(*layers, aneUnits, pairs);
+  model.layers = static_cast<uint32_t>(layers->size());
+  model.simdgroupMma = operators.calibration().simdgroupMma;
+  model.plannedBytes = [layers](uint32_t aneUnits) {
+    return ops::AneFfn::plannedBytes(*layers, {aneUnits, aneUnits});
   };
-  const auto onArena = [&backend, &loaded, &operators, format](const auto &use) {
-    model::withPrefillArena(backend, loaded, operators, format, use);
+  const auto on = [&backend, &loaded, &operators, format, buffers = timing.buffers](const AneFfnTiming::Use &use) {
+    if (buffers)
+      buffers(use);
+    else
+      model::withPrefillArena(backend, loaded, operators, format, use);
   };
   const ops::Linear &linear = operators.linear();
-  model.time = [&backend, &linear, layers, cancelled, onArena] {
-    ops::ane_ffn::Timings timings;
-    onArena([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
-      timings = ops::ane_ffn::Measurement(backend, linear, *layers, ffn, hidden, cancelled).time();
+  const std::function<bool()> cancelled = timing.cancelled;
+  // A measurement of the split on the buffers `on` hands it.
+  const auto measured = [&backend, &linear, layers, cancelled, on](const auto &measure) {
+    on([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
+      ops::ane_ffn::Measurement measurement(backend, linear, *layers, ffn, hidden, cancelled);
+      measure(measurement);
     });
+  };
+  model.time = [measured] {
+    ops::ane_ffn::Timings timings;
+    measured([&](ops::ane_ffn::Measurement &measurement) { timings = measurement.time(); });
     return timings;
   };
-  model.timeAt = [&backend, &linear, layers, cancelled, onArena](uint32_t aneUnits, double gpuAlone) {
+  model.timeAt = [measured](uint32_t aneUnits) {
     ops::ane_ffn::Timing timing;
-    onArena([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
-      timing = ops::ane_ffn::Measurement(backend, linear, *layers, ffn, hidden, cancelled).time(aneUnits, gpuAlone);
-    });
+    measured([&](ops::ane_ffn::Measurement &measurement) { timing = measurement.time(aneUnits); });
     return timing;
   };
-  model.prepare = [&backend, &linear, layers, cancelled, onArena](uint32_t aneUnits, bool timeChunks,
-                                                                   ops::AneFfn::Mode mode) {
+  model.prepare = [&backend, &linear, layers, cancelled, on](ops::AneFfn::Shares shares, ops::AneFfn::Rows rows,
+                                                             bool timeChunks) {
     AneFfnPrepared prepared;
-    onArena([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
-      // The chunks are timed on a split of their own, before this one is
-      // made, so that no two splits are held at once.
+    on([&](const ops::PrefillFfnBuffers &ffn, const std::array<metal::MetalBuffer, 2> &hidden) {
+      // The chunks are timed on a split of their own, of the same program,
+      // before this one is made, so that no two splits are held at once.
       if (timeChunks)
-        prepared.chunks = ops::ane_ffn::Measurement(backend, linear, *layers, ffn, hidden, cancelled).chunks(aneUnits);
-      prepared.split = std::make_unique<ops::AneFfn>(backend, linear, *layers, aneUnits, cancelled, mode);
+        prepared.chunks =
+            ops::ane_ffn::Measurement(backend, linear, *layers, ffn, hidden, cancelled).chunks(shares);
+      prepared.split = std::make_unique<ops::AneFfn>(backend, linear, *layers, shares, rows, cancelled);
       prepared.error = prepared.split->verify(*layers, ffn, hidden);
     });
     return prepared;
-  };
-  model.timingPair = [&backend, &linear, layers, cancelled](uint32_t aneUnits) {
-    return ops::ane_ffn::Measurement::pair(backend, linear, *layers, aneUnits, cancelled);
   };
   const std::string key = ops::AneFfn::calibrationKey(*layers, linear) + " device " +
                           backend.capabilities().deviceName + " macos " +
@@ -1672,7 +1717,6 @@ AneFfnModel aneFfnModel(metal::MetalBackend &backend, const model::LoadedModel &
   model.remember = [key](uint32_t maxAneUnits, const ops::ane_ffn::Calibration &calibration) {
     return ane::remember(key + std::to_string(maxAneUnits), calibration.text());
   };
-  model.forget = [key](uint32_t maxAneUnits) { ane::forget(key + std::to_string(maxAneUnits)); };
   model.healthy = [&backend] { return backend.healthy(); };
   return model;
 }

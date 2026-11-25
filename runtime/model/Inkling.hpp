@@ -56,6 +56,9 @@ constexpr InklingLayout::InklingLayout()
                         .attentionQueryHeads = 24,
                         .attentionKvHeads = 8,
                         .attentionHeadDimension = 128,
+                        // Unread: its own loader (planInklingLayer) takes its
+                        // norms as stored, and it has no q or k norm.
+                        .attentionNormMean = 1.0F,
                         .familyAttention = true,
                         .rotaryPairs = 0,
                         .slidingWindow = 1024,

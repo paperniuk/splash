@@ -73,7 +73,7 @@ struct NativeArguments final {
   std::optional<uint32_t> aneFfnMinimumRows;
   // --prefill-mode bounded|full and --prefill-bound-ms: the isolated prefill
   // command bound (Scheduler.hpp), infinite for full.
-  double prefillCommandMilliseconds = EngineConfig{}.prefillCommandMilliseconds;
+  double prefillCommandMilliseconds = kDefaultPrefillCommandMilliseconds;
   // --prefill-bound-scope buffer|command: whether that bound holds each
   // command buffer or the whole command (EngineConfig::prefillBoundPerBuffer).
   bool prefillBoundPerBuffer = EngineConfig{}.prefillBoundPerBuffer;
@@ -81,6 +81,10 @@ struct NativeArguments final {
   // command never shrinks (EngineConfig::contendedPrefillRows). Zero for the
   // GPU family's default (defaultContendedFloorRows).
   uint32_t contendedPrefillRows = 0;
+  // --ane-calibration again: the split's start calibrates again instead of
+  // taking this Mac's record (splash serve --recalibrate-ane,
+  // AneFfnSetting::recalibrate).
+  bool recalibrateAne = false;
   // --ple-memory BYTES|auto|off and --expert-memory BYTES|auto|off: a
   // target's per-layer embedding (PLE) table through a row cache of BYTES and
   // a MoE target's routed experts through a store of BYTES, which
@@ -104,6 +108,9 @@ struct NativeArguments final {
   // --verify-rows auto|all: the rows of the draft's block a decode
   // cycle verifies (RuntimeResourcesConfig::verifyRows).
   model::VerifyRows verifyRows = model::VerifyRows::Auto;
+  // --max-concurrent-requests REQUESTS: the lanes the runtime runs, 1 to
+  // ExecutionLimits::maximumBatchWidth (RuntimeResourcesConfig::lanes).
+  uint32_t lanes = model::ExecutionLimits::defaultLanes;
   // --activations auto|bf16: whether activations may round to int8 where
   // an int8-activation path takes them
   // (RuntimeResourcesConfig::int8Activations).

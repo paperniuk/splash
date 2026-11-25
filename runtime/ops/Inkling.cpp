@@ -154,7 +154,9 @@ void Inkling::addConvolution(metal::CommandGraph &graph, InklingRows input, std:
   if(tape.buffer){ requireRows(tape,convolution.channels,rows.rows,2); p.count=1; p.source[1]=rowParams(tape); }
   p.outputFloat=residual.outputFloat;
   if(residual.addend.buffer){ requireRows(residual.addend,convolution.channels,rows.rows,residual.addendFloat?4:2); p.addend=1; p.addendFloat=residual.addendFloat; p.source[2]=rowParams(residual.addend); }
-  graph.add("inkling_conv",{input.buffer,in[0],in[1],in[2],in[3],out[0],out[1],out[2],out[3],convolution.weights,convolution.dynamic?dynamicTaps.buffer:convolution.weights,output.buffer,layout,hasTree?tree:convolution.weights,tape.buffer?tape.buffer:output.buffer,residual.addend.buffer?residual.addend.buffer:output.buffer},p,{rows.bound+(write?convolution.taps-1:0),groups(convolution.channels),rows.sequences},{threads,1,1});
+  std::vector<metal::MetalBuffer> bindings{input.buffer}; bindings.insert(bindings.end(),in.begin(),in.end()); bindings.insert(bindings.end(),out.begin(),out.end());
+  bindings.insert(bindings.end(),{convolution.weights,convolution.dynamic?dynamicTaps.buffer:convolution.weights,output.buffer,layout,hasTree?tree:convolution.weights,tape.buffer?tape.buffer:output.buffer,residual.addend.buffer?residual.addend.buffer:output.buffer});
+  graph.add("inkling_conv",std::move(bindings),p,{rows.bound+(write?convolution.taps-1:0),groups(convolution.channels),rows.sequences},{threads,1,1});
 }
 void Inkling::addConvolutionHistory(metal::CommandGraph &graph, InklingRows input, metal::MetalBuffer historyIn, metal::MetalBuffer historyOut, uint32_t historyOffset, uint32_t historyStride, uint32_t channels, uint32_t taps, uint32_t rows) {
   shape(channels,taps); requireRows(input,channels,rows,2); requireHistory(historyIn,historyOffset,historyStride,channels,taps); requireHistory(historyOut,historyOffset,historyStride,channels,taps);
@@ -173,7 +175,8 @@ void Inkling::addConvolutionCommit(metal::CommandGraph &graph, InklingRows input
   for(const auto &h:historyOut) requireBytes(h,bytes,"Inkling commit next history");
   requireBytes(paths,uint64_t{rows.sequences}*4,"Inkling commit paths"); requireBytes(layout,uint64_t{rows.sequences}*sizeof(SplashLaneRows),"Inkling commit layout");
   auto in=laneBindings(historyIn),out=laneBindings(historyOut); InklingParams p{}; p.hidden=channels; p.rows=rows.rows; p.taps=taps; p.sequences=rows.sequences; p.blocks=blocks; p.blockStride=blockStride; p.historyBlockStride=historyBlockStride; p.historyStride=historyStride; p.count=pathRows; p.source[0]=rowParams(inputs);
-  graph.add("inkling_commit",{inputs.buffer,in[0],in[1],in[2],in[3],out[0],out[1],out[2],out[3],paths,layout},p,{taps-1,groups(blocks*channels),rows.sequences},{threads,1,1});
+  std::vector<metal::MetalBuffer> bindings{inputs.buffer}; bindings.insert(bindings.end(),in.begin(),in.end()); bindings.insert(bindings.end(),out.begin(),out.end()); bindings.insert(bindings.end(),{paths,layout});
+  graph.add("inkling_commit",std::move(bindings),p,{taps-1,groups(blocks*channels),rows.sequences},{threads,1,1});
 }
 void Inkling::addLogitCap(metal::CommandGraph &graph, metal::MetalBuffer logits, float softcap, uint32_t vocabulary, uint32_t width, uint32_t rows) {
   if(!rows || !width || vocabulary>width || !(softcap>0) || uint64_t{rows}*width>std::numeric_limits<uint32_t>::max()) throw std::invalid_argument("invalid Inkling logit cap");

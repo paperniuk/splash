@@ -9,16 +9,18 @@
 // - the split: which layers, units and chunks it takes; for three layers of MLX af4g64 and of mixed GGUF formats,
 //   Metal allocates what plannedBytes plans, and chunks of the fewest rows, of a count between two functions and of the
 //   most rows compute what the GPU computes alone within int8's error, as do quiet rows, whose intermediate values
-//   fp16 barely holds, and rows of a hidden channel of about 1e5; verify() passes every function of either model and
-//   fails a function bound to another's procedure; layers it is given out of order are refused, and it keeps what it
-//   needs of the layers it was built from; an infinity in the ANE's output stops it; its program unloaded for the idle
-//   release and loaded again computes what it computed before, and a command encoded or in flight refuses the
+//   fp16 barely holds, and rows of a hidden channel of about 1e5; commands in two pipelined steps compute bit for bit
+//   what one step computes, and a step joins before the next and the commit; verify() passes every function of either
+//   model and fails a function bound to another's procedure; layers it is given out of order are refused, and it keeps
+//   what it needs of the layers it was built from; an infinity in the ANE's output stops it; its program unloaded for
+//   the idle release and loaded again computes what it computed before, and a command encoded or in flight refuses the
 //   release;
 // - faults: each fault of the ANE's evaluations (ane/ProgramInstrumentation.hpp) at each layer of chunks of three
 //   sizes, and a program that does not load again after the idle release, stop the split without failing the Metal
-//   command or throwing, and the GPU alone then computes what it computes on its own; so does a Neural Engine slower
-//   than the GPU alone, through the breaker, after a window of commands whose results stay usable; an evaluation that
-//   signals the shared event below its value leaves the value as it is;
+//   command or throwing, and the GPU alone then computes what it computes on its own; a Neural Engine slower than the
+//   GPU alone pauses the split at its first command, whose results stay usable, and the probe after the pause stops
+//   it; a command whose submission throws starts no evaluation and stops the split; an evaluation that signals the
+//   shared event below its value leaves the value as it is;
 // - the program (runtime/ane/Program.mm): an invalid MIL, a function it lacks and a binding short of an input fail as
 //   std::exceptions; a limit that runs out and an interrupted wait end the wait, after which a program still comes up;
 //   unload() and load() round-trip, and load() does not compile; the cache writes a file of other bytes again and
@@ -42,7 +44,6 @@
 #include "metal/abi/AneFfn.h"
 #include "metal/abi/QuantFormat.h"
 #include "ops/AneFfn.hpp"
-#include "ops/AneFfnMeasurement.hpp"
 #include "ops/Linear.hpp"
 
 #include <algorithm>
@@ -93,9 +94,6 @@ constexpr uint32_t kHidden = 5120, kSegment = 2560, kIntermediate = 6144, kLayer
 // The most the split's output may differ from the GPU's alone, as the RMS of their difference relative to the GPU's:
 // int8 leaves about 1%.
 constexpr double kMaximumError = 0.05;
-// The most a chunk's rows on the GPU alone may differ from a full chunk's where Apple7/8 split K at short chunks, as
-// the RMS of their difference relative to the full chunk's: bf16's unit roundoff (the order leaves about 0.06%).
-constexpr double kBf16Roundoff = 0x1p-8;
 // What a kernel must leave as it was.
 constexpr uint8_t kUntouched = 0x5A;
 constexpr uint16_t kUntouchedHalf = 0x5A5A;
@@ -214,7 +212,7 @@ void inputs(MetalBackend &backend, const MetalBuffer &signs, const std::vector<f
 }
 
 // ---------------------------------------------------------------- weights
-constexpr uint32_t kWeightRows = 512, kWeightInputs = 2048;
+constexpr uint32_t kWeightRows = 1536, kWeightInputs = 2048;
 // A [kWeightRows, kWeightInputs] projection's planes as the weight kernels bind them, its parameters and its values.
 struct Source {
   std::string name;
@@ -224,7 +222,7 @@ struct Source {
 };
 
 // A row of zero weights, which takes the least scale and codes of 0: native blocks of zero bytes, whose scales are 0.
-constexpr uint32_t kZeroWeightRow = 300;
+constexpr uint32_t kZeroWeightRow = 700;
 
 Source ggufSource(MetalBackend &backend, gguf_reference::Fmt format) {
   using namespace gguf_reference;
@@ -246,7 +244,12 @@ Source ggufSource(MetalBackend &backend, gguf_reference::Fmt format) {
 // Rows [row, kWeightRows) of `source` under their scales over inputs [scaled, kWeightInputs), and their int8 values
 // over inputs [input, kWeightInputs), rotated in blocks of `block` from `scaled`: as the split stages the rows of
 // gate and up the ANE takes over a segment of the hidden inputs (block 128), or the rows of down over a segment of
-// the ANE's inputs (block 512). Each row's values lie a stride apart, and its scales' copies another.
+// the ANE's inputs (block 512). Each row's values lie a stride apart, and its scales' copies another. The ANE's
+// channels lie in descending units of 512, the last first: gate's and up's rows, and down's inputs.
+uint32_t descending(uint32_t index, uint32_t span) {
+  constexpr uint32_t block = ANE_FFN_INTERMEDIATE_BLOCK;
+  return span - (index / block + 1) * block + index % block;
+}
 void weights(MetalBackend &backend, const MetalBuffer &signs, const std::vector<float> &sign, const Source &source,
              uint32_t block, uint32_t row, uint32_t scaled, uint32_t input) {
   const uint32_t rows = kWeightRows - row, width = kWeightInputs - input, stride = width + 64, scaleStride = 3;
@@ -257,16 +260,17 @@ void weights(MetalBackend &backend, const MetalBuffer &signs, const std::vector<
   const auto &[a, b, c] = source.planes;
   CommandGraph graph;
   graph.add("ane_ffn_row_scale_gguf" + variant, {a, b, c, rowScales, signs},
-            AneFfnWeightParams{source.groups, row, scaled, kWeightInputs - scaled, 0, 0, source.format},
+            AneFfnWeightParams{source.groups, row, scaled, kWeightInputs - scaled, 0, 0, source.format, rows},
             {rows / ANE_FFN_WEIGHT_ROWS, 1, 1}, {ANE_FFN_WEIGHT_THREADS, 1, 1});
   graph.add("ane_ffn_weights_gguf" + variant, {a, b, c, rowScales, output, scales, signs},
-            AneFfnWeightParams{source.groups, row, input, width, stride, scaleStride, source.format},
+            AneFfnWeightParams{source.groups, row, input, width, stride, scaleStride, source.format, rows},
             {rows / ANE_FFN_WEIGHT_ROWS, width / block, 1}, {ANE_FFN_WEIGHT_THREADS, 1, 1});
   run(backend, graph);
 
   const std::string label = source.name + variant;
+  const bool rowsDescend = block == ANE_FFN_INPUT_BLOCK;
   for (uint32_t r = 0; r < rows; ++r) {
-    const auto first = source.values.begin() + uint64_t{row + r} * kWeightInputs;
+    const auto first = source.values.begin() + uint64_t{row + (rowsDescend ? descending(r, rows) : r)} * kWeightInputs;
     std::vector<float> v(first + scaled, first + kWeightInputs);
     rotate(v, block, sign);
     const uint16_t bits = contents<uint16_t>(rowScales)[r];
@@ -286,7 +290,7 @@ void weights(MetalBackend &backend, const MetalBuffer &signs, const std::vector<
     const float inverse = ANE_FFN_INT8_UNIT / rowScale;
     const int8_t *values = contents<int8_t>(output) + uint64_t{r} * stride;
     for (uint32_t i = 0; i < width; ++i) {
-      const int8_t value = toInt8(v[input - scaled + i] * inverse);
+      const int8_t value = toInt8(v[input - scaled + (rowsDescend ? i : descending(i, width))] * inverse);
       if (!near(values[i], value))
         fail(label + " row " + std::to_string(r) + " input " + std::to_string(input + i) + ": " +
              std::to_string(values[i]) + ", not " + std::to_string(value));
@@ -299,11 +303,12 @@ void weights(MetalBackend &backend, const MetalBuffer &signs, const std::vector<
 void weights(MetalBackend &backend, const MetalBuffer &signs, const std::vector<float> &sign) {
   for (int format = 0; format < gguf_reference::FMT_COUNT; ++format) {
     const Source source = ggufSource(backend, gguf_reference::Fmt(format));
-    weights(backend, signs, sign, source, ANE_FFN_INPUT_BLOCK, 256, 0, 512);
+    weights(backend, signs, sign, source, ANE_FFN_INPUT_BLOCK, 512, 0, 512);
     weights(backend, signs, sign, source, ANE_FFN_INTERMEDIATE_BLOCK, 0, 512, 1024);
   }
   section("weights: " + std::to_string(gguf_reference::FMT_COUNT) +
-          " image formats as int8 rows and scales, rotated in blocks of 128 and 512; a row of zeros as codes of 0");
+          " image formats as int8 rows and scales, rotated in blocks of 128 and 512, the ANE's channels in descending "
+          "units; a row of zeros as codes of 0");
 }
 
 // ---------------------------------------------------------------- join
@@ -453,7 +458,7 @@ void takes(const Model &mlx, const Model &gguf) {
   if (AneFfn::units(mlx.layers) != kIntermediate / 512) fail("the split moves other units than 512 channels");
   // Units that leave the GPU or the ANE no channels.
   for (const uint32_t aneUnits : {0u, AneFfn::units(mlx.layers)})
-    test::rejects([&] { static_cast<void>(AneFfn::plannedBytes(mlx.layers, aneUnits, false)); }, "no channels",
+    test::rejects([&] { static_cast<void>(AneFfn::plannedBytes(mlx.layers, {aneUnits, aneUnits})); }, "no channels",
                   std::to_string(aneUnits) + " units leave the GPU or the ANE no channels, yet plan");
   section("takes: models of one splittable shape, and units that leave each part channels");
 }
@@ -461,9 +466,9 @@ void takes(const Model &mlx, const Model &gguf) {
 // A calibration is remembered under the layers' shapes and formats and the int8 activations the GPU's part plans with
 // (AneFfn::calibrationKey): each setting and each model's layers have a key of their own, and a key repeats.
 void keys(const DeviceCapabilities &device, const Model &mlx, const Model &gguf) {
-  const Linear on(device, Int8Activations::On), off(device, Int8Activations::Off);
+  const Linear on(device, Int8Activations::On, StepKind::Prefill), off(device, Int8Activations::Off, StepKind::Prefill);
   const std::string mlxOn = AneFfn::calibrationKey(mlx.layers, on);
-  if (mlxOn != AneFfn::calibrationKey(mlx.layers, Linear(device, Int8Activations::On)))
+  if (mlxOn != AneFfn::calibrationKey(mlx.layers, Linear(device, Int8Activations::On, StepKind::Prefill)))
     fail("a calibration key does not repeat");
   if (mlxOn == AneFfn::calibrationKey(mlx.layers, off) ||
       AneFfn::calibrationKey(gguf.layers, on) == AneFfn::calibrationKey(gguf.layers, off))
@@ -482,18 +487,14 @@ struct Chunk {
 };
 Chunk chunk(MetalBackend &backend, uint32_t rows) {
   const auto bf16Rows = [&](uint32_t width) { return test::sharedBuffer(backend, uint64_t{rows} * width * 2); };
-  // Where the family runs the int8 prefill tile, its codes and scales, and where it splits K in chunks of at least
-  // kMinimumRows rows (Apple7/8), the partials and counters of the projections and of the split's GPU part at any
-  // share, as the runtime's prefill arena sizes them (RuntimeArenas.cpp).
-  const Linear linear(backend.capabilities(), Int8Activations::On);
+  // Include the full FFN's scratch and the split-K scratch for the narrower Apple7/8 gate and up projections.
+  const Linear linear(backend.capabilities(), Int8Activations::On, StepKind::Prefill);
   LinearScratchSize size = linear.scratchSize({kIntermediate, kHidden}, SPLASH_PREFILL_TOKEN_BUDGET);
   size.include(linear.scratchSize({kHidden, kIntermediate}, SPLASH_PREFILL_TOKEN_BUDGET));
-  size.include(AneFfn::prefillScratchSize(linear, {kIntermediate, kHidden}));
+  size.include(AneFfn::prefillScratchSize(linear, {kIntermediate, kHidden}, SPLASH_PREFILL_TOKEN_BUDGET));
   const auto bytes = [&](uint64_t count) { return count ? test::sharedBuffer(backend, count) : MetalBuffer{}; };
   return {{bf16Rows(kHidden), bf16Rows(kIntermediate), bf16Rows(kIntermediate),
-           {.input = bytes(size.input),
-            .sums = bytes(size.sums),
-            .partials = bytes(size.partials),
+           {.input = bytes(size.input), .sums = bytes(size.sums), .partials = bytes(size.partials),
             .counters = bytes(size.counters)}},
           {bf16Rows(kHidden), bf16Rows(kHidden)}};
 }
@@ -506,8 +507,10 @@ void fillRows(const Chunk &chunk, uint32_t rows, Scale row) {
 }
 
 // A forward of every layer's FFN of a chunk's `rows` normalized rows from a zero residual, split where `split` takes
-// the chunk and on the GPU alone otherwise, as the target's prefill encodes it: its bf16 output, whether the split's
-// results were usable, and the command's milliseconds.
+// the chunk and on the GPU alone otherwise, as the target's prefill encodes it: in the two steps the split's first
+// step's rows cut it into (AneFfn::firstStepRows), each step's buffers its rows of the chunk's, a step's join after
+// the other step's FFN layer and before its own next (QwenTarget::addPrefillLayers): its bf16 output, whether the
+// split's results were usable, and the command's milliseconds.
 struct Forward {
   std::vector<uint16_t> bits;
   bool usable = true;
@@ -520,22 +523,46 @@ Forward forward(MetalBackend &backend, const Linear &linear, const Model &model,
   std::memset(hidden[0].contents(), 0, hidden[0].sizeBytes());
   CommandGraph graph;
   const bool splits = split && split->splits(rows);
-  if (split) static_cast<void>(split->begin());
+  if (split) static_cast<void>(split->begin(split->steps(rows)));
+  // Each step's rows from `first` of the chunk's: its normalized and hidden rows.
+  struct Step {
+    uint32_t first, rows;
+    PrefillFfnBuffers ffn;
+    std::array<MetalBuffer, 2> hidden;
+  };
+  const uint32_t firstRows = splits ? split->firstStepRows(rows) : rows;
+  std::vector<Step> steps;
+  for (const auto &[first, count] : {std::pair{0u, firstRows}, std::pair{firstRows, rows - firstRows}}) {
+    if (!count) continue;
+    const auto view = [&](const MetalBuffer &buffer) {
+      const uint64_t offset = uint64_t{first} * kHidden * 2;
+      return backend.view(buffer, offset, buffer.sizeBytes() - offset);
+    };
+    PrefillFfnBuffers rowsFfn = ffn;
+    rowsFfn.normalized = view(ffn.normalized);
+    steps.push_back({first, count, rowsFfn, {view(hidden[0]), view(hidden[1])}});
+  }
   for (uint32_t layer = 0; layer < kLayers; ++layer) {
-    const MetalBuffer &residual = hidden[layer & 1], &output = hidden[(layer & 1) ^ 1];
-    if (splits)
-      split->add(graph, layer, ffn, residual, output, rows);
-    else
-      linear.addSwiGlu(graph, model.layers[layer], ffn, residual, output, rows);
+    for (const Step &step : steps) {
+      const MetalBuffer &residual = step.hidden[layer & 1], &output = step.hidden[(layer & 1) ^ 1];
+      if (splits) {
+        split->join(graph);
+        split->add(graph, layer, step.ffn, residual, output, step.rows);
+      } else {
+        linear.addSwiGlu(graph, model.layers[layer], step.ffn, residual, output, step.rows);
+      }
+    }
+    if (splits && (steps.size() == 1 || layer + 1 == kLayers)) split->join(graph);
   }
   Forward result;
   const auto start = AwakeClock::now();
+  metal::CommandTiming timing;
   if (split)
-    static_cast<void>(split->commit(graph, {}).wait());
+    timing = split->commit(graph, {}).wait();
   else
     run(backend, graph);
   result.milliseconds = millisecondsSince(start);
-  result.usable = !split || split->finish();
+  result.usable = !split || split->finish(timing);
   const uint16_t *bits = contents<uint16_t>(hidden[kLayers & 1]);
   result.bits.assign(bits, bits + uint64_t{rows} * kHidden);
   return result;
@@ -561,30 +588,50 @@ std::pair<double, bool> difference(const Forward &expected, const Forward &got) 
 }
 
 // The split's layers, built from copies of the model's projections that are gone before it runs: it keeps what it
-// needs of them.
-using Mode = AneFfn::Mode;
+// needs of them. The main fixtures exercise both kinds of command from 512 rows up, with the family's calibrated
+// crossover. Separate checks exercise the earlier Apple7/8 functions.
+constexpr AneFfn::Shares kShares{kAneUnits, kAneUnits};
+constexpr AneFfn::Rows kOneStep{AneFfn::kMinimumRows, 0};
+AneFfn::Rows pipelinedRows(const Linear &linear) {
+  return {kOneStep.oneStep, AneFfn::twoStepRows(linear.calibration().simdgroupMma)};
+}
 
-const char *name(Mode mode) { return mode == Mode::Single ? "single" : mode == Mode::Pair ? "pair slots" : "fallback"; }
-
-std::unique_ptr<AneFfn> splitOf(MetalBackend &backend, const Model &model, Mode mode) {
+std::unique_ptr<AneFfn> splitOf(MetalBackend &backend, const Model &model, AneFfn::Shares shares, AneFfn::Rows rows,
+                                std::optional<bool> blocks = std::nullopt) {
   const std::vector<Projection> copies = model.projections;
   std::vector<SwiGluProjections> layers;
   for (uint32_t layer = 0; layer < kLayers; ++layer)
     layers.push_back({&copies[3 * layer], &copies[3 * layer + 1], &copies[3 * layer + 2]});
-  return std::make_unique<AneFfn>(backend, Linear(backend.capabilities(), Int8Activations::On), layers, kAneUnits,
-                                  nullptr, mode);
+  return std::make_unique<AneFfn>(backend, Linear(backend.capabilities(), Int8Activations::On, StepKind::Prefill),
+                                  layers, shares, rows, nullptr, blocks);
 }
 
-void split(MetalBackend &backend, const Linear &linear, const Model &model, const Chunk &chunk, Mode mode) {
-  const std::unique_ptr<AneFfn> split = splitOf(backend, model, mode);
-  if (split->share() != 0.5) fail(model.name + ": runs share " + std::to_string(split->share()));
+void split(MetalBackend &backend, const Linear &linear, const Model &model, const Chunk &chunk) {
+  const bool mma = linear.calibration().simdgroupMma;
+  const AneFfn::Rows bothRows = pipelinedRows(linear);
+  const uint32_t crossover = bothRows.twoSteps;
+  const std::unique_ptr<AneFfn> split = splitOf(backend, model, kShares, bothRows);
+  if (mma) {
+    const auto early = splitOf(backend, model, kShares, {AneFfn::kMmaMinimumRows, 256});
+    if (early->splits(127) || !early->splits(128) || early->firstStepRows(256) != 128)
+      fail(model.name + ": Apple7/8 split did not take its 128-row functions");
+    fillRows(chunk, 256, [](uint64_t) { return 1.0f; });
+    for (uint32_t rows : {128u, 256u}) {
+      const Forward expected = forward(backend, linear, model, nullptr, chunk, rows);
+      const Forward got = forward(backend, linear, model, early.get(), chunk, rows);
+      const auto [error, finite] = difference(expected, got);
+      if (!got.usable || !finite || !(error <= kMaximumError))
+        fail(model.name + ": Apple7/8 early split differed at " + std::to_string(rows) + " rows");
+    }
+  }
+  if (split->share(AneFfn::Steps::One) != 0.5 || split->share(AneFfn::Steps::Two) != 0.5)
+    fail(model.name + ": runs share " + std::to_string(split->share(AneFfn::Steps::One)));
   if (split->splits(AneFfn::kMinimumRows - 1) || !split->splits(AneFfn::kMinimumRows) ||
       !split->splits(AneFfn::kMaximumRows) || split->splits(AneFfn::kMaximumRows + 1))
-    fail(model.name + ": the split takes other chunks than those of 256 to 2048 rows");
+    fail(model.name + ": the split takes other commands than those of 512 to 2048 rows");
   // The plan takes whole pages of each of its four buffers, of which Metal may report less.
-  const uint64_t planned = AneFfn::plannedBytes(model.layers, kAneUnits, mode != Mode::Single), allocated = split->allocatedBytes();
-  // A Fallback takes one slot of the two a Pair's plan holds, so it need not fill the plan.
-  if (allocated > planned || (mode != Mode::Fallback && planned - allocated >= 4 * kHostPageBytes))
+  const uint64_t planned = AneFfn::plannedBytes(model.layers, kShares), allocated = split->allocatedBytes();
+  if (allocated > planned || planned - allocated >= 4 * kHostPageBytes)
     fail(model.name + ": allocated " + std::to_string(allocated) + " bytes, planned " + std::to_string(planned));
   fillRows(chunk, AneFfn::kMaximumRows, [](uint64_t) { return 1.0f; });
   // The most rows first: later commands run on what earlier ones left in the split's surfaces.
@@ -598,175 +645,161 @@ void split(MetalBackend &backend, const Linear &linear, const Model &model, cons
       fail(model.name + ", " + std::to_string(rows) + " rows: " + std::to_string(100.0 * error) +
            "% RMS from the GPU alone" + (got.usable ? "" : ", unusable: " + split->reason()));
   }
-  section("split (" + std::string(name(mode)) + "): " + model.name + " layers at share 0.5 from layers gone before it runs, its planned memory, "
-          "chunks of 2048, " + std::to_string(AneFfn::kMinimumRows) + " and 700 rows");
+  section("split: " + model.name + " layers at share 0.5 from layers gone before it runs, its planned memory, "
+          "chunks of 2048, 512 and 700 rows");
 
-  // A least chunk of more rows leaves the smaller ones to the GPU; one of rows no function holds is refused.
-  split->setMinimumRows(640);
-  if (split->minimumRows() != 640 || split->splits(639) || !split->splits(640))
-    fail(model.name + ": a least chunk of 640 rows took other chunks than those of 640 rows or more");
-  for (const uint32_t rows : {AneFfn::kMinimumRows - 1, AneFfn::kMaximumRows + 1})
-    test::rejects([&] { split->setMinimumRows(rows); }, "no function of",
-                  model.name + ": a least chunk of " + std::to_string(rows) + " rows was taken");
-  // verify() checks every function, in each slot, against the leading rows of a full chunk on the GPU
-  // alone, which computes every row alike whatever the chunk's rows: bit for bit where no projection splits K, and
-  // where Apple7/8 split K at short chunks within fp32 summation order, which moves the rows by bf16's unit roundoff
-  // in RMS at most (values near zero differ by far more relatively, so no element bound holds).
-  const auto splitsK = [&](uint32_t rows) {
-    return std::any_of(model.layers.begin(), model.layers.end(), [&](const SwiGluProjections &layer) {
-      return linear.plan(*layer.gate, rows, LinearEpilogue::None).configuration().splits > 1 ||
-             linear.plan(*layer.up, rows, LinearEpilogue::UpWithGate).configuration().splits > 1 ||
-             linear.plan(*layer.down, rows, LinearEpilogue::Residual).configuration().splits > 1;
-    });
-  };
-  const Forward full = forward(backend, linear, model, nullptr, chunk, AneFfn::kMaximumRows);
-  for (const uint32_t rows : {AneFfn::kMinimumRows, 700u}) {
-    const Forward fewer = forward(backend, linear, model, nullptr, chunk, rows);
-    const bool bitwise = std::equal(fewer.bits.begin(), fewer.bits.end(), full.bits.begin());
-    if (!splitsK(rows) && !splitsK(AneFfn::kMaximumRows)) {
-      if (!bitwise)
+  // Raising the minimum leaves smaller commands to the GPU. Reject thresholds outside the program's function rows.
+  {
+    const std::unique_ptr<AneFfn> oneStep = splitOf(backend, model, {kAneUnits, 0}, kOneStep);
+    oneStep->setRows({640, 0});
+    if (oneStep->minimumRows() != 640 || oneStep->splits(639) || !oneStep->splits(640) ||
+        oneStep->firstStepRows(2048) != 2048)
+      fail(model.name + ": least rows of 640 took other commands than those of 640 rows or more in one step");
+    using Rows = AneFfn::Rows;
+    for (const Rows rows :
+         {Rows{AneFfn::minimumFunctionRows(mma) - 1, 0}, Rows{AneFfn::kMaximumRows + 1, 0}, Rows{0, 0}, Rows{256, 1024}})
+      test::rejects([&] { oneStep->setRows(rows); }, "no function of",
+                    model.name + ": rows " + std::to_string(rows.oneStep) + "/" + std::to_string(rows.twoSteps) +
+                        " were taken");
+    if (split->steps(crossover - 1) != AneFfn::Steps::One || split->steps(crossover) != AneFfn::Steps::Two ||
+        split->firstStepRows(crossover - 1) != crossover - 1)
+      fail(model.name + ": steps did not switch at " + std::to_string(crossover) + " rows");
+    for (const AneFfn::Rows rows : {AneFfn::Rows{AneFfn::kMinimumRows, AneFfn::kMaximumRows + 1},
+                                    AneFfn::Rows{AneFfn::kMinimumRows, 2 * AneFfn::minimumFunctionRows(mma) - 1},
+                                    AneFfn::Rows{crossover, crossover},
+                                    AneFfn::Rows{AneFfn::kMinimumRows, crossover + 2}})
+      test::rejects([&] { split->setRows(rows); }, "no function of",
+                    model.name + ": rows no function of its program holds were taken");
+    split->setRows({640, crossover});
+    if (split->minimumRows() != 640 || split->splits(639) || split->steps(crossover - 1) != AneFfn::Steps::One)
+      fail(model.name + ": least rows of 640 beside two steps took other commands than those of 640 rows or more");
+    // Two steps alone leave every command below the crossover on the GPU.
+    split->setRows({0, crossover});
+    if (split->minimumRows() != crossover || split->splits(crossover - 1) ||
+        !split->splits(crossover) || !split->splits(AneFfn::kMaximumRows) ||
+        split->firstStepRows(crossover) != (mma ? 384u : 512u) ||
+        split->firstStepRows(AneFfn::kMaximumRows) != AneFfn::kMaximumRows / 2)
+      fail(model.name + ": two steps alone did not start at " + std::to_string(crossover) + " rows");
+    for (const uint32_t rows : {crossover - 1, crossover, AneFfn::kMaximumRows}) {
+      const Forward expected = forward(backend, linear, model, nullptr, chunk, rows);
+      const Forward got = forward(backend, linear, model, split.get(), chunk, rows);
+      const auto [error, finite] = difference(expected, got);
+      if (!got.usable || !finite || !(error <= kMaximumError) ||
+          (rows < crossover && got.bits != expected.bits))
+        fail(model.name + ", " + std::to_string(rows) + " rows of two steps alone: " +
+             std::to_string(100.0 * error) + "% RMS from the GPU alone" + (got.usable ? "" : ", unusable"));
+    }
+    split->setRows(bothRows);
+  }
+  // verify() checks every function and both weight sets against the leading rows of a full chunk on the GPU.
+  // Apple9+ use the same accumulation order for a short or full chunk.
+  if (!mma) {
+    const Forward full = forward(backend, linear, model, nullptr, chunk, AneFfn::kMaximumRows);
+    for (const uint32_t rows : {AneFfn::kMinimumRows, 700u}) {
+      const Forward fewer = forward(backend, linear, model, nullptr, chunk, rows);
+      if (!std::equal(fewer.bits.begin(), fewer.bits.end(), full.bits.begin()))
         fail(model.name + ": the GPU computed the rows of a chunk of " + std::to_string(rows) +
-             " rows other than a full chunk's, and no projection splits K");
-      continue;
+             " rows other than a full chunk's");
     }
-    double largest = 0.0;
-    uint64_t unequal = 0;
-    for (uint64_t i = 0; i < fewer.bits.size(); ++i) {
-      unequal += fewer.bits[i] != full.bits[i];
-      largest = std::max(largest, std::fabs(double(fewer[i]) - full[i]));
-    }
-    const double error = difference(full, fewer).first;
-    std::cout << "  " << model.name << ", " << rows << " rows, split K: " << unequal << " of " << fewer.bits.size()
-              << " values differ from a full chunk's, by at most " << largest << ", " << 100.0 * error
-              << "% RMS\n";
-    if (!(error <= kBf16Roundoff))
-      fail(model.name + ": the GPU computed the rows of a chunk of " + std::to_string(rows) + " rows " +
-           std::to_string(100.0 * error) + "% RMS from a full chunk's, past fp32 summation order");
   }
   const auto started = AwakeClock::now();
   const double error = split->verify(model.layers, chunk.ffn, chunk.hidden);
   std::cout << "  " << model.name << ": verified in " << millisecondsSince(started) << " ms, " << 100.0 * error
             << "% from the GPU alone on the Neural Engine's part\n";
   if (split->retired()) fail(model.name + ": verify stopped the split: " + split->reason());
-  section("split (" + std::string(name(mode)) + "): " + model.name + " least chunk rows, a chunk's rows on the GPU alone as a full chunk's, and "
-          "verify() of every function");
+  // Gate and up whole and in blocks, the form this chip does not run too (AneFfn.cpp): every function of each
+  // within verify()'s bound of the GPU alone.
+  for (const bool blocks : {false, true}) {
+    const std::unique_ptr<AneFfn> form = splitOf(backend, model, kShares, bothRows, blocks);
+    const double formError = form->verify(model.layers, chunk.ffn, chunk.hidden);
+    std::cout << "  " << model.name << ", gate and up " << (blocks ? "in blocks" : "whole") << ": " << 100.0 * formError
+              << "% from the GPU alone on the Neural Engine's part\n";
+  }
+  section("split: " + model.name + " least chunk rows and verify() of every function, gate and up whole and in blocks");
+}
+
+// A command above the crossover runs as two interleaved steps, each on the function of its rows. Their output agrees
+// with the one-step command: bitwise on the upstream tile, within the split's error bound on Apple7/8, where the GPU
+// tile can change with the shape. A share of one step beside a larger share of two, which reads
+// the leading rows of the same surfaces, computes what a split of that share alone computes, the larger share's two
+// steps what that share's do alone. A step's join must come before the next add and before the commit.
+void pipelined(MetalBackend &backend, const Linear &linear, const Model &model, const Chunk &chunk) {
+  const bool mma = linear.calibration().simdgroupMma;
+  const AneFfn::Rows bothRows = pipelinedRows(linear);
+  const uint32_t crossover = bothRows.twoSteps;
+  const std::unique_ptr<AneFfn> two = splitOf(backend, model, kShares, bothRows),
+                                one = splitOf(backend, model, {kAneUnits, 0}, kOneStep);
+  if (two->firstStepRows(AneFfn::kMaximumRows) != AneFfn::kMaximumRows / 2 ||
+      two->firstStepRows(1100) != (mma ? 512u : 550u) ||
+      two->firstStepRows(crossover - 1) != crossover - 1 || two->firstStepRows(crossover) != (mma ? 384u : 512u))
+    fail(model.name + ": the split chose the wrong first-step rows");
+  fillRows(chunk, AneFfn::kMaximumRows, [](uint64_t) { return 1.0f; });
+  for (const uint32_t rows : {AneFfn::kMaximumRows, 1100u, crossover}) {
+    const Forward oneStep = forward(backend, linear, model, one.get(), chunk, rows);
+    const Forward twoSteps = forward(backend, linear, model, two.get(), chunk, rows);
+    const auto [error, finite] = difference(oneStep, twoSteps);
+    std::cout << "  " << model.name << ", " << rows << " rows in two steps: " << 100.0 * error
+              << "% RMS from one step, " << twoSteps.milliseconds << " ms against " << oneStep.milliseconds << " ms\n";
+    if (!oneStep.usable || !twoSteps.usable || !finite ||
+        (mma ? !(error <= kMaximumError) : oneStep.bits != twoSteps.bits))
+      fail(model.name + ", " + std::to_string(rows) + " rows: two steps computed other rows than one, " +
+           std::to_string(100.0 * error) + "% RMS");
+  }
+  // Shares of 4 units below the crossover and 6 from it, against each share alone.
+  constexpr uint32_t kSmall = 4;
+  const std::unique_ptr<AneFfn> both = splitOf(backend, model, {kSmall, kAneUnits}, bothRows),
+                                small = splitOf(backend, model, {kSmall, 0}, kOneStep);
+  for (const auto &[rows, alone] : {std::pair{700u, small.get()}, std::pair{crossover - 1, small.get()},
+                                    std::pair{AneFfn::kMaximumRows, two.get()}}) {
+    const Forward expected = forward(backend, linear, model, alone, chunk, rows);
+    const Forward got = forward(backend, linear, model, both.get(), chunk, rows);
+    if (!expected.usable || !got.usable || expected.bits != got.bits)
+      fail(model.name + ", " + std::to_string(rows) + " rows: a split of two shares computed other rows than its "
+                                                     "share alone, " +
+           std::to_string(100.0 * difference(expected, got).first) + "% RMS");
+  }
+  const auto &[ffn, hidden] = chunk;
+  CommandGraph graph;
+  static_cast<void>(two->begin(AneFfn::Steps::Two));
+  two->add(graph, 0, ffn, hidden[0], hidden[1], AneFfn::kMinimumRows);
+  test::rejects([&] { two->add(graph, 0, ffn, hidden[0], hidden[1], AneFfn::kMinimumRows); }, "before it joined",
+                model.name + ": a step was added before the one before it joined");
+  test::rejects([&] { static_cast<void>(two->commit(graph, {})); }, "did not join",
+                model.name + ": a command whose step did not join was committed");
+  static_cast<void>(one->begin(AneFfn::Steps::Two));
+  test::rejects([&] { one->add(graph, 0, ffn, hidden[0], hidden[1], AneFfn::kMinimumRows); }, "no command of this kind",
+                model.name + ": a split of one step took a command of two");
+  static_cast<void>(two->begin(AneFfn::Steps::Two));
+  section("pipelined: " + model.name + " commands of 2048, 1100 and " + std::to_string(crossover) +
+          " rows in two steps compute what one step does, "
+          "two shares in one program what each computes alone, and a step joins before the next and the commit");
 }
 
 // A program whose function of 640 rows is bound to the procedure of 512 rows leaves rows of the ANE's output
 // unwritten, which verify() fails, and the split stops.
 void misbound(MetalBackend &backend, const Model &model, const Chunk &chunk) {
-  ane::ProgramInstrumentation::arm({.swappedBinding = {"ffn640", "ffn512"}});
-  AneFfn split(backend, Linear(backend.capabilities(), Int8Activations::On), model.layers, kAneUnits, nullptr,
-               Mode::Single);
+  ane::ProgramInstrumentation::arm({.swappedBinding = {"ffn3072_640", "ffn3072_512"}});
+  AneFfn split(backend, Linear(backend.capabilities(), Int8Activations::On, StepKind::Prefill), model.layers,
+               {kAneUnits, 0}, kOneStep, nullptr);
   test::rejects([&] { static_cast<void>(split.verify(model.layers, chunk.ffn, chunk.hidden)); },
                 "split of 640 rows failed", "verify() passed a function bound to another's procedure");
   if (!split.retired() || split.splits(AneFfn::kMaximumRows)) fail("a split that failed verify() did not stop");
   section("verify: a function bound to the procedure of fewer rows fails it");
 }
 
-// A pair: two chunks' layers in turn in one command, each chunk's join left until the other chunk's FFN is added, as
-// the target's prefill encodes them. Each chunk's output is what the split computes of the chunk alone, bit for bit,
-// and a command with a join left is not committed.
-void pair(MetalBackend &backend, const Linear &linear, const Model &model) {
-  constexpr std::array<uint32_t, 2> kRows{1024, 700};
-  const std::unique_ptr<AneFfn> split = splitOf(backend, model, Mode::Pair);
-  // Both of 1024 rows: the GPU's tiles run past a chunk's 700.
-  const std::array<Chunk, 2> chunks{chunk(backend, kRows[0]), chunk(backend, kRows[0])};
-  std::array<Forward, 2> alone;
-  for (uint32_t c = 0; c < 2; ++c) {
-    fillRows(chunks[c], kRows[c], [](uint64_t) { return 1.0f; });
-    alone[c] = forward(backend, linear, model, split.get(), chunks[c], kRows[c]);
-    if (!alone[c].usable) fail("pair: chunk " + std::to_string(c) + " alone: " + split->reason());
-    std::memset(chunks[c].hidden[0].contents(), 0, chunks[c].hidden[0].sizeBytes());
-  }
-  CommandGraph graph;
-  if (!split->begin()) fail("pair: the split does not begin a command");
-  for (uint32_t layer = 0; layer < kLayers; ++layer)
-    for (const Chunk &part : chunks) {
-      const uint32_t rows = kRows[&part - chunks.data()];
-      split->settle(graph, &part);
-      split->add(graph, layer, part.ffn, part.hidden[layer & 1], part.hidden[(layer & 1) ^ 1], rows, &part);
-    }
-  test::rejects([&] { static_cast<void>(split->commit(graph, {})); }, "a join left to settle",
-                "a command with a join left to settle was committed");
-  split->settle(graph);
-  static_cast<void>(split->commit(graph, {}).wait());
-  if (!split->finish()) fail("pair: unusable: " + split->reason());
-  for (uint32_t c = 0; c < 2; ++c)
-    if (std::memcmp(chunks[c].hidden[kLayers & 1].contents(), alone[c].bits.data(), alone[c].bits.size() * 2))
-      fail("pair: chunk " + std::to_string(c) + " differs from its output alone");
-  section("pair: chunks of 1024 and 700 rows layer by layer, each joined after the other's FFN, as each alone");
-
-  // Every command of two least functions' rows or more, up to a chunk's, has a pair; each chunk is one the split
-  // takes, the first fills a function, and a full command halves.
-  constexpr uint32_t kLeast = AneFfn::kMinimumRows, kMost = AneFfn::kMaximumRows;
-  for (uint32_t rows = 1; rows <= kMost + kLeast; ++rows) {
-    const std::optional<uint32_t> first = split->pairRows(rows);
-    if (first.has_value() != (rows >= 2 * kLeast && rows <= kMost))
-      fail("pair: a command of " + std::to_string(rows) + " rows " + (first ? "has a pair" : "has no pair"));
-    else if (first && (!split->pairs(*first) || !split->pairs(rows - *first) || *first % AneFfn::kProgramStep))
-      fail("pair: a command of " + std::to_string(rows) + " rows starts with " + std::to_string(*first));
-  }
-  // 577 rows: 256 and 321 or 384 and 193 take the same functions; the smaller chunk goes first.
-  if (split->pairRows(kMost) != kMost / 2 || split->pairRows(2 * kLeast) != kLeast ||
-      split->pairRows(1100) != 512u || split->pairRows(577) != 256u || split->pairRows(477) != 256u)
-    fail("pair: 2048, 256, 1100, 577 or 477 rows do not split as 1024, 128, 512, 256 and 256 first");
-  section("pair: the rows of a command's two chunks");
-
-  // The split a start times a pair's command on holds the one function a full command's two chunks run, and runs
-  // them.
-  const std::unique_ptr<AneFfn> timing = ane_ffn::Measurement::pair(backend, linear, model.layers, kAneUnits, nullptr);
-  if (timing->pairRows(kMost) != kMost / 2) fail("pair: the split that times a pair does not halve a full command");
-  CommandGraph full;
-  if (!timing->begin()) fail("pair: the split that times a pair does not begin a command");
-  for (uint32_t layer = 0; layer < kLayers; ++layer)
-    for (const Chunk &part : chunks) {
-      timing->settle(full, &part);
-      timing->add(full, layer, part.ffn, part.hidden[layer & 1], part.hidden[(layer & 1) ^ 1], kRows[0], &part);
-    }
-  timing->settle(full);
-  static_cast<void>(timing->commit(full, {}).wait());
-  if (!timing->finish()) fail("pair: the split that times a pair: " + timing->reason());
-  section("pair: the split a start times a pair's command on runs a full command's two chunks");
-
-  // From the least rows a split is given, it takes no smaller command as two chunks, and the others as before.
-  split->setPairMinimumRows(768);
-  if (split->pairRows(767) || split->pairRows(768) != 384u || split->pairRows(kMost) != kMost / 2)
-    fail("pair: a split of pairs from 768 rows does not take 767 rows as none, 768 as 384 first and 2048 as 1024");
-  for (const uint32_t rows : {2 * kLeast - 1, kMost + 1})
-    test::rejects([&] { split->setPairMinimumRows(rows); }, "no pair of " + std::to_string(rows) + " rows",
-                  "a split took " + std::to_string(rows) + " rows for its least pair");
-  section("pair: the least rows of a command it takes as two chunks");
-
-  // A split built without pairs takes no command as two chunks and refuses a second chunk of a layer.
-  AneFfn single(backend, Linear(backend.capabilities(), Int8Activations::On), model.layers, kAneUnits, nullptr,
-                Mode::Single);
-  for (uint32_t rows = 1; rows <= kMost + kLeast; ++rows)
-    if (single.pairs(rows) || single.pairRows(rows)) fail("pair: a split without pairs took " + std::to_string(rows));
-  CommandGraph oneChunk;
-  if (!single.begin()) fail("pair: a split without pairs does not begin a command");
-  single.add(oneChunk, 0, chunks[0].ffn, chunks[0].hidden[0], chunks[0].hidden[1], kRows[0], &chunks[0]);
-  test::rejects([&] { single.add(oneChunk, 0, chunks[1].ffn, chunks[1].hidden[0], chunks[1].hidden[1], kRows[1], &chunks[1]); },
-                "not its next layer 1", "a split without pairs took a second chunk of a layer");
-  section("pair: a split without pairs takes one chunk of a layer at a time");
-}
-
 // Layers added out of order and buffers short of a chunk's rows are refused before anything is encoded.
 void refusals(MetalBackend &backend, const Model &model, const Chunk &chunk) {
-  AneFfn split(backend, Linear(backend.capabilities(), Int8Activations::On), model.layers, kAneUnits, nullptr,
-               Mode::Pair);
+  AneFfn split(backend, Linear(backend.capabilities(), Int8Activations::On, StepKind::Prefill), model.layers,
+               {kAneUnits, 0}, kOneStep, nullptr);
   constexpr uint32_t kRows = AneFfn::kMinimumRows;
   const auto &[ffn, hidden] = chunk;
   CommandGraph graph;
-  if (!split.begin()) fail("a new split does not begin a command");
-  test::rejects([&] { split.add(graph, 1, ffn, hidden[0], hidden[1], kRows); }, "not its next layer 0",
+  if (!split.begin(AneFfn::Steps::One)) fail("a new split does not begin a command");
+  test::rejects([&] { split.add(graph, 1, ffn, hidden[0], hidden[1], kRows); }, "adds layer 1 after 0 layers",
                 "the split added layer 1 first");
   split.add(graph, 0, ffn, hidden[0], hidden[1], kRows);
-  // A layer again is the command's second chunk; it has no third.
-  split.add(graph, 0, ffn, hidden[0], hidden[1], kRows);
-  test::rejects([&] { split.add(graph, 0, ffn, hidden[0], hidden[1], kRows); }, "not its next layer 1",
-                "the split added layer 0 for a third chunk");
-  test::rejects([&] { split.add(graph, 2, ffn, hidden[1], hidden[0], kRows); }, "not its next layer 1",
+  split.join(graph);
+  test::rejects([&] { split.add(graph, 2, ffn, hidden[1], hidden[0], kRows); }, "adds layer 2 after 1 layers",
                 "the split skipped layer 1");
   const size_t encoded = graph.dispatches().size();
   const MetalBuffer shorter = backend.view(hidden[0], 0, uint64_t{kRows} * kHidden * 2 - 2);
@@ -777,10 +810,7 @@ void refusals(MetalBackend &backend, const Model &model, const Chunk &chunk) {
   test::rejects([&] { split.add(graph, 1, narrow, hidden[1], hidden[0], kRows); }, "ANE FFN input buffer holds",
                 "an input one element short was accepted");
   if (graph.dispatches().size() != encoded) fail("a refused layer encoded a dispatch");
-  split.add(graph, 1, ffn, hidden[1], hidden[0], kRows);
-  test::rejects([&] { split.add(graph, 0, ffn, hidden[0], hidden[1], kRows); }, "not its next layer 2",
-                "the split went back to layer 0");
-  if (!split.begin()) fail("a split does not begin a command again");
+  if (!split.begin(AneFfn::Steps::One)) fail("a split does not begin a command again");
   split.add(graph, 0, ffn, hidden[0], hidden[1], kRows);
   section("refusals: layers out of order and buffers short of the chunk's rows");
 }
@@ -796,7 +826,7 @@ void refusals(MetalBackend &backend, const Model &model, const Chunk &chunk) {
 constexpr double kQuietRatio = 0x1p-5, kQuietError = 0x1p-8;
 void quietRows(MetalBackend &backend, const Linear &linear, const Model &model, const Chunk &chunk) {
   constexpr uint32_t kRows = AneFfn::kMaximumRows, kScales = 16;
-  const std::unique_ptr<AneFfn> split = splitOf(backend, model, Mode::Single);
+  const std::unique_ptr<AneFfn> split = splitOf(backend, model, kShares, pipelinedRows(linear));
   fillRows(chunk, kRows, [](uint64_t row) { return std::ldexp(1.0f, -int(row % kScales)); });
   const Forward expected = forward(backend, linear, model, nullptr, chunk, kRows);
   // The last layer's intermediate rows, which the GPU alone leaves.
@@ -872,7 +902,7 @@ void massiveChannel(MetalBackend &backend, const Linear &linear, const Chunk &ch
     scale(down, kChannel, kFirst / 64, kFirst / 64 + 1,
           1e5f / peak(forward(backend, linear, model, nullptr, chunk, kRows)));
   const Forward expected = forward(backend, linear, model, nullptr, chunk, kRows);
-  const std::unique_ptr<AneFfn> split = splitOf(backend, model, Mode::Single);
+  const std::unique_ptr<AneFfn> split = splitOf(backend, model, kShares, pipelinedRows(linear));
   const Forward got = forward(backend, linear, model, split.get(), chunk, kRows);
   const auto [error, finite] = difference(expected, got);
   const auto [channelError, channelFinite] =
@@ -890,7 +920,7 @@ void massiveChannel(MetalBackend &backend, const Linear &linear, const Chunk &ch
 // bit for bit; a release while a command is encoded, or committed and not finished, is refused.
 void idle(MetalBackend &backend, const Linear &linear, const Model &model, const Chunk &chunk) {
   constexpr uint32_t kRows = AneFfn::kMaximumRows;
-  const std::unique_ptr<AneFfn> split = splitOf(backend, model, Mode::Single);
+  const std::unique_ptr<AneFfn> split = splitOf(backend, model, {kAneUnits, 0}, kOneStep);
   fillRows(chunk, kRows, [](uint64_t) { return 1.0f; });
   const Forward before = forward(backend, linear, model, split.get(), chunk, kRows);
   if (!split->release()) fail("idle: the program was not unloaded");
@@ -906,11 +936,14 @@ void idle(MetalBackend &backend, const Linear &linear, const Model &model, const
 
   const auto &[ffn, hidden] = chunk;
   CommandGraph graph;
-  if (!split->begin()) fail("idle: the split does not begin a command once loaded again");
+  if (!split->begin(AneFfn::Steps::One)) fail("idle: the split does not begin a command once loaded again");
   split->add(graph, 0, ffn, hidden[0], hidden[1], kRows);
   test::rejects([&] { static_cast<void>(split->release()); }, "unfinished", "a command encoded allowed a release");
-  for (uint32_t layer = 1; layer < kLayers; ++layer)
+  for (uint32_t layer = 1; layer < kLayers; ++layer) {
+    split->join(graph);
     split->add(graph, layer, ffn, hidden[layer & 1], hidden[(layer & 1) ^ 1], kRows);
+  }
+  split->join(graph);
   metal::CommandTicket command = split->commit(graph, {});
   test::rejects([&] { static_cast<void>(split->release()); }, "unfinished", "a command in flight allowed a release");
   static_cast<void>(command.wait());
@@ -927,9 +960,9 @@ void idle(MetalBackend &backend, const Linear &linear, const Model &model, const
 // the evaluation's start, and the GPU alone then computes, bit for bit, what it computes on its own.
 void stops(MetalBackend &backend, const Linear &linear, const Model &model, const Chunk &chunk,
            ane::ProgramInstrumentation::Faults faults, const std::string &what, uint32_t rows,
-           std::string_view reason, Mode mode = Mode::Single) {
+           std::string_view reason) {
   ane::ProgramInstrumentation::arm(faults);
-  const auto split = std::make_unique<AneFfn>(backend, linear, model.layers, kAneUnits, nullptr, mode);
+  const auto split = std::make_unique<AneFfn>(backend, linear, model.layers, kShares, pipelinedRows(linear), nullptr);
   const Forward faulted = forward(backend, linear, model, split.get(), chunk, rows);
   const std::string label = what + ", " + std::to_string(rows) + " rows";
   if (faulted.usable) fail(label + ": the results were usable");
@@ -947,20 +980,21 @@ void stops(MetalBackend &backend, const Linear &linear, const Model &model, cons
 // A Neural Engine slower than the GPU alone: every evaluation starts a lag after its event reaches its wait, twice the
 // longer of the GPU alone's layer of its rows and the Neural Engine's own evaluation of them as timed here, so that on
 // a fast GPU as on a slow one the lag is most of the time the evaluations take and alone makes them take twice what
-// trips the breaker, the GPU alone's layers. Each command's results are usable, the breaker given those timings stops
-// the split after ane_ffn::Breaker::kWindow commands and not before, for losing to the GPU alone, with the Neural
-// Engine's time over them counted, lag and all, telling its owner once, and the GPU alone then computes, bit for bit,
-// what it computes on its own; idle, the stopped split unloads its program for good.
+// trips the breaker, the GPU alone's layers. The breaker given those timings, its pause none long, pauses the split
+// at its first command, whose results are usable; the GPU alone runs the next command, computing, bit for bit, what
+// it computes on its own, and ends the pause; the probe after it loses too and stops the split for losing to the GPU
+// alone, with the Neural Engine's time over both split commands counted, lag and all; idle, the stopped split unloads
+// its program for good.
 void loses(MetalBackend &backend, const Linear &linear, const Model &model, const Chunk &chunk) {
-  constexpr uint32_t kRows = AneFfn::kMaximumRows, kWindow = ane_ffn::Breaker::kWindow;
+  constexpr uint32_t kRows = AneFfn::kMaximumRows;
   ane_ffn::ChunkTimings timings;
   for (const uint32_t index : {0u, 1u}) {
-    const uint32_t rows = index ? kRows : AneFfn::kMinimumRows;
+    const uint32_t rows = index ? kRows : AneFfn::minimumFunctionRows(linear.calibration().simdgroupMma);
     timings.gpu[index] = {rows, forward(backend, linear, model, nullptr, chunk, rows).milliseconds / kLayers};
   }
   double evaluation = 0.0;
   {
-    AneFfn unlagged(backend, linear, model.layers, kAneUnits, nullptr, Mode::Single);
+    AneFfn unlagged(backend, linear, model.layers, kShares, pipelinedRows(linear), nullptr);
     if (!forward(backend, linear, model, &unlagged, chunk, kRows).usable) {
       fail("a slow Neural Engine: a split without the lag was unusable: " + unlagged.reason());
       return;
@@ -970,68 +1004,153 @@ void loses(MetalBackend &backend, const Linear &linear, const Model &model, cons
   const auto lag = std::chrono::ceil<std::chrono::milliseconds>(
       2.0 * std::chrono::duration<double, std::milli>(std::max(timings.gpu[1].milliseconds, evaluation)));
   ane::ProgramInstrumentation::arm({.lag = lag});
-  const auto split = std::make_unique<AneFfn>(backend, linear, model.layers, kAneUnits, nullptr, Mode::Single);
-  uint32_t lost = 0;
-  split->setBreaker(ane_ffn::Breaker(timings.gpu), [&] { ++lost; });
-  for (uint32_t command = 1; command <= kWindow; ++command) {
+  const auto split = std::make_unique<AneFfn>(backend, linear, model.layers, kShares, pipelinedRows(linear), nullptr);
+  split->setBreaker(ane_ffn::Breaker(timings.gpu, 0.0), AwakeClock::duration::zero());
+  const Forward alone = forward(backend, linear, model, nullptr, chunk, kRows);
+  // The paused split, the GPU alone, the probe.
+  for (uint32_t command = 1; command <= 3; ++command) {
+    const bool splits = split->splits(kRows);
     const Forward got = forward(backend, linear, model, split.get(), chunk, kRows);
     const std::string label = "a slow Neural Engine, command " + std::to_string(command);
     if (!got.usable) fail(label + ": unusable: " + split->reason());
-    if (split->retired() != (command == kWindow) || lost != (command == kWindow))
-      fail(label + (split->retired() ? ": the split stopped for " + split->reason() : ": the split did not stop") +
-           ", its owner told " + std::to_string(lost) + " times");
+    if (splits != (command != 2) || (command == 2 && got.bits != alone.bits))
+      fail(label + (splits ? ": split" : ": not split") + (got.bits == alone.bits ? "" : ", not the GPU alone's"));
+    if (split->retired() != (command == 3))
+      fail(label + (split->retired() ? ": the split stopped for " + split->reason() : ": the split did not stop"));
   }
   std::cout << "  a lag of " << lag.count() << " ms, the Neural Engine's own evaluation " << evaluation
             << " ms: stopped for " << split->reason() << '\n';
   if (!split->reason().starts_with("losing to the GPU alone ("))
     fail("a slow Neural Engine: stopped for " + split->reason());
   const AneFfn::Served served = split->served();
-  if (served.commands != kWindow || served.evaluations != kWindow * kLayers ||
-      !(served.milliseconds >= 0.9 * kWindow * kLayers * lag.count()))
+  // Each layer of a full chunk's command runs its two steps' evaluations.
+  if (served.commands != 2 || served.evaluations != 2 * 2 * kLayers ||
+      !(served.milliseconds >= 0.9 * 2 * 2 * kLayers * lag.count()))
     fail("a slow Neural Engine: served " + std::to_string(served.commands) + " commands, " +
          std::to_string(served.evaluations) + " evaluations in " + std::to_string(served.milliseconds) + " ms");
-  const Forward alone = forward(backend, linear, model, nullptr, chunk, kRows);
   const Forward after = forward(backend, linear, model, split.get(), chunk, kRows);
   if (!after.usable || after.bits != alone.bits)
     fail("a slow Neural Engine: the GPU's forward after the split stopped differs from the GPU's alone");
-  if (split->served().commands != kWindow || lost != 1)
-    fail("a slow Neural Engine: the stopped split counted a command, or told its owner again");
+  if (split->served().commands != 2) fail("a slow Neural Engine: the stopped split counted a command");
   // Its evaluations all reported, the stopped split unloads its program while idle, once, and keeps it unloaded.
   if (!split->release()) fail("a slow Neural Engine: the stopped split did not unload its program while idle");
   split->restore();
   if (split->release()) fail("a slow Neural Engine: the stopped split loaded its program again");
 }
 
+// A command whose submission throws starts none of its evaluations (AneFfn::commit submits it first): the split
+// stops for that, not for the evaluation armed to fail at the program's first enqueue, the backend stays healthy, and
+// the GPU alone then computes what it computes on its own.
+void unsubmitted(MetalBackend &backend, const Linear &linear, const Model &model, const Chunk &chunk) {
+  constexpr uint32_t kRows = AneFfn::kMaximumRows;
+  ane::ProgramInstrumentation::arm({.throwingEnqueue = 1});
+  const std::unique_ptr<AneFfn> split = splitOf(backend, model, {kAneUnits, 0}, kOneStep);
+  const auto &[ffn, hidden] = chunk;
+  CommandGraph graph;
+  if (!split->begin(AneFfn::Steps::One)) fail("unsubmitted: the split does not begin a command");
+  for (uint32_t layer = 0; layer < kLayers; ++layer) {
+    split->join(graph);
+    split->add(graph, layer, ffn, hidden[layer & 1], hidden[(layer & 1) ^ 1], kRows);
+  }
+  split->join(graph);
+  graph.add("ane_ffn_no_such_kernel", {hidden[0]}, {1, 1, 1});
+  test::rejects([&] { static_cast<void>(split->commit(graph, {})); }, "ane_ffn_no_such_kernel",
+                "a command of a kernel the library lacks was submitted");
+  if (!split->retired() || !split->reason().starts_with("its Metal command was not submitted"))
+    fail("unsubmitted: the split " + (split->retired() ? "stopped for " + split->reason() : "did not stop"));
+  if (!backend.healthy()) fail("unsubmitted: the backend is unhealthy: " + backend.unhealthyReason());
+  const Forward alone = forward(backend, linear, model, nullptr, chunk, kRows);
+  const Forward after = forward(backend, linear, model, split.get(), chunk, kRows);
+  if (!after.usable || after.bits != alone.bits)
+    fail("unsubmitted: the GPU's forward after the split stopped differs from the GPU's alone");
+}
+
+// A split's program holds the functions of its shares alone. A command queues every evaluation, which the ANE holds at
+// most 127 of (AneFfn::fits): a model's last layer runs on the GPU alone, so a split of 64 layers takes commands of two
+// steps, 126 evaluations, and one of 65 does not; one of 128 takes commands of one step, 127, and one of 129 none
+// (AneFfn::unsupported). A command of more is refused before any evaluation starts, not left to wait on the client.
+void programAndInFlight(MetalBackend &backend, const Linear &linear, const Model &model, const Chunk &chunk) {
+  using Steps = AneFfn::Steps;
+  const bool mma = linear.calibration().simdgroupMma;
+  const uint32_t least = mma ? 128u : 512u;
+  const auto every = [](uint32_t least, uint32_t most) {
+    std::vector<uint32_t> rows;
+    for (uint32_t row = least; row <= most; row += AneFfn::kProgramStep) rows.push_back(row);
+    return rows;
+  };
+  auto full = every(least, mma ? 1792u : 2048u);
+  if (mma) full.push_back(2048); // The compiler's 15-function cap leaves out 1920.
+  const auto one = AneFfn::programRows({kAneUnits, 0}, mma);
+  const auto two = AneFfn::programRows({0, kAneUnits}, mma);
+  const auto both = AneFfn::programRows({4, kAneUnits}, mma);
+  if (one[0] != full || !one[1].empty() || !two[0].empty() || two[1] != every(least, 1024) ||
+      both[0] != every(least, mma ? 768u : 1024u) || both[1] != two[1] ||
+      AneFfn::programRows(kShares, mma) != both)
+    fail("a split's program holds other functions than those of its shares");
+  if (!AneFfn::fits(64, Steps::Two) || AneFfn::fits(65, Steps::Two) || !AneFfn::fits(128, Steps::One) ||
+      AneFfn::fits(129, Steps::One) || AneFfn::fits(0, Steps::One))
+    fail("the evaluations in flight bound commands other than those of (layers - 1) * steps <= 127");
+  // The model's three layers, again and again.
+  const auto repeated = [&](uint32_t count) {
+    std::vector<SwiGluProjections> layers;
+    for (uint32_t layer = 0; layer < count; ++layer) layers.push_back(model.layers[layer % kLayers]);
+    return layers;
+  };
+  if (!AneFfn::unsupported(repeated(129)) || AneFfn::unsupported(repeated(128)))
+    fail("a split of 129 layers was taken, or one of 128 refused");
+  test::rejects([&] { static_cast<void>(AneFfn(backend, linear, repeated(65), kShares, pipelinedRows(linear), nullptr)); },
+                "in two steps", "a split of 65 layers took commands of two steps");
+  AneFfn split(backend, linear, repeated(128), {kAneUnits, 0}, kOneStep, nullptr);
+  const auto &[ffn, hidden] = chunk;
+  const auto command = [&](uint32_t layers) {
+    CommandGraph graph;
+    if (!split.begin(Steps::One)) fail("in flight: the split stopped: " + split.reason());
+    for (uint32_t layer = 0; layer < layers; ++layer) {
+      split.add(graph, layer, ffn, hidden[layer & 1], hidden[(layer & 1) ^ 1], AneFfn::kMinimumRows);
+      split.join(graph);
+    }
+    static_cast<void>(split.commit(graph, {}).wait());
+    return split.finish();
+  };
+  fillRows(chunk, AneFfn::kMinimumRows, [](uint64_t) { return 1.0f; });
+  if (!command(127)) fail("in flight: a command of 127 evaluations did not complete: " + split.reason());
+  test::rejects([&] { static_cast<void>(command(128)); }, "more than the Neural Engine holds in flight",
+                "a command of 128 evaluations was queued");
+  section("program and in flight: a split's functions are its shares' alone, two steps of 64 layers and one of 128 "
+          "are the most the ANE holds in flight, and a command of 127 evaluations runs, one of 128 is refused");
+}
+
 // The split of the MLX and the GGUF model over normalized rows of normal values, and the numerics of rows the ANE's
 // fp16 barely holds.
 void split(MetalBackend &backend) {
-  const Linear linear(backend.capabilities(), Int8Activations::On);
+  const Linear linear(backend.capabilities(), Int8Activations::On, StepKind::Prefill);
   const Model mlx = mlxModel(backend), gguf = ggufModel(backend);
   takes(mlx, gguf);
   keys(backend.capabilities(), mlx, gguf);
   const Chunk buffers = chunk(backend, AneFfn::kMaximumRows);
-  split(backend, linear, mlx, buffers, Mode::Single);
-  split(backend, linear, gguf, buffers, Mode::Single);
-  split(backend, linear, mlx, buffers, Mode::Pair);
-  split(backend, linear, mlx, buffers, Mode::Fallback);
+  split(backend, linear, mlx, buffers);
+  split(backend, linear, gguf, buffers);
+  pipelined(backend, linear, mlx, buffers);
+  pipelined(backend, linear, gguf, buffers);
+  programAndInFlight(backend, linear, mlx, buffers);
   misbound(backend, mlx, buffers);
   refusals(backend, mlx, buffers);
-  pair(backend, linear, mlx);
   quietRows(backend, linear, mlx, buffers);
   massiveChannel(backend, linear, buffers);
   idle(backend, linear, mlx, buffers);
   fillRows(buffers, AneFfn::kMaximumRows, [](uint64_t) { return 1.0f; });
-  stops(backend, linear, mlx, buffers, {.poisonedEvaluation = 2}, "an infinity in layer 1's output",
+  stops(backend, linear, mlx, buffers, {.poisonedEvaluation = 3}, "an infinity in layer 1's output",
         AneFfn::kMaximumRows, "not finite");
   section("stops: an infinity in the ANE's output stops the split");
 }
 
 // ---------------------------------------------------------------- faults
-// Each fault of an evaluation at layer 0, 1 and 2 of chunks of kMinimumRows, 700 and 2048 rows stops the split (stops()); an
-// evaluation that signals the event below its value leaves it there.
+// Each fault of an evaluation at layer 0, 1 and 2 of chunks of 512 and 700 rows, one step, and of 2048 rows, two
+// steps, the first step's evaluation of the layer, stops the split (stops()); an evaluation that signals the event
+// below its value leaves it there.
 void faults(MetalBackend &backend) {
   using Faults = ane::ProgramInstrumentation::Faults;
-  const Linear linear(backend.capabilities(), Int8Activations::On);
+  const Linear linear(backend.capabilities(), Int8Activations::On, StepKind::Prefill);
   const Model model = mlxModel(backend);
   const Chunk buffers = chunk(backend, AneFfn::kMaximumRows);
   fillRows(buffers, AneFfn::kMaximumRows, [](uint64_t) { return 1.0f; });
@@ -1049,22 +1168,20 @@ void faults(MetalBackend &backend) {
        "did not complete"},
       {"an infinite output", [](uint64_t at) { return Faults{.poisonedEvaluation = at}; }, "not finite"},
   };
+  const AneFfn::Rows bothRows = pipelinedRows(linear);
   for (const Fault &kind : kinds) {
-    for (const Mode mode : {Mode::Single, Mode::Pair}) {
-      for (uint32_t layer = 0; layer < kLayers; ++layer)
-        for (const uint32_t count : {AneFfn::kMinimumRows, 700u, AneFfn::kMaximumRows})
-          stops(backend, linear, model, buffers, kind.arm(layer + 1),
-                std::string(kind.name) + " at layer " + std::to_string(layer), count, kind.reason, mode);
-      section(std::string("faults (") + name(mode) + "): " + kind.name + " at each layer of chunks of " +
-              std::to_string(AneFfn::kMinimumRows) + ", 700 and 2048 rows");
-    }
+    for (uint32_t layer = 0; layer < kLayers; ++layer)
+      for (const uint32_t count : {AneFfn::kMinimumRows, 700u, AneFfn::kMaximumRows}) {
+        const uint32_t steps = count >= bothRows.twoSteps ? 2 : 1;
+        stops(backend, linear, model, buffers, kind.arm(steps * layer + 1),
+              std::string(kind.name) + " at layer " + std::to_string(layer), count, kind.reason);
+      }
+    section(std::string("faults: ") + kind.name + " at each layer of chunks of 512, 700 and 2048 rows");
   }
 
   // A program that does not load again after the idle release.
   ane::ProgramInstrumentation::arm({.failingLoad = true});
-  const auto split =
-      std::make_unique<AneFfn>(backend, Linear(backend.capabilities(), Int8Activations::On), model.layers, kAneUnits,
-                               nullptr, Mode::Single);
+  const auto split = std::make_unique<AneFfn>(backend, linear, model.layers, kShares, bothRows, nullptr);
   if (!split->release()) fail("a failed reload: the program was not unloaded");
   split->restore();
   if (!split->retired() || split->splits(AneFfn::kMaximumRows)) fail("a failed reload: the split did not stop");
@@ -1082,8 +1199,11 @@ void faults(MetalBackend &backend) {
           "computes on its own");
 
   loses(backend, linear, model, buffers);
-  section("faults: a Neural Engine slower than the GPU alone stops the split after 8 usable commands, and the GPU "
-          "alone then computes what it computes on its own");
+  section("faults: a Neural Engine slower than the GPU alone pauses the split at its first usable command, the GPU "
+          "alone runs the next, and the probe after the pause stops the split");
+
+  unsubmitted(backend, linear, model, buffers);
+  section("faults: a command whose submission throws starts no evaluation and stops the split");
 
   // The CPU raises the event past an evaluation's signal before it runs.
   test::AneSum sum(backend);
