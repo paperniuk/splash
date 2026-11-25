@@ -173,10 +173,16 @@ const char *tableSuffix(LinearInput layout) noexcept {
 
 LinearInput LinearPlan::input() const noexcept { return rotated_ ? LinearInput::Plain : table(); }
 LinearInput LinearPlan::table() const noexcept {
-  if (config_.tile != LinearTile::GgufRegister) return LinearInput::Plain;
+  if (passes_ || config_.tile != LinearTile::GgufRegister) return LinearInput::Plain;
   return config_.fp32Table ? LinearInput::Table16F : LinearInput::Table16;
 }
 uint64_t LinearPlan::gateScratchBytes() const noexcept {
+  // Each pass's gate rows lie at its first row.
+  if (passes_) {
+    const LinearPlan &first = passes_->front();
+    const uint64_t rest = passes_->back().gateScratchBytes();
+    return rest ? uint64_t{first.workload_.rows} * workload_.matrix.outputSize * 2 + rest : first.gateScratchBytes();
+  }
   // Gate/up runs as a gate pass into the gate scratch and an up-with-gate
   // pass, but in one pass (LinearConfig::oneGateUpPass).
   const bool needed = workload_.epilogue == LinearEpilogue::UpWithGate ||
@@ -198,52 +204,84 @@ LinearPlan::LinearPlan(LinearWorkload w, LinearConfig config, FloatOutput destin
   requireConfiguration();
 }
 
+LinearPlan::LinearPlan(LinearPlan first, LinearPlan rest)
+    : workload_{first.workload_.matrix, first.workload_.rows + rest.workload_.rows, first.workload_.epilogue},
+      config_(first.config_), destination_(first.destination_), rotated_(first.rotated_) {
+  if (first.storageRows() != first.workload_.rows || rest.workload_.matrix != workload_.matrix ||
+      rest.workload_.epilogue != workload_.epilogue || rest.destination_ != destination_ ||
+      rest.rotated_ != rotated_ || rest.passes_ || first.passes_)
+    throw std::invalid_argument("a plan's passes take rows of one workload, the first's stored alone");
+  validate(workload_);
+  passes_ = std::make_shared<const std::vector<LinearPlan>>(std::vector{std::move(first), std::move(rest)});
+}
+
+std::span<const LinearPlan> LinearPlan::passes() const noexcept {
+  return passes_ ? std::span<const LinearPlan>(*passes_) : std::span<const LinearPlan>{};
+}
+
 Linear::Linear(const DeviceCapabilities &device, Int8Activations int8Activations, StepKind step) noexcept
     : calibration_(KernelCalibration::of(device)), int8Activations_(int8Activations), step_(step) {}
+
+LinearPlan Linear::planUnit(LinearWorkload w, uint32_t planOutputs, const UnitFormats &unit,
+                            std::span<const UnitFormats> pairTensors, FloatOutput destination, bool rotated,
+                            const Projection *p, const Projection *gate) const {
+  validate(w);
+  const LinearWorkload selected = selectedWorkload(w, planOutputs);
+  validate(selected);
+  if (const uint32_t first = decodePassRows(calibration_, step_, w, unit, p, gate))
+    return LinearPlan(
+        planUnit({w.matrix, first, w.epilogue}, planOutputs, unit, pairTensors, destination, rotated, p, gate),
+        planUnit({w.matrix, w.rows - first, w.epilogue}, planOutputs, unit, pairTensors, destination, rotated, p,
+                 gate));
+  LinearPlan result(w, selectProjection(calibration_, int8Activations_, step_, selected, unit, pairTensors),
+                    destination);
+  // A view of leading inputs (the ANE FFN split's down) has no split prefill
+  // kernel (requireLeadingInputs): it runs the prefill tile unsplit.
+  if (p && p->planeInputs() && result.config_.tile == LinearTile::GgufPrefill) result.config_.splits = 1;
+  result.rotated_ = rotated;
+  return result;
+}
 
 uint32_t Linear::storageRows(uint32_t rows, ProjectionShape shape) const {
   // The None and Residual plans share a tile; a gate/up pair of one format
   // counts both tensors' columns in one pass and may stage where they do not.
-  // Past the decode tiles a pair runs as its tensors' own plans.
+  // Where Apple7/8 decode splits into two passes (33-56 rows), a two-format
+  // gate/up pair also runs its 1-2-row tail on an 8-row register tile (40 rows
+  // at 33-34). Past the decode tiles a pair runs as its tensors' own plans.
   UnitFormats unit = unitFormats(shape);
   uint32_t storage = 0;
   for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::GateUp}) {
     if (epilogue == LinearEpilogue::GateUp && rows > kMaximumDecodeTileRows) continue;
     const LinearWorkload w{{shape.outputSize, shape.inputSize}, rows, epilogue};
-    validate(w);
     unit.oneFormat = epilogue == LinearEpilogue::GateUp;
-    const LinearWorkload selected = selectedWorkload(w, shape.planOutputs);
-    storage = std::max(storage,
-                       LinearPlan(w, selectProjection(calibration_, int8Activations_, step_, selected, unit)).storageRows());
+    storage = std::max(storage, planUnit(w, shape.planOutputs, unit, {}, FloatOutput::BFloat16, shape.rotated, nullptr,
+                                         nullptr)
+                                    .storageRows());
+    if (epilogue == LinearEpilogue::GateUp && decodePassRows(calibration_, step_, w, unit)) {
+      unit.oneFormat = false;
+      storage = std::max(storage, planUnit(w, shape.planOutputs, unit, {}, FloatOutput::BFloat16, shape.rotated,
+                                           nullptr, nullptr)
+                                      .storageRows());
+    }
   }
   return storage;
 }
 
 LinearPlan Linear::plan(LinearWorkload workload) const {
-  validate(workload);
-  return LinearPlan(workload, selectProjection(calibration_, int8Activations_, step_, workload, {}));
+  return planUnit(workload, 0, {}, {}, FloatOutput::BFloat16, false, nullptr, nullptr);
 }
 LinearPlan Linear::plan(LinearWorkload workload, LinearConfig config, FloatOutput destination) {
   return LinearPlan(workload, config, destination);
 }
 LinearPlan Linear::plan(LinearWorkload w, const Projection &p, const Projection *gate) const {
-  validate(w);
-  const LinearWorkload selected = selectedWorkload(w, p.planOutputs());
-  validate(selected);
   const std::array<const Projection *, 2> projections{&p, gate};
   // A gate/up pair's 16-row tile follows its tensors' own formats.
   std::array<UnitFormats, 2> tensors{};
   const bool pair = w.epilogue == LinearEpilogue::GateUp && gate;
   if (pair) tensors = {unitFormats(std::span(&projections[0], 1)), unitFormats(std::span(&projections[1], 1))};
-  LinearPlan plan(w,
-                  selectProjection(calibration_, int8Activations_, step_, selected, unitFormats(projections),
-                                   pair ? std::span<const UnitFormats>(tensors) : std::span<const UnitFormats>{}),
-                  p.destination);
-  // A view of leading inputs (the ANE FFN split's down) has no split prefill
-  // kernel (requireLeadingInputs): it runs the prefill tile unsplit.
-  if (p.planeInputs() && plan.config_.tile == LinearTile::GgufPrefill) plan.config_.splits = 1;
-  plan.rotated_ = static_cast<bool>(p.rotation);
-  return plan;
+  return planUnit(w, p.planOutputs(), unitFormats(projections),
+                  pair ? std::span<const UnitFormats>(tensors) : std::span<const UnitFormats>{}, p.destination,
+                  static_cast<bool>(p.rotation), &p, gate);
 }
 
 LinearPlan Linear::plan(const Projection &p, uint32_t rows, LinearEpilogue epilogue, const Projection *gate,
@@ -252,13 +290,23 @@ LinearPlan Linear::plan(const Projection &p, uint32_t rows, LinearEpilogue epilo
   if (!chunkRows || chunkRows == rows) return plan(w, p, gate);
   if (rows > chunkRows) throw std::invalid_argument("a plan of a chunk's rows takes rows of its chunk");
   const LinearPlan chunk = plan({w.matrix, chunkRows, epilogue}, p, gate);
-  // Apple7/8's 24-row tile holds 17 to 24 rows; fewer of its chunk's rows run
-  // the staged tile of their own height.
-  LinearConfig config = chunk.configuration();
-  if (rows <= 16) config.twentyFourRows = false;
-  LinearPlan part(w, config, chunk.destination());
-  part.rotated_ = chunk.rotated_;
-  return part;
+  const auto sub = [](const LinearPlan &parent, uint32_t subRows) {
+    LinearWorkload sw = parent.workload();
+    sw.rows = subRows;
+    // Apple7/8's 24-row tile holds 17 to 24 rows; fewer of its chunk's rows
+    // run the staged tile of their own height.
+    LinearConfig config = parent.configuration();
+    if (subRows <= 16) config.twentyFourRows = false;
+    LinearPlan part(sw, config, parent.destination());
+    part.rotated_ = parent.rotated_;
+    return part;
+  };
+  if (const std::span<const LinearPlan> passes = chunk.passes(); !passes.empty()) {
+    const LinearPlan &first = passes.front();
+    if (rows <= first.workload().rows) return sub(first, rows);
+    return LinearPlan(first, sub(passes.back(), rows - first.workload().rows));
+  }
+  return sub(chunk, rows);
 }
 
 LinearScratchSize Linear::scratchSize(ProjectionShape shape, uint32_t rows) const {
@@ -332,6 +380,26 @@ PreparedInput Linear::add(metal::CommandGraph &graph, LinearBuffers b,
   requireBytes(b.scratch.partials, scratch.partials, "projection partials");
   requireBytes(b.scratch.counters, scratch.counters, "projection counters");
   if (p.rotation) requireBytes(b.scratch.rotated, rotatedBytes(k, rows), "projection rotated input");
+  // Each pass runs on views of its rows, from its first, and takes what the
+  // scratch holds after the pass before it.
+  uint64_t first = 0;
+  for (const LinearPlan &pass : selected.passes()) {
+    const uint64_t stored = pass.storageRows();
+    const auto view = [&](const metal::MetalBuffer &buffer, uint64_t rowBytes) {
+      return buffer ? buffer.view(first * rowBytes, stored * rowBytes) : metal::MetalBuffer{};
+    };
+    b.prepared = add(graph,
+                     {.input = view(b.input, uint64_t{k} * 2),
+                      .output = view(b.output, uint64_t{n} * elementBytes(selected.destination())),
+                      .residual = w.epilogue == LinearEpilogue::Residual ? view(b.residual, uint64_t{n} * 2)
+                                                                         : metal::MetalBuffer{},
+                      .gateScratch = pass.gateScratchBytes() ? view(b.gateScratch, uint64_t{n} * 2) : metal::MetalBuffer{},
+                      .scratch = b.scratch,
+                      .prepared = b.prepared},
+                     p, pass, gate);
+    first += pass.workload().rows;
+  }
+  if (!selected.passes().empty()) return b.prepared;
   addGguf(graph, b, p, selected, gate);
   // A rotated projection's plan prepares its table, if any, from the rotated
   // rows, which no other plan reads. The int8 prefill tile leaves its codes

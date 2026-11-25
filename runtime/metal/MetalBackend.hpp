@@ -69,6 +69,9 @@ public:
   // Allocation identity and exact view range, including Private storage.
   // This compares metadata only; it never maps or reads device contents.
   [[nodiscard]] bool sameView(const MetalBuffer &other) const noexcept;
+  // Bytes [offsetBytes, offsetBytes + lengthBytes) of this view, as
+  // MetalBackend::view makes them of its backend's buffers.
+  [[nodiscard]] MetalBuffer view(uint64_t offsetBytes, uint64_t lengthBytes) const;
 
 private:
   struct Impl;

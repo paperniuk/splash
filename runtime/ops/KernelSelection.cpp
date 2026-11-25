@@ -332,6 +332,39 @@ SplitChoice splitsFor(const SplitLaw &law, uint32_t n, uint32_t k, uint32_t rows
   return waveSplits(wave, n, k, rows, bits16 ? bits16 : kMostWeightBits16, cores, passes, bits16 >= wave.wideBits16);
 }
 
+// Apple7/8 run a decode step's plan of 33 to 64 rows on the MMA prefill tile,
+// which computes 64 (bf16Projection): a step of 48 rows took as long as one of
+// 64. A quantized unit the register and column tiles take runs a step of 33 to
+// 56 rows as that tile's plan of 32 rows and the plan of the rest, as a step of
+// their rows runs them, each preparing its own table: on an M2 Max the 27B
+// Q4_0's 48-row projections took 11-34% less time (its gate/up pair 2.095
+// against 2.879 ms, the Q6_K head 15.02 against 19.69), its 36-row ones 29-42%
+// less, and Flash-Next's and the 27B's of 49 to 56 rows 2-26% less. From 57
+// rows Flash-Next's took up to 6% more, and at 64 most shapes 2-15% more.
+uint32_t decodePassRows(const KernelCalibration &calibration, StepKind step, LinearWorkload w,
+                        const UnitFormats &unit, const Projection *p, const Projection *gate) noexcept {
+  if (!calibration.simdgroupMma || step != StepKind::Decode || !unit.registerTakes ||
+      w.rows <= kMaximumRegisterRows || w.rows > kApple7DecodePassRows)
+    return 0;
+  if (!p) return kMaximumRegisterRows;
+  if (p->planeInputs() || (gate && gate->planeInputs())) return 0;
+  const std::vector<QuantizedSegment> &segments = p->blocks().segments;
+  size_t quantized = 0;
+  for (const QuantizedSegment &s : segments) quantized += !s.isFloat();
+  if (!quantized) return 0;
+  if (w.epilogue != LinearEpilogue::None && segments.size() != 1) return 0;
+  if (w.epilogue == LinearEpilogue::GateUp && gate &&
+      (gate->blocks().segments.size() != 1 || gate->blocks().segments.front().isFloat()))
+    return 0;
+  // At one or two remaining rows the column tile fuses plain bf16 quantized
+  // segments, up to kFusedSegments (addGguf dispatches float segments before
+  // entering the column tile), so a projection with more quantized segments
+  // keeps one plan.
+  if (w.epilogue == LinearEpilogue::None && p->destination == FloatOutput::BFloat16 && quantized > kFusedSegments)
+    return 0;
+  return kMaximumRegisterRows;
+}
+
 // The configuration in bf16 activations (bf16Projection), then with int8
 // activations on the plan's last choice: a plan of more rows than one tile
 // holds runs the int8 prefill tile, unsplit, where its work takes the int8

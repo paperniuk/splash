@@ -150,11 +150,15 @@ public:
     encode(where, false, [&](metal::CommandGraph &graph) {
       const Projection twin = narrow(p);
       const std::optional<Projection> gateTwin = gate ? std::optional(narrow(*gate)) : std::nullopt;
-      LinearWorkload workload = plan.workload();
-      workload.matrix = {twin.outputSize, twin.inputSize};
       const metal::MetalBuffer &b = buffer_;
-      linear.add(graph, {b, b, b, b, {b, b, b, b, b}}, twin,
-                 Linear::plan(workload, plan.configuration(), plan.destination()), gateTwin ? &*gateTwin : nullptr);
+      const auto addPass = [&](const LinearPlan &step) {
+        LinearWorkload workload = step.workload();
+        workload.matrix = {twin.outputSize, twin.inputSize};
+        linear.add(graph, {b, b, b, b, {b, b, b, b, b}}, twin,
+                   Linear::plan(workload, step.configuration(), step.destination()), gateTwin ? &*gateTwin : nullptr);
+      };
+      if (plan.passes().empty()) addPass(plan);
+      else for (const LinearPlan &pass : plan.passes()) addPass(pass);
     });
   }
   // An attention plan's split and reduce kernels; the reduce also writes the
@@ -361,6 +365,7 @@ std::string describe(const LinearPlan &plan) {
        << c.oneGateUpPass << " sixteen " << c.sixteenRows << " storage " << plan.storageRows() << " input "
        << unsigned(plan.input()) << " scratch " << s.input << "/" << s.sums << "/" << s.partials << "/"
        << s.counters << "/" << s.rotated << " gate " << plan.gateScratchBytes();
+  for (const LinearPlan &pass : plan.passes()) line << " pass " << pass.workload().rows << ": " << describe(pass);
   return line.str();
 }
 
@@ -1240,9 +1245,15 @@ void decodeClassesHold(const std::string &name, const ExecutionPlans &plans, std
   };
   const std::vector<uint32_t> dense = plans.decodeRowClasses(most, std::nullopt);
   const Linear &linear = plans.decodeLinear();
-  const auto tile = [](const LinearPlan &plan) {
+  // A plan's tile and the height that names its kernels, each of its passes' (LinearPlan::passes).
+  const auto height = [](const LinearPlan &plan) {
     const LinearTile t = plan.configuration().tile;
     return uint32_t(t) << 8 | (t == LinearTile::GgufStaged || t == LinearTile::GgufRegister ? plan.storageRows() : 0);
+  };
+  const auto tile = [&](const LinearPlan &plan) {
+    const std::span<const LinearPlan> passes = plan.passes();
+    return passes.empty() ? uint64_t{height(plan)}
+                          : uint64_t{height(passes.front())} << 32 | height(passes.back()) | uint64_t{1} << 63;
   };
   std::vector<UnitFormats> units;
   for (const FormatSet &set : formatSets()) {

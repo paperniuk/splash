@@ -11,9 +11,12 @@
 #include <array>
 #include <compare>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
+#include <type_traits>
+#include <vector>
 
 namespace splash::ops {
 
@@ -109,6 +112,8 @@ enum class LinearTile : uint8_t { GgufStaged, GgufPrefill, GgufRegister, GgufPre
 // plan (LinearEpilogue).
 inline constexpr uint32_t kMaximumDecodeTileRows = GGUF_ROW_GROUP_ROWS;
 inline constexpr uint32_t kMaximumStagedRows = GGUF_STAGED_ROWS;
+// The quantized segments one fused decode or column dispatch runs.
+inline constexpr size_t kFusedSegments = std::extent_v<decltype(GgufDecodeFusedParams::cols)>;
 // The register tile computes its rows in groups of an activation table's tile
 // (Table16, metal/abi/Gguf.h): a plan of r rows stores ⌈r / 8⌉ of them, at
 // most four (its kernels' lanes, kRegisterTableTiles), so it holds plans of
@@ -325,10 +330,17 @@ public:
   [[nodiscard]] LinearInput table() const noexcept;
   [[nodiscard]] LinearScratchSize scratchSize() const noexcept;
   [[nodiscard]] uint64_t gateScratchBytes() const noexcept;
+  // A plan of two passes (decodePassRows): the plans of its first rows, which
+  // store those rows alone, and of the rest, each the plan of a step of that
+  // many rows, which Linear::add runs on views of their rows; none for a plan
+  // of one pass. A plan of passes reads plain rows, each pass preparing its
+  // own table, and its configuration() is its first pass's.
+  [[nodiscard]] std::span<const LinearPlan> passes() const noexcept;
 
 private:
   friend class Linear;
   LinearPlan(LinearWorkload workload, LinearConfig config, FloatOutput destination = FloatOutput::BFloat16);
+  LinearPlan(LinearPlan first, LinearPlan rest);
   // Throws unless the tile takes the workload and the splits (LinearGguf.cpp).
   void requireConfiguration() const;
   LinearWorkload workload_;
@@ -336,6 +348,7 @@ private:
   FloatOutput destination_;
   // The plan's projection multiplies the rotated input (InputRotation).
   bool rotated_ = false;
+  std::shared_ptr<const std::vector<LinearPlan>> passes_;
 };
 
 // The plan defines which fields are used and how much scratch they require.
@@ -444,6 +457,12 @@ private:
   // scratch's, or for one partition, which reads neither, the output.
   [[nodiscard]] static std::array<metal::MetalBuffer, 2> splitScratch(const LinearBuffers &buffers,
                                                                       uint32_t splits);
+  // One planner for plan(LinearWorkload), plan(LinearWorkload, Projection,
+  // gate) and storageRows(rows, shape), so pass splitting and per-width
+  // selection agree across all three.
+  [[nodiscard]] LinearPlan planUnit(LinearWorkload workload, uint32_t planOutputs, const UnitFormats &unit,
+                                    std::span<const UnitFormats> pairTensors, FloatOutput destination, bool rotated,
+                                    const Projection *projection, const Projection *gate) const;
   // The scratch of every tile a decode plan of the workload may take, the
   // register tile's and the int8 decode tiles' where they take the unit
   // (decodeConfigurations), those of planOutputs columns' workload for a

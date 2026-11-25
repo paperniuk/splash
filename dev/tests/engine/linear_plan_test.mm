@@ -1,6 +1,7 @@
 #include "TestBuffers.hpp"
 #include "TestChecks.hpp"
 #include "ops/GDN.hpp"
+#include "ops/KernelSelection.hpp"
 #include "ops/LaneRows.hpp"
 #include "ops/Linear.hpp"
 #include "ops/Normalization.hpp"
@@ -86,7 +87,8 @@ Projection blockProjection(uint32_t n, uint32_t k, uint32_t segments, uint32_t f
 // fp32 destinations (the logits): the plan of a projection with an fp32
 // destination keeps the configuration, input table and scratch of its bf16
 // plan on every family and core count. The vocabulary head takes a plain
-// plan even past 32 rows, where Apple7/8 use the MMA prefill tile.
+// plan even past 32 rows, where Apple7/8 use the MMA prefill tile or, at 33
+// to 56 rows, two plans (apple7DecodePasses).
 void floatOutputPlans() {
   const auto fp32 = [](Projection p) {
     p.destination = FloatOutput::Float32;
@@ -967,7 +969,8 @@ void ggufPlans() {
     }
   // Apple7/8's staged MMA tile holds a plan of 17 to 24 rows in 24 rows (LinearConfig::twentyFourRows); other
   // devices' tiles hold 8, 16, 32, 48 or 64. Apple7/8 run a plan of up to 32 rows the register tile takes on its F32
-  // instances, and one of 33 to 64 rows on the MMA prefill tile, their staged MMA tile holding at most 32.
+  // instances, and a prefill chunk of 33 to 64 rows on the MMA prefill tile, their staged MMA tile holding at most 32
+  // (a decode step's of 33 to 56 rows: apple7DecodePasses).
   {
     const auto storage = [&](uint32_t rows, bool twentyFour) {
       return Linear::plan({{5120, 17408}, rows, LinearEpilogue::Residual},
@@ -2057,6 +2060,196 @@ void apple7DecodePrefillSplits() {
   }
 }
 
+// Apple7/8's decode steps of 33 to 56 rows (kApple7DecodePassRows) run two plans where decodePassRows takes the unit
+// (LinearPlan::passes): the plan of 32 rows, then the plan a step of the rest's rows takes, from the column tile at one
+// or two rows on (8-row register tile for a two-format gate/up pair); a plan of passes reads plain rows and stores 32
+// rows and the rest's, within stagedTileRows(rows) and Linear::storageRows(rows, shape), in the scratch of the shape's
+// bound (scratchSize). Refused layouts (segmented epilogues, leading-input views, multi-segment or float gate/up,
+// float-only projections, >3 bf16 plain quantized segments, non-register formats/K), prefill chunks and steps outside
+// 33-56 rows run one plan. Linear::storageRows is unchanged from base 1.7.3 everywhere outside Apple7/8 decode 33-56
+// rows, and is never below the prefill tile's storage at 33-56 rows. Decode subplans of 33-56-row chunks inherit their
+// passes without throwing.
+void apple7DecodePasses() {
+  const Projection down = blockProjection(5120, 17408, 1), up = blockProjection(17408, 5120, 1, GGUF_FMT_AF4G64),
+                   gate = blockProjection(17408, 5120, 1, GGUF_FMT_AF4G64),
+                   q4k = blockProjection(17408, 5120, 1, GGUF_FMT_Q4K),
+                   q5k = blockProjection(17408, 5120, 1, GGUF_FMT_Q5K),
+                   narrow = blockProjection(10240, 320, 1);
+  Projection head = blockProjection(248320, 5120, 1, GGUF_FMT_Q6K);
+  head.destination = FloatOutput::Float32;
+  const Projection fusedSame = blockProjection(4096, 5120, std::array<uint32_t, 2>{GGUF_FMT_Q4K, GGUF_FMT_Q4K}),
+                   fusedMix = blockProjection(4096, 5120, std::array<uint32_t, 2>{GGUF_FMT_Q4K, GGUF_FMT_Q5K}),
+                   fourSegs = blockProjection(
+                       4096, 5120, std::array<uint32_t, 4>{GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_Q4K, GGUF_FMT_Q4K});
+  const Projection singleQ4 = blockProjection(4096, 5120, 1, GGUF_FMT_Q4K);
+  const Projection floatOnly(4096, 5120, BlockWeights{{QuantizedSegment::floats(4096, 5120, {})}});
+  const Projection gdnWithFloat = [] {
+    BlockWeights w;
+    QuantizedSegment a = QuantizedSegment::planes(GGUF_FMT_Q4K, 2048, 5120, {}, {}, {});
+    QuantizedSegment b = QuantizedSegment::planes(GGUF_FMT_Q4K, 1920, 5120, {}, {}, {});
+    b.columnOffset = 2048;
+    QuantizedSegment c = QuantizedSegment::floats(64, 5120, {});
+    c.columnOffset = 3968;
+    QuantizedSegment d = QuantizedSegment::floats(64, 5120, {});
+    d.columnOffset = 4032;
+    w.segments = {a, b, c, d};
+    return Projection(4096, 5120, std::move(w));
+  }();
+  const Projection wideDown = blockProjection(5120, 10240, 1, GGUF_FMT_Q4K);
+  const Projection leadingDown = wideDown.leadingInputs(5120);
+  const Projection sideTensor = blockProjection(1024, 2304, 1, GGUF_FMT_Q4K);
+  const std::array<const Projection *, 2> sidePair{&sideTensor, &sideTensor};
+  const std::optional<Projection> side = Projection::sideBySide(sidePair);
+  require(side.has_value(), "sideBySide Q4_K pair");
+
+  for (const uint32_t family : {7U, 8U})
+    for (const uint32_t cores : {8U, 10U, 14U, 16U, 19U, 24U, 32U, 38U}) {
+      const Linear step = gpu(family, cores, StepKind::Decode), chunk = gpu(family, cores);
+      // Eligible projections split at 33-56 rows, never on prefill chunks.
+      for (const auto &[p, epilogue, pair] :
+           {std::tuple{&down, LinearEpilogue::Residual, static_cast<const Projection *>(nullptr)},
+            {&up, LinearEpilogue::GateUp, &gate}, {&q5k, LinearEpilogue::GateUp, &q4k},
+            {&head, LinearEpilogue::None, nullptr}, {&fusedSame, LinearEpilogue::None, nullptr},
+            {&fusedMix, LinearEpilogue::None, nullptr}, {&gdnWithFloat, LinearEpilogue::None, nullptr},
+            {&*side, LinearEpilogue::None, nullptr}})
+        for (uint32_t rows = 1; rows <= kMaximumDecodeTileRows; ++rows) {
+          const LinearPlan plan = step.plan(*p, rows, epilogue, pair);
+          const std::span<const LinearPlan> passes = plan.passes();
+          const bool takes = rows > kMaximumRegisterRows && rows <= kApple7DecodePassRows;
+          if (!chunk.plan(*p, rows, epilogue, pair).passes().empty() || passes.size() != (takes ? 2 : 0))
+            broke("Apple7/8 decode passes", family, cores, plan.workload());
+          if (rows > kApple7DecodePassRows && !plan.configuration().mmaPrefill)
+            broke("Apple7/8 decode step past the passes off the MMA prefill tile", family, cores, plan.workload());
+          if (!takes) continue;
+          const LinearPlan first = step.plan(*p, kMaximumRegisterRows, epilogue, pair),
+                           rest = step.plan(*p, rows - kMaximumRegisterRows, epilogue, pair);
+          const LinearScratchSize own = plan.scratchSize(), bound = step.scratchSize(p->shape(), rows);
+          const bool mixedPair = epilogue == LinearEpilogue::GateUp && pair && p == &q5k;
+          const bool expectColumn = rows - kMaximumRegisterRows <= GGUF_COLUMN_ROWS && !mixedPair;
+          if (passes[0].configuration() != first.configuration() || passes[0].workload() != first.workload() ||
+              first.configuration().tile != LinearTile::GgufRegister || passes[0].storageRows() != kMaximumRegisterRows ||
+              passes[1].configuration() != rest.configuration() || passes[1].workload() != rest.workload() ||
+              (rest.configuration().tile == LinearTile::GgufColumn) != expectColumn ||
+              plan.configuration() != first.configuration() || plan.input() != LinearInput::Plain ||
+              plan.destination() != p->destination ||
+              plan.storageRows() != kMaximumRegisterRows + rest.storageRows() ||
+              plan.storageRows() > stagedTileRows(rows) || plan.storageRows() > step.storageRows(rows, p->shape()) ||
+              step.storageRows(rows, p->shape()) < rows ||
+              (mixedPair && rows <= 40 && plan.storageRows() != 40) ||
+              own.input > bound.input || own.sums > bound.sums || own.partials > bound.partials ||
+              own.counters > bound.counters ||
+              plan.gateScratchBytes() > uint64_t{stagedTileRows(rows)} * p->outputSize * 2)
+            broke("an Apple7/8 decode step's passes departed from the plans of their rows", family, cores,
+                  plan.workload());
+        }
+      // Side-by-side projection passes match one tensor's own passes at 33-56 rows.
+      for (uint32_t rows = kMaximumRegisterRows + 1; rows <= kApple7DecodePassRows; ++rows) {
+        const LinearPlan own = step.plan(sideTensor, rows), both = step.plan(*side, rows);
+        require(both.passes().size() == 2 && own.passes().size() == 2 &&
+                    both.passes()[0].configuration() == own.passes()[0].configuration() &&
+                    both.passes()[1].configuration() == own.passes()[1].configuration() &&
+                    both.storageRows() == own.storageRows() &&
+                    step.storageRows(rows, side->shape()) == step.storageRows(rows, sideTensor.shape()),
+                "Apple7/8 sideBySide decode passes match single tensor");
+      }
+      // Refused layouts stay on one MMA prefill plan across 33-56 rows, and storageRows stays >= rows.
+      for (const auto &[p, epilogue, pair] :
+           {std::tuple{&narrow, LinearEpilogue::None, static_cast<const Projection *>(nullptr)},
+            {&fusedSame, LinearEpilogue::Residual, nullptr}, {&fusedMix, LinearEpilogue::Residual, nullptr},
+            {&fusedSame, LinearEpilogue::UpWithGate, nullptr}, {&leadingDown, LinearEpilogue::Residual, nullptr},
+            {&fusedSame, LinearEpilogue::GateUp, &singleQ4}, {&singleQ4, LinearEpilogue::GateUp, &fusedSame},
+            {&singleQ4, LinearEpilogue::GateUp, &floatOnly}, {&floatOnly, LinearEpilogue::None, nullptr},
+            {&fourSegs, LinearEpilogue::None, nullptr}})
+        for (const uint32_t rows : {33U, 34U, 40U, 48U, 56U}) {
+          const LinearPlan plan = step.plan(*p, rows, epilogue, pair);
+          if (!plan.passes().empty() || !plan.configuration().mmaPrefill ||
+              (p == &leadingDown && plan.configuration().splits != 1) ||
+              plan.storageRows() > step.storageRows(rows, p->shape()) ||
+              step.storageRows(rows, p->shape()) < rows)
+            broke("refused Apple7/8 decode layout split or under-sized storage", family, cores, plan.workload());
+        }
+      // storageRows(rows, shape) equals max storage across None, one-format GateUp, and two-format GateUp at 33-56.
+      for (uint32_t rows = kMaximumRegisterRows + 1; rows <= kApple7DecodePassRows; ++rows) {
+        const uint32_t want = std::max({step.plan(q4k, rows, LinearEpilogue::None).storageRows(),
+                                        step.plan(q4k, rows, LinearEpilogue::GateUp, &q4k).storageRows(),
+                                        step.plan(q5k, rows, LinearEpilogue::GateUp, &q4k).storageRows()});
+        require(step.storageRows(rows, q4k.shape()) == want && want >= rows &&
+                    (rows > 40 || want == 40),
+                "Apple7/8 storageRows matches two-format gate/up at 33-56 rows");
+      }
+      // Head 64-row chunking splits the second chunk for 97-120 rows (33-56 remainder), not 121-128.
+      for (uint32_t total = 97; total <= 128; ++total) {
+        const LinearPlan tail = step.plan(head, total - kMaximumDecodeTileRows);
+        require(tail.passes().size() == (total <= 120 ? 2U : 0U), "Apple7/8 head second chunk 97-120 splits");
+      }
+      // Decode subplans of 33-56-row chunks inherit their passes without throwing.
+      for (const auto &[p, epilogue, pair] :
+           {std::tuple{&down, LinearEpilogue::Residual, static_cast<const Projection *>(nullptr)},
+            {&up, LinearEpilogue::GateUp, &gate}, {&q5k, LinearEpilogue::GateUp, &q4k},
+            {&head, LinearEpilogue::None, nullptr}})
+        for (const uint32_t chunkRows : {34U, 40U, 48U, 56U}) {
+          const LinearPlan whole = step.plan(*p, chunkRows, epilogue, pair);
+          require(whole.passes().size() == 2, "chunk plan splits");
+          for (const uint32_t rows : {1U, 2U, 8U, 16U, 32U, 33U, 34U, 40U, 48U, chunkRows}) {
+            if (rows > chunkRows) continue;
+            const LinearPlan part = step.plan(*p, rows, epilogue, pair, chunkRows);
+            const LinearScratchSize own = part.scratchSize(), bound = whole.scratchSize();
+            if (rows <= kMaximumRegisterRows) {
+              require(part.passes().empty() && part.configuration() == whole.passes()[0].configuration(),
+                      "subplan <= 32 rows inherits pass 0 config");
+            } else {
+              require(part.passes().size() == 2 &&
+                          part.passes()[0].configuration() == whole.passes()[0].configuration() &&
+                          part.passes()[1].configuration() == whole.passes()[1].configuration() &&
+                          part.passes()[1].workload().rows == rows - kMaximumRegisterRows &&
+                          part.storageRows() <= step.storageRows(rows, p->shape()),
+                      "subplan > 32 rows inherits both passes' configs");
+            }
+            require(part.workload().rows == rows && part.storageRows() <= whole.storageRows() &&
+                        own.input <= bound.input && own.sums <= bound.sums && own.partials <= bound.partials &&
+                        own.counters <= bound.counters && part.gateScratchBytes() <= whole.gateScratchBytes(),
+                    "subplan fits in chunk storage and scratch");
+          }
+        }
+    }
+  // storageRows is unchanged from base 1.7.3 for every family at 1-32 and 57-128 rows, and at all rows on Apple9-11
+  // and on prefill chunks.
+  const auto baseStorageRows = [](const Linear &linear, StepKind kind, uint32_t rows, ProjectionShape shape) {
+    UnitFormats unit = unitFormats(shape);
+    uint32_t storage = 0;
+    for (const auto epilogue : {LinearEpilogue::None, LinearEpilogue::GateUp}) {
+      if (epilogue == LinearEpilogue::GateUp && rows > kMaximumDecodeTileRows) continue;
+      const LinearWorkload w{{shape.outputSize, shape.inputSize}, rows, epilogue};
+      unit.oneFormat = epilogue == LinearEpilogue::GateUp;
+      LinearWorkload selected = w;
+      if (shape.planOutputs) selected.matrix.outputSize = shape.planOutputs;
+      storage = std::max(storage, Linear::plan(w,
+                                               selectProjection(linear.calibration(), linear.int8Activations(), kind,
+                                                                selected, unit),
+                                               FloatOutput::BFloat16)
+                                      .storageRows());
+    }
+    return storage;
+  };
+  const Projection f16 = blockProjection(1024, 5120, 1, GGUF_FMT_F16);
+  for (const auto &[family, cores] : {std::pair{7U, 32U}, {8U, 38U}, {9U, 10U}, {10U, 20U}, {10U, 32U}, {11U, 12U}})
+    for (const StepKind kind : {StepKind::Prefill, StepKind::Decode}) {
+      const Linear linear = gpu(family, cores, kind);
+      for (const ProjectionShape &shape : {q4k.shape(), down.shape(), side->shape(), f16.shape(), narrow.shape()})
+        for (uint32_t rows = 1; rows <= kMaximumStagedRows; ++rows) {
+          const bool apple7DecodeSplit = family <= 8 && kind == StepKind::Decode && shape.registerFormats &&
+                                         rows > kMaximumRegisterRows && rows <= kApple7DecodePassRows;
+          if (!apple7DecodeSplit) {
+            require(linear.storageRows(rows, shape) == baseStorageRows(linear, kind, rows, shape),
+                    "storageRows changed outside Apple7/8 decode passes");
+          }
+          if (family >= 9) {
+            require(linear.plan(q4k, rows).passes().empty(), "Apple9-11 never splits decode passes");
+          }
+        }
+    }
+}
+
 // Leading-input views and non-Apple7/8 devices refuse split GgufPrefill dispatches; Apple7/8 encodes
 // gguf_prefill_mma_split_* with its 3D grid.
 void apple7PrefillSplitDispatch(metal::MetalBackend &backend) {
@@ -2119,6 +2312,7 @@ int main(int argc, char **argv) {
     prefillInt8Rule();
     apple7PrefillSplits();
     apple7DecodePrefillSplits();
+    apple7DecodePasses();
     if (std::string_view(argv[1]) == "--cpu") {
       std::cout << "Linear CPU plans: PASS\n";
       return 0;
