@@ -5,9 +5,9 @@
 
 An unofficial port of [Inco's Splash](https://github.com/incoai/splash) to
 Macs with an M1 or M2 chip. Splash is a local inference engine that serves
-Qwen3.8-27B, Qwen3.6-35B-A3B, Qwen3.8-Flash-Next and Flint to coding agents and to
-any OpenAI or Anthropic compatible client. Official Splash needs an M3 or
-newer; this fork runs the same engine, version 1.7.1, on M1 and M2.
+Qwen3.8-27B, Qwen3.6-35B-A3B, Qwen3.8-Flash-Next, Flint and Inkling-2-Mini to
+coding agents and to any OpenAI or Anthropic compatible client. Official Splash needs an M3 or
+newer; this fork runs the same engine, version 1.7.3, on M1 and M2.
 
 **On an M3 or newer, use official Splash:** `brew install incoai/tap/splash`.
 Nothing here is faster there.
@@ -70,6 +70,7 @@ itself; new versions come from the releases page.
 | 64 GB | Flint | `unsloth/flint-GGUF:UD-Q4_K_XL` | 25 GB |
 | 36 GB or more | Qwen3.8-27B, dense | `mlx-community/Qwen3.8-27B-4bit` | 15 GB |
 | 36 GB or more | Qwen3.6-35B-A3B, MoE, fastest | `mlx-community/Qwen3.6-35B-A3B-4bit` | 20 GB |
+| 36 GB or more | Inkling-2-Mini, MoE, reads images | `unsloth/Inkling-2-Mini-GGUF:UD-Q4_K_M` | 17 GB |
 | 36 GB or more | Qwen3.8-27B as GGUF, other quants | `unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_M` | 17 GB |
 | 24 GB | a smaller GGUF quant | `unsloth/Qwen3.8-27B-GGUF:UD-IQ3_XXS` | |
 | 16 GB | Ternary Bonsai 2, a 27B in 7 GB | `prism-ml/Ternary-Bonsai-2-27B-gguf:PQ2_0` | 7 GB |
@@ -103,9 +104,12 @@ on a short prompt. Decode in tok/s, one request / two at once:
 | `unsloth/flint-GGUF:UD-Q4_K_XL` | 77 | 94 |
 | `mlx-community/Qwen3.8-27B-4bit` | 61 | 72 |
 | `unsloth/Qwen3.8-27B-GGUF:UD-Q5_K_M` | 49 | 60 |
+| `unsloth/Inkling-2-Mini-GGUF:UD-Q4_K_M` | 51 | 69 |
 
 Prose is slower than code because the draft model guesses fewer tokens.
-Flint was measured on 1.5.0-m1 with its fork pull request. With four
+Flint was measured on 1.5.0-m1 with its fork pull request, Inkling-2-Mini on
+1.7.3-m1. Inkling-2-Mini reasons even with reasoning off, so give it room in
+`max_tokens`. With four
 requests at once the 27B MLX decodes 80 tok/s in total.
 
 The 27B reads a cold 16K prompt at about 225 tok/s with the Neural Engine.
@@ -163,7 +167,7 @@ twice the memory, and in a 128K agent session on an M1 Max it read prompts
 The API is upstream's: OpenAI Chat Completions, OpenAI Responses and
 Anthropic Messages on `127.0.0.1:8000`, with streaming, tool calls, images
 and PDFs. `splash-m1 serve --help` lists the options. For the rest, read
-[the README of the 1.7.1 branch](https://github.com/paperniuk/splash/blob/apple7-m1-1.7.1/README.md)
+[the README of the 1.7.3 branch](https://github.com/paperniuk/splash/blob/apple7-m1-1.7.3/README.md)
 with `splash-m1` in place of `splash`. Since 1.4, `--max-context` can go past
 a model's native window with YaRN (`--yarn-factor`).
 
@@ -174,19 +178,19 @@ Reasoning is turned off per request with `"reasoning_effort": "none"`.
 Needs Xcode with the Metal Toolchain.
 
 ```bash
-git clone -b apple7-m1-1.7.1 https://github.com/paperniuk/splash.git
+git clone -b apple7-m1-1.7.3 https://github.com/paperniuk/splash.git
 cd splash
 make -j4
 ./splash serve --model mlx-community/Qwen3.8-27B-4bit
 ```
 
-Branch `apple7-m1-1.7.1` is upstream 1.7.1 plus the M1/M2 commits. `main`
+Branch `apple7-m1-1.7.3` is upstream 1.7.3 plus the M1/M2 commits. `main`
 follows upstream and does not run on M1/M2.
 
 ## Status
 
-- Stable: [1.7.1-m1](https://github.com/paperniuk/splash/releases/latest),
-  upstream 1.7.1 plus the M1/M2 work.
+- Stable: [1.7.3-m1](https://github.com/paperniuk/splash/releases/latest),
+  upstream 1.7.3 plus the M1/M2 work.
 - Known gaps: the 35B MoE's expert kernels are not tuned for M1/M2 yet;
   Macs below 64 GB are covered by the kernel tests, not run end to end on
   this release.
