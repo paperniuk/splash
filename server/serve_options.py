@@ -522,8 +522,9 @@ class ServeOption:
     # What a model's family must have for the option to act on it, one of
     # the facts install/families.py reports: a fact of its layout, as the
     # engine gives it (experts, recurrent_state, ple_table, sparse_kv,
-    # dense_ffn), or of its release (vision, reasoning_switch). None: every
-    # model.
+    # dense_ffn), or of its release (vision; reasoning_switch, its chat
+    # format's effort reaching the model, and prompt_switches_reasoning, the
+    # effort turning its reasoning on and off). None: every model.
     needs: str | None = None
 
     @property
@@ -848,7 +849,7 @@ SERVE_OPTIONS = (
             "SPLASH_THINKING_TOKEN_BUDGET, else no cap)",
         ),
         environment="SPLASH_THINKING_TOKEN_BUDGET",
-        needs="reasoning_switch",
+        needs="prompt_switches_reasoning",
     ),
     ServeOption(
         "--thinking-end-text",
@@ -862,7 +863,7 @@ SERVE_OPTIONS = (
             "after a reasoning)",
         ),
         environment="SPLASH_THINKING_END_TEXT",
-        needs="reasoning_switch",
+        needs="prompt_switches_reasoning",
     ),
     ServeOption(
         "--chat-template-file",
@@ -894,8 +895,11 @@ SERVE_OPTIONS = (
             default=images.MAX_PIXELS,
             metavar="PIXELS",
             help=f"maximum resized pixels per image, {images.MIN_PIXELS}–"
-            f"{images.MAX_PIXELS} (default: {images.MAX_PIXELS}); bounds the "
-            "vision scratch one image needs",
+            f"{images.MAX_PIXELS} (default: {images.MAX_PIXELS}); for "
+            "Inkling-2-Mini, PIXELS / 256 is the most 20-pixel patches an "
+            "image keeps its size within "
+            f"({images.max_patches(images.MAX_PIXELS):,} at the default); "
+            "bounds the vision scratch one image needs",
         ),
         engine=EngineArgument(
             "--max-image-patches", text=lambda pixels: str(images.max_patches(pixels))
@@ -1063,9 +1067,9 @@ SERVE_OPTIONS = (
             help="auto rounds activations to 8 bits where the GPU multiplies "
             "them twice as fast (M5 and later) and leaves the others bf16: "
             "long prompts through MLX 4- and 5-bit weights (about a quarter "
-            "less time to the first token), rotated PQ2_0 decode and attention "
-            "over the INT8 KV cache; bf16 keeps every activation bf16, for "
-            "evaluations and bf16 parity (default: auto)",
+            "less time to the first token) and Q8_0 ones, rotated PQ2_0 decode "
+            "and attention over the INT8 KV cache; bf16 keeps every activation "
+            "bf16, for evaluations and bf16 parity (default: auto)",
         ),
         engine=EngineArgument("--activations"),
     ),

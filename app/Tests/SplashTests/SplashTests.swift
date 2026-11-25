@@ -1190,6 +1190,15 @@ struct ChildRecordTests {
         #expect(defaults.object(forKey: Preference.installerPID) == nil)
     }
 
+    @Test func installerCommandsCarryTextOnly() {
+        let runtime = Runtime(root: URL(filePath: "/"))
+        #expect(Array(runtime.installCommand("a/b").suffix(4)) == ["--model", "a/b", "prepare", "--json-progress"])
+        #expect(Array(runtime.installCommand("a/b", textOnly: true).suffix(5))
+                == ["--model", "a/b", "--language-only", "prepare", "--json-progress"])
+        #expect(Array(runtime.removeCommand("a/b", textOnly: true).suffix(4))
+                == ["--model", "a/b", "--language-only", "remove"])
+    }
+
     /// A leftover server stops by itself once its app has ended, as SIGTERM stops it, and a
     /// Ctrl+C would then stop its engine at once: the next launch sends SIGTERM, which it ignores
     /// by then, and waits for it.
@@ -1323,6 +1332,63 @@ struct ModelFamilyTests {
         try record(".selections/0123", model: "/models/27B.gguf", family: "Qwen3.8-27B")
         #expect(runtime.installedModels().map { [$0.id, $0.family] } == [["a/Flint-GGUF:Q4", "Flint"]])
         #expect(runtime.preparedFamilies() == ["/models/27B.gguf": "Qwen3.8-27B"])
+    }
+
+    /// A model installed with Text only alone, as the app downloads one with it on, is listed by the
+    /// selection link `install/models.py` gives it (`selection_link`, whose name for owner/repo:Q4
+    /// this pins), and its removal names that option; installed without it too, it is listed once,
+    /// and the model alone removes both. A selection of other options than the app's is not listed.
+    @Test func aModelInstalledWithTextOnlyAloneIsListed() throws {
+        let root = FileManager.default.temporaryDirectory.appending(path: "splash-text-only-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let runtime = Runtime(root: root)
+        func record(_ link: String, model: String) throws {
+            let folder = runtime.models.appending(path: link)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            try #"{"model": "\#(model)", "family": "Gemma", "files": {}}"#
+                .write(to: folder.appending(path: "model.json"), atomically: true, encoding: .utf8)
+        }
+        #expect(Runtime.textOnlySelection("owner/repo:Q4")
+                == "322f1b99e584a792642a70c0962fdc9f25a7d7d03d3cf5c1a72db5b5dab50d81")
+        try record(".selections/\(Runtime.textOnlySelection("a/b:Q4"))", model: "a/b:Q4")
+        try record(".selections/0123", model: "c/d:Q4")
+        let listed = { runtime.installedModels().map { [$0.id, $0.textOnly ? "text only" : "named"] } }
+        #expect(listed() == [["a/b:Q4", "text only"]])
+        try record("a/b:Q4", model: "a/b:Q4")
+        #expect(listed() == [["a/b:Q4", "named"]])
+        #expect(Array(runtime.removeCommand("a/b:Q4").suffix(3)) == ["--model", "a/b:Q4", "remove"])
+    }
+
+    /// An installation made text only before Splash served its family's images awaits its vision
+    /// tower, which an update takes in: its record names no tower and no reason, its family serves
+    /// images, and Text only is off. One whose repository has no tower Splash serves
+    /// (`vision_unavailable`), one that has its tower and one of a family without vision do not.
+    @Test func anInstallationMadeBeforeItsFamilyServedImagesAwaitsItsTower() async throws {
+        let fake = try FakeRuntime("splash-families", launcher: "stepped_server")
+        defer { try? FileManager.default.removeItem(at: fake.root) }
+        let runtime = Runtime(root: fake.root)
+        try #"print('{"Inkling-2-Mini": {"unusable": []}, "Flint": {"unusable": ["--language-only"]}}')"#
+            .write(to: runtime.root.appending(path: "install/families.py"), atomically: true, encoding: .utf8)
+        func record(_ model: String, family: String, _ vision: String) throws {
+            let folder = runtime.models.appending(path: model)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            try #"{"model": "\#(model)", "family": "\#(family)", "files": {}, \#(vision)}"#
+                .write(to: folder.appending(path: "model.json"), atomically: true, encoding: .utf8)
+        }
+        try record("a/Inkling-GGUF:Q4", family: "Inkling-2-Mini", #""vision_format": "none""#)
+        try record("b/Inkling-GGUF:Q4", family: "Inkling-2-Mini",
+                   #""vision_format": "none", "vision_unavailable": "its repository holds no projector""#)
+        try record("c/Inkling-GGUF:Q4", family: "Inkling-2-Mini", #""vision_format": "gguf""#)
+        try record("d/Flint-GGUF:Q4", family: "Flint", #""vision_format": "none""#)
+        #expect(runtime.installedModels().filter(\.towerless).map(\.id) == ["a/Inkling-GGUF:Q4", "d/Flint-GGUF:Q4"])
+        let state = fake.state()
+        defer { state.quit() }
+        await state.launch()
+        #expect(state.installed.count == 4)
+        #expect(state.awaitingVision.map(\.id) == ["a/Inkling-GGUF:Q4"])
+        await Snapshot.save("server-awaiting-vision", MainView().environment(state))
+        state.options["--language-only"] = "true"
+        #expect(state.awaitingVision.isEmpty)
     }
 
     @Test func theRuntimeReportsWhatEachFamilyMakesOfTheOptions() async throws {

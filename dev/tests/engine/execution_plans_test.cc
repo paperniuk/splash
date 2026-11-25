@@ -314,6 +314,53 @@ void ggufMoePlans() {
     require(plans.moeWorkspace(shape, kRouterFormat, 2048, StepKind::Prefill) == devicePlans,
             "GGUF MoE prefill bound is not the bound of the device's plans");
   }
+  // The M5 Pro (Apple10, 16 to 31 cores) runs a prefill chunk whose routes
+  // average MoeCalibration::wideTileRoutes or more an expert on 64-row tiles:
+  // from 20 cores 64 (2048 rows of 8 of 256 experts, 1024 of 8 of 128), on the
+  // 16-core 128 (2048 rows of 8 of 128 alone). Its decode steps and shorter
+  // chunks run as every GPU's do; the 10-core M5, the M5 Max, the M6 and
+  // Apple9 keep 32-row tiles. The prefill bound holds the 64-row plans.
+  MoeShape eightOf128 = shape;
+  eightOf128.experts = 128;
+  // Flint's routing (a sigmoid router's top 6 of 256 experts and two ungated
+  // shared slices), whose chunks average at most 48 routes an expert, takes
+  // 64-row tiles on no device, and a plan of it on them throws: its passes
+  // have no 64-row kernels.
+  MoeShape flint = shape;
+  flint.expertsPerToken = 6;
+  flint.router = MoeRouter::SigmoidNormalized;
+  flint.sharedSlices = 2;
+  flint.sharedGate = false;
+  for (const auto [family, cores] : {std::pair{10U, 16U}, {10U, 19U}, {10U, 20U}, {10U, 31U}, {10U, 10U}, {10U, 32U},
+                                     {10U, 40U}, {11U, 20U}, {9U, 20U}}) {
+    DeviceCapabilities capabilities = device(family);
+    capabilities.gpuCoreCount = cores;
+    const ExecutionPlans plans(capabilities, Int8Activations::On);
+    const bool pro = family == 10 && cores >= 16 && cores < 32, sixtyFour = pro && cores >= 20;
+    for (const uint32_t rows : {33U, 1024U, 2047U, 2048U})
+      for (const auto &[block, wide] : {std::pair{shape, sixtyFour && rows == 2048},
+                                        {eightOf128, (sixtyFour && rows >= 1024) || (pro && rows == 2048)}})
+        require(plans.moe(block, kRouterFormat, rows, StepKind::Prefill).tileRows() == (wide ? 64U : 32U),
+                "GGUF MoE prefill plan of " + std::to_string(block.experts) + " experts on Apple" +
+                    std::to_string(family) + ", " + std::to_string(cores) + " cores, at " + std::to_string(rows) +
+                    " rows left its tiles");
+    for (uint32_t rows = 1; rows <= SPLASH_PREFILL_TOKEN_BUDGET; ++rows)
+      require(plans.moe(flint, kRouterFormat, rows, StepKind::Prefill).tileRows() <= 32,
+              "Flint's MoE prefill plan on Apple" + std::to_string(family) + ", " + std::to_string(cores) +
+                  " cores, at " + std::to_string(rows) + " rows runs 64-row tiles");
+    for (const MoeShape &block : {shape, eightOf128}) {
+      for (uint32_t lanes = 1; lanes <= 4; ++lanes)
+        require(plans.moe(block, kRouterFormat, lanes * 16, StepKind::Decode).tileRows() <= 32,
+                "a GGUF MoE decode plan runs 64-row tiles");
+      const MoePlan widest = plans.moe(block, kRouterFormat, 2048, StepKind::Prefill);
+      covers(plans.moeWorkspace(block, kRouterFormat, 2048, StepKind::Prefill), widest.workspace(), 1,
+             kMoeWorkspaceFields);
+    }
+  }
+  rejects([&] { (void)MoE::plan(flint, 2048, MoeConfig{MoeExpertTile::M64}); },
+          "no 64-row passes for two shared slices", "a MoE plan of two shared slices on 64-row tiles was accepted");
+  rejects([&] { (void)MoE::plan(shape, 2048, {.expertTile = MoeExpertTile::M64, .ggufTile = MoeGgufTile::Mma}); },
+          "no 64-row MMA passes", "a MoE plan on 64-row MMA tiles was accepted");
 }
 
 // A dense tile of a sequence of more than one tile takes a history split per
@@ -450,6 +497,59 @@ void invalidLookupsAndContextEdges() {
   rejects([&] { (void)lanesAfter(edge); }, "context_out_of_range",
           "decode rows past the physical context were accepted");
 }
+
+// A draft's gate and up, af4g64 planes (DraftCheckpoint), run as one pair
+// over its block's rows, 8 a lane, on the tile their format takes, which the
+// shape gateUpWorkspace sizes by does not name. Where the pair runs two
+// passes, below ProjectionCalibration::onePassFromCores or by the wave law,
+// its gate pass writes the rows its tile stores: 16 at one lane's 8 on the
+// 16-row tile, which Inkling-2-Mini's draft takes on an M5 of 10 GPU cores
+// (a start at one lane threw "projection gate scratch buffer holds 114688
+// bytes, needs 221184") and Ornith's on an M5 Pro of 16.
+void draftGateUpScratch() {
+  // Inkling-2-Mini's, Qwen3.6-35B-A3B's and Flint's, Qwen3.8-27B's,
+  // Qwen3.8-Flash-Next's and Ornith's.
+  constexpr std::array pairs{LinearMatrix{6912, 2304}, LinearMatrix{6144, 2048}, LinearMatrix{17408, 5120},
+                             LinearMatrix{7680, 2560}, LinearMatrix{9216, 3072}};
+  const auto planes = [](LinearMatrix matrix) {
+    return Projection(matrix.outputSize, matrix.inputSize,
+                      BlockWeights{{QuantizedSegment::planes(GGUF_FMT_AF4G64, matrix.outputSize, matrix.inputSize, {},
+                                                             {}, {})}});
+  };
+  bool tallerTile = false;
+  for (uint32_t family : {9U, 10U, 11U})
+    for (uint32_t cores : {8U, 10U, 12U, 14U, 16U, 18U, 20U, 30U, 32U, 40U, 60U, 80U}) {
+      DeviceCapabilities value = device(family);
+      value.gpuCoreCount = cores;
+      const ExecutionPlans plans(value, Int8Activations::On);
+      for (const auto matrix : pairs) {
+        const Projection up = planes(matrix);
+        for (uint32_t lanes = 1; lanes <= SPLASH_MAXIMUM_BATCH_WIDTH; ++lanes) {
+          const uint64_t bound = plans.gateUpWorkspace(gateUp(matrix), lanes * SPLASH_DRAFT_QUERY_ROWS);
+          // No more than the staged tile of the lanes' rows, 16 at the fewest.
+          require(bound == uint64_t{stagedStorageRows(lanes * SPLASH_DRAFT_QUERY_ROWS, true)} * matrix.outputSize * 2,
+                  "the gate/up workspace is not the staged tile's rows of a draft's lanes");
+          for (uint32_t step = 1; step <= lanes; ++step) {
+            const uint32_t rows = step * SPLASH_DRAFT_QUERY_ROWS;
+            const LinearPlan pair = plans.draftLinear().plan(up, rows, LinearEpilogue::GateUp, &up);
+            require(bound >= pair.gateScratchBytes(),
+                    "the gate/up workspace is below a draft's pair on its formats' tile");
+            tallerTile |= pair.gateScratchBytes() && pair.storageRows() > rows;
+          }
+        }
+      }
+    }
+  require(tallerTile, "no device ran a draft's two-pass pair on a tile of more rows than its own");
+  DeviceCapabilities m5 = device(10);
+  m5.gpuCoreCount = 10;
+  const ExecutionPlans plans(m5, Int8Activations::On);
+  const Projection up = planes(pairs[0]);
+  const LinearPlan pair = plans.draftLinear().plan(up, SPLASH_DRAFT_QUERY_ROWS, LinearEpilogue::GateUp, &up);
+  require(pair.configuration().sixteenRows && !pair.configuration().oneGateUpPass &&
+              pair.gateScratchBytes() == 221184 &&
+              plans.gateUpWorkspace(gateUp(pairs[0]), SPLASH_DRAFT_QUERY_ROWS) == 221184,
+          "Inkling-2-Mini's draft at one lane on an M5 of 10 cores left its gate scratch's 16 rows");
+}
 } // namespace
 
 int main() {
@@ -463,6 +563,7 @@ int main() {
     hyperNormPlans();
     prefillSplitsFollowTheDeviceRow();
     workspaceBounds();
+    draftGateUpScratch();
     invalidLookupsAndContextEdges();
     std::cout << "PASS execution plans: device policies, int8 activations on and off, the draft's bf16 prefill, "
                  "device MoE tiles, B1-B4 and prefill workspace bounds (CPU only)\n";

@@ -376,7 +376,7 @@ final class AppState {
 
     func download(_ model: String) {
         guard ready else { return }
-        installer.install(model)
+        installer.install(model, textOnly: settings(for: model).textOnly)
     }
 
     /// What quitting now would cut off: the requests the model answers, as its last status said
@@ -735,17 +735,30 @@ final class AppState {
             && !findingCachedModels
     }
 
-    /// Deletes `model`, a model Splash installed, with the files of it nothing else uses.
+    /// Deletes `model`, a model Splash installed, with the files of it nothing else uses: every
+    /// installation of it, Text only's too, whatever the launch options; one installed with Text
+    /// only alone by that option, as the model alone names no installation then.
     func delete(_ model: String) {
         guard canDelete(model) else { return }
-        installer.remove(model)
+        installer.remove(model, textOnly: installed.first { $0.id == model }?.textOnly == true)
     }
 
     /// Asks the Hub whether `model` or its draft has moved on, and installs what has, as its
     /// download did: the starts skip that question (`--offline`).
     func checkForUpdates(_ model: String) {
         guard ready, !serving(model) else { return }
-        installer.install(model, .check)
+        installer.install(model, .check, textOnly: settings(for: model).textOnly)
+    }
+
+    /// The models installed text only, Text only off, whose family serves images: installations
+    /// made before Splash served them (Inkling-2-Mini's before 1.7.3). A check for updates takes
+    /// the vision tower in, as a start that reaches the Hub does (`_lacks_tower` in
+    /// `install/upstream.py`); the app's starts ask the Hub nothing (`--offline`).
+    var awaitingVision: [InstalledModel] {
+        installed.filter { model in
+            model.towerless && !model.textOnly && !settings(for: model.id).textOnly
+                && model.family.flatMap { families[$0] }?.uses("--language-only") == true
+        }
     }
 
     func isInstalled(_ model: String) -> Bool {

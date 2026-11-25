@@ -43,6 +43,8 @@ model::DFlashDraftLayout draftOf(std::string_view family) {
     return test::flashNextDraft();
   if (family == model::FlintLayout{}.family)
     return test::flintDraft();
+  if (family == model::Inkling2LoopLayout{}.family)
+    return test::inkling2Draft();
   throw std::logic_error(std::string(family) + " has no draft to take its values with");
 }
 
@@ -63,7 +65,7 @@ std::string familyValues() {
     if (target.draftChoosesMaskToken()) target.maskToken = target.firstDraftMaskToken;
     const model::ModelDescriptor model =
         model::makeModelDescriptor(std::string(family.family), target, draft,
-                                   {.outputHiddenSize = draft.hiddenSize}, model::TargetSource::Gguf,
+                                   ops::visionLayout(family.visionTower, draft.hiddenSize), model::TargetSource::Gguf,
                                    model::VisionSource::None);
     require(model.valid(), std::string(family.family) + "'s descriptor is not valid");
     const kv::Layout &kv = model.targetKvLayout;

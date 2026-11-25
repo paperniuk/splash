@@ -18,6 +18,18 @@ void requireTensor(const HeadTensor &tensor, uint32_t heads, uint32_t rows, uint
   requireBytes(tensor.buffer, last * 2, what);
 }
 
+// The Apple7/8 kernel (shared/vision_mma.metal) stages keys and values in
+// 16-byte runs of eight bf16, so their view offsets and strides must align.
+constexpr uint32_t kMmaRunElements = 8;
+
+void requireRuns(const HeadTensor &tensor, const char *what) {
+  if (tensor.buffer.offsetBytes() % (kMmaRunElements * sizeof(uint16_t)))
+    throw std::invalid_argument(std::string(what) + " view offset must be a multiple of 16 bytes");
+  if (tensor.headStride % kMmaRunElements || tensor.rowStride % kMmaRunElements)
+    throw std::invalid_argument(std::string(what) + " strides must be multiples of " +
+                                std::to_string(kMmaRunElements) + " elements");
+}
+
 } // namespace
 
 DenseAttention::DenseAttention(const DeviceCapabilities &device) noexcept : mma_(device.appleGpuFamily < 9) {}
@@ -35,6 +47,10 @@ void DenseAttention::add(metal::CommandGraph &graph, const DenseAttentionTensors
   requireTensor(tensors.keys, heads, paddedKeys(rows), padded, "dense attention key");
   requireTensor(tensors.values, heads, paddedKeys(rows), dimensions, "dense attention value");
   requireTensor(tensors.output, heads, rows, dimensions, "dense attention output");
+  if (mma_) {
+    requireRuns(tensors.keys, "dense attention key");
+    requireRuns(tensors.values, "dense attention value");
+  }
   const DenseAttentionParams params{rows,
                                     scale,
                                     tensors.queries.headStride,

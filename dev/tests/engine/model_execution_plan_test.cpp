@@ -28,6 +28,11 @@ using namespace splash;
 using splash::test::rejects;
 using splash::test::require;
 
+// A family's layout check: its architecture's own where it has one, else the
+// Qwen hybrid's.
+template <class Layout> void requireLayout(const Layout &layout) { model::requireQwenLayout(layout); }
+void requireLayout(const model::Inkling2LoopLayout &layout) { model::requireInkling2Layout(layout); }
+
 template <class Weights>
 model::DFlashDraftLayout draftOf() {
   if constexpr (std::is_same_v<Weights, model::Qwen3_6MoeWeights>)
@@ -216,6 +221,36 @@ void checkGateUpLayers() {
       }
     }
   }
+}
+
+// A decode arena's gate scratch holds its draft's gate/up pair, af4g64 planes
+// (DraftCheckpoint) of 8 rows a lane, on the tile their format takes, at every
+// lane count of every runtime: a MoE target adds no bound of its own, and one
+// lane's pair stores 16 rows where it runs two passes on the 16-row tile.
+void checkDraftGateScratch(const model::LoadedModel &loaded) {
+  const auto &d = loaded.draft.layout;
+  const ops::Projection up(d.intermediateSize, d.hiddenSize,
+                           ops::BlockWeights{{ops::QuantizedSegment::planes(GGUF_FMT_AF4G64, d.intermediateSize,
+                                                                            d.hiddenSize, {}, {}, {})}});
+  const model::StreamedParts parts = model::StreamedParts::loaded(loaded);
+  for (uint32_t family : {9U, 10U, 11U})
+    for (uint32_t cores : {8U, 10U, 12U, 14U, 16U, 18U, 20U, 30U, 32U, 40U, 60U, 80U}) {
+      DeviceCapabilities device;
+      device.appleGpuFamily = family;
+      device.gpuCoreCount = cores;
+      const ops::ExecutionPlans plans(device, ops::Int8Activations::On);
+      for (uint32_t runtimeLanes = 1; runtimeLanes <= model::kLaneCount; ++runtimeLanes) {
+        const auto geometry = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32, parts,
+                                                           runtimeLanes);
+        const uint64_t held = model::DecodeArena::gateScratchBytes(geometry, plans);
+        for (uint32_t lanes = 1; lanes <= runtimeLanes; ++lanes)
+          require(held >= plans.draftLinear()
+                              .plan(up, lanes * model::kDraftRows, ops::LinearEpilogue::GateUp, &up)
+                              .gateScratchBytes(),
+                  "the decode arena's gate scratch is below its draft's pair of " + std::to_string(lanes) +
+                      " lanes on Apple" + std::to_string(family) + " of " + std::to_string(cores) + " cores");
+      }
+    }
 }
 
 // The prefill arena holds the int8 prefill tile's codes and scales of a full
@@ -446,14 +481,17 @@ void checkDecodeArenaPages(const model::LoadedModel &loaded) {
 // rows to a verify block a lane (ExecutionLimits::stepRows); a runtime of more
 // lanes than a step holds is refused.
 //
-// A default runtime's arenas are pinned to the byte: `decode` and `prefill`,
-// Apple9's and Apple10's (Apple11 plans as Apple10), are what
-// model::plannedDecodeBytes and plannedPrefillBytes give a runtime of four
-// lanes, which the planning of more lanes leaves as they are. A dense
-// target's prefill arena holds its two half chunks' group cell, one GDN
-// layer's state (3.26 MB on Qwen3.8-27B).
+// A default runtime's arenas are pinned to the byte: `decode`, Apple9's and
+// Apple10's (Apple11 plans as Apple10), and `prefill`, Apple9's, Apple10's
+// and Apple11's, are what model::plannedDecodeBytes and plannedPrefillBytes
+// give a runtime of four lanes on 20 cores, which the planning of more lanes
+// leaves as they are. A dense target's prefill arena holds its two half
+// chunks' group cell, one GDN layer's state (3.26 MB on Qwen3.8-27B). The
+// 20-core Apple10 (an M5 Pro) runs a MoE target's chunks whose routes average
+// 64 an expert on 64-row expert tiles (the 35B's 2048 rows), whose scratch
+// holds 32 grouped rows more past the routes than the 32-row tiles' (160 KiB).
 void checkArenasHoldTheirLanes(const char *name, const model::LoadedModel &loaded, std::array<uint64_t, 2> decode,
-                               std::array<uint64_t, 2> prefill) {
+                               std::array<uint64_t, 3> prefill) {
   const model::StreamedParts parts = model::StreamedParts::loaded(loaded);
   const auto four = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32, parts);
   const auto eight = model::RuntimeGeometry::from(loaded, kv::Format::Int8, ops::GdnStateFormat::Float32, parts, 8);
@@ -471,10 +509,11 @@ void checkArenasHoldTheirLanes(const char *name, const model::LoadedModel &loade
   for (uint32_t family : {9U, 10U, 11U}) {
     device.appleGpuFamily = family;
     const ops::ExecutionPlans familyPlans(device, ops::Int8Activations::On);
-    const size_t index = family == 9 ? 0 : 1;
-    require(model::plannedDecodeBytes(four, familyPlans) == decode[index] &&
-                model::plannedPrefillBytes(four, familyPlans) == prefill[index],
-            std::string(name) + "'s default arenas are not the base's on Apple" + std::to_string(family));
+    require(model::plannedDecodeBytes(four, familyPlans) == decode[family == 9 ? 0 : 1] &&
+                model::plannedPrefillBytes(four, familyPlans) == prefill[family - 9],
+            std::string(name) + "'s default arenas are not the base's on Apple" + std::to_string(family) + " (" +
+                std::to_string(model::plannedDecodeBytes(four, familyPlans)) + " and " +
+                std::to_string(model::plannedPrefillBytes(four, familyPlans)) + " bytes)");
   }
   // One to eight lanes on every device family: arenas that grow with the
   // lanes, decode tensors of at least the lanes (the default's four at four),
@@ -692,8 +731,9 @@ void checkGdnWidths() {
   withoutGates.packedGdnWidth = shipped.convolutionDimension + shipped.attentionWidth;
   rejects([&] { sizeArenas(withoutGates); }, "invalid model runtime geometry",
           "packed GDN rows without the gates reached arena sizing");
-  // Every family's layout, the 122B's among them, passes the layout check.
-  model::forEachFamily([](const auto &family) { model::requireQwenLayout(family); });
+  // Every family's layout, the 122B's among them, passes its architecture's
+  // layout check.
+  model::forEachFamily([](const auto &family) { requireLayout(family); });
   // A layout without GDN layers sets none of the GDN dimensions.
   auto strayGdn = model::FlintLayout{};
   strayGdn.gdnKeyHeads = 16;
@@ -763,6 +803,10 @@ int main() {
     checkGdnWidths();
     checkDraftVocabulary();
     checkGateUpLayers();
+    checkDraftGateScratch(loadedModel<model::Qwen3_8Weights>());
+    checkDraftGateScratch(loadedModel<model::Qwen3_6MoeWeights>());
+    checkDraftGateScratch(loadedModel<model::Qwen3_6MoeWeights>(model::kQwen3_5_122BLayout, test::qwen3_5_122BDraft()));
+    checkDraftGateScratch(loadedModel<model::Qwen4ExpWeights>());
     checkYarnGeometry();
     checkIndexTables();
     checkSpilledKvGeometry();
@@ -774,11 +818,11 @@ int main() {
     checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>());
     checkLaneScratch(loadedModel<model::Qwen3_6MoeWeights>(model::kQwen3_5_122BLayout, test::qwen3_5_122BDraft()));
     checkArenasHoldTheirLanes("Qwen3.8-27B", loadedModel<model::Qwen3_8Weights>(), {450'576'384, 434'864'128},
-                              {749'715'456, 733'609'984});
+                              {749'715'456, 733'609'984, 733'609'984});
     checkArenasHoldTheirLanes("Qwen3.6-35B-A3B", loadedModel<model::Qwen3_6MoeWeights>(), {279'281'664, 273'874'944},
-                              {539'017'216, 533'446'656});
+                              {539'017'216, 533'610'496, 533'446'656});
     checkArenasHoldTheirLanes("Qwen3.8-Flash-Next", loadedModel<model::Qwen4ExpWeights>(),
-                              {409'796'608, 403'963'904}, {1'124'614'144, 1'118'781'440});
+                              {409'796'608, 403'963'904}, {1'124'614'144, 1'118'781'440, 1'118'781'440});
     checkDecodeArenaPages(loadedModel<model::Qwen3_8Weights>());
     checkDecodeArenaPages(loadedModel<model::Qwen3_6MoeWeights>());
     checkDecodeStepRows(loadedModel<model::Qwen3_8Weights>());

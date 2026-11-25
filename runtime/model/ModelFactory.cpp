@@ -39,9 +39,9 @@ std::unique_ptr<VisionLoader> planVisionLoader(const std::filesystem::path &root
   return std::make_unique<VisionLoader>(root / "vision", descriptor.visionSource, descriptor.vision);
 }
 
-QwenVisionWeights loadVisionWeights(metal::MetalBackend &backend, WeightImages &images,
-                                    const VisionLoader *loader) {
-  return loader ? loadQwenVisionWeights(backend, images, *loader) : QwenVisionWeights{};
+VisionTowerWeights loadVisionWeights(metal::MetalBackend &backend, WeightImages &images,
+                                     const VisionLoader *loader) {
+  return loader ? loadVisionTowerWeights(backend, images, *loader) : VisionTowerWeights{};
 }
 
 namespace {
@@ -63,6 +63,11 @@ TargetWeights readTarget(metal::MetalBackend &backend, const Qwen4ExpLayout &lay
 
 TargetWeights readTarget(metal::MetalBackend &backend, const FlintLayout &layout, const QwenTargetFiles &files) {
   return loadFlintWeights(backend, layout, files);
+}
+
+TargetWeights readTarget(metal::MetalBackend &backend, const Inkling2LoopLayout &layout,
+                         const QwenTargetFiles &files) {
+  return loadInkling2LoopWeights(backend, layout, files);
 }
 
 } // namespace
@@ -99,11 +104,11 @@ TargetWeights loadTarget(metal::MetalBackend &backend, WeightImages &images, con
         table.readers = options.readers;
         switch (descriptor.targetSource) {
         case TargetSource::Safetensors: {
-          SafetensorsTargetLoader loader(backend, images, directory, layout, table, experts);
+          SafetensorsTargetLoader loader(backend, images, directory, safetensorsTargetPlan(layout), table, experts);
           return readTarget(backend, layout, std::ref(loader));
         }
         case TargetSource::Gguf: {
-          GgufTargetLoader loader(backend, images, findTargetGgufs(directory), layout.ggufArchitecture, layout, table,
+          GgufTargetLoader loader(backend, images, findTargetGgufs(directory), ggufTargetPlan(layout), table,
                                   experts);
           return readTarget(backend, layout, std::ref(loader));
         }

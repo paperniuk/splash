@@ -12,6 +12,7 @@
 #include "engine/Bootstrap.hpp"
 #include "metal/MetalBackend.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -919,36 +920,65 @@ void testTwoStepsFromFixedRows() {
           "a start did not set up two steps from 1024 rows beside one step from 897: " + text(fake.preparations));
 }
 
-// Apple7/8 time the one-step functions through 768 rows with two shares. The same split serves after recall.
-void testApple7Calibration() {
+void testApple9Refusal() {
   Fake fake;
-  fake.simdgroupMma = true;
   fake.time = pipelined;
   fake.mixer = 10.0;
-  const std::array<ChunkTimings::Gpu, 2> gpu{{{128, 2.0}, {2048, 20.0}}};
-  fake.prepare = [&](AneFfn::Shares, bool timed) {
-    AneFfnPrepared prepared;
-    if (timed)
-      prepared.chunks = {gpu, {{641, 768, 1.0}, {513, 640, 1.0}, {385, 512, 1.0},
-                               {257, 384, 1.0}, {129, 256, 1.0}, {128, 128, 1.0}}};
-    return prepared;
+  fake.prepare = [](AneFfn::Shares shares, bool timed) {
+    if (shares.twoSteps == 13) throw ane::Refused("ANE load failed");
+    return Fake{}.prepare(shares, timed);
   };
-  Ran ran = run(fake);
-  require(ran.outcome().kind == Kind::Split && fake.remembered && fake.remembered->minimumRows == 128 &&
-              fake.remembered->gpu[0].rows == 128 &&
-              fake.preparations == std::vector<Preparation>{{8, 13, 128, 769, true}},
-          "the Apple7/8 calibration timed other thresholds: " + text(fake.preparations) + ran.log);
+  const Ran ran = run(fake);
+  require(ran.outcome().kind == Kind::Unavailable &&
+              fake.preparations == std::vector<Preparation>{{8, 13, 512, 1024, true}} && fake.remembered &&
+              fake.remembered->refusals == 1 && !fake.remembered->aneUnits && has(ran.log, "ANE load failed"),
+          "Apple9 retried a refused two-step split: " + text(fake.preparations) + ran.log);
+}
 
-  fake.preparations.clear();
-  ran = run(fake);
-  require(ran.outcome().kind == Kind::Split && fake.timings == 1 &&
-              fake.preparations == std::vector<Preparation>{{8, 13, 128, 769, false}},
-          "the Apple7/8 calibration recalled other thresholds: " + text(fake.preparations) + ran.log);
+// A refused Apple7/8 split tries a smaller two-step share or one step alone.
+// The split that prepares serves again after recall.
+void testApple7Calibration() {
+  for (const bool oneStepOnly : {false, true}) {
+    Fake fake;
+    fake.simdgroupMma = true;
+    // With a 110 ms mixer, 13 units predicts 122.2 ms against 129.0 ms
+    // GPU-only, while 12 predicts 122.7 ms and misses the 5% threshold.
+    fake.time = [=] {
+      Timings timings = pipelined();
+      if (oneStepOnly) timings.highHalf = 111.0;
+      return timings;
+    };
+    fake.mixer = oneStepOnly ? 110.0 : 10.0;
+    fake.prepare = [](AneFfn::Shares shares, bool timed) {
+      if (shares.twoSteps == 13) throw ane::Refused("ANE load failed");
+      AneFfnPrepared prepared;
+      if (timed) {
+        prepared.chunks.gpu = {{{128, 2.0}, {2048, 20.0}}};
+        for (uint32_t rows = shares.twoSteps ? 768 : 2048; rows >= 128; rows -= 128)
+          prepared.chunks.functions.push_back({std::max(128U, rows - 127), rows, 1.0});
+      }
+      return prepared;
+    };
+    const uint32_t two = oneStepOnly ? 0 : 12, twoRows = two ? 769 : 0;
+    Ran ran = run(fake);
+    require(ran.outcome().kind == Kind::Split &&
+                fake.preparations == std::vector<Preparation>{{8, 13, 128, 769, true}, {8, two, 128, twoRows, true}} &&
+                fake.remembered && fake.remembered->aneUnits == 8 && fake.remembered->twoStepUnits == two &&
+                fake.remembered->minimumRows == 128 && fake.remembered->gpu[0].rows == 128 && !fake.remembered->refusals,
+            "the Apple7/8 retry chose the wrong shares: " + text(fake.preparations) + ran.log);
+    fake.preparations.clear();
+    ran = run(fake);
+    require(ran.outcome().kind == Kind::Split && fake.timings == 1 &&
+                fake.preparations == std::vector<Preparation>{{8, two, 128, twoRows, false}},
+            "the Apple7/8 calibration recalled the wrong shares: " + text(fake.preparations) + ran.log);
 
-  fake.stored->minimumRows = 769;
-  const Started rejected = start(fake);
-  require(rejected.start.outcome.kind == Kind::Pending && !rejected.start.calibration,
-          "the Apple7/8 calibration took one step at the two-step crossover");
+    if (two) {
+      fake.stored->minimumRows = 769;
+      const Started rejected = start(fake);
+      require(rejected.start.outcome.kind == Kind::Pending && !rejected.start.calibration,
+              "the Apple7/8 calibration took one step at the two-step crossover");
+    }
+  }
 }
 
 // Two steps run only where a command of them queues no more evaluations than the Neural Engine holds in flight
@@ -1628,6 +1658,7 @@ int main() {
     testNoGain();
     testTheMixerComesFromThePrefill();
     testTwoStepsFromFixedRows();
+    testApple9Refusal();
     testApple7Calibration();
     testTwoStepsOnlyWhereTheyFit();
     testTwoStepsStandAlone();

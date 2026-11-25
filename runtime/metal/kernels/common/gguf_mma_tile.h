@@ -121,8 +121,8 @@ template <uint FM, class Fn> inline void elements(thread float2 (&acc)[FN][FM], 
 // weights before the multiply. Decoding each column's coefficients once per group this way beat decoding every
 // lane's own chunks in registers on an M1 Max (Q4_K 5120 x 17408, ms at one and four lanes: 0.38 and 1.0 against
 // 0.46 and 2.2).
-template <class F, uint FM>
-inline void accumulate(device const bfloat *x, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size,
+template <class F, uint FM, class Input>
+inline void accumulate(Input x, device uchar *w0, device uchar *w1, device uchar *meta, uint input_size,
                        uint origin, threadgroup half *stage, threadgroup half2 *tl, uint lane, uint step_begin,
                        uint step_end, thread float2 (&acc)[FN][FM]) {
   if (step_begin >= step_end) return;
