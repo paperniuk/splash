@@ -144,7 +144,9 @@ struct AttentionCalibration final {
   // relative attention fills (RelativeAttention::decodeSplits); 0 in a row
   // no device made.
   uint32_t cores = 0;
-  bool registerRelativePrefill = false;
+  // Relative attention over INT8 pages with bf16 queries runs the register tile (relative_attention_register_loop)
+  // in its splits, direct tiles and decode steps: Apple7/8, whose tensor ops emulate matmul2d.
+  bool registerRelative = false;
 };
 
 // The MoE expert passes' tiles (selectMoe).
@@ -560,7 +562,7 @@ inline KernelCalibration KernelCalibration::of(const DeviceCapabilities &device)
   if (gpu == GpuClass::Apple7) {
     attention = kApple9Attention;
     attention.cores = cores;
-    attention.registerRelativePrefill = true;
+    attention.registerRelative = true;
     return {cores, kApple7Projection, kApple9FloatTile, kApple9DenseTile, attention,
             device.appleGpuFamily == 7 ? kApple7Moe : moe, true};
   }

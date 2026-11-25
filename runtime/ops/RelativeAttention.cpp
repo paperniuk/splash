@@ -140,18 +140,25 @@ RelativeAttentionPlan RelativeAttention::plan(std::span<const kv::ChunkedPrefill
   const bool int8Queries = int8Activations == Int8Activations::On && layout.format == kv::Format::Int8 &&
                            splitReads >= calibration.int8QueriesFromPages;
   const std::string format = int8Queries ? std::string("q8q") : kernelFormat(layout);
+  // Apple7/8 run INT8 pages with bf16 queries on the register tile (AttentionCalibration::registerRelative).
+  plan.registerTile_ = calibration.registerRelative && layout.format == kv::Format::Int8 && !int8Queries;
+  const std::string tile = plan.registerTile_ ? "_register" : "";
   if (decode) {
-    plan.decodePipeline_ = "relative_attention_" + format + "_decode" +
+    plan.decodePipeline_ = "relative_attention_" + format + "_decode" + tile +
                            (sequences.front().chunk_tokens > kv::kAttentionTileRows ? "_r16" : "") + window +
                            (variant.positionScaled ? "_scaled" : "");
   } else {
-    plan.splitPipeline_ = "relative_attention_" + format + "_split" + window;
+    plan.splitPipeline_ = "relative_attention_" + format + "_split" + tile + window;
     plan.reducePipeline_ = "relative_attention_reduce" + window;
-    const bool registerTile = calibration.registerRelativePrefill && layout.format == kv::Format::Int8 && !int8Queries;
-    plan.directPipeline_ = "relative_attention_" + format + (registerTile ? "_direct_register" : "_direct") + window;
+    plan.directPipeline_ = "relative_attention_" + format + "_direct" + tile + window;
   }
   group(plan);
   return plan;
+}
+
+uint32_t RelativeAttentionPlan::threads(uint32_t rows) const noexcept {
+  return registerTile_ ? rows * (RelativeAttention::kQueryHeads / RelativeAttention::kKvHeads) / 8 * 32
+                       : metal::CommandGraph::kDefaultThreads;
 }
 
 uint32_t RelativeAttention::decodeMostSplits(uint32_t laneCap, uint32_t cores) {
@@ -308,10 +315,12 @@ PreparedInput RelativeAttention::addAttention(metal::CommandGraph &graph, const 
       // plain reduce does.
       if (table) throw std::invalid_argument("the direct relative attention writes no out-projection table");
       split.insert(split.end(), {output.packed, output.hidden, tableInput, tableSums, staging.sinks});
-      graph.add(plan.directPipeline(), std::move(split), params, plan.directGroups(dispatch));
+      graph.add(plan.directPipeline(), std::move(split), params, plan.directGroups(dispatch),
+                {plan.threads(SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS), 1, 1});
       return slot;
     }
-    graph.add(plan.splitPipeline(), std::move(split), params, plan.splitGroups(dispatch));
+    graph.add(plan.splitPipeline(), std::move(split), params, plan.splitGroups(dispatch),
+              {plan.threads(kv::kAttentionTileRows), 1, 1});
     graph.add(reducePipeline,
               {partials, statistics, output.packed, output.hidden, tableInput, tableSums, rows.layout, staging.sinks},
               params, plan.reduceGroups(dispatch), {kHeadDimension, 1, 1});
@@ -406,7 +415,10 @@ PreparedInput RelativeAttention::addDecode(metal::CommandGraph &graph, const Rel
     // for them, of which it reads nothing.
     bindings.insert(bindings.end(), {rows.tree ? rows.tree : layerRows.projection, rows.layout});
     graph.add(plan.decodePipeline() + tableSuffix(output.input), std::move(bindings), params,
-              plan.splitGroups(dispatch));
+              plan.splitGroups(dispatch),
+              {plan.threads(plan.sequences()[0].rows > kv::kAttentionTileRows ? 2 * kv::kAttentionTileRows
+                                                                              : kv::kAttentionTileRows),
+               1, 1});
   }
   return table ? PreparedInput{output.hidden, output.input} : PreparedInput{};
 }

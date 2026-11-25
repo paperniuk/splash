@@ -74,7 +74,7 @@ RELATIVE_ATTENTION_PREPARE(relative_attention_bf16_prepare_scaled, 24, 8, 128, t
 // as splash_attention_split_phase's; a tile reads its fused rows' relative
 // states from the states' staging at its queries' place.
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint HeadDim, uint Window, typename CacheElement,
-          bool Int8Queries>
+          bool Int8Queries, bool RegisterTile>
 inline void relative_attention_split_phase(
     device bfloat *queries, device float *partials, device float *statistics,
     device const SplashKvPage *page_table, device const SplashTreeRow *tree, device const SplashLaneRows *layout,
@@ -99,26 +99,39 @@ inline void relative_attention_split_phase(
   // it writes only after its last page.
   const ulong slot = tile.first_slot + split;
   device float *own = partials + slot * M * HeadDim;
-  relative_attention_page_loop<KVHeads, QueryHeadsPerKVHead, SPLASH_ATTENTION_TILE_ROWS, HeadDim, Window,
-                               CacheElement, Int8Queries>(
-      queries + tile.offset, reinterpret_cast<device int8_t *>(own),
-      relative_states + tile.offset / HeadDim * SPLASH_RELATIVE_ATTENTION_STATES, relative_bias, page_table,
-      params.kv, kv_head, tile.first_position, tile.active_rows, run, scores, probabilities, row_max, row_sum,
-      previous_scale, rescale, splash_attention_tree(params, sequence, rows, tree, tile.first_position),
-      thread_index,
-      [&](thread auto &running, bool) {
-        auto target = tensor(own, dextents<int, 2>{HeadDim, M}, array<int, 2>{1, HeadDim});
-        running.store(target.slice<HeadDim, M>(0, 0));
-        if (thread_index < M) {
-          statistics[(slot * M + thread_index) * 2] = row_max[thread_index];
-          statistics[(slot * M + thread_index) * 2 + 1] = row_sum[thread_index];
-        }
-      });
+  constexpr uint Rows = SPLASH_ATTENTION_TILE_ROWS;
+  const auto publish = [&](thread auto &running, bool) {
+    if constexpr (RegisterTile) {
+      for (ushort index = 0; index < running.get_capacity(); ++index) {
+        const uint2 coordinates = running.get_multidimensional_index(index);
+        if (coordinates.y < M)
+          own[coordinates.y * HeadDim + coordinates.x] = running[index];
+      }
+    } else {
+      auto target = tensor(own, dextents<int, 2>{HeadDim, M}, array<int, 2>{1, HeadDim});
+      running.store(target.slice<HeadDim, M>(0, 0));
+    }
+    if (thread_index < M) {
+      statistics[(slot * M + thread_index) * 2] = row_max[thread_index];
+      statistics[(slot * M + thread_index) * 2 + 1] = row_sum[thread_index];
+    }
+  };
+  device const float *states = relative_states + tile.offset / HeadDim * SPLASH_RELATIVE_ATTENTION_STATES;
+  const SplashAttentionTree path = splash_attention_tree(params, sequence, rows, tree, tile.first_position);
+  if constexpr (RegisterTile)
+    relative_attention_register_loop<KVHeads, QueryHeadsPerKVHead, Rows, HeadDim, Window, CacheElement>(
+        queries + tile.offset, states, relative_bias, page_table, params.kv, kv_head, tile.first_position,
+        tile.active_rows, run, scores, row_max, row_sum, path, thread_index, publish);
+  else
+    relative_attention_page_loop<KVHeads, QueryHeadsPerKVHead, Rows, HeadDim, Window, CacheElement, Int8Queries>(
+        queries + tile.offset, reinterpret_cast<device int8_t *>(own), states, relative_bias, page_table, params.kv,
+        kv_head, tile.first_position, tile.active_rows, run, scores, probabilities, row_max, row_sum,
+        previous_scale, rescale, path, thread_index, publish);
 }
 
 // The paged attention's split bindings, then the relative states' staging
 // and the layer's bias table (F32, [distance][state]) before the parameters.
-#define RELATIVE_ATTENTION_SPLIT(Name, Heads, Group, HeadDim, Window, CacheElement, Int8Queries)                \
+#define RELATIVE_ATTENTION_SPLIT(Name, Heads, Group, HeadDim, Window, CacheElement, Int8Queries, RegisterTile)  \
   kernel void Name(                                                                                           \
       device bfloat *queries [[buffer(0)]],                                                                   \
       device float *partials [[buffer(1)]],                                                                   \
@@ -140,14 +153,14 @@ inline void relative_attention_split_phase(
       uint thread_index [[thread_index_in_threadgroup]]) {                                                    \
     constexpr uint M = Group * SPLASH_ATTENTION_TILE_ROWS;                                                    \
     constexpr uint N = SplashKvPageTokens;                                                                    \
-    alignas(16) threadgroup float scores[M * N];                                                              \
+    alignas(16) threadgroup float scores[M * (RegisterTile ? kRelativeBiasSpan + 64 : N)];                         \
     alignas(16) threadgroup bfloat probabilities[M * N];                                                      \
     threadgroup float row_max[M];                                                                             \
     threadgroup float row_sum[M];                                                                             \
     threadgroup float previous_scale[M];                                                                      \
     threadgroup atomic_uint rescale;                                                                          \
     const uint s = splash_attention_sequence_of_tile(params, group.y);                                        \
-    relative_attention_split_phase<Heads, Group, HeadDim, Window, CacheElement, Int8Queries>(                 \
+    relative_attention_split_phase<Heads, Group, HeadDim, Window, CacheElement, Int8Queries, RegisterTile>(   \
         queries, partials, statistics,                                                                        \
         SPLASH_LANE_BINDING(s, page_table0, page_table1, page_table2, page_table3, page_table4, page_table5,  \
                             page_table6, page_table7),                                                        \
@@ -156,11 +169,14 @@ inline void relative_attention_split_phase(
   }
 // Over the whole history (the full layers) and over a window of the 1023
 // keys before each row (the sliding layers' 1024 keys, the row's own
-// included); INT8 pages with bf16 or INT8 queries, and BF16 pages.
+// included); INT8 pages with bf16 or INT8 queries, and BF16 pages; _register, INT8 pages with bf16 queries on the
+// register tile (relative_attention_register_loop).
 #define RELATIVE_ATTENTION_SPLITS(Suffix, Window)                                                             \
-  RELATIVE_ATTENTION_SPLIT(relative_attention_q8_split##Suffix, 8, 3, 128, Window, int8_t, false)             \
-  RELATIVE_ATTENTION_SPLIT(relative_attention_q8q_split##Suffix, 8, 3, 128, Window, int8_t, true)             \
-  RELATIVE_ATTENTION_SPLIT(relative_attention_bf16_split##Suffix, 8, 3, 128, Window, bfloat, false)
+  RELATIVE_ATTENTION_SPLIT(relative_attention_q8_split##Suffix, 8, 3, 128, Window, int8_t, false, false)      \
+  RELATIVE_ATTENTION_SPLIT(relative_attention_q8_split_register##Suffix, 8, 3, 128, Window, int8_t, false,    \
+                           true)                                                                              \
+  RELATIVE_ATTENTION_SPLIT(relative_attention_q8q_split##Suffix, 8, 3, 128, Window, int8_t, true, false)      \
+  RELATIVE_ATTENTION_SPLIT(relative_attention_bf16_split##Suffix, 8, 3, 128, Window, bfloat, false, false)
 RELATIVE_ATTENTION_SPLITS(, 0)
 RELATIVE_ATTENTION_SPLITS(_w1023, 1023)
 #undef RELATIVE_ATTENTION_SPLITS
@@ -289,54 +305,61 @@ inline void relative_attention_direct_phase(
                                        (SPLASH_ATTENTION_TILE_ROWS * QueryHeadsPerKVHead) * HeadDim;
   static_assert(M * HeadDim <= SPLASH_ATTENTION_TILE_ROWS * QueryHeadsPerKVHead * HeadDim * sizeof(float),
                 "a tile's query codes fit a slot of the paged attention's partials");
-  relative_attention_page_loop<KVHeads, QueryHeadsPerKVHead, Rows, HeadDim, Window, CacheElement, Int8Queries, RegisterTile>(
-      queries + offset, reinterpret_cast<device int8_t *>(codes),
-      relative_states + offset / HeadDim * SPLASH_RELATIVE_ATTENTION_STATES, relative_bias, page_table, params.kv,
-      kv_head, first_position, active_rows, run, scores, probabilities, row_max, row_sum, previous_scale, rescale,
-      splash_attention_tree(params, sequence, rows, tree, first_position), thread_index,
-      [&](thread auto &running, bool running_full) {
-        // The combine of the one split (relative_attention_tile.h's
-        // Reduce): each active fused row's weight into previous_scale and
-        // its denominator into row_sum, from its statistics and its sink,
-        // the split's product rounded before the sink's term is added
-        // (contract(off)), as the reduce's loop over splits rounds a row's
-        // one product: contracted into one fused multiply-add, the two gave
-        // other bits.
-        if (thread_index < M && thread_index / QueryHeadsPerKVHead < active_rows) {
+  const auto combine = [&](thread auto &running, bool running_full) {
+    // The combine of the one split (relative_attention_tile.h's
+    // Reduce): each active fused row's weight into previous_scale and
+    // its denominator into row_sum, from its statistics and its sink,
+    // the split's product rounded before the sink's term is added
+    // (contract(off)), as the reduce's loop over splits rounds a row's
+    // one product: contracted into one fused multiply-add, the two gave
+    // other bits.
+    if (thread_index < M && thread_index / QueryHeadsPerKVHead < active_rows) {
 #pragma clang fp contract(off)
-          const float sink = sinks[offset / HeadDim + thread_index];
-          const float maximum = row_max[thread_index];
-          const float row_maximum = max(maximum, sink);
-          const float weight = relative_attention_split_weight(maximum, row_maximum);
-          const float denominator =
-              relative_attention_denominator(weight * row_sum[thread_index], sink, row_maximum);
-          previous_scale[thread_index] = weight;
-          row_sum[thread_index] = denominator;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+      const float sink = sinks[offset / HeadDim + thread_index];
+      const float maximum = row_max[thread_index];
+      const float row_maximum = max(maximum, sink);
+      const float weight = relative_attention_split_weight(maximum, row_maximum);
+      const float denominator =
+          relative_attention_denominator(weight * row_sum[thread_index], sink, row_maximum);
+      previous_scale[thread_index] = weight;
+      row_sum[thread_index] = denominator;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 #pragma unroll
-        for (ushort index = 0; index < running.get_capacity(); ++index) {
-          if (!running_full && !running.is_valid_element(index))
-            continue;
-          const auto coordinates = running.get_multidimensional_index(index);
-          const uint fused_row = uint(coordinates[1]), dimension = uint(coordinates[0]);
-          const uint row = fused_row / QueryHeadsPerKVHead;
-          if (row >= active_rows)
-            continue;
-          const SplashAttentionOutput place = splash_attention_output(params, s, rows, start + row);
-          if (!place.writes)
-            continue;
-          float numerator = 0.0f;
-          numerator += previous_scale[fused_row] * running[index];
-          const float denominator = row_sum[fused_row];
-          const bfloat value = bfloat(denominator > 0.0f ? numerator / denominator : 0.0f);
-          const uint query_head = kv_head * QueryHeadsPerKVHead + fused_row % QueryHeadsPerKVHead;
-          const float gate =
-              float(projection[place.packed * Row::Stride + Row::GateOffset + query_head * HeadDim + dimension]);
-          hidden[place.output * Width + query_head * HeadDim + dimension] =
-              relative_attention_gated(float(value), gate);
-        }
-      });
+    for (ushort index = 0; index < running.get_capacity(); ++index) {
+      if (!running_full && !running.is_valid_element(index))
+        continue;
+      const auto coordinates = running.get_multidimensional_index(index);
+      const uint fused_row = uint(coordinates[1]), dimension = uint(coordinates[0]);
+      const uint row = fused_row / QueryHeadsPerKVHead;
+      if (row >= active_rows)
+        continue;
+      const SplashAttentionOutput place = splash_attention_output(params, s, rows, start + row);
+      if (!place.writes)
+        continue;
+      float numerator = 0.0f;
+      numerator += previous_scale[fused_row] * running[index];
+      const float denominator = row_sum[fused_row];
+      const bfloat value = bfloat(denominator > 0.0f ? numerator / denominator : 0.0f);
+      const uint query_head = kv_head * QueryHeadsPerKVHead + fused_row % QueryHeadsPerKVHead;
+      const float gate =
+          float(projection[place.packed * Row::Stride + Row::GateOffset + query_head * HeadDim + dimension]);
+      hidden[place.output * Width + query_head * HeadDim + dimension] =
+          relative_attention_gated(float(value), gate);
+    }
+  };
+  device const bfloat *tile_queries = queries + offset;
+  device const float *states = relative_states + offset / HeadDim * SPLASH_RELATIVE_ATTENTION_STATES;
+  const SplashAttentionTree path = splash_attention_tree(params, sequence, rows, tree, first_position);
+  if constexpr (RegisterTile)
+    relative_attention_register_loop<KVHeads, QueryHeadsPerKVHead, Rows, HeadDim, Window, CacheElement>(
+        tile_queries, states, relative_bias, page_table, params.kv, kv_head, first_position, active_rows, run,
+        scores, row_max, row_sum, path, thread_index, combine);
+  else
+    relative_attention_page_loop<KVHeads, QueryHeadsPerKVHead, Rows, HeadDim, Window, CacheElement, Int8Queries>(
+        queries + offset, reinterpret_cast<device int8_t *>(codes), states, relative_bias, page_table, params.kv,
+        kv_head, first_position, active_rows, run, scores, probabilities, row_max, row_sum, previous_scale, rescale,
+        path, thread_index, combine);
 }
 
 // The split's bindings without its statistics, then the plain reduce's: the
@@ -373,7 +396,7 @@ inline void relative_attention_direct_phase(
       uint simd_group [[simdgroup_index_in_threadgroup]]) {                                                   \
     constexpr uint M = 3 * SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS;                                             \
     constexpr uint N = SplashKvPageTokens;                                                                    \
-    alignas(16) threadgroup float scores[M * N];                                                              \
+    alignas(16) threadgroup float scores[M * (RegisterTile ? kRelativeBiasSpan + 64 : N)];                         \
     alignas(16) threadgroup bfloat probabilities[M * N];                                                      \
     threadgroup float row_max[M];                                                                             \
     threadgroup float row_sum[M];                                                                             \
@@ -416,7 +439,7 @@ RELATIVE_ATTENTION_DIRECTS(_w1023, 1023)
 // head's splits' staging: the INT8 query codes, the relative states and the
 // bf16 queries, in that order.
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint RowsPerTile, uint HeadDim, uint Window, bool PositionScaled,
-          typename CacheElement, bool Int8Queries, class Table>
+          typename CacheElement, bool Int8Queries, class Table, bool RegisterTile>
 inline void relative_attention_decode_phase(
     device const bfloat *projection, device const bfloat *keys, device const bfloat *values,
     device const float *query_scale, device const float *relative_scale, device const float *relative_bias,
@@ -428,7 +451,9 @@ inline void relative_attention_decode_phase(
     uint thread_index, uint lane, uint simd_group) {
   using Row = RelativeAttentionRow<KVHeads * QueryHeadsPerKVHead, HeadDim>;
   constexpr uint M = RowsPerTile * QueryHeadsPerKVHead, D = HeadDim, States = Row::States;
-  constexpr uint Simdgroups = 8;
+  // The register tile's threadgroup is its simdgroups', one per eight fused rows (RelativeAttentionPlan::threads):
+  // the matmul2d tile's eight simdgroups left five of a decode step's eight rows idle.
+  constexpr uint Simdgroups = RegisterTile ? M / 8 : 8;
   constexpr uint Tiles = RowsPerTile / SPLASH_ATTENTION_TILE_ROWS;
   static_assert(Tiles * SPLASH_ATTENTION_TILE_ROWS == RowsPerTile && M <= 64, "whole tiles of a 256-thread loop");
   const uint kv_head = group.x, s = group.y, split = group.z;
@@ -467,26 +492,32 @@ inline void relative_attention_decode_phase(
   threadgroup_barrier(mem_flags::mem_device);
   // Publish the tile's rows' partials and statistics, then arrive.
   const ulong slot = head_slot + split;
-  relative_attention_page_loop<KVHeads, QueryHeadsPerKVHead, RowsPerTile, D, Window, CacheElement, Int8Queries>(
-      queries, reinterpret_cast<device int8_t *>(staging), states, relative_bias, page_table, params.kv, kv_head,
-      first, rows.rows, run, scores, probabilities, row_max, row_sum, previous_scale, rescale,
-      splash_attention_tree(params, sequence, rows, tree, first), thread_index,
-      [&](thread auto &running, bool running_full) {
-        device coherent(device) float *published = partials + slot * M * D;
+  const auto publish = [&](thread auto &running, bool running_full) {
+    device coherent(device) float *published = partials + slot * M * D;
 #pragma unroll
-        for (ushort index = 0; index < running.get_capacity(); ++index) {
-          if (!running_full && !running.is_valid_element(index))
-            continue;
-          const auto coordinates = running.get_multidimensional_index(index);
-          if (uint(coordinates[1]) < fused_rows)
-            published[uint(coordinates[1]) * D + uint(coordinates[0])] = running[index];
-        }
-        if (thread_index < fused_rows) {
-          device coherent(device) float *row_statistics = statistics + (slot * M + thread_index) * 2;
-          row_statistics[0] = row_max[thread_index];
-          row_statistics[1] = row_sum[thread_index];
-        }
-      });
+    for (ushort index = 0; index < running.get_capacity(); ++index) {
+      if (!running_full && !running.is_valid_element(index))
+        continue;
+      const auto coordinates = running.get_multidimensional_index(index);
+      if (uint(coordinates[1]) < fused_rows)
+        published[uint(coordinates[1]) * D + uint(coordinates[0])] = running[index];
+    }
+    if (thread_index < fused_rows) {
+      device coherent(device) float *row_statistics = statistics + (slot * M + thread_index) * 2;
+      row_statistics[0] = row_max[thread_index];
+      row_statistics[1] = row_sum[thread_index];
+    }
+  };
+  const SplashAttentionTree path = splash_attention_tree(params, sequence, rows, tree, first);
+  if constexpr (RegisterTile)
+    relative_attention_register_loop<KVHeads, QueryHeadsPerKVHead, RowsPerTile, D, Window, CacheElement>(
+        queries, states, relative_bias, page_table, params.kv, kv_head, first, rows.rows, run, scores, row_max,
+        row_sum, path, thread_index, publish);
+  else
+    relative_attention_page_loop<KVHeads, QueryHeadsPerKVHead, RowsPerTile, D, Window, CacheElement, Int8Queries>(
+        queries, reinterpret_cast<device int8_t *>(staging), states, relative_bias, page_table, params.kv, kv_head,
+        first, rows.rows, run, scores, probabilities, row_max, row_sum, previous_scale, rescale, path, thread_index,
+        publish);
   device atomic_uint *counter = counters + (params.first_sequence + s) * KVHeads + kv_head;
   if (!split_arrive_last(counter, run.written, thread_index, arrival))
     return;
@@ -524,7 +555,8 @@ inline void relative_attention_decode_phase(
 // sliding one's (windowed, unscaled: _w1023); plain and writing the
 // out-projection's Table16 input too (_table16); for INT8 pages with bf16 or
 // INT8 queries, and BF16 pages.
-#define RELATIVE_ATTENTION_DECODE_KERNEL(Name, RowsPerTile, Window, PositionScaled, CacheElement, Int8Queries, Table) \
+#define RELATIVE_ATTENTION_DECODE_KERNEL(Name, RowsPerTile, Window, PositionScaled, CacheElement, Int8Queries, Table, \
+                                         RegisterTile)                                                         \
   kernel void Name(                                                                                           \
       device const bfloat *projection [[buffer(0)]],                                                          \
       device const bfloat *keys [[buffer(1)]],                                                                \
@@ -555,7 +587,7 @@ inline void relative_attention_decode_phase(
       uint simd_group [[simdgroup_index_in_threadgroup]]) {                                                   \
     constexpr uint M = 3 * RowsPerTile;                                                                       \
     constexpr uint N = SplashKvPageTokens;                                                                    \
-    alignas(16) threadgroup float scores[M * N];                                                              \
+    alignas(16) threadgroup float scores[M * (RegisterTile ? kRelativeBiasSpan + 64 : N)];                         \
     alignas(16) threadgroup bfloat probabilities[M * N];                                                      \
     threadgroup float row_max[M];                                                                             \
     threadgroup float row_sum[M];                                                                             \
@@ -563,7 +595,7 @@ inline void relative_attention_decode_phase(
     threadgroup atomic_uint rescale;                                                                          \
     threadgroup uint arrival;                                                                                 \
     relative_attention_decode_phase<8, 3, RowsPerTile, 128, Window, PositionScaled, CacheElement, Int8Queries,  \
-                                    Table>(                                                                   \
+                                    Table, RegisterTile>(                                                     \
         projection, keys, values, query_scale, relative_scale, relative_bias, partials, statistics, counters,  \
         hidden, table, sums,                                                                                  \
         SPLASH_LANE_BINDING(group.y, page_table0, page_table1, page_table2, page_table3, page_table4,          \
@@ -571,19 +603,24 @@ inline void relative_attention_decode_phase(
         tree, layout, params, scores, probabilities, row_max, row_sum, previous_scale, &rescale, &arrival,     \
         group, thread_index, lane, simd_group);                                                               \
   }
-#define RELATIVE_ATTENTION_DECODE_OUTPUTS(Name, RowsPerTile, Window, PositionScaled, CacheElement, Int8Queries)  \
-  RELATIVE_ATTENTION_DECODE_KERNEL(Name, RowsPerTile, Window, PositionScaled, CacheElement, Int8Queries, void)  \
+#define RELATIVE_ATTENTION_DECODE_OUTPUTS(Name, RowsPerTile, Window, PositionScaled, CacheElement, Int8Queries,  \
+                                          RegisterTile)                                                        \
+  RELATIVE_ATTENTION_DECODE_KERNEL(Name, RowsPerTile, Window, PositionScaled, CacheElement, Int8Queries, void,  \
+                                   RegisterTile)                                                               \
   RELATIVE_ATTENTION_DECODE_KERNEL(Name##_table16, RowsPerTile, Window, PositionScaled, CacheElement, Int8Queries, \
-                                  gguf_sg::Table16)                                                          \
+                                   gguf_sg::Table16, RegisterTile)                                             \
   RELATIVE_ATTENTION_DECODE_KERNEL(Name##_table16f, RowsPerTile, Window, PositionScaled, CacheElement, Int8Queries, \
-                                  gguf_sg::Table16F)
+                                   gguf_sg::Table16F, RegisterTile)
+// _register: INT8 pages with bf16 queries on the register tile (relative_attention_register_loop).
 #define RELATIVE_ATTENTION_DECODE_FORMATS(Suffix, RowsPerTile, Window, PositionScaled)                         \
   RELATIVE_ATTENTION_DECODE_OUTPUTS(relative_attention_q8_decode##Suffix, RowsPerTile, Window, PositionScaled,  \
-                                    int8_t, false)                                                            \
+                                    int8_t, false, false)                                                     \
+  RELATIVE_ATTENTION_DECODE_OUTPUTS(relative_attention_q8_decode_register##Suffix, RowsPerTile, Window,         \
+                                    PositionScaled, int8_t, false, true)                                      \
   RELATIVE_ATTENTION_DECODE_OUTPUTS(relative_attention_q8q_decode##Suffix, RowsPerTile, Window, PositionScaled, \
-                                    int8_t, true)                                                             \
+                                    int8_t, true, false)                                                      \
   RELATIVE_ATTENTION_DECODE_OUTPUTS(relative_attention_bf16_decode##Suffix, RowsPerTile, Window, PositionScaled, \
-                                    bfloat, false)
+                                    bfloat, false, false)
 #define RELATIVE_ATTENTION_DECODE_VARIANTS(Suffix, RowsPerTile)                                                \
   RELATIVE_ATTENTION_DECODE_FORMATS(Suffix##_scaled, RowsPerTile, 0, true)                                     \
   RELATIVE_ATTENTION_DECODE_FORMATS(Suffix##_w1023, RowsPerTile, 1023, false)

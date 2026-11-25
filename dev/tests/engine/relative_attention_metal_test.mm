@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <tuple>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -148,6 +149,10 @@ double clipFactor(std::span<const double> head, double clip) {
 // extents of a pool of two layers, its history written into them directly;
 // with a window, the entries of a lane's table below its first row's window
 // name a page of NaNs.
+// Whether the cases run Apple7/8's register tile (AttentionCalibration::registerRelative), which main sets for a
+// second pass of the INT8 cases with bf16 queries.
+bool gRegisterTile = false;
+
 struct Case final {
   kv::Layout layout;
   ops::RelativeAttentionVariant variant;
@@ -161,11 +166,13 @@ struct Case final {
   std::array<metal::MetalBuffer, SPLASH_MAXIMUM_BATCH_WIDTH> tables;
   uint32_t poisoned = 0;
   ops::RelativeAttentionWeights weights;
+  bool registerTile = gRegisterTile;
 
   [[nodiscard]] uint32_t page(uint32_t lane, uint32_t token) const { return pages[lane][token / kPageTokens]; }
   [[nodiscard]] ops::AttentionCalibration attention() const {
     ops::AttentionCalibration row = test::attentionRow(int8Queries ? 1U : ops::kNever);
     row.cores = kCores;
+    row.registerRelative = registerTile;
     return row;
   }
   [[nodiscard]] double key(uint32_t lane, uint32_t head, uint32_t token, uint32_t dimension) const {
@@ -713,7 +720,8 @@ double checkOutput(const Case &data, const Step &step, const std::string &what) 
 }
 
 std::string label(kv::Format format, bool int8Queries) {
-  return std::string(kv::formatName(format)) + (int8Queries ? " with INT8 queries" : "");
+  return std::string(kv::formatName(format)) + (int8Queries ? " with INT8 queries" : "") +
+         (gRegisterTile ? " on the register tile" : "");
 }
 std::string describe(const Case &data, std::string_view phase) {
   std::string text = std::string(phase) + " " + label(data.layout.format, data.int8Queries) +
@@ -1032,7 +1040,10 @@ void runMultiPass(metal::MetalBackend &backend, const Case &data, const Step &st
   std::vector<metal::MetalBuffer> split{step.staging.queries, partials, statistics};
   split.insert(split.end(), data.tables.begin(), data.tables.end());
   split.insert(split.end(), {step.tree ? step.tree : partials, step.layout, step.staging.states, data.weights.bias});
-  graph.add("relative_attention_" + format + "_split" + window, std::move(split), params, {kKvHeads, 1, splits});
+  // The register tile's single pass reads as its split does (relative_attention_register_loop).
+  const std::string tile = decode.decodePipeline().find("_register") != std::string::npos ? "_register" : "";
+  graph.add("relative_attention_" + format + "_split" + tile + window, std::move(split), params,
+            {kKvHeads, 1, splits});
   graph.add("relative_attention_reduce" + window,
             {partials, statistics, step.inputs.projection, step.output, step.output, step.output, step.layout,
              step.staging.sinks},
@@ -1222,6 +1233,28 @@ void checkPlans() {
                   "a decode plan's INT8 queries score INT8 pages alone");
         }
   }
+  // Apple7/8's register tile: INT8 pages with bf16 queries name its split, direct and decode kernels; INT8 queries
+  // and BF16 pages keep the matmul2d tile's.
+  {
+    ops::AttentionCalibration row = test::attentionRow(ops::kNever);
+    row.registerRelative = true;
+    row.cores = kCores;
+    const kv::Layout int8 = layoutOf(kv::Format::Int8);
+    const ops::RelativeAttentionPlan prompt = RelativeAttention::plan(
+        sequence, int8, row, ops::Int8Activations::On, RelativeAttention::workspace(ops::kAttentionSequenceSplits, int8),
+        kSliding);
+    const ops::RelativeAttentionPlan step =
+        RelativeAttention::plan(lane, int8, row, ops::Int8Activations::On, RelativeAttention::laneWorkspace(int8),
+                                kSliding, ops::StepKind::Decode);
+    const ops::RelativeAttentionPlan bf16 = RelativeAttention::plan(
+        sequence, layoutOf(kv::Format::BFloat16), row, ops::Int8Activations::On,
+        RelativeAttention::workspace(ops::kAttentionSequenceSplits, layoutOf(kv::Format::BFloat16)), kSliding);
+    require(prompt.splitPipeline() == "relative_attention_q8_split_register_w1023" &&
+                prompt.directPipeline() == "relative_attention_q8_direct_register_w1023" &&
+                step.decodePipeline() == "relative_attention_q8_decode_register_w1023" &&
+                bf16.directPipeline() == "relative_attention_bf16_direct_w1023",
+            "the register tile's plans name other kernels");
+  }
   // A lane's splits: one per kDecodeCorePages / cores pages, but one a page
   // up to a verify block's most, at most decodeMostSplits, and as many as the
   // runs of pages they make. On 20 cores (most 12 and 7) 9 pages' 7 splits of
@@ -1325,8 +1358,10 @@ int main(int argc, char **argv) {
     metal::MetalBackend backend(argv[1]);
     checkPlans();
     checkFloatTable(backend);
-    for (const auto &[format, int8Queries] : {std::pair{kv::Format::Int8, false}, std::pair{kv::Format::Int8, true},
-                                              std::pair{kv::Format::BFloat16, false}}) {
+    for (const auto &[format, int8Queries, registerTile] :
+         {std::tuple{kv::Format::Int8, false, false}, std::tuple{kv::Format::Int8, false, true},
+          std::tuple{kv::Format::Int8, true, false}, std::tuple{kv::Format::BFloat16, false, false}}) {
+      gRegisterTile = registerTile;
       // Sliding layers: prompt chunks from position 0 and after cached
       // prefixes on either side of the window (its start's page entries of
       // NaNs), whose windows and extents coincide; a chunk again as several.
