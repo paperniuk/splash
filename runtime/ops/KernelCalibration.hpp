@@ -104,6 +104,14 @@ struct ProjectionCalibration final {
   // K-split tiers for long prefill chunks (GgufPrefill) over the chunk's
   // 2D grid of 64-row by 64-column tiles; empty leaves prefill unsplit.
   std::span<const SplitTier> prefillSplits{};
+  // Decode steps on Apple7/8's MMA prefill tile split deeper on large-K
+  // projections (k >= minInputs) whose unsplit 64x64 grid sits at most
+  // maxGridPerCore per core; empty tiers leave decode on prefillSplits.
+  struct DecodePrefillSplits final {
+    std::span<const SplitTier> tiers{};
+    uint32_t minInputs = 0;
+    uint32_t maxGridPerCore = 0;
+  } decodePrefillSplits{};
 };
 
 struct FloatTileCalibration final {
@@ -355,6 +363,34 @@ inline constexpr SplitTier kMmaTiers[] = {{24, 512}};
 // history by 13.7%/3.7% in decode-profile while leaving wide projections
 // (e.g. 2560x6144 at >= 1024 rows, 5120x17408 from 384 rows) unsplit.
 inline constexpr SplitTier kMmaPrefillTiers[] = {{8, 512, 8}};
+// Decode steps on Apple7/8's 64x64 MMA prefill tile (`#84`): #73's 8 TG/core
+// ceiling halves K splits on large-K projections (K >= 8192) where grids are
+// still short per core. Measured on M2 Max (38c) across Q4_0/af4g64/Q4_K/Q6_K
+// (+ Q5_K on 5120x17408):
+// - 27B down (5120x17408): S8 vs S4 at 40-64 rows (-3.3% to -6.0%, g/c 2.11),
+//   S4 vs S2 at 80-128 rows (-5.1% to -7.8%, g/c 4.21); on a 14c M1 Pro S4 beats
+//   S2 by ~5% at 40-64 rows (CarloArpini, g/c 5.71). Moving g/c 11.42 at K 17408
+//   from S1 to S2 lost 5.15% (Q4_K 13888x17408 at 128 rows), so maxGridPerCore = 6
+//   restricts the deeper tier to g/c <= 6.
+// - 122B gdn-output (3072x8192): S8 vs S4 at 80-128 rows (g/c 2.53, -2.1% to
+//   -4.0% on q40/af4g64, -0.3% to -3.4% on q4k/q6k) and at 40-64 rows (-3.0% to
+//   -6.6%); emulated g/c 5.05-6.00 (12288x8192, 14592x8192) S4 vs S2 wins -4.3%
+//   to -7.6% on q4k/af4g64 at 40-64 rows.
+// Across every family in the kernel selection golden (with maxGridPerCore = 6):
+// - Qwen3.8-27B (GGUF & MLX) down 5120x17408: 33-64 rows 14/16/19c S2->S4 and
+//   24/30/32/38c S4->S8 (8/10c stay S1); 65-128 rows 30/32/38c S2->S4 (8-19c
+//   stay S1, 24c stays S2).
+// - Qwen3.5-122B-A10B gdn-output 3072x8192: 33-64 rows 8/10c S2->S4 and
+//   14/16/19/24c S4->S8 (30-38c already S8); 65-128 rows 16/19/24c S2->S4 and
+//   30/32/38c S4->S8 (8/10c stay S1, 14c stays S2).
+// - Qwen3.6-35B-A3B, Qwen3.8-Flash-Next (HC down 320x10240 already hits S8),
+//   and Flint: unchanged across 8-38c and 33-128 rows.
+// K <= 6144 stays on kMmaPrefillTiers because M2 Max and CarloArpini's 14c M1 Pro
+// disagree at g/c = 4.5-6.9 (Q4_K 13888x6144 and Q8_0 11264x2048 favor S2 by
+// 5.1-7.6% on M2 Max where M1 Pro favors S1 by 4-10%), waiting for M1 Max / M1 Pro data.
+inline constexpr SplitTier kMmaDecodePrefillTiers[] = {{16, 512, 8}};
+inline constexpr ProjectionCalibration::DecodePrefillSplits kMmaDecodePrefillSplits{
+    .tiers = kMmaDecodePrefillTiers, .minInputs = 8192, .maxGridPerCore = 6};
 
 // Apple7/8's register tile over MLX affine units: a wave law, its constants a grid search's fit to the 27B MLX
 // 4-bit projections' fastest splits at one to four lanes on a 32-core M1 Max, weighted by their calls a decode step.
@@ -392,6 +428,7 @@ inline constexpr ProjectionCalibration kApple7Projection{
     .decodeInt8FromRows = kNever,
     .prefillInt8 = false,
     .prefillSplits = kMmaPrefillTiers,
+    .decodePrefillSplits = kMmaDecodePrefillSplits,
 };
 
 // ---- Float projections ----------------------------------------------------
