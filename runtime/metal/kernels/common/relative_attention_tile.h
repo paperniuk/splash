@@ -1,5 +1,6 @@
 #pragma once
 
+#include "metal/kernels/common/sgmatrix.h"
 #include "metal/abi/Gguf.h"
 #include "metal/abi/RelativeAttention.h"
 #include "metal/kernels/common/activation.h"
@@ -357,6 +358,19 @@ inline RelativeAttentionPages relative_attention_pages(uint first_position, uint
   return {begin, min(pages, begin + per_split), (pages - first_page + per_split - 1) / per_split};
 }
 
+struct RelativeAttentionRegisterOutput {
+  sgmatrix::Lane coord;
+  ushort sg;
+  float2 values[12];
+  static constexpr ushort get_capacity() { return 24; }
+  static bool is_valid_element(ushort) { return true; }
+  uint2 get_multidimensional_index(ushort index) const {
+    uint tile = sg + 8 * (index / 2);
+    return uint2(8 * (tile % 16) + coord.fn + (index & 1), 8 * (tile / 16) + coord.fm);
+  }
+  thread float &operator[](ushort i) thread { return reinterpret_cast<thread float *>(values)[i]; }
+};
+
 // splash_paged_attention_tile with the bias, over a split's nonempty run of
 // pages (relative_attention_pages): the tile's fused rows' relative states
 // (`states`, staged as their queries) and the layer's bias table (`table`).
@@ -370,7 +384,7 @@ inline RelativeAttentionPages relative_attention_pages(uint first_position, uint
 // running_full says is valid) and their statistics, which row_max and row_sum
 // hold.
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint RowsPerTile, uint HeadDim,
-          uint Window, typename CacheElement, bool Int8Queries, class Store>
+          uint Window, typename CacheElement, bool Int8Queries, bool RegisterTile = false, class Store>
 inline void relative_attention_page_loop(
     device bfloat *tile_queries, device int8_t *query_codes, device const float *states,
     device const float *table, device const SplashKvPage *page_table,
@@ -453,8 +467,12 @@ inline void relative_attention_page_loop(
                           matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<qk_descriptor, execution_simdgroups<8>> qk;
   matmul2d<pv_descriptor, execution_simdgroups<8>> pv;
-  auto running = pv.template get_destination_cooperative_tensor<
-      decltype(p0), decltype(v0), float>();
+  auto running = [&] {
+    if constexpr (RegisterTile)
+      return RelativeAttentionRegisterOutput{sgmatrix::lane_map(thread_index % 32), ushort(thread_index / 32), {}};
+    else
+      return pv.template get_destination_cooperative_tensor<decltype(p0), decltype(v0), float>();
+  }();
   const bool running_full =
       uint(running.get_capacity()) * (8u * 32u) == uint(M) * D;
 #pragma unroll
@@ -463,6 +481,17 @@ inline void relative_attention_page_loop(
       running[index] = 0.0f;
   }
 
+  const uint sg = thread_index / 32;
+  const auto coord = sgmatrix::lane_map(thread_index % 32);
+  static_assert(!RegisterTile || (M == 48 && N == 32 && D == 128 && Quantized && !Int8Queries));
+  float2 queryParts[3][D / 8];
+  if constexpr (RegisterTile) {
+    for (ushort tile = 0; tile < 3; ++tile) {
+      const uint row = ((sg + 8 * tile) / 4) * 8 + coord.fm;
+      for (ushort k = 0; k < D / 8; ++k)
+        queryParts[tile][k] = float2(*reinterpret_cast<device const bfloat2 *>(tile_queries + row * D + 8 * k + coord.fn));
+    }
+  }
   const SplashAttentionWholePages whole =
       splash_attention_whole_pages<Window>(committed_tokens, active_rows, in_tree, tree.anchor);
   for (uint page = run.begin; page < run.end; ++page) {
@@ -472,11 +501,26 @@ inline void relative_attention_page_loop(
     auto kt = tensor(tensors.keys, dextents<int, 2>{D, N}, array<int, 2>{1, D});
     auto vt = tensor(tensors.values, dextents<int, 2>{N, D}, array<int, 2>{1, N});
 
-    auto page_scores = qk.template get_destination_cooperative_tensor<
-        decltype(q0), decltype(k0), Score>();
-    auto ks = kt.template slice<D, N>(0, 0);
-    qk.run(q0, ks, page_scores);
-    page_scores.store(st.template slice<N, M>(0, 0));
+    if constexpr (RegisterTile) {
+      const uint col = (sg % 4) * 8 + coord.fn;
+      float2 acc[3] = {};
+      for (ushort k = 0; k < D / 8; ++k) {
+        const uint dim = 8 * k + coord.fm;
+        const half2 key(tensors.keys[col * D + dim], tensors.keys[(col + 1) * D + dim]);
+        for (ushort tile = 0; tile < 3; ++tile)
+          sgmatrix::mma_mixed(acc[tile], queryParts[tile][k], key);
+      }
+      for (ushort tile = 0; tile < 3; ++tile) {
+        const uint row = ((sg + 8 * tile) / 4) * 8 + coord.fm;
+        *reinterpret_cast<threadgroup float2 *>(scores + row * N + col) = acc[tile];
+      }
+    } else {
+      auto page_scores = qk.template get_destination_cooperative_tensor<
+          decltype(q0), decltype(k0), Score>();
+      auto ks = kt.template slice<D, N>(0, 0);
+      qk.run(q0, ks, page_scores);
+      page_scores.store(st.template slice<N, M>(0, 0));
+    }
     if (thread_index == 0)
       atomic_store_explicit(rescale, 0u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -501,8 +545,25 @@ inline void relative_attention_page_loop(
         running[index] *= previous_scale[coordinates[1]];
       }
     }
-    auto vs = vt.template slice<N, D>(0, 0);
-    pv.run(p0, vs, running);
+    if constexpr (RegisterTile) {
+      for (ushort k = 0; k < N / 8; ++k) {
+        half2 v[2];
+        for (ushort c = 0; c < 2; ++c) {
+          const uint col = sg * 8 + c * 64 + coord.fn;
+          const uint tok = 8 * k + coord.fm;
+          v[c] = half2(tensors.values[col * N + tok], tensors.values[(col + 1) * N + tok]);
+        }
+        for (ushort r = 0; r < 6; ++r) {
+          const uint offset = (r * 8 + coord.fm) * N + 8 * k + coord.fn;
+          const float2 prob = float2(*reinterpret_cast<threadgroup const bfloat2 *>(probabilities + offset));
+          for (ushort c = 0; c < 2; ++c)
+            sgmatrix::mma_mixed(running.values[2 * r + c], prob, v[c]);
+        }
+      }
+    } else {
+      auto vs = vt.template slice<N, D>(0, 0);
+      pv.run(p0, vs, running);
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
   store(running, running_full);

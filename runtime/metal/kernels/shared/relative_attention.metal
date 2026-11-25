@@ -259,7 +259,8 @@ RELATIVE_ATTENTION_REDUCE(relative_attention_reduce_w1023, 1023)
 // without) and a full layer's 1.7% after 8,192; a tile of twice the rows,
 // which reads each page once for both, ran 5-11% faster than two tiles at
 // short histories (0 to 2,048 tokens) and 0.6-4% at 8,192 and 30,720.
-template <uint KVHeads, uint QueryHeadsPerKVHead, uint HeadDim, uint Window, typename CacheElement, bool Int8Queries>
+template <uint KVHeads, uint QueryHeadsPerKVHead, uint HeadDim, uint Window, typename CacheElement, bool Int8Queries,
+          bool RegisterTile>
 inline void relative_attention_direct_phase(
     device bfloat *queries, device float *partials, device const SplashKvPage *page_table,
     device const SplashTreeRow *tree, device const SplashLaneRows *layout, device const float *relative_states,
@@ -288,7 +289,7 @@ inline void relative_attention_direct_phase(
                                        (SPLASH_ATTENTION_TILE_ROWS * QueryHeadsPerKVHead) * HeadDim;
   static_assert(M * HeadDim <= SPLASH_ATTENTION_TILE_ROWS * QueryHeadsPerKVHead * HeadDim * sizeof(float),
                 "a tile's query codes fit a slot of the paged attention's partials");
-  relative_attention_page_loop<KVHeads, QueryHeadsPerKVHead, Rows, HeadDim, Window, CacheElement, Int8Queries>(
+  relative_attention_page_loop<KVHeads, QueryHeadsPerKVHead, Rows, HeadDim, Window, CacheElement, Int8Queries, RegisterTile>(
       queries + offset, reinterpret_cast<device int8_t *>(codes),
       relative_states + offset / HeadDim * SPLASH_RELATIVE_ATTENTION_STATES, relative_bias, page_table, params.kv,
       kv_head, first_position, active_rows, run, scores, probabilities, row_max, row_sum, previous_scale, rescale,
@@ -344,7 +345,7 @@ inline void relative_attention_direct_phase(
 // the rows' sinks' staging, before the parameters. Over the whole history and
 // a sliding layer's window, for INT8 pages with bf16 or INT8 queries and BF16
 // pages.
-#define RELATIVE_ATTENTION_DIRECT_KERNEL(Name, Window, CacheElement, Int8Queries)                                \
+#define RELATIVE_ATTENTION_DIRECT_KERNEL(Name, Window, CacheElement, Int8Queries, RegisterTile)               \
   kernel void Name(                                                                                           \
       device bfloat *queries [[buffer(0)]],                                                                   \
       device float *partials [[buffer(1)]],                                                                   \
@@ -379,17 +380,18 @@ inline void relative_attention_direct_phase(
     threadgroup float previous_scale[M];                                                                      \
     threadgroup atomic_uint rescale;                                                                          \
     const uint s = splash_attention_sequence_of_tile(params, group.y);                                        \
-    relative_attention_direct_phase<8, 3, 128, Window, CacheElement, Int8Queries>(                            \
+    relative_attention_direct_phase<8, 3, 128, Window, CacheElement, Int8Queries, RegisterTile>(              \
         queries, partials,                                                                                    \
         SPLASH_LANE_BINDING(s, page_table0, page_table1, page_table2, page_table3, page_table4, page_table5,  \
                             page_table6, page_table7),                                                        \
-        tree, layout, relative_states, relative_bias, projection, hidden, table, sums, sinks, params, scores,  \
-        probabilities, row_max, row_sum, previous_scale, &rescale, group, thread_index, lane, simd_group, s);   \
+        tree, layout, relative_states, relative_bias, projection, hidden, table, sums, sinks, params, scores, \
+        probabilities, row_max, row_sum, previous_scale, &rescale, group, thread_index, lane, simd_group, s); \
   }
 #define RELATIVE_ATTENTION_DIRECTS(Suffix, Window)                                                            \
-  RELATIVE_ATTENTION_DIRECT_KERNEL(relative_attention_q8_direct##Suffix, Window, int8_t, false)               \
-  RELATIVE_ATTENTION_DIRECT_KERNEL(relative_attention_q8q_direct##Suffix, Window, int8_t, true)               \
-  RELATIVE_ATTENTION_DIRECT_KERNEL(relative_attention_bf16_direct##Suffix, Window, bfloat, false)
+  RELATIVE_ATTENTION_DIRECT_KERNEL(relative_attention_q8_direct##Suffix, Window, int8_t, false, false)        \
+  RELATIVE_ATTENTION_DIRECT_KERNEL(relative_attention_q8_direct_register##Suffix, Window, int8_t, false, true) \
+  RELATIVE_ATTENTION_DIRECT_KERNEL(relative_attention_q8q_direct##Suffix, Window, int8_t, true, false)        \
+  RELATIVE_ATTENTION_DIRECT_KERNEL(relative_attention_bf16_direct##Suffix, Window, bfloat, false, false)
 RELATIVE_ATTENTION_DIRECTS(, 0)
 RELATIVE_ATTENTION_DIRECTS(_w1023, 1023)
 #undef RELATIVE_ATTENTION_DIRECTS

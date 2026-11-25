@@ -147,7 +147,8 @@ RelativeAttentionPlan RelativeAttention::plan(std::span<const kv::ChunkedPrefill
   } else {
     plan.splitPipeline_ = "relative_attention_" + format + "_split" + window;
     plan.reducePipeline_ = "relative_attention_reduce" + window;
-    plan.directPipeline_ = "relative_attention_" + format + "_direct" + window;
+    const bool registerTile = calibration.registerRelativePrefill && layout.format == kv::Format::Int8 && !int8Queries;
+    plan.directPipeline_ = "relative_attention_" + format + (registerTile ? "_direct_register" : "_direct") + window;
   }
   group(plan);
   return plan;

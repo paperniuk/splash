@@ -136,6 +136,7 @@ struct AttentionCalibration final {
   // relative attention fills (RelativeAttention::decodeSplits); 0 in a row
   // no device made.
   uint32_t cores = 0;
+  bool registerRelativePrefill = false;
 };
 
 // The MoE expert passes' tiles (selectMoe).
@@ -514,6 +515,7 @@ inline KernelCalibration KernelCalibration::of(const DeviceCapabilities &device)
   if (gpu == GpuClass::Apple7) {
     attention = kApple9Attention;
     attention.cores = cores;
+    attention.registerRelativePrefill = true;
     return {cores, kApple7Projection, kApple9FloatTile, kApple9DenseTile, attention,
             device.appleGpuFamily == 7 ? kApple7Moe : moe, true};
   }
