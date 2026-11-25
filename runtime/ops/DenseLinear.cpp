@@ -21,6 +21,8 @@ struct DenseTile final {
 constexpr DenseTile kEight{64, 64, 8, "dense_linear_m64n64s8"};
 constexpr DenseTile kSquare{64, 64, 4, "dense_linear_m64n64s4"};
 constexpr DenseTile kWide{64, 128, 4, "dense_linear_m64n128s4"};
+constexpr DenseTile kMmaSmall{8, 64, 2, "dense_linear_mma_m8n64"};
+constexpr DenseTile kMmaMedium{16, 64, 2, "dense_linear_mma_m16n64"};
 constexpr DenseTile kMma{64, 128, 8, "dense_linear_mma_m64n128"};
 constexpr DenseTile kMmaWide{32, 256, 8, "dense_linear_mma_m32n256"};
 constexpr uint32_t kRowTile = 64;
@@ -34,8 +36,14 @@ constexpr uint32_t kRowTile = 64;
 // device class's thresholds are measured (KernelCalibration.hpp).
 const DenseTile &tileOf(const KernelCalibration &calibration, uint32_t rows, uint32_t outputs,
                         uint32_t inputs) noexcept {
-  if (calibration.simdgroupMma)
+  if (calibration.simdgroupMma) {
+    const auto groups = [&](const DenseTile &tile) {
+      return ((uint64_t{rows} + tile.rows - 1) / tile.rows) * (outputs / tile.columns);
+    };
+    if (groups(kMmaSmall) <= 24ull * calibration.cores) return kMmaSmall;
+    if (groups(kMmaMedium) <= 128ull * calibration.cores) return kMmaMedium;
     return inputs >= 4096 && outputs % kMmaWide.columns == 0 ? kMmaWide : kMma;
+  }
   const DenseTileCalibration &d = calibration.denseTile;
   // The grid's half 64 x 64 tiles, against a threshold's per core.
   const uint64_t halves = 2 * uint64_t{(rows + kRowTile - 1) / kRowTile} * (outputs / 64);
@@ -91,7 +99,12 @@ void DenseLinear::add(metal::CommandGraph &graph, const DenseWeights &weights, u
   const DenseTile &tile = tileOf(calibration_, rows, outputSize, inputSize);
   std::vector<metal::MetalBuffer> buffers{input, weights.weight, weights.bias, output};
   if (scaled) buffers.push_back(weights.scale);
-  graph.add(std::string(tile.name) + epilogueSuffix(epilogue), std::move(buffers),
+  std::string pipeline = std::string(tile.name) + epilogueSuffix(epilogue);
+  if (&tile == &kMma && inputSize == 1024 && outputSize == 4096 && epilogue == DenseEpilogue::GeluErf)
+    pipeline = "dense_linear_mma_inkling_ffn_up";
+  else if (&tile == &kMmaWide && inputSize == 4096 && outputSize == 1024 && scaled)
+    pipeline = "dense_linear_mma_inkling_ffn_down";
+  graph.add(std::move(pipeline), std::move(buffers),
             DenseLinearParams{rows, outputSize, inputSize, 0},
             {(rows + tile.rows - 1) / tile.rows, outputSize / tile.columns, 1}, {tile.simdgroups * 32, 1, 1});
 }

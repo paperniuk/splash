@@ -33,20 +33,22 @@ __attribute__((always_inline)) inline float widen(uint2 w, uint e) {
 }
 
 // output[M, N] = input[M, K] x weights[N, K]^T + bias with the MPP kernel's
-// epilogue. Eight simdgroups of 32 rows x 32 columns (SGM x SGN) cover the
+// epilogue. The simdgroups cover the
 // TileM x TileN tile; each computes C^T fragments (A = weights, B = input^T)
 // and walks K 32 inputs at a time. K order within a block: B row fm at step j
 // is input 4 fm + j, so lane (fm, fn) reads one 8-byte run of each of its two
 // rows; A column fn at step j is input 4 fn + j, one 16-byte run of its
 // weight row for both columns fn and fn + 1.
-template <ushort TileM, ushort TileN, Activation Act, bool AddResidual, typename Output, bool Scaled = false>
+template <ushort TileM, ushort TileN, Activation Act, bool AddResidual, typename Output, bool Scaled = false,
+          uint Inputs = 0, uint Outputs = 0>
 inline void gemm(device const bfloat *input, device const bfloat *weights,
                  device const bfloat *bias, device Output *output,
                  constant DenseLinearParams &p, uint2 tg,
                  uint sg, uint lane, device const bfloat *scale = nullptr) {
-  const uint N = p.output_size, K = p.input_size;
-  constexpr uint FM = 4, FN = 4, SGN = TileN / (FN * 8);
-  static_assert((TileM / (FM * 8)) * SGN == 8, "eight simdgroups per tile");
+  const uint N = Outputs ? Outputs : p.output_size, K = Inputs ? Inputs : p.input_size;
+  constexpr uint FM = TileM < 32 ? TileM / 8 : 4;
+  constexpr uint FN = 4, SGN = TileN / (FN * 8);
+  static_assert(TileM % (FM * 8) == 0 && TileN % (FN * 8) == 0);
   const Lane l = lane_map(lane);
   const uint fm = l.fm, fn = l.fn;
   const uint row0 = tg.x * TileM + (sg / SGN) * FM * 8 + fn;
@@ -218,24 +220,24 @@ inline void attention(device const bfloat *queries, device const bfloat *keys,
 
 } // namespace vision_mma
 
-#define DENSE_MMA_GEMM(name, tile_m, tile_n, activation, add_residual, output_type) \
+#define DENSE_MMA_GEMM(name, tile_m, tile_n, activation, add_residual, output_type, inputs, outputs) \
   kernel void name(device bfloat *input [[buffer(0)]], device bfloat *weights [[buffer(1)]], \
                    device bfloat *bias [[buffer(2)]], device output_type *output [[buffer(3)]], \
                    constant DenseLinearParams &params [[buffer(4)]], \
                    uint2 tg [[threadgroup_position_in_grid]], \
                    uint sg [[simdgroup_index_in_threadgroup]], \
                    uint lane [[thread_index_in_simdgroup]]) { \
-    vision_mma::gemm<tile_m, tile_n, vision_mma::activation, add_residual, output_type>( \
+    vision_mma::gemm<tile_m, tile_n, vision_mma::activation, add_residual, output_type, false, inputs, outputs>( \
         input, weights, bias, output, params, tg, sg, lane); \
   }
 
-template <ushort Rows, ushort Columns>
+template <ushort Rows, ushort Columns, uint Inputs = 0, uint Outputs = 0>
 kernel void dense_mma_scaled_residual(device bfloat *input [[buffer(0)]], device bfloat *weights [[buffer(1)]],
                                       device bfloat *bias [[buffer(2)]], device float *output [[buffer(3)]],
                                       device bfloat *scale [[buffer(4)]], constant DenseLinearParams &params [[buffer(5)]],
                                       uint2 tg [[threadgroup_position_in_grid]], uint sg [[simdgroup_index_in_threadgroup]],
                                       uint lane [[thread_index_in_simdgroup]]) {
-  vision_mma::gemm<Rows, Columns, vision_mma::None, true, float, true>(input, weights, bias, output, params,
+  vision_mma::gemm<Rows, Columns, vision_mma::None, true, float, true, Inputs, Outputs>(input, weights, bias, output, params,
                                                                       tg, sg, lane, scale);
 }
 
@@ -244,14 +246,19 @@ using DenseScaledKernel = void(device bfloat *, device bfloat *, device bfloat *
 
 #define DENSE_MMA_TILE(name, rows, columns) \
   template [[host_name(#name "_scaled_residual")]] kernel DenseScaledKernel dense_mma_scaled_residual<rows, columns>; \
-  DENSE_MMA_GEMM(name, rows, columns, None, false, bfloat) \
-  DENSE_MMA_GEMM(name##_residual, rows, columns, None, true, float) \
-  DENSE_MMA_GEMM(name##_gelu_tanh, rows, columns, GeluTanh, false, bfloat) \
-  DENSE_MMA_GEMM(name##_gelu_erf, rows, columns, GeluErf, false, bfloat)
+  DENSE_MMA_GEMM(name, rows, columns, None, false, bfloat, 0, 0) \
+  DENSE_MMA_GEMM(name##_residual, rows, columns, None, true, float, 0, 0) \
+  DENSE_MMA_GEMM(name##_gelu_tanh, rows, columns, GeluTanh, false, bfloat, 0, 0) \
+  DENSE_MMA_GEMM(name##_gelu_erf, rows, columns, GeluErf, false, bfloat, 0, 0)
 
+DENSE_MMA_TILE(dense_linear_mma_m8n64, 8, 64)
+DENSE_MMA_TILE(dense_linear_mma_m16n64, 16, 64)
 DENSE_MMA_TILE(dense_linear_mma_m64n128, 64, 128)
 DENSE_MMA_TILE(dense_linear_mma_m32n256, 32, 256)
 #undef DENSE_MMA_TILE
+DENSE_MMA_GEMM(dense_linear_mma_inkling_ffn_up, 64, 128, GeluErf, false, bfloat, 1024, 4096)
+template [[host_name("dense_linear_mma_inkling_ffn_down")]] kernel DenseScaledKernel
+    dense_mma_scaled_residual<32, 256, 4096, 1024>;
 #undef DENSE_MMA_GEMM
 
 template <uint Dimensions>
