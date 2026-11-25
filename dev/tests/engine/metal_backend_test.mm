@@ -758,9 +758,11 @@ void functionConstantsSpecializePipelines(const std::string &metallibPath) {
     std::cout << "PASS function constants specialize pipelines\n";
 }
 
-// A pipeline sets exactly its function's function constants: Metal would
-// run one left unset as zero. One short of them, past them, or for a function
-// of none is refused with nothing cached or run.
+// A pipeline sets exactly its function's function constants, value i at index
+// i: Metal would run one left unset as zero. One short of them, past them, a
+// nonzero value at an index the function does not declare, or one for a
+// function of none is refused with nothing cached or run; zeros below a lone
+// constant at index 3 are padding.
 void pipelinesSetEveryFunctionConstant(const std::string &metallibPath) {
     MetalBackend backend(metallibPath);
     auto buffer = sharedBuffer(backend, sizeof(uint32_t));
@@ -785,10 +787,24 @@ void pipelinesSetEveryFunctionConstant(const std::string &metallibPath) {
     rejects([&] { backend.preparePipelines({&unspecialized, 1}); },
             "pipeline test_add_u32 sets 1 uint function constants of the function's 0",
             "a function of no constants took one");
+    const ComputeDispatch unpadded = dispatch("test_add_constant3_u32", {5});
+    rejects([&] { backend.preparePipelines({&unpadded, 1}); },
+            "pipeline test_add_constant3_u32 sets 1 uint function constants of the function's 4",
+            "a pipeline short of its function's index-3 constant was created");
+    const ComputeDispatch trailing = dispatch("test_add_constant3_u32", {0, 0, 0, 5, 0});
+    rejects([&] { backend.preparePipelines({&trailing, 1}); },
+            "pipeline test_add_constant3_u32 sets 5 uint function constants of the function's 4",
+            "a pipeline past its function's index-3 constant was created");
+    const ComputeDispatch padded = dispatch("test_add_constant3_u32", {0, 1, 0, 5});
+    rejects([&] { backend.preparePipelines({&padded, 1}); },
+            "pipeline test_add_constant3_u32 sets function constant 1, which the function does not declare, to 1",
+            "a nonzero value at an undeclared index was taken as padding");
     require(*value == 0 && backend.healthy() && BackendInstrumentation::cachedPipelines(backend) == 0,
             "a refused pipeline ran, poisoned the backend or was cached");
     (void)backend.submit(dispatch("test_add_constant_u32", {3}));
     require(*value == 3, "a pipeline setting its function's constants did not run");
+    (void)backend.submit(dispatch("test_add_constant3_u32", {0, 0, 0, 5}));
+    require(*value == 8, "a pipeline setting its function's index-3 constant over padding did not run");
     std::cout << "PASS pipelines set every function constant\n";
 }
 

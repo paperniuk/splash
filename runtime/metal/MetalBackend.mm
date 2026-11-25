@@ -340,12 +340,15 @@ id<MTLLibrary> loadLibrary(id<MTLDevice> device, const std::string &metallibPath
 // function declares it. It touches no backend state, and Metal's device and
 // library are thread-safe, so any thread may create one.
 //
-// The constants must set exactly the function's required ones, all uint, at
-// indices 0 up: Metal runs a function with a constant left unset, reading it
-// as zero, so a format-switch kernel short of one would decode the wrong
-// format without an error. Optional constants (is_function_constant_defined,
-// as kMoeStagedOnly) are not counted. The check reads the function's
-// declarations once per pipeline created, never per dispatch.
+// The constants are positional, value i at index i, and must reach exactly the
+// function's last required one, all uint: Metal runs a function with a
+// constant left unset, reading it as zero, so a format-switch kernel short of
+// one would decode the wrong format without an error. An index below the last
+// that the function does not declare is padding and must be zero (fused PQ2_0
+// int8 decode declares index 3 alone). Optional constants
+// (is_function_constant_defined, as kMoeStagedOnly) are not counted. The check
+// reads the function's declarations once per pipeline created, never per
+// dispatch.
 id<MTLComputePipelineState> createPipeline(id<MTLDevice> device, id<MTLLibrary> source,
                                            std::string_view name, std::span<const uint32_t> constants,
                                            [[maybe_unused]] bool stagedExpertTiles) {
@@ -353,16 +356,25 @@ id<MTLComputePipelineState> createPipeline(id<MTLDevice> device, id<MTLLibrary> 
     id<MTLFunction> function = [source newFunctionWithName:key];
     if (!function) throw MetalBackendError("missing Metal function: " + std::string(name));
     NSDictionary<NSString *, MTLFunctionConstant *> *declared = function.functionConstantsDictionary;
-    size_t required = 0;
-    bool covered = true;
+    size_t span = 0;
+    bool uints = true;
+    std::vector<bool> declares(constants.size());
     for (MTLFunctionConstant *constant in declared.allValues) {
         if (!constant.required) continue;
-        ++required;
-        covered = covered && constant.index < constants.size() && constant.type == MTLDataTypeUInt;
+        span = std::max<size_t>(span, size_t{constant.index} + 1);
+        uints = uints && constant.type == MTLDataTypeUInt;
+        if (constant.index < declares.size()) declares[constant.index] = true;
     }
-    if (!covered || required != constants.size()) {
+    if (!uints || span != constants.size()) {
         throw MetalBackendError("pipeline " + std::string(name) + " sets " + std::to_string(constants.size()) +
-                                " uint function constants of the function's " + std::to_string(required));
+                                " uint function constants of the function's " + std::to_string(span));
+    }
+    for (size_t index = 0; index < constants.size(); ++index) {
+        if (!declares[index] && constants[index] != 0) {
+            throw MetalBackendError("pipeline " + std::string(name) + " sets function constant " +
+                                    std::to_string(index) + ", which the function does not declare, to " +
+                                    std::to_string(constants[index]));
+        }
     }
     NSError *error = nil;
     if (!constants.empty()) {
