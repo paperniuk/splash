@@ -5,6 +5,8 @@
 
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace splash::ops {
 namespace {
@@ -19,6 +21,8 @@ struct DenseTile final {
 constexpr DenseTile kEight{64, 64, 8, "dense_linear_m64n64s8"};
 constexpr DenseTile kSquare{64, 64, 4, "dense_linear_m64n64s4"};
 constexpr DenseTile kWide{64, 128, 4, "dense_linear_m64n128s4"};
+constexpr DenseTile kMmaSmall{8, 64, 2, "dense_linear_mma_m8n64"};
+constexpr DenseTile kMmaMedium{16, 64, 2, "dense_linear_mma_m16n64"};
 constexpr DenseTile kMma{64, 128, 8, "dense_linear_mma_m64n128"};
 constexpr DenseTile kMmaWide{32, 256, 8, "dense_linear_mma_m32n256"};
 constexpr uint32_t kRowTile = 64;
@@ -32,8 +36,14 @@ constexpr uint32_t kRowTile = 64;
 // device class's thresholds are measured (KernelCalibration.hpp).
 const DenseTile &tileOf(const KernelCalibration &calibration, uint32_t rows, uint32_t outputs,
                         uint32_t inputs) noexcept {
-  if (calibration.simdgroupMma)
+  if (calibration.simdgroupMma) {
+    const auto groups = [&](const DenseTile &tile) {
+      return ((uint64_t{rows} + tile.rows - 1) / tile.rows) * (outputs / tile.columns);
+    };
+    if (groups(kMmaSmall) <= 24ull * calibration.cores) return kMmaSmall;
+    if (groups(kMmaMedium) <= 128ull * calibration.cores) return kMmaMedium;
     return inputs >= 4096 && outputs % kMmaWide.columns == 0 ? kMmaWide : kMma;
+  }
   const DenseTileCalibration &d = calibration.denseTile;
   // The grid's half 64 x 64 tiles, against a threshold's per core.
   const uint64_t halves = 2 * uint64_t{(rows + kRowTile - 1) / kRowTile} * (outputs / 64);
@@ -52,6 +62,8 @@ const char *epilogueSuffix(DenseEpilogue epilogue) noexcept {
     return "_gelu_erf";
   case DenseEpilogue::Residual:
     return "_residual";
+  case DenseEpilogue::ScaledResidual:
+    return "_scaled_residual";
   }
   return "";
 }
@@ -73,6 +85,7 @@ void DenseLinear::requireWeights(const DenseWeights &weights, uint32_t outputSiz
                                 " x " + std::to_string(kInputMultiple));
   requireBytes(weights.weight, uint64_t{outputSize} * inputSize * 2, name + " weight");
   requireBytes(weights.bias, uint64_t{outputSize} * 2, name + " bias");
+  if (weights.scale) requireBytes(weights.scale, uint64_t{outputSize} * 2, name + " scale");
 }
 
 void DenseLinear::add(metal::CommandGraph &graph, const DenseWeights &weights, uint32_t outputSize,
@@ -80,10 +93,18 @@ void DenseLinear::add(metal::CommandGraph &graph, const DenseWeights &weights, u
                       uint32_t rows, DenseEpilogue epilogue) const {
   // The weights and their sizes are requireWeights', which their owner checks once.
   requireBytes(input, uint64_t{paddedRows(rows)} * inputSize * 2, "dense input");
-  const uint64_t outputBytes = epilogue == DenseEpilogue::Residual ? 4 : 2;
+  const bool scaled = epilogue == DenseEpilogue::ScaledResidual;
+  const uint64_t outputBytes = scaled || epilogue == DenseEpilogue::Residual ? 4 : 2;
   requireBytes(output, uint64_t{rows} * outputSize * outputBytes, "dense output");
   const DenseTile &tile = tileOf(calibration_, rows, outputSize, inputSize);
-  graph.add(std::string(tile.name) + epilogueSuffix(epilogue), {input, weights.weight, weights.bias, output},
+  std::vector<metal::MetalBuffer> buffers{input, weights.weight, weights.bias, output};
+  if (scaled) buffers.push_back(weights.scale);
+  std::string pipeline = std::string(tile.name) + epilogueSuffix(epilogue);
+  if (&tile == &kMma && inputSize == 1024 && outputSize == 4096 && epilogue == DenseEpilogue::GeluErf)
+    pipeline = "dense_linear_mma_inkling_ffn_up";
+  else if (&tile == &kMmaWide && inputSize == 4096 && outputSize == 1024 && scaled)
+    pipeline = "dense_linear_mma_inkling_ffn_down";
+  graph.add(std::move(pipeline), std::move(buffers),
             DenseLinearParams{rows, outputSize, inputSize, 0},
             {(rows + tile.rows - 1) / tile.rows, outputSize / tile.columns, 1}, {tile.simdgroups * 32, 1, 1});
 }

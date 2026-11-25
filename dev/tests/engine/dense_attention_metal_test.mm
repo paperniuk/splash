@@ -1,13 +1,12 @@
 // ops::DenseAttention (kernels/shared/dense_attention.metal) against an fp64
-// reference, row by row, in the vision tower's layout: per-head planes of
-// heads of 72 (queries and keys padded to 80), every patch attending the
-// whole image, the output in per-head planes or, as the tower writes it, in
-// rows of every head. Token counts straddle the query and key tile sizes
-// and reach 4,100, ending in a tile of four keys. Each runs random queries,
-// keys and values; keys whose scores rise tile by tile, so every
-// row rescales its running output at every tile;
-// and scores and values over a wide dynamic range, whose probabilities
-// underflow. Each tensor is bound at the extent the operator requires and
+// reference, row by row, in the vision towers' layout: per-head planes of
+// Qwen3.5's heads of 72 (queries and keys padded to 80) or Inkling 2's of 64
+// (unpadded), every patch attending the whole image, the output in per-head
+// planes or, as the towers write it, in rows of every head. Token counts
+// range across the query and key tile sizes up to 4,100, with four live keys
+// in the last tile. Cases use random queries, keys and values, rising key
+// scores that require rescales, and a wide dynamic range that underflows
+// probabilities. Each tensor is bound at the extent the operator requires and
 // followed by bf16 NaNs: shader validation does not see MPP
 // loads and stores past a binding, but a NaN read reaches its row and a
 // write past the output changes its tail. Keys and values past the rows hold
@@ -370,7 +369,8 @@ int main(int argc, char **argv) {
       MetalBackend backend(argv[1]);
       requireExtents(backend);
       const Case cases[] = {
-          {"output planes", 72, false}, {"output rows", 72, true}, {"padded input rows", 72, true, 8}};
+          {"output planes", 72, false}, {"output rows", 72, true},
+          {"padded input rows", 72, true, 8}, {"heads of 64", 64, true}};
       for (const Case &c : cases)
         for (const uint32_t rows : {4U, 24U, 36U, 124U, 128U, 132U, 144U, 260U, 4100U})
           for (const Kind kind : {Kind::Random, Kind::Rising, Kind::Wide})

@@ -725,7 +725,7 @@ struct Stats {
 // (ops::CompiledMoeRouting).
 std::string_view withoutSlices(std::string_view name) {
   for (const std::string_view suffix :
-       {kShape.compiledRouting()->activationSuffix, kShape.compiledRouting()->slicesSuffix})
+       {std::string_view{"_routed8"}, kShape.compiledRouting()->activationSuffix, kShape.compiledRouting()->slicesSuffix})
     if (name.ends_with(suffix)) name = name.substr(0, name.size() - suffix.size());
   return name;
 }

@@ -486,7 +486,10 @@ MoeConfig selectMoe(const KernelCalibration &calibration, Int8Activations int8Ac
   config.ggufRouterTile = selectFloatTile(calibration, rows, shape.experts, routerFormat);
   config.int8Passes = shape.int8Experts && int8PrefillPaths(calibration, int8Activations, step) &&
                       rows > kMaximumDecodeTileRows && routes >= uint64_t{kInt8PassRoutesPerExpert} * shape.experts;
-  config.expertTile = routes <= shape.experts ? MoeExpertTile::M8
+  const uint64_t smallTileRoutes = step == StepKind::Prefill && shape.gateSoftcap
+                                       ? calibration.moe.softcapPrefillSmallTileRoutes
+                                       : 1;
+  config.expertTile = routes <= smallTileRoutes * shape.experts ? MoeExpertTile::M8
                       : step == StepKind::Prefill && !config.int8Passes &&
                               routes >= uint64_t{calibration.moe.wideTileRoutes} * shape.experts
                           ? MoeExpertTile::M64
