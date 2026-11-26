@@ -102,11 +102,15 @@ AttentionWorkspace RelativeAttention::workspace(uint32_t slots, kv::Layout layou
 RelativeAttentionPlan RelativeAttention::plan(std::span<const kv::ChunkedPrefillParams> sequences,
                                               kv::Layout layout, const AttentionCalibration &calibration,
                                               Int8Activations int8Activations, AttentionWorkspace capacity,
-                                              RelativeAttentionVariant variant, StepKind step) {
+                                              RelativeAttentionVariant variant, StepKind step,
+                                              uint32_t skipRows) {
   requireLayout(layout);
   requireVariant(variant);
   static_cast<void>(commandRows(sequences, layout));
   const bool decode = step == StepKind::Decode;
+  if (skipRows && (decode || sequences.size() != 1 || skipRows % SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS ||
+                   skipRows >= sequences.front().chunk_tokens))
+    throw std::invalid_argument("skipped rows are whole direct tiles of one prompt sequence's chunk, not all of it");
   // The single pass is compiled for the layers' two variants alone: a full
   // layer's, over the whole history and position-scaled, and a sliding
   // layer's, windowed and unscaled.
@@ -134,7 +138,8 @@ RelativeAttentionPlan RelativeAttention::plan(std::span<const kv::ChunkedPrefill
     const uint32_t splits = decode ? decodeSplits(pages, chunk.chunk_tokens, calibration.cores)
                                    : attentionSplits(tiles, pages, variant.windowTokens, calibration.pagesPerSplit);
     splitReads = std::max(splitReads, (pages + splits - 1) / splits);
-    plan.sequences_[plan.sequenceCount_++] = {chunk.chunk_tokens, chunk.committed_tokens, 0, splits};
+    plan.sequences_[plan.sequenceCount_++] = {chunk.chunk_tokens, chunk.committed_tokens,
+                                              skipRows / kv::kAttentionTileRows, splits};
   }
   const std::string window = variant.windowTokens ? "_w" + std::to_string(variant.windowTokens) : "";
   const bool int8Queries = int8Activations == Int8Activations::On && layout.format == kv::Format::Int8 &&

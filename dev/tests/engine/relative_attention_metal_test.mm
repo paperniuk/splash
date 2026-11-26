@@ -7,10 +7,12 @@
 #include "metal/MetalBackend.hpp"
 #include "metal/abi/KvExtent.h"
 #include "metal/abi/RelativeAttention.h"
+#include "ops/CpuRelativeAttention.hpp"
 #include "ops/KernelCalibration.hpp"
 #include "ops/LaneRows.hpp"
 #include "ops/PagedAttention.hpp"
 #include "ops/RelativeAttention.hpp"
+#include "ops/RowCopy.hpp"
 
 #include <algorithm>
 #include <array>
@@ -688,7 +690,8 @@ std::vector<uint32_t> checkedRows(uint32_t position, uint32_t rows) {
 // the bf16 rounding of the probabilities (2^-9 of the mass, twice over) and of
 // the attention row, both times the gate, and of the gated row. Returns the
 // largest error in units of that bound.
-double checkOutput(const Case &data, const Step &step, const std::string &what) {
+double checkOutput(const Case &data, const Step &step, const std::string &what, uint32_t fromRow = 0,
+                   uint32_t endRow = UINT32_MAX) {
   double largest = 0;
   for (uint32_t lane = 0; lane < data.lanes; ++lane) {
     // Every key a checked row attends: from the first row's window (a tree's
@@ -696,7 +699,7 @@ double checkOutput(const Case &data, const Step &step, const std::string &what) 
     const uint32_t position = data.histories[lane] + step.first;
     const StoredKv kv = stored(data, lane, windowStart(data.variant, position), position + step.laneRows[lane]);
     for (const uint32_t row : checkedRows(position, step.laneRows[lane]))
-      for (uint32_t head = 0; head < kQueryHeads; ++head) {
+      for (uint32_t head = 0; head < kQueryHeads && row >= fromRow && row < endRow; ++head) {
         const Reference expected = reference(data, step, kv, lane, row, head);
         for (uint32_t d = 0; d < kHeadDimension; ++d) {
           const double gate = 1 / (1 + std::exp(-double(projection(lane, step.first + row,
@@ -849,6 +852,82 @@ void checkPrefill(metal::MetalBackend &backend, kv::Format format, bool int8Quer
   std::cout << what << (split.size() > 1 ? " and in chunks" : "") << ": " << data.poisoned
             << " table entries of NaNs below the window, largest error " << largest << " of its bound, " << direct
             << " of " << chunks << " chunks direct, the split and reduce's bits PASS\n";
+}
+
+// A full layer's prompt chunk whose first `cpuRows` rows the CPU computes
+// (ops::CpuRelativeAttention) in a host step beside the GPU's attention of
+// the rest, as the runtime encodes it: the GPU's rows are the bits of the
+// chunk run on the GPU alone, whatever the plan's splits, and the CPU's rows
+// are within the reference's bound as the GPU's are.
+void checkCpuRows(metal::MetalBackend &backend, uint32_t history, uint32_t rows, uint32_t cpuRows) {
+  if (!ops::CpuRelativeAttention::available()) {
+    std::cout << "cpu rows: SKIP (no AMX on this CPU)\n";
+    return;
+  }
+  const Case data = makeCase(backend, kv::Format::Int8, false, kFull, 1, rows, {history, 0, 0, 0});
+  const std::string what = describe(data, "prefill") + " rows " + std::to_string(rows) + " of which the CPU's " +
+                           std::to_string(cpuRows);
+  const Step step = makeStep(backend, data, 0, rows, (rows + kPageTokens - 1) / kPageTokens * kPageTokens);
+  const ops::RelativeAttentionPlan whole = planOf(data, step);
+  run(backend, data, step, whole);
+  constexpr uint32_t width = kQueryHeads * kHeadDimension;
+  const auto *begin = contents<std::byte>(step.output);
+  const std::vector<std::byte> gpuOnly(begin, begin + step.output.sizeBytes());
+  const double gpuRatio = checkOutput(data, step, what + " on the GPU alone", cpuRows);
+
+  const std::vector<kv::ChunkedPrefillParams> sequences = sequencesOf(data, step);
+  const ops::RelativeAttentionPlan skipped = RelativeAttention::plan(
+      sequences, data.layout, data.attention(), ops::Int8Activations::On,
+      RelativeAttention::workspace(data.lanes * ops::kAttentionSequenceSplits, data.layout), data.variant,
+      ops::StepKind::Prefill, cpuRows);
+  require(skipped.sequences()[0].splits == whole.sequences()[0].splits &&
+              skipped.sequences()[0].firstTile == cpuRows / kv::kAttentionTileRows,
+          what + ": the GPU's tiles start elsewhere or take other splits");
+  Step cpuStep = step;
+  cpuStep.output = poisoned(backend, step.output.sizeBytes());
+  const metal::MetalBuffer cpuBuffer = poisoned(backend, uint64_t{cpuRows} * width * 2);
+  const metal::MetalBuffer partials = poisoned(backend, skipped.workspace().partialsBytes);
+  const metal::MetalBuffer statistics = poisoned(backend, skipped.workspace().statisticsBytes);
+  metal::CommandGraph graph;
+  const ops::AttentionRows attentionRows{step.layout, step.rows, step.tree};
+  RelativeAttention::addProjection(graph, step.inputs, data.weights, step.staging, data.layer,
+                                   std::span(data.tables).first(1), sequences, attentionRows, data.layout, data.variant);
+  ops::CpuRelativeAttention::Rows input;
+  input.queries = contents<uint16_t>(step.staging.queries);
+  input.states = contents<float>(step.staging.states);
+  input.sinks = contents<float>(step.staging.sinks);
+  input.stride = step.stride;
+  input.projection = contents<uint16_t>(step.inputs.projection);
+  input.projectionStride = kStride;
+  input.gateColumn = kGateOffset;
+  input.bias = contents<float>(data.weights.bias);
+  input.pageTable = contents<SplashKvPage>(data.tables[0]);
+  input.pageTableEntries = uint32_t(data.pages[0].size());
+  input.layer = data.layer;
+  const std::vector<kv::HostExtent> extents = data.pool.hostExtents();
+  input.extents = extents;
+  input.dataBytes = data.layout.dataBytesPerLayerPage();
+  input.scaleBytes = data.layout.scaleBytesPerLayerPage();
+  input.committed = data.histories[0];
+  input.rows = cpuRows;
+  input.hidden = contents<uint16_t>(cpuBuffer);
+  const std::vector<ops::AttentionHistory> histories{{data.layer, data.tables[0]}};
+  graph.host([&] { ops::CpuRelativeAttention::run(input, 8); }, {}, metal::HostStepGpu::Idle, {},
+             [&] {
+               RelativeAttention::addAttention(graph, skipped, step.staging, data.weights, partials, statistics,
+                                               sequences, histories, attentionRows,
+                                               {step.inputs.projection, cpuStep.output, ops::AttentionOutput::Every,
+                                                {}, ops::LinearInput::Plain});
+             },
+             {cpuBuffer});
+  ops::RowCopy::add(graph, cpuBuffer, {0, width, 0}, cpuStep.output, {0, width, 0}, cpuRows, width);
+  static_cast<void>(backend.submitCommandAsync(graph.command()).wait());
+  const size_t from = size_t{cpuRows} * width * 2;
+  require(std::memcmp(contents<std::byte>(cpuStep.output) + from, gpuOnly.data() + from, gpuOnly.size() - from) == 0,
+          what + ": the GPU's rows are not the bits of the chunk run on the GPU alone");
+  const double cpuRatio = checkOutput(data, cpuStep, what + " on the CPU", 0, cpuRows);
+  std::cout << what << ": the GPU's rows keep their bits, the CPU's largest error " << cpuRatio
+            << " of its bound against the GPU's " << gpuRatio << " PASS\n";
 }
 
 // A verify step of chains of a lane's eight rows each, one to a batch of
@@ -1358,6 +1437,14 @@ int main(int argc, char **argv) {
     metal::MetalBackend backend(argv[1]);
     checkPlans();
     checkFloatTable(backend);
+    // The CPU's first rows of a full layer's chunk, on the register tile of the
+    // Apple7/8 GPUs: a chunk of one split (the direct kernel) and chunks of
+    // two or more (the split and the reduce), at a history past the extent.
+    gRegisterTile = true;
+    checkCpuRows(backend, 9000, 2048, 640);
+    checkCpuRows(backend, 9000, 2048, 16);
+    checkCpuRows(backend, 20000, 700, 224);
+    checkCpuRows(backend, 20000, 520, 144);
     for (const auto &[format, int8Queries, registerTile] :
          {std::tuple{kv::Format::Int8, false, false}, std::tuple{kv::Format::Int8, false, true},
           std::tuple{kv::Format::Int8, true, false}, std::tuple{kv::Format::BFloat16, false, false}}) {

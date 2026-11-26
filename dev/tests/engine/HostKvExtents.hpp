@@ -116,6 +116,12 @@ public:
     return result;
   }
 
+  // The extents as a host reader of the pages resolves their entries by.
+  [[nodiscard]] std::vector<kv::HostExtent> hostExtents() const {
+    std::vector<kv::HostExtent> result;
+    for (const Extent &extent : extents_) result.push_back({extent.gpuAddress, extent.contents});
+    return result;
+  }
   [[nodiscard]] uint32_t extentPages() const noexcept { return extentPages_; }
   [[nodiscard]] uint32_t extentCount() const noexcept {
     return static_cast<uint32_t>(extents_.size());

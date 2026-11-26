@@ -89,6 +89,11 @@ public:
   // Zeroes everything each page holds (spans()). std::out_of_range for a
   // page past the pool.
   void clearPages(std::span<const uint32_t> pages) override;
+  // The allocated extents' host addresses, which a CPU reader of the pages
+  // resolves their entries by (writeEntries). Extents are released only
+  // between commands, so a snapshot taken as a command is encoded holds
+  // until it completes.
+  [[nodiscard]] std::vector<HostExtent> hostExtents() const;
   // Where each attention layer's K/V region sits in every extent that holds
   // it, by layer.
   [[nodiscard]] std::span<const SplashKvLayer> layers() const noexcept {

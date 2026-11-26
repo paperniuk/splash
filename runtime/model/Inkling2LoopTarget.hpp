@@ -26,6 +26,8 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <optional>
 #include <span>
 #include <vector>
@@ -80,6 +82,12 @@ private:
     Inkling2LoopScratch scratch{};
     std::optional<ops::RelativeAttentionPlan> fullAttention{};
     std::optional<ops::RelativeAttentionPlan> slidingAttention{};
+    // Where the CPU takes the first cpuRows rows of a full layer's attention
+    // (ops::CpuRelativeAttention), the plan of the GPU's rows after them
+    // (none when the CPU takes none), and the pages' host addresses it reads.
+    uint32_t cpuRows = 0;
+    std::optional<ops::RelativeAttentionPlan> cpuAttention{};
+    std::shared_ptr<const std::vector<kv::HostExtent>> hostExtents{};
     ops::LayoutRows layoutRows{};
   };
 
@@ -117,6 +125,11 @@ private:
   // The application's attention of its normalized inputs into
   // buffers.attentionOutput, its output projection's rows.
   void addAttention(PrefillStep &step, uint32_t application, const std::array<metal::MetalBuffer, 3> &inputs) const;
+  [[nodiscard]] bool cpuTakesRows(const PrefillStep &step, uint32_t kvLayer, const ops::AttentionHistory &history,
+                                  const metal::MetalBuffer &bias, ops::LinearInput input) const;
+  [[nodiscard]] ops::PreparedInput addCpuAttention(
+      PrefillStep &step, uint32_t application, uint32_t kvLayer, const metal::MetalBuffer &bias,
+      const std::function<ops::PreparedInput(const ops::RelativeAttentionPlan &)> &attend) const;
   // One of an application's message gates: `message` (0 to 3: q, k, v, FFN)
   // of its fp32 mix rows, query `column`'s, by its message, into `output`
   // through `norm`.

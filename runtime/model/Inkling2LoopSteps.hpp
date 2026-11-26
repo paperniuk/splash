@@ -56,6 +56,9 @@ struct Inkling2LoopScratch final {
   metal::MetalBuffer convolvedValues;
   metal::MetalBuffer relativeStates;
   metal::MetalBuffer rowSinks;
+  // The CPU's rows of a full layer's attention (ops::CpuRelativeAttention),
+  // bf16 [row][queryHeads x headDimension]; only where the CPU takes a share.
+  metal::MetalBuffer cpuAttention;
   metal::MetalBuffer gateConcat;
   metal::MetalBuffer gateLow;
   metal::MetalBuffer gateForget;
