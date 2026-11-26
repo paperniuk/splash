@@ -1265,7 +1265,8 @@ int main(int argc, const char *argv[]) {
               mixTest(backend, stack, queries, currentFloat, rows);
         for (const uint32_t rows : {5u, BLOCK_RESIDUAL_MIX_QUERY_ROWS + 3}) mixTest(backend, 0, 1, currentFloat, rows);
       }
-      for (const uint32_t rows : {6u, 13u, ops::MessageGate::kFusedRows, ops::MessageGate::kFusedRows + 1}) {
+      // 1 and 3 rows: the narrow gates (MESSAGE_GATE_NARROW_ROWS); 6 and 13 the decode step's fused ones.
+      for (const uint32_t rows : {1u, 3u, 6u, 13u, ops::MessageGate::kFusedRows, ops::MessageGate::kFusedRows + 1}) {
         gateTest(backend, rows, 1, true);
         gateTest(backend, rows, 3, false);
       }

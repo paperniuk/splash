@@ -306,6 +306,157 @@ kernel void message_gate_apply(device const float *x [[buffer(0)]], device const
   split_release(counter, tid);
 }
 
+// ---- The narrow gates (metal/abi/MessageGate.h): a decode step of at most MESSAGE_GATE_NARROW_ROWS rows ----
+//
+// Three kernels: message_gate_narrow_down normalizes its group's rows and writes MESSAGE_GATE_NARROW_OUTPUTS of their
+// rank values a threadgroup; message_gate_narrow_up takes MESSAGE_GATE_NARROW_UP_THREADS of a row's values a
+// threadgroup, a thread each, forget, gain and the gated value into the gated rows; message_gate_norm writes each
+// gated row through the gate's norm, a threadgroup a row. A thread holds MESSAGE_GATE_ROW_SLOTS of a row's values
+// in registers, every load issued before any is summed (a loop of loads bounded at run time waits for each in turn).
+constant constexpr uint kRowSlots = MESSAGE_GATE_ROW_SLOTS;
+constant constexpr uint kNarrowOutputs = MESSAGE_GATE_NARROW_OUTPUTS;
+constant constexpr uint kNarrowUpThreads = MESSAGE_GATE_NARROW_UP_THREADS;
+
+// A row's squares over its `hidden` values, a thread's values tid + MESSAGE_GATE_THREADS i.
+inline float message_gate_squares(device const float *row, uint hidden, uint tid) {
+  float v[kRowSlots], squares = 0.0f;
+#pragma unroll
+  for (uint i = 0; i < kRowSlots; ++i) v[i] = row[min(tid + i * kGateThreads, hidden - 1)];
+#pragma unroll
+  for (uint i = 0; i < kRowSlots; ++i)
+    if (tid + i * kGateThreads < hidden) squares += v[i] * v[i];
+  for (uint d = tid + kRowSlots * kGateThreads; d < hidden; d += kGateThreads) squares += row[d] * row[d];
+  return squares;
+}
+
+// Rank values k0 .. k0 + kNarrowOutputs - 1 of a group of rows of each gate: each row's and message's inverse RMS,
+// then the dot of each output's weights' row (`down`, [rank][2 hidden]) with the row's normalized concatenation,
+// [x, message] each times its inverse RMS and rounded to bf16 as message_gate_test_prepare rounds it, four inputs a
+// step; rounded to bf16 into `low` [gates][rows][rank]. Grid: (rank / kNarrowOutputs, groups, gates).
+template <typename Weight>
+kernel void message_gate_narrow_down(device const float *x [[buffer(0)]], device const float *message [[buffer(1)]],
+                                     device const Weight *down0 [[buffer(2)]], device const Weight *down1 [[buffer(3)]],
+                                     device const Weight *down2 [[buffer(4)]], device bfloat *low [[buffer(5)]],
+                                     constant MessageGateFusedParams &p [[buffer(6)]],
+                                     uint3 group [[threadgroup_position_in_grid]],
+                                     uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                                     uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float partials[kGateSimdgroups][kGroupRows][kNarrowOutputs];
+  threadgroup float inverse[kGroupRows][2];
+  const uint first = group.y * kGroupRows, g = group.z, k0 = group.x * kNarrowOutputs;
+  if (first >= p.rows || g >= p.gates) return;
+  const uint count = min(kGroupRows, p.rows - first);
+  static_assert(kNarrowOutputs >= 2, "a row's two squares take a partial's first two slots");
+  for (uint r = 0; r < count; ++r)
+    for (uint own = 0; own < 2; ++own) {
+      const float squares =
+          simd_sum(message_gate_squares(message_gate_row(x, message, p, g, first, count, r, own == 0), p.hidden, tid));
+      if (lane == 0) partials[sg][r][own] = squares;
+    }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid < 2 * count) {
+    float total = 0.0f;
+    for (uint s = 0; s < kGateSimdgroups; ++s) total += partials[s][tid / 2][tid % 2];
+    inverse[tid / 2][tid % 2] = rsqrt(total / p.hidden + kRmsEpsilon);
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  device const Weight *down = message_gate_pick(g, down0, down1, down2);
+  float acc[kGroupRows][kNarrowOutputs];
+  for (uint r = 0; r < kGroupRows; ++r)
+    for (uint o = 0; o < kNarrowOutputs; ++o) acc[r][o] = 0.0f;
+  for (uint quad = tid; quad < p.hidden / 2; quad += kGateThreads) {
+    const bool own = quad < p.hidden / 4;
+    float4 w[kNarrowOutputs];
+    for (uint o = 0; o < kNarrowOutputs; ++o)
+      w[o] = k0 + o < p.rank ? message_gate_quad(down + ulong(k0 + o) * 2 * p.hidden, quad) : float4(0.0f);
+    for (uint r = 0; r < count; ++r) {
+      device const float4 *values =
+          reinterpret_cast<device const float4 *>(message_gate_row(x, message, p, g, first, count, r, own));
+      const float4 normalized = float4(bfloat4(values[own ? quad : quad - p.hidden / 4] * inverse[r][own ? 0 : 1]));
+      for (uint o = 0; o < kNarrowOutputs; ++o) acc[r][o] += dot(w[o], normalized);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint r = 0; r < count; ++r)
+    for (uint o = 0; o < kNarrowOutputs; ++o) {
+      const float sum = simd_sum(acc[r][o]);
+      if (lane == 0) partials[sg][r][o] = sum;
+    }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid < count * kNarrowOutputs) {
+    const uint r = tid / kNarrowOutputs, o = tid % kNarrowOutputs;
+    float total = 0.0f;
+    for (uint s = 0; s < kGateSimdgroups; ++s) total += partials[s][r][o];
+    if (k0 + o < p.rank) low[(ulong(g) * p.rows + first + r) * p.rank + k0 + o] = bfloat(total);
+  }
+}
+
+// The gated values of a group of rows of each gate, kNarrowUpThreads values a threadgroup, a thread each: forget and
+// gain from the group's rank values (`low`) and the value's weights' rows ([hidden][rank]) read once for the group's
+// rows, a quad a step, and the gated value (1 - tanh(forget)) x + tanh(gain) message in fp32 into `values`
+// [gates][rows][hidden]. Grid: (hidden / kNarrowUpThreads, groups, gates).
+template <typename Weight>
+kernel void message_gate_narrow_up(device const float *x [[buffer(0)]], device const float *message [[buffer(1)]],
+                                   device const Weight *forget0 [[buffer(2)]], device const Weight *forget1 [[buffer(3)]],
+                                   device const Weight *forget2 [[buffer(4)]], device const Weight *gain0 [[buffer(5)]],
+                                   device const Weight *gain1 [[buffer(6)]], device const Weight *gain2 [[buffer(7)]],
+                                   device const bfloat *low [[buffer(8)]], device float *values [[buffer(9)]],
+                                   constant MessageGateFusedParams &p [[buffer(10)]],
+                                   uint3 group [[threadgroup_position_in_grid]],
+                                   uint tid [[thread_index_in_threadgroup]]) {
+  threadgroup float4 h[kGroupRows][MESSAGE_GATE_MAXIMUM_RANK / 4];
+  const uint first = group.y * kGroupRows, g = group.z;
+  if (first >= p.rows || g >= p.gates) return;
+  const uint count = min(kGroupRows, p.rows - first), quarters = p.rank / 4;
+  device const bfloat *gateLow = low + (ulong(g) * p.rows + first) * p.rank;
+  threadgroup float *hs = reinterpret_cast<threadgroup float *>(h);
+  for (uint i = tid; i < count * p.rank; i += kNarrowUpThreads)
+    hs[(i / p.rank) * MESSAGE_GATE_MAXIMUM_RANK + i % p.rank] = float(gateLow[i]);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const uint d = group.x * kNarrowUpThreads + tid;
+  if (d >= p.hidden) return;
+  device const Weight *f4 = message_gate_pick(g, forget0, forget1, forget2) + ulong(d) * p.rank;
+  device const Weight *e4 = message_gate_pick(g, gain0, gain1, gain2) + ulong(d) * p.rank;
+  float f[kGroupRows], e[kGroupRows];
+  for (uint r = 0; r < kGroupRows; ++r) f[r] = e[r] = 0.0f;
+  for (uint j = 0; j < quarters; ++j) {
+    const float4 a = message_gate_quad(f4, j), b = message_gate_quad(e4, j);
+    for (uint r = 0; r < count; ++r) {
+      f[r] += dot(a, h[r][j]);
+      e[r] += dot(b, h[r][j]);
+    }
+  }
+  for (uint r = 0; r < count; ++r) {
+    const float xv = x[ulong(first + r) * p.x_stride + p.x_columns[g] + d];
+    const float mv = message[ulong(first + r) * p.message_stride + p.message_columns[g] + d];
+    values[(ulong(g) * p.rows + first + r) * p.hidden + d] =
+        (1.0f - precise::tanh(f[r])) * xv + precise::tanh(e[r]) * mv;
+  }
+}
+
+// Each gated row through the gate's weighted RMS norm into bf16, as message_gate_test_norm writes each value: a
+// threadgroup a row, a thread's values tid + MESSAGE_GATE_THREADS i. Grid: (rows, 1, gates).
+kernel void message_gate_norm(device const float *values [[buffer(0)]], device const float *norm0 [[buffer(1)]],
+                              device const float *norm1 [[buffer(2)]], device const float *norm2 [[buffer(3)]],
+                              device bfloat *output0 [[buffer(4)]], device bfloat *output1 [[buffer(5)]],
+                              device bfloat *output2 [[buffer(6)]], constant MessageGateFusedParams &p [[buffer(7)]],
+                              uint3 group [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+                              uint lane [[thread_index_in_simdgroup]], uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float partials[kGateSimdgroups];
+  const uint row = group.x, g = group.z;
+  if (row >= p.rows || g >= p.gates) return;
+  device const float *v = values + (ulong(g) * p.rows + row) * p.hidden;
+  const float squares = simd_sum(message_gate_squares(v, p.hidden, tid));
+  if (lane == 0) partials[sg] = squares;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float total = 0.0f;
+  for (uint s = 0; s < kGateSimdgroups; ++s) total += partials[s];
+  const float inverse = rsqrt(total / p.hidden + kRmsEpsilon);
+  device const float *norm = message_gate_pick(g, norm0, norm1, norm2);
+  device bfloat *out = message_gate_pick(g, output0, output1, output2) + ulong(row) * p.hidden;
+  for (uint d = tid; d < p.hidden; d += kGateThreads) out[d] = bfloat((v[d] * inverse) * norm[d]);
+}
+
 // ---- The fused gates of a prompt chunk's rows (metal/abi/MessageGate.h) ----
 //
 // message_gate_rows runs a gate of MESSAGE_GATE_TILE_ROWS rows a threadgroup
@@ -650,6 +801,13 @@ kernel void message_gate_rows(device const float *x [[buffer(0)]], device const 
       device const bfloat *, device const float *, device const float *, device const float *,                    \
       device coherent(device) float *, device coherent(device) float *, device atomic_uint *, device bfloat *,    \
       device bfloat *, device bfloat *, constant MessageGateFusedParams &, uint3, uint, uint, uint);              \
+  template [[host_name("message_gate_narrow_down" suffix)]] kernel void message_gate_narrow_down<Weight>(         \
+      device const float *, device const float *, device const Weight *, device const Weight *,                   \
+      device const Weight *, device bfloat *, constant MessageGateFusedParams &, uint3, uint, uint, uint);         \
+  template [[host_name("message_gate_narrow_up" suffix)]] kernel void message_gate_narrow_up<Weight>(             \
+      device const float *, device const float *, device const Weight *, device const Weight *,                   \
+      device const Weight *, device const Weight *, device const Weight *, device const Weight *,                 \
+      device const bfloat *, device float *, constant MessageGateFusedParams &, uint3, uint);                     \
   template [[host_name("message_gate_rows" suffix)]] kernel void message_gate_rows<Weight>(                       \
       device const float *, device const float *, device const Weight *, device const Weight *,                   \
       device const Weight *, device const Weight *, device const Weight *, device const Weight *,                 \
