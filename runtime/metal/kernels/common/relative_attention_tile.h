@@ -522,6 +522,12 @@ inline void relative_attention_page_loop(
 // loop's does. On an M1 Max, a one-row Inkling-2-Mini decode step after 8,192 tokens spent 10.8 ms in attention on
 // the matmul2d tile and 6.7 ms here.
 constant constexpr uint kRelativeBiasSpan = 48;
+// The tree keys (a decode step's own rows) whose bias a fused row's table holds before the page loop.
+constant constexpr uint kRelativeTreeKeys = 16;
+// The register loop's page step (relative_attention_register_loop): lean or general.
+template <bool Value> struct RelativeLeanPages {
+  static constant constexpr bool value = Value;
+};
 
 // A simdgroup's output rows of the register tile, as the page loop's cooperative tensor: element i is dimension
 // 8 (i / 2) + fm of fused row sg * 8 + fn + i % 2.
@@ -599,7 +605,39 @@ inline void relative_attention_register_loop(
         splash_attention_whole_pages<Window>(committed_tokens, active_rows, in_tree, tree.anchor);
     const uint scale_base = q8sgf::page_token(fm, 0);
     const SplashKvAddressing<KVHeads, D, CacheElement> addressing(kv, kv_head);
-    for (uint page = run.begin; page < run.end; ++page) {
+    // Where the rows fit the span, a page takes the lean step: its history keys' bias from the stage at an index
+    // computed once (lean_index), its tree keys' (the step's own rows) from the rows' table below, computed once a
+    // step, and no branch a key. Its tree keys summed key by key in the loop, with the bounds-checked stage loads,
+    // held 50 spilled values a page that the loop reloaded and waited on: a one-row Inkling-2-Mini decode step's
+    // attention took 0.5 ms more of 34.9 on an M1 Max.
+    // The table: each of the simdgroup's fused rows' bias at each tree key, zero past the extent: its distance is
+    // its depth less the ancestors before the key, as the general step computes it.
+    threadgroup float *tree_rows = stage + M * (kRelativeBiasSpan + 64) + sg * 8 * kRelativeTreeKeys;
+    if (in_tree && spanned) {
+#pragma unroll
+      for (uint i = 0; i < 8 * kRelativeTreeKeys / 32; ++i) {
+        const uint index = i * 32 + lane, f = index / kRelativeTreeKeys, key = index % kRelativeTreeKeys;
+        const uint fused = sg * 8 + f, query = min(fused / G, active_rows - 1);
+        const SplashTreeRow tree_row = tree.rows[query];
+        const uint distance = tree_row.depth - popcount(tree_row.ancestors & ((1u << min(key, 31u)) - 1u));
+        float bias = 0.0f;
+        if (distance < Extent) {
+          device const float4 *state =
+              reinterpret_cast<device const float4 *>(states + (query * G + fused % G) * States);
+          device const float4 *column = reinterpret_cast<device const float4 *>(table) + ulong(distance) * 4;
+          bias = dot(state[0], column[0]) + dot(state[1], column[1]) + dot(state[2], column[2]) +
+                 dot(state[3], column[3]);
+        }
+        tree_rows[f * kRelativeTreeKeys + key] = bias;
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // A history key's index in the stage, distance - first_distance: its row's position less the lowest row's plus
+    // its slot's from the page's last key, the same every page; and the position past which a key is within reach.
+    const uint2 lean_index((fn + uint2(0, 1)) * kRelativeBiasSpan + position - low + (N - 1));
+    const int2 lean_far = int2(position) - int(Extent);
+    const auto page_step = [&](uint page, auto lean) {
+      constexpr bool Lean = decltype(lean)::value;
       const SplashKvPageTensors<CacheElement> tensors = addressing.page(page_table[page]);
       float key_scale[4] = {1.0f, 1.0f, 1.0f, 1.0f}, value_scale[4] = {1.0f, 1.0f, 1.0f, 1.0f};
       if constexpr (Quantized) {
@@ -626,20 +664,46 @@ inline void relative_attention_register_loop(
       const bool biased = page >= biased_page, masked = !(page >= whole.begin && page < whole.end);
       // The span's first distance: the lowest row's from the page's last key.
       const int first_distance = int(low) - int(token_start + N - 1);
-      if (biased && spanned) {
+      if (Lean ? biased : biased && spanned) {
         simdgroup_barrier(mem_flags::mem_threadgroup);
+        if constexpr (Lean) {
+          // Every table load first, at clamped distances, then the products with each outside distance's term
+          // zeroed: a branch a load waited for each in turn.
+          float2 operand[kRelativeBiasSpan / 8][2];
 #pragma unroll
-        for (uint tile = 0; tile < kRelativeBiasSpan / 8; ++tile) {
-          const int d = first_distance + int(tile * 8 + fn);
-          float2 c(0.0f);
+          for (uint tile = 0; tile < kRelativeBiasSpan / 8; ++tile) {
+            const int d = first_distance + int(tile * 8 + fn);
+            const uint d0 = uint(clamp(d, 0, int(Extent) - 1)), d1 = uint(clamp(d + 1, 0, int(Extent) - 1));
 #pragma unroll
-          for (uint step = 0; step < 2; ++step) {
-            device const float *column = table + step * 8 + fm;
-            const float2 b(d >= 0 && d < int(Extent) ? column[d * States] : 0.0f,
-                           d + 1 >= 0 && d + 1 < int(Extent) ? column[(d + 1) * States] : 0.0f);
-            q8sgf::mma(c, bias_a[step], b);
+            for (uint step = 0; step < 2; ++step) {
+              device const float *column = table + step * 8 + fm;
+              operand[tile][step] = float2(column[d0 * States], column[d1 * States]);
+            }
           }
-          *reinterpret_cast<threadgroup float2 *>(bias_rows + fm * kRelativeBiasSpan + tile * 8 + fn) = c;
+#pragma unroll
+          for (uint tile = 0; tile < kRelativeBiasSpan / 8; ++tile) {
+            const int d = first_distance + int(tile * 8 + fn);
+            const bool2 inside(d >= 0 && d < int(Extent), d + 1 >= 0 && d + 1 < int(Extent));
+            float2 c(0.0f);
+#pragma unroll
+            for (uint step = 0; step < 2; ++step)
+              q8sgf::mma(c, bias_a[step], select(float2(0.0f), operand[tile][step], inside));
+            *reinterpret_cast<threadgroup float2 *>(bias_rows + fm * kRelativeBiasSpan + tile * 8 + fn) = c;
+          }
+        } else {
+#pragma unroll
+          for (uint tile = 0; tile < kRelativeBiasSpan / 8; ++tile) {
+            const int d = first_distance + int(tile * 8 + fn);
+            float2 c(0.0f);
+#pragma unroll
+            for (uint step = 0; step < 2; ++step) {
+              device const float *column = table + step * 8 + fm;
+              const float2 b(d >= 0 && d < int(Extent) ? column[d * States] : 0.0f,
+                             d + 1 >= 0 && d + 1 < int(Extent) ? column[(d + 1) * States] : 0.0f);
+              q8sgf::mma(c, bias_a[step], b);
+            }
+            *reinterpret_cast<threadgroup float2 *>(bias_rows + fm * kRelativeBiasSpan + tile * 8 + fn) = c;
+          }
         }
         simdgroup_barrier(mem_flags::mem_threadgroup);
       }
@@ -655,7 +719,16 @@ inline void relative_attention_register_loop(
         if constexpr (Quantized)
           score *= key_scale[s];
         score *= splash_attention_scale<D>();
-        if (biased) {
+        if (Lean && biased) {
+          // An unseen key's score is replaced below, whatever its index reads.
+#pragma unroll
+          for (uint r = 0; r < 2; ++r) {
+            const float b = token < block ? bias_rows[lean_index[r] - q8sgf::page_token(fm, s)]
+                                          : tree_rows[(fn + r) * kRelativeTreeKeys + min(token - block,
+                                                                                         kRelativeTreeKeys - 1)];
+            score[r] = token >= block || int(token) > lean_far[r] ? score[r] + b : score[r];
+          }
+        } else if (biased) {
 #pragma unroll
           for (uint r = 0; r < 2; ++r) {
             if (!seen[s][r])
@@ -719,7 +792,12 @@ inline void relative_attention_register_loop(
         q8sgf::mma(output.values[d], values.step(2), weights[2]);
         q8sgf::mma(output.values[d], values.step(3), weights[3]);
       }
-    }
+    };
+    const uint lean_end = spanned ? run.end : run.begin;
+    for (uint page = run.begin; page < lean_end; ++page)
+      page_step(page, RelativeLeanPages<true>{});
+    for (uint page = lean_end; page < run.end; ++page)
+      page_step(page, RelativeLeanPages<false>{});
   }
   if (sg < M / 8 && fm == 0) {
     row_max[row] = maximum.x, row_sum[row] = denominator.x;

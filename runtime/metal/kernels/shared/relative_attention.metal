@@ -153,7 +153,7 @@ inline void relative_attention_split_phase(
       uint thread_index [[thread_index_in_threadgroup]]) {                                                    \
     constexpr uint M = Group * SPLASH_ATTENTION_TILE_ROWS;                                                    \
     constexpr uint N = SplashKvPageTokens;                                                                    \
-    alignas(16) threadgroup float scores[M * (RegisterTile ? kRelativeBiasSpan + 64 : N)];                         \
+    alignas(16) threadgroup float scores[M * (RegisterTile ? kRelativeBiasSpan + 64 + kRelativeTreeKeys : N)]; \
     alignas(16) threadgroup bfloat probabilities[M * N];                                                      \
     threadgroup float row_max[M];                                                                             \
     threadgroup float row_sum[M];                                                                             \
@@ -396,7 +396,7 @@ inline void relative_attention_direct_phase(
       uint simd_group [[simdgroup_index_in_threadgroup]]) {                                                   \
     constexpr uint M = 3 * SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS;                                             \
     constexpr uint N = SplashKvPageTokens;                                                                    \
-    alignas(16) threadgroup float scores[M * (RegisterTile ? kRelativeBiasSpan + 64 : N)];                         \
+    alignas(16) threadgroup float scores[M * (RegisterTile ? kRelativeBiasSpan + 64 + kRelativeTreeKeys : N)]; \
     alignas(16) threadgroup bfloat probabilities[M * N];                                                      \
     threadgroup float row_max[M];                                                                             \
     threadgroup float row_sum[M];                                                                             \
@@ -587,7 +587,7 @@ inline void relative_attention_decode_phase(
       uint simd_group [[simdgroup_index_in_threadgroup]]) {                                                   \
     constexpr uint M = 3 * RowsPerTile;                                                                       \
     constexpr uint N = SplashKvPageTokens;                                                                    \
-    alignas(16) threadgroup float scores[M * (RegisterTile ? kRelativeBiasSpan + 64 : N)];                         \
+    alignas(16) threadgroup float scores[M * (RegisterTile ? kRelativeBiasSpan + 64 + kRelativeTreeKeys : N)]; \
     alignas(16) threadgroup bfloat probabilities[M * N];                                                      \
     threadgroup float row_max[M];                                                                             \
     threadgroup float row_sum[M];                                                                             \
