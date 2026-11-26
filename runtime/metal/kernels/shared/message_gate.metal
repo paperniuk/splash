@@ -312,7 +312,8 @@ kernel void message_gate_apply(device const float *x [[buffer(0)]], device const
 // rank values a threadgroup; message_gate_narrow_up takes MESSAGE_GATE_NARROW_UP_THREADS of a row's values a
 // threadgroup, a thread each, forget, gain and the gated value into the gated rows; message_gate_norm writes each
 // gated row through the gate's norm, a threadgroup a row. A thread holds MESSAGE_GATE_ROW_SLOTS of a row's values
-// in registers, every load issued before any is summed (a loop of loads bounded at run time waits for each in turn).
+// in registers, and its rows' values, every load issued before any is summed (a loop of loads bounded at run time
+// waits for each in turn): a four-row Inkling-2-Mini decode step took 52.19 ms against 53.05 on an M1 Max.
 constant constexpr uint kRowSlots = MESSAGE_GATE_ROW_SLOTS;
 constant constexpr uint kNarrowOutputs = MESSAGE_GATE_NARROW_OUTPUTS;
 constant constexpr uint kNarrowUpThreads = MESSAGE_GATE_NARROW_UP_THREADS;
@@ -347,12 +348,32 @@ kernel void message_gate_narrow_down(device const float *x [[buffer(0)]], device
   if (first >= p.rows || g >= p.gates) return;
   const uint count = min(kGroupRows, p.rows - first);
   static_assert(kNarrowOutputs >= 2, "a row's two squares take a partial's first two slots");
-  for (uint r = 0; r < count; ++r)
-    for (uint own = 0; own < 2; ++own) {
-      const float squares =
-          simd_sum(message_gate_squares(message_gate_row(x, message, p, g, first, count, r, own == 0), p.hidden, tid));
-      if (lane == 0) partials[sg][r][own] = squares;
+  // A row's x and message slots load together, then sum: two rounds of loads a row waited for each other.
+  for (uint r = 0; r < count; ++r) {
+    device const float *own = message_gate_row(x, message, p, g, first, count, r, true);
+    device const float *other = message_gate_row(x, message, p, g, first, count, r, false);
+    float a[kRowSlots], b[kRowSlots], squares[2] = {0.0f, 0.0f};
+#pragma unroll
+    for (uint i = 0; i < kRowSlots; ++i) {
+      const uint c = min(tid + i * kGateThreads, p.hidden - 1);
+      a[i] = own[c];
+      b[i] = other[c];
     }
+#pragma unroll
+    for (uint i = 0; i < kRowSlots; ++i)
+      if (tid + i * kGateThreads < p.hidden) {
+        squares[0] += a[i] * a[i];
+        squares[1] += b[i] * b[i];
+      }
+    for (uint d = tid + kRowSlots * kGateThreads; d < p.hidden; d += kGateThreads) {
+      squares[0] += own[d] * own[d];
+      squares[1] += other[d] * other[d];
+    }
+    for (uint h = 0; h < 2; ++h) {
+      const float total = simd_sum(squares[h]);
+      if (lane == 0) partials[sg][r][h] = total;
+    }
+  }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (tid < 2 * count) {
     float total = 0.0f;
@@ -369,12 +390,18 @@ kernel void message_gate_narrow_down(device const float *x [[buffer(0)]], device
     float4 w[kNarrowOutputs];
     for (uint o = 0; o < kNarrowOutputs; ++o)
       w[o] = k0 + o < p.rank ? message_gate_quad(down + ulong(k0 + o) * 2 * p.hidden, quad) : float4(0.0f);
-    for (uint r = 0; r < count; ++r) {
-      device const float4 *values =
-          reinterpret_cast<device const float4 *>(message_gate_row(x, message, p, g, first, count, r, own));
-      const float4 normalized = float4(bfloat4(values[own ? quad : quad - p.hidden / 4] * inverse[r][own ? 0 : 1]));
-      for (uint o = 0; o < kNarrowOutputs; ++o) acc[r][o] += dot(w[o], normalized);
-    }
+    // Every row's values load before any sums (rows past the group's reload its last, summing nothing).
+    float4 values[MESSAGE_GATE_NARROW_ROWS];
+#pragma unroll
+    for (uint r = 0; r < MESSAGE_GATE_NARROW_ROWS; ++r)
+      values[r] = reinterpret_cast<device const float4 *>(message_gate_row(x, message, p, g, first, count, r,
+                                                                           own))[own ? quad : quad - p.hidden / 4];
+#pragma unroll
+    for (uint r = 0; r < MESSAGE_GATE_NARROW_ROWS; ++r)
+      if (r < count) {
+        const float4 normalized = float4(bfloat4(values[r] * inverse[r][own ? 0 : 1]));
+        for (uint o = 0; o < kNarrowOutputs; ++o) acc[r][o] += dot(w[o], normalized);
+      }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   for (uint r = 0; r < count; ++r)
@@ -417,21 +444,32 @@ kernel void message_gate_narrow_up(device const float *x [[buffer(0)]], device c
   if (d >= p.hidden) return;
   device const Weight *f4 = message_gate_pick(g, forget0, forget1, forget2) + ulong(d) * p.rank;
   device const Weight *e4 = message_gate_pick(g, gain0, gain1, gain2) + ulong(d) * p.rank;
-  float f[kGroupRows], e[kGroupRows];
-  for (uint r = 0; r < kGroupRows; ++r) f[r] = e[r] = 0.0f;
-  for (uint j = 0; j < quarters; ++j) {
-    const float4 a = message_gate_quad(f4, j), b = message_gate_quad(e4, j);
+  float f[MESSAGE_GATE_NARROW_ROWS], e[MESSAGE_GATE_NARROW_ROWS];
+  for (uint r = 0; r < MESSAGE_GATE_NARROW_ROWS; ++r) f[r] = e[r] = 0.0f;
+  // Two quads a step (a rank of runs of 8): half the steps of a loop whose loads wait for the step before.
+  for (uint j = 0; j < quarters; j += 2) {
+    const float4 a0 = message_gate_quad(f4, j), b0 = message_gate_quad(e4, j);
+    const float4 a1 = message_gate_quad(f4, j + 1), b1 = message_gate_quad(e4, j + 1);
     for (uint r = 0; r < count; ++r) {
-      f[r] += dot(a, h[r][j]);
-      e[r] += dot(b, h[r][j]);
+      f[r] += dot(a0, h[r][j]);
+      e[r] += dot(b0, h[r][j]);
+      f[r] += dot(a1, h[r][j + 1]);
+      e[r] += dot(b1, h[r][j + 1]);
     }
   }
-  for (uint r = 0; r < count; ++r) {
-    const float xv = x[ulong(first + r) * p.x_stride + p.x_columns[g] + d];
-    const float mv = message[ulong(first + r) * p.message_stride + p.message_columns[g] + d];
-    values[(ulong(g) * p.rows + first + r) * p.hidden + d] =
-        (1.0f - precise::tanh(f[r])) * xv + precise::tanh(e[r]) * mv;
+  // Every row's x and message load before any is gated (rows past the group's reload its last).
+  float xv[MESSAGE_GATE_NARROW_ROWS], mv[MESSAGE_GATE_NARROW_ROWS];
+#pragma unroll
+  for (uint r = 0; r < MESSAGE_GATE_NARROW_ROWS; ++r) {
+    const ulong row = first + min(r, count - 1);
+    xv[r] = x[row * p.x_stride + p.x_columns[g] + d];
+    mv[r] = message[row * p.message_stride + p.message_columns[g] + d];
   }
+#pragma unroll
+  for (uint r = 0; r < MESSAGE_GATE_NARROW_ROWS; ++r)
+    if (r < count)
+      values[(ulong(g) * p.rows + first + r) * p.hidden + d] =
+          (1.0f - precise::tanh(f[r])) * xv[r] + precise::tanh(e[r]) * mv[r];
 }
 
 // Each gated row through the gate's weighted RMS norm into bf16, as message_gate_test_norm writes each value: a
@@ -454,7 +492,19 @@ kernel void message_gate_norm(device const float *values [[buffer(0)]], device c
   const float inverse = rsqrt(total / p.hidden + kRmsEpsilon);
   device const float *norm = message_gate_pick(g, norm0, norm1, norm2);
   device bfloat *out = message_gate_pick(g, output0, output1, output2) + ulong(row) * p.hidden;
-  for (uint d = tid; d < p.hidden; d += kGateThreads) out[d] = bfloat((v[d] * inverse) * norm[d]);
+  // A thread's values and weights load together before any is written.
+  float value[kRowSlots], weight[kRowSlots];
+#pragma unroll
+  for (uint i = 0; i < kRowSlots; ++i) {
+    const uint d = min(tid + i * kGateThreads, p.hidden - 1);
+    value[i] = v[d];
+    weight[i] = norm[d];
+  }
+#pragma unroll
+  for (uint i = 0; i < kRowSlots; ++i)
+    if (tid + i * kGateThreads < p.hidden) out[tid + i * kGateThreads] = bfloat((value[i] * inverse) * weight[i]);
+  for (uint d = tid + kRowSlots * kGateThreads; d < p.hidden; d += kGateThreads)
+    out[d] = bfloat((v[d] * inverse) * norm[d]);
 }
 
 // ---- The fused gates of a prompt chunk's rows (metal/abi/MessageGate.h) ----
