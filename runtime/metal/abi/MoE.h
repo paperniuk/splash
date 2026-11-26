@@ -84,9 +84,16 @@ inline bool moe_column_tile(Tiles tiles, uint32_t t) {
 constexpr inline bool moe_mma_nvfp4_format(uint32_t format) {
   return format == GGUF_FMT_NVFP4 || format == GGUF_FMT_NVFP464;
 }
+// Q5_K, Q8_0 and MXFP8: Inkling-2-Mini's coda experts (layers 20-23: Q5_K gate/up and Q8_0 down in unsloth's GGUF,
+// MXFP8 in mlx-community's 4-bit). Their one-row expert layer took 0.234 ms instead of 0.363 (Q5_K/Q8_0) and 0.254
+// instead of 0.367 (MXFP8) on the column tile with split gate/up on an M1 Max (gguf-moe-benchmark inkling).
+constexpr inline bool moe_mma_eight_bit_format(uint32_t format) {
+  return format == GGUF_FMT_Q5K || format == GGUF_FMT_Q80 || format == GGUF_FMT_MXFP8;
+}
 constexpr inline bool moe_mma_column_format(uint32_t format, uint32_t tile_rows) {
   return format == GGUF_FMT_Q20 || (tile_rows == 8 && (format == GGUF_FMT_IQ2XXS || format == GGUF_FMT_IQ2S ||
-                                                       format == GGUF_FMT_AF4G64 || moe_mma_nvfp4_format(format)));
+                                                       format == GGUF_FMT_AF4G64 || moe_mma_nvfp4_format(format) ||
+                                                       moe_mma_eight_bit_format(format)));
 }
 
 // Whether an Apple7/8 MMA gate/up pass of `tile_rows`-row tiles whose formats are all `format` runs its grid at
@@ -97,7 +104,8 @@ constexpr inline bool moe_mma_column_format(uint32_t format, uint32_t tile_rows)
 // pass took no gain from parts.
 #define MOE_MMA_SPLIT 2u
 constexpr inline bool moe_mma_split_format(uint32_t format, uint32_t tile_rows) {
-  return tile_rows == 8 && (format == GGUF_FMT_AF4G64 || moe_mma_nvfp4_format(format));
+  return tile_rows == 8 && (format == GGUF_FMT_AF4G64 || moe_mma_nvfp4_format(format) ||
+                            moe_mma_eight_bit_format(format));
 }
 
 // The column tiles of the gate/up and down passes, whose grids the grouping
