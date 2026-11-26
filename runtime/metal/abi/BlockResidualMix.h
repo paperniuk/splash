@@ -36,6 +36,14 @@
 // 2,048 rows 5,511 against 4,633. A one-lane decode step (at most 16 rows)
 // keeps a threadgroup a row and query.
 #define BLOCK_RESIDUAL_MIX_QUERY_ROWS 64u
+// A call of at most BLOCK_RESIDUAL_MIX_QUERY_ROWS rows given scratch for its sums runs in two dispatches over
+// chunks of BLOCK_RESIDUAL_MIX_CHUNK values a row instead (the _chunks kernels): each chunk's sums of each state's
+// squares and of each query's dots with each state (BLOCK_RESIDUAL_MIX_SUMS a chunk), then each chunk's outputs
+// from every chunk's sums, a thread a value, so that a row's values spread over threadgroups of every core. A
+// one-row Inkling-2-Mini decode step's 72 plain mixes took 1.67 ms on an M1 Max against 4.59 ms at a threadgroup a
+// row and query, whose few threadgroups each walked their whole row (the step 36.99 -> 36.10 ms).
+#define BLOCK_RESIDUAL_MIX_CHUNK 256u
+#define BLOCK_RESIDUAL_MIX_SUMS 32u
 // The most states a mix reads, a stack of four blocks' inputs and the
 // current rows, and the most queries it runs, four (the most outputs a mix
 // of a model in the tree needs: four messages of the previous pass).

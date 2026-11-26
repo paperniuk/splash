@@ -23,8 +23,9 @@
 //   uninstrumented), and against fp64;
 // - the mix of 1, 3 and 4 queries over 1 to 5 states (bf16 stack planes, bf16
 //   or fp32 current rows), plain and through its norms, of 5 rows (a
-//   threadgroup a row and query) and of BLOCK_RESIDUAL_MIX_QUERY_ROWS + 3 (a
-//   threadgroup a row);
+//   threadgroup a row and query, and plain the _chunks kernels given scratch
+//   for their sums) and of BLOCK_RESIDUAL_MIX_QUERY_ROWS + 3 (a threadgroup a
+//   row);
 // - the message gate through its norm, its fused kernels' and its reference
 //   path's, and the paths against each other;
 // - the logit finish's softcap and padding rows.
@@ -832,6 +833,22 @@ void mixTest(MetalBackend &backend, uint32_t stack, uint32_t queries, bool curre
     for (size_t i = 0; i < want.size(); ++i) ok &= closeF32(got[size_t{r} * queries * m.hidden + i], want[i]);
   }
   check(ok, scope);
+  if (rows <= BLOCK_RESIDUAL_MIX_QUERY_ROWS) {
+    // The same call given scratch for its sums: the _chunks kernels, a threadgroup a chunk of a row.
+    const MetalBuffer sums = scratch(backend, ops::BlockResidualMix::sumsBytes(m.hidden, m.rows)),
+                      chunked = scratch(backend, size_t{m.rows} * queries * m.hidden * 4);
+    CommandGraph chunks;
+    ops::BlockResidualMix::addMix(chunks, states, queryBuffer, chunked, shape, m.rows, sums);
+    run(backend, chunks);
+    const auto gotChunks = download<float>(chunked, size_t{m.rows} * queries * m.hidden);
+    bool okChunks = true;
+    for (uint32_t r = 0; r < m.rows; ++r) {
+      const auto want = mixReference(m, r);
+      for (size_t i = 0; i < want.size(); ++i)
+        okChunks &= closeF32(gotChunks[size_t{r} * queries * m.hidden + i], want[i]);
+    }
+    check(okChunks, scope + ", its chunks' sums apart");
+  }
   if (queries > BLOCK_RESIDUAL_MIX_MAXIMUM_NORMS) return;
   std::vector<ops::NormWeights> norms;
   std::vector<MetalBuffer> outputs;
