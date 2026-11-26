@@ -185,7 +185,7 @@ void Inkling2LoopTarget::addPrefillLayer(PrefillStep &step, uint32_t application
     addGates(step, application, 1, std::span(&gate, 1));
   } else {
     ops::BlockResidualMix::addMixNorm(step.graph, states, layer.ffnQuery, std::span(&layer.ffnNorm, 1),
-                                      std::span(&b.normalized, 1), shape, step.rows);
+                                      std::span(&b.normalized, 1), shape, step.rows, s.mixSums);
   }
   // The MoE's weighted sum alone (added to zero rows), into the rows its
   // convolution reads after the layer's load, or a decode step's straight
@@ -244,7 +244,7 @@ std::array<metal::MetalBuffer, 3> Inkling2LoopTarget::addMixerInputs(PrefillStep
     return shared;
   }
   ops::BlockResidualMix::addMixNorm(step.graph, states, layer.mixerQueries, std::span(norms).first(queries),
-                                    std::span(separate).first(queries), shape, step.rows);
+                                    std::span(separate).first(queries), shape, step.rows, s.mixSums);
   return full ? separate : shared;
 }
 

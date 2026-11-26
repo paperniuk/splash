@@ -23,8 +23,8 @@
 //   uninstrumented), and against fp64;
 // - the mix of 1, 3 and 4 queries over 1 to 5 states (bf16 stack planes, bf16
 //   or fp32 current rows), plain and through its norms, of 5 rows (a
-//   threadgroup a row and query, and plain the _chunks kernels given scratch
-//   for their sums) and of BLOCK_RESIDUAL_MIX_QUERY_ROWS + 3 (a threadgroup a
+//   threadgroup a row and query, and the _chunks kernels given scratch for
+//   their sums, plain and through the norms) and of BLOCK_RESIDUAL_MIX_QUERY_ROWS + 3 (a threadgroup a
 //   row);
 // - the message gate through its norm, its fused kernels' and its reference
 //   path's, and the paths against each other;
@@ -875,6 +875,29 @@ void mixTest(MetalBackend &backend, uint32_t stack, uint32_t queries, bool curre
     }
   }
   check(okNorm, scope + ", each query through its own norm");
+  if (rows > BLOCK_RESIDUAL_MIX_QUERY_ROWS) return;
+  // The same norms given scratch for the sums: the _chunks kernels, the output's squares from the states' pair dots.
+  std::vector<MetalBuffer> chunked;
+  for (uint32_t q = 0; q < queries; ++q) chunked.push_back(scratch(backend, size_t{m.rows} * m.hidden * 2));
+  CommandGraph chunks;
+  ops::BlockResidualMix::addMixNorm(chunks, states, queryBuffer, norms, chunked, shape, m.rows,
+                                    scratch(backend, ops::BlockResidualMix::sumsBytes(m.hidden, m.rows)));
+  run(backend, chunks);
+  bool okChunks = true;
+  for (uint32_t r = 0; r < m.rows; ++r) {
+    const auto want = mixReference(m, r);
+    for (uint32_t q = 0; q < queries; ++q) {
+      const auto gotRows = download<uint16_t>(chunked[q], size_t{m.rows} * m.hidden);
+      double squares = 0;
+      for (uint32_t d = 0; d < m.hidden; ++d)
+        squares += want[size_t{q} * m.hidden + d] * want[size_t{q} * m.hidden + d];
+      const double inverse = 1 / std::sqrt(squares / m.hidden + 1e-6);
+      for (uint32_t d = 0; d < m.hidden; ++d)
+        okChunks &= closeBf16(f32(gotRows[size_t{r} * m.hidden + d]),
+                              want[size_t{q} * m.hidden + d] * inverse * m.norms[q][d]);
+    }
+  }
+  check(okChunks, scope + ", each query through its own norm on the chunks");
 }
 
 // A call's gates on the same rows (MessageGateInput): x rows of a mix of
