@@ -578,11 +578,12 @@ inline void relative_attention_register_loop(
     const uint2 state_row(query_row.x * G + row % G, query_row.y * G + (row + 1) % G);
     const uint block = in_tree ? tree.anchor : 0xffffffffu;
     // Q^T fragments for the D / 4 QK steps, bf16 pairs (row, row + 1), in the lane's own words of the stage after
-    // the bias rows (step-major, so lanes never share a bank), out of registers.
+    // the bias rows (step-major, so lanes never share a bank), out of registers. A partly active simdgroup's rows
+    // past the last active one read that row's queries (state_row's clamped fused rows), whose outputs it discards.
     threadgroup uint *queries = reinterpret_cast<threadgroup uint *>(stage + M * kRelativeBiasSpan) + sg * 32 * (D / 8);
     {
-      device const ushort *q0 = reinterpret_cast<device const ushort *>(tile_queries) + row * D;
-      device const ushort *q1 = q0 + D;
+      device const ushort *q0 = reinterpret_cast<device const ushort *>(tile_queries) + state_row.x * D;
+      device const ushort *q1 = reinterpret_cast<device const ushort *>(tile_queries) + state_row.y * D;
 #pragma unroll
       for (uint b = 0; b < D / 64; ++b)
 #pragma unroll
@@ -605,15 +606,17 @@ inline void relative_attention_register_loop(
         splash_attention_whole_pages<Window>(committed_tokens, active_rows, in_tree, tree.anchor);
     const uint scale_base = q8sgf::page_token(fm, 0);
     const SplashKvAddressing<KVHeads, D, CacheElement> addressing(kv, kv_head);
-    // Where the rows fit the span, a page takes the lean step: its history keys' bias from the stage at an index
-    // computed once (lean_index), its tree keys' (the step's own rows) from the rows' table below, computed once a
-    // step, and no branch a key. Its tree keys summed key by key in the loop, with the bounds-checked stage loads,
-    // held 50 spilled values a page that the loop reloaded and waited on: a one-row Inkling-2-Mini decode step's
-    // attention took 0.5 ms more of 34.9 on an M1 Max.
+    // Where the rows fit the span and a tree's keys the table, a page takes the lean step: its history keys' bias
+    // from the stage at an index computed once (lean_index), its tree keys' (the step's own rows) from the rows'
+    // table below, computed once a step, and no branch a key. Its tree keys summed key by key in the loop, with the
+    // bounds-checked stage loads, held 50 spilled values a page that the loop reloaded and waited on: a one-row
+    // Inkling-2-Mini decode step's attention took 0.5 ms more of 34.9 on an M1 Max. A tree of more than
+    // kRelativeTreeKeys visible keys (decode trees hold 16 rows; addAttention takes 32) takes the general step.
+    const bool lean_pages = spanned && (!in_tree || visible - tree.anchor <= kRelativeTreeKeys);
     // The table: each of the simdgroup's fused rows' bias at each tree key, zero past the extent: its distance is
     // its depth less the ancestors before the key, as the general step computes it.
     threadgroup float *tree_rows = stage + M * (kRelativeBiasSpan + 64) + sg * 8 * kRelativeTreeKeys;
-    if (in_tree && spanned) {
+    if (in_tree && lean_pages) {
 #pragma unroll
       for (uint i = 0; i < 8 * kRelativeTreeKeys / 32; ++i) {
         const uint index = i * 32 + lane, f = index / kRelativeTreeKeys, key = index % kRelativeTreeKeys;
@@ -793,7 +796,7 @@ inline void relative_attention_register_loop(
         q8sgf::mma(output.values[d], values.step(3), weights[3]);
       }
     };
-    const uint lean_end = spanned ? run.end : run.begin;
+    const uint lean_end = lean_pages ? run.end : run.begin;
     for (uint page = run.begin; page < lean_end; ++page)
       page_step(page, RelativeLeanPages<true>{});
     for (uint page = lean_end; page < run.end; ++page)
