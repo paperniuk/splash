@@ -112,9 +112,9 @@ inline void moe_mma_split_column(uint format, RowInput row_input, uint rows, uin
                                  uint lane, threadgroup half2 *table, thread float (&sums)[GGUF_COLUMN_ROWS]) {
   const uint groups = K / 32, which = lane / kSplitWidth;
   moe_mma_grid_column<Rows, Count>(format, [&](auto f) {
-    column_dot_rows<decltype(f), GGUF_COLUMN_ROWS>(row_input, rows, K, s.w0, s.w1, s.meta, column + lane % kSplitWidth,
-                                                  which * groups / MOE_MMA_SPLIT, (which + 1) * groups / MOE_MMA_SPLIT,
-                                                  table, sums);
+    column_dot_rows<decltype(f), GGUF_COLUMN_ROWS, true>(row_input, rows, K, s.w0, s.w1, s.meta,
+                                                        column + lane % kSplitWidth, which * groups / MOE_MMA_SPLIT,
+                                                        (which + 1) * groups / MOE_MMA_SPLIT, table, sums);
   });
   for (uint r = 0; r < GGUF_COLUMN_ROWS; ++r)
     for (uint width = 16; width >= kSplitWidth; width /= 2) sums[r] += simd_shuffle_down(sums[r], width);
@@ -175,9 +175,9 @@ kernel void moe_expert_gguf_mma_down(device bfloat *input [[buffer(0)]], device 
     float sums[GGUF_COLUMN_ROWS];
     moe_mma_grid_column<Rows, 2>(s.format, [&](auto f) {
       quant_pair_table<decltype(f)>(tl, thread_index, GGUF_STAGED_THREADS);
-      column_dot_rows<decltype(f), GGUF_COLUMN_ROWS>([&](uint r) { return x + ulong(r) * p.input_size; }, tile.rows,
-                                                     p.input_size, s.w0, s.w1, s.meta, origin + simd_lane, 0,
-                                                     p.input_size / 32, tl, sums);
+      column_dot_rows<decltype(f), GGUF_COLUMN_ROWS, true>([&](uint r) { return x + ulong(r) * p.input_size; },
+                                                           tile.rows, p.input_size, s.w0, s.w1, s.meta,
+                                                           origin + simd_lane, 0, p.input_size / 32, tl, sums);
     });
     for (uint row = 0; row < tile.rows; ++row)
       output[out + ulong(row) * p.output_size + origin + simd_lane] = bfloat(sums[row] * scale);
@@ -345,8 +345,8 @@ kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
                                                table, sums);
     } else if (on_grid) {
       moe_mma_grid_column<Rows, 4>(s.format, [&](auto f) {
-        column_dot_rows<decltype(f), GGUF_COLUMN_ROWS>(row_input, tile.rows, K, s.w0, s.w1, s.meta,
-                                                       origin + simd_lane, 0, K / 32, table, sums);
+        column_dot_rows<decltype(f), GGUF_COLUMN_ROWS, true>(row_input, tile.rows, K, s.w0, s.w1, s.meta,
+                                                             origin + simd_lane, 0, K / 32, table, sums);
       });
     } else {
       zero(acc);
