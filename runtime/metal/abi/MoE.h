@@ -76,10 +76,13 @@ inline bool moe_column_tile(Tiles tiles, uint32_t t) {
 }
 
 // Whether Apple7/8's MMA expert passes (kernels/shared/moe_gguf_mma.metal) of `tile_rows`-row tiles run a projection
-// in `format` on the column tile of a moe_column_tile tile, rather than the 8-row MMA: Q2_0 in every pass, IQ2_XXS and
-// IQ2_S in the 8-row (decode) passes only. The kernels and the MoE test's expected tile kinds ask this.
+// in `format` on the column tile of a moe_column_tile tile, rather than the 8-row MMA: Q2_0 in every pass, IQ2_XXS,
+// IQ2_S, NVFP4 and NVFP4_64 in the 8-row (decode) passes only. The kernels and the MoE test's expected tile kinds ask
+// this.
 constexpr inline bool moe_mma_column_format(uint32_t format, uint32_t tile_rows) {
-  return format == GGUF_FMT_Q20 || (tile_rows == 8 && (format == GGUF_FMT_IQ2XXS || format == GGUF_FMT_IQ2S));
+  return format == GGUF_FMT_Q20 ||
+         (tile_rows == 8 && (format == GGUF_FMT_IQ2XXS || format == GGUF_FMT_IQ2S ||
+                             format == GGUF_FMT_NVFP4 || format == GGUF_FMT_NVFP464));
 }
 
 // The column tiles of the gate/up and down passes, whose grids the grouping

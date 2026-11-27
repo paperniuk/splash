@@ -146,11 +146,13 @@ kernel void moe_expert_gguf_mma_down(device bfloat *input [[buffer(0)]], device 
   }
   if (moe_mma_grid_column_pass<Rows, 2>() && moe_column_tile(tiles, t) &&
       moe_mma_grid_column_format<Rows>(s.format)) {
-    // The grid formats (moe_mma_grid_column_pass), whose grids are constant tables.
+    // The grid and codebook formats (moe_mma_grid_column_pass).
     float sums[GGUF_COLUMN_ROWS];
     moe_mma_grid_column<Rows, 2>(s.format, [&](auto f) {
-      column_dot<decltype(f), GGUF_COLUMN_ROWS>(x, tile.rows, p.input_size, s.w0, s.w1, s.meta,
-                                                    origin + simd_lane, 0, p.input_size / 32, tl, sums);
+      typedef decltype(f) F;
+      quant_pair_table<F>(tl, thread_index, GGUF_STAGED_THREADS);
+      column_dot<F, GGUF_COLUMN_ROWS>(x, tile.rows, p.input_size, s.w0, s.w1, s.meta,
+                                      origin + simd_lane, 0, p.input_size / 32, tl, sums);
     });
     for (uint row = 0; row < tile.rows; ++row)
       output[out + ulong(row) * p.output_size + origin + simd_lane] = bfloat(sums[row] * scale);
@@ -231,12 +233,14 @@ kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
   const uint K = p.input_size, N = p.output_size;
   static_assert(!Routes || (Rows == 8 && Shared == 0), "direct input uses one routed fragment");
   device bfloat *x = Routes ? input : input + ulong(tile.first_row) * K;
+  device const uint *grouped = Routes ? reinterpret_cast<device const uint *>(gsw0) + tile.first_row : nullptr;
   const ulong out = ulong(tile.first_row) * N;
   const uint origin = group.x * kColumns, thread_index = simd_group * 32 + simd_lane;
   const bool up = simd_group == 1;
   threadgroup bfloat *gate = reinterpret_cast<threadgroup bfloat *>(stage);
-  const bool column = !Routes && moe_column_tile(tiles, t);
-  const bool gate_column = column && gs.format == FmtQ20::Id, up_column = column && us.format == FmtQ20::Id;
+  const bool column = moe_column_tile(tiles, t);
+  const bool gate_column = !Routes && column && gs.format == FmtQ20::Id,
+             up_column = !Routes && column && us.format == FmtQ20::Id;
   const bool grid = moe_mma_grid_column_pass<Rows, 4>() && column;
   const bool gate_grid = grid && moe_mma_grid_column_format<Rows>(gs.format);
   const bool up_grid = grid && moe_mma_grid_column_format<Rows>(us.format);
@@ -276,7 +280,7 @@ kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
   threadgroup half *my = stage + simd_group * kSimdgroupStage;
   const sgmatrix::Lane l = sgmatrix::lane_map(simd_lane);
   static_assert(Rows * kColumns * sizeof(bfloat) <= kSimdgroupStage * sizeof(half), "the gate fits a stage");
-  if (column) {
+  if (column && (!Routes || (gate_grid && up_grid))) {
     // At most GGUF_COLUMN_ROWS live rows, one fragment. Each simdgroup sums its projection on its own tile, the
     // gate parks bf16(gate) in its stage, and both meet at the one barrier before the up writes the products: the
     // simdgroups may take different tiles (a shared expert of Q2_0 gate and another up format), so neither tile's
@@ -290,8 +294,8 @@ kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
                                                table, sums);
     } else if (on_grid) {
       moe_mma_grid_column<Rows, 4>(s.format, [&](auto f) {
-        column_dot<decltype(f), GGUF_COLUMN_ROWS>(x, tile.rows, K, s.w0, s.w1, s.meta, origin + simd_lane, 0,
-                                                      K / 32, table, sums);
+        column_dot<decltype(f), GGUF_COLUMN_ROWS, Routes>(x, tile.rows, K, s.w0, s.w1, s.meta, origin + simd_lane, 0,
+                                                          K / 32, table, sums, grouped);
       });
     } else {
       zero(acc);

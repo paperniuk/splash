@@ -21,17 +21,21 @@ using namespace metal;
 // step rounds once (and as fast as the fma() chain). Each thread loads the next group's payload while the group's FMAs
 // run, and its meta unit when the next group enters a new one, and reads the activations 16 bytes at a time (their
 // rows of K, a multiple of 64, start 16-byte aligned in page-aligned buffers).
-template <class F, ushort Rows>
+template <class F, ushort Rows, uint Routes = 0>
 inline void column_dot(device const bfloat *x, uint rows, uint input_size, device uchar *w0, device uchar *w1,
                        device uchar *meta, uint column, uint g_begin, uint g_end, threadgroup half2 *tl,
-                       thread float (&sums)[Rows]) {
+                       thread float (&sums)[Rows], device const uint *grouped = nullptr) {
   const uint groups = input_size / 32, units = groups / F::MetaGroups;
   const uint plane_tile = column / QUANT_TILE_ROWS, plane_row = column % QUANT_TILE_ROWS;
   device uchar *tw0 = w0 + (ulong(plane_tile) * groups * QUANT_TILE_ROWS + plane_row) * F::P0;
   device uchar *tw1 = w1 + (ulong(plane_tile) * groups * QUANT_TILE_ROWS + plane_row) * F::P1;
   device uchar *tmeta = meta + (ulong(plane_tile) * units * QUANT_TILE_ROWS + plane_row) * F::MetaBytes;
+  device const bfloat *row_x[Rows];
 #pragma unroll
-  for (ushort r = 0; r < Rows; ++r) sums[r] = 0.0f;
+  for (ushort r = 0; r < Rows; ++r) {
+    sums[r] = 0.0f;
+    row_x[r] = r < rows ? x + ulong(Routes ? grouped[r] / Routes : r) * input_size : x;
+  }
   typename F::Payload w =
       F::load(tw0 + ulong(g_begin) * QUANT_TILE_ROWS * F::P0, tw1 + ulong(g_begin) * QUANT_TILE_ROWS * F::P1);
   typename F::Meta m = F::loadMeta(tmeta + ulong(g_begin / F::MetaGroups) * QUANT_TILE_ROWS * F::MetaBytes);
@@ -50,7 +54,7 @@ inline void column_dot(device const bfloat *x, uint rows, uint input_size, devic
 #pragma unroll
     for (ushort r = 0; r < Rows; ++r) {
       if (r >= rows) break;
-      device const uint4 *xr = reinterpret_cast<device const uint4 *>(x + ulong(r) * input_size + g * 32);
+      device const uint4 *xr = reinterpret_cast<device const uint4 *>(row_x[r] + g * 32);
       float sum = 0.0f;
 #pragma unroll
       for (ushort i = 0; i < 8; ++i) {
