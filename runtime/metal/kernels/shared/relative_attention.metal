@@ -304,7 +304,7 @@ inline void relative_attention_direct_phase(
         // other bits.
         if (thread_index < M && thread_index / QueryHeadsPerKVHead < active_rows) {
 #pragma clang fp contract(off)
-          const float sink = sinks[offset / HeadDim + thread_index];
+          const float sink = sinks[offset / HeadDim + thread_index] * kRelativeAttentionLog2E;
           const float maximum = row_max[thread_index];
           const float row_maximum = max(maximum, sink);
           const float weight = relative_attention_split_weight(maximum, row_maximum);
