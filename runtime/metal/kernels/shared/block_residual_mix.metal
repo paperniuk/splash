@@ -187,10 +187,13 @@ kernel void block_residual_mix_norm(device const bfloat *stack [[buffer(0)]],
 constant constexpr uint kChunk = BLOCK_RESIDUAL_MIX_CHUNK;
 constant constexpr uint kChunkSums = BLOCK_RESIDUAL_MIX_SUMS;
 constant constexpr uint kQueries = BLOCK_RESIDUAL_MIX_MAXIMUM_QUERIES;
-static_assert(kStates * (1 + kQueries) <= kChunkSums, "a chunk's squares and dots fit its sums");
+// The sums a chunk writes; the rest of its kChunkSums are zeros.
+constant constexpr uint kChunkWritten = kStates * (1 + kQueries);
+static_assert(kChunkWritten <= kChunkSums, "a chunk's squares and dots fit its sums");
 
 // The chunk's sums into sums[row][chunk]: state s's squares at s, query q's dot with state s at kStates (1 + q) + s,
-// each a value's products by simd_sum then over the simdgroups in order.
+// each a value's products by simd_sum then over the simdgroups in order; zeros past kChunkWritten, whose partials no
+// simdgroup writes.
 template <class Current>
 [[max_total_threads_per_threadgroup(BLOCK_RESIDUAL_MIX_CHUNK)]]
 kernel void block_residual_mix_sums(device const bfloat *stack [[buffer(0)]], device const Current *current [[buffer(1)]],
@@ -225,7 +228,8 @@ kernel void block_residual_mix_sums(device const bfloat *stack [[buffer(0)]], de
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if (tid < kChunkSums) {
     float total = 0.0f;
-    for (uint g = 0; g < kChunk / 32; ++g) total += partials[g][tid];
+    if (tid < kChunkWritten)
+      for (uint g = 0; g < kChunk / 32; ++g) total += partials[g][tid];
     sums[(ulong(row) * chunks + chunk) * kChunkSums + tid] = total;
   }
 }

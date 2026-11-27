@@ -180,7 +180,7 @@ void Inkling2LoopTarget::addPrefillLayer(PrefillStep &step, uint32_t application
       .stack = s.stack, .planeRows = s.planeRows, .current = s.residual, .currentFloat = true};
   const ops::BlockResidualShape shape{.hidden = hidden, .stack = schedule_.ffnStates(application), .queries = 1};
   if (schedule_.gated(application)) {
-    ops::BlockResidualMix::addMix(step.graph, states, layer.ffnQuery, s.mixed, shape, step.rows, s.mixSums);
+    ops::BlockResidualMix::addMix(step.graph, states, layer.ffnQuery, s.mixed, shape, step.rows, mixSums(s));
     const Gate gate{.message = 3, .column = 0, .norm = layer.ffnNorm, .output = b.normalized};
     addGates(step, application, 1, std::span(&gate, 1));
   } else {
@@ -231,8 +231,8 @@ std::array<metal::MetalBuffer, 3> Inkling2LoopTarget::addMixerInputs(PrefillStep
                                    .planeRows = s.planeRows,
                                    .current = rows(step, {Inkling2LoopRowsKind::Previous, planes - 1})},
                                   layer.messages->queries, s.messages,
-                                  {.hidden = hidden, .stack = planes - 1, .queries = 4}, step.rows, s.mixSums);
-    ops::BlockResidualMix::addMix(step.graph, states, layer.mixerQueries, s.mixed, shape, step.rows, s.mixSums);
+                                  {.hidden = hidden, .stack = planes - 1, .queries = 4}, step.rows, mixSums(s));
+    ops::BlockResidualMix::addMix(step.graph, states, layer.mixerQueries, s.mixed, shape, step.rows, mixSums(s));
     std::array<Gate, 3> gates;
     for (uint32_t index = 0; index < 3; ++index)
       gates[index] = {.message = index, .column = full ? index : 0, .norm = norms[index], .output = separate[index]};
@@ -273,7 +273,12 @@ void Inkling2LoopTarget::addGates(const PrefillStep &step, uint32_t application,
                          .forget = s.gateForget,
                          .gain = s.gateGain,
                          .counters = s.gateCounters},
-                        std::span(inputs).first(gates.size()), hidden, step.rows);
+                        std::span(inputs).first(gates.size()), hidden, step.rows,
+                        operators_.calibration().simdgroupMma);
+}
+
+metal::MetalBuffer Inkling2LoopTarget::mixSums(const Inkling2LoopScratch &s) const {
+  return operators_.calibration().simdgroupMma ? s.mixSums : metal::MetalBuffer{};
 }
 
 // A prompt sequence's history through the command's reads of spilled K/V

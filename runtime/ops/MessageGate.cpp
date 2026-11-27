@@ -48,7 +48,7 @@ void MessageGate::requireWeights(std::span<const MessageGateWeights> gates, uint
 }
 
 PreparedInput MessageGate::add(metal::CommandGraph &graph, const MessageGateBuffers &buffers,
-                               std::span<const MessageGateInput> gates, uint32_t hidden, uint32_t rows) {
+                               std::span<const MessageGateInput> gates, uint32_t hidden, uint32_t rows, bool narrow) {
   if (gates.empty() || !hidden || !rows || !gates.front().weights.down.outputSize)
     throw std::invalid_argument("invalid message gates");
   if (gates.size() > kMaximumGates)
@@ -109,7 +109,7 @@ PreparedInput MessageGate::add(metal::CommandGraph &graph, const MessageGateBuff
   }
   const metal::DispatchSize threads{MESSAGE_GATE_THREADS, 1, 1};
   const uint32_t groups = (rows + MESSAGE_GATE_GROUP_ROWS - 1) / MESSAGE_GATE_GROUP_ROWS;
-  if (rows <= MESSAGE_GATE_NARROW_ROWS) {
+  if (narrow && rows <= MESSAGE_GATE_NARROW_ROWS) {
     // The narrow gates: rank values, then the gated rows in forget, fp32 [gates][rows][hidden], then their norms.
     requireBytes(buffers.low, uint64_t{count} * rows * rank * sizeof(uint16_t), "message gate rank values");
     requireBytes(buffers.forget, uint64_t{count} * rows * hidden * sizeof(float), "message gate gated rows");

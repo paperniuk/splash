@@ -39,11 +39,13 @@
 #define MESSAGE_GATE_DOWN_OUTPUTS 2u
 #define MESSAGE_GATE_MAXIMUM_RANK 64u
 #define MESSAGE_GATE_MAXIMUM_GATES 3u
-// The narrow gates (message_gate.metal): a call of at most MESSAGE_GATE_NARROW_ROWS rows runs
+// The narrow gates (message_gate.metal), Apple7/8's: a call of at most MESSAGE_GATE_NARROW_ROWS rows runs
 // message_gate_narrow_down (each threadgroup normalizing its group's rows itself, MESSAGE_GATE_NARROW_OUTPUTS rank
 // values a threadgroup), message_gate_narrow_up (MESSAGE_GATE_NARROW_UP_THREADS of a row's values a threadgroup) and
 // message_gate_norm, where the three kernels above took a one-row Inkling-2-Mini decode step 0.69 ms more on an M1
-// Max (35.46 against 34.77 ms) and a four-row one 0.24 ms more; at eight rows the narrow gates ran slower. A thread of MESSAGE_GATE_THREADS holds MESSAGE_GATE_ROW_SLOTS of a row's values in
+// Max (35.46 against 34.77 ms) and a four-row one 0.24 ms more; at eight rows the narrow gates ran slower. Apple9+
+// keeps the three kernels (ops::MessageGate::add's `narrow`), which ran a four-row call there faster (2.41 against
+// 2.68 ms a step on an M3 Ultra). A thread of MESSAGE_GATE_THREADS holds MESSAGE_GATE_ROW_SLOTS of a row's values in
 // registers (Inkling-2-Mini's 2,304).
 #define MESSAGE_GATE_NARROW_ROWS 4u
 #define MESSAGE_GATE_NARROW_OUTPUTS 4u

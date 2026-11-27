@@ -41,7 +41,9 @@
 // squares and of each query's dots with each state (BLOCK_RESIDUAL_MIX_SUMS a chunk), then each chunk's outputs
 // from every chunk's sums, a thread a value, so that a row's values spread over threadgroups of every core. A
 // one-row Inkling-2-Mini decode step's 72 plain mixes took 1.67 ms on an M1 Max against 4.59 ms at a threadgroup a
-// row and query, whose few threadgroups each walked their whole row (the step 36.99 -> 36.10 ms).
+// row and query, whose few threadgroups each walked their whole row (the step 36.99 -> 36.10 ms). Only Apple7/8
+// pass the scratch (model::Inkling2LoopTarget::mixSums): on an M3 Ultra the chunks' mixes took 2.37-2.45 ms against
+// 1.92, the two dispatches costing more than a quick threadgroup a row saves.
 #define BLOCK_RESIDUAL_MIX_CHUNK 256u
 #define BLOCK_RESIDUAL_MIX_SUMS 32u
 // The most states a mix reads, a stack of four blocks' inputs and the

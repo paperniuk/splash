@@ -87,10 +87,12 @@ struct MessageGate final {
                                              sizeof(uint32_t);
   // The gated rows of `rows` rows of `hidden` values, each gate's through its
   // norm into its output. The projections reading the outputs prepare their
-  // own tables, so the scratch describes nothing. Throws for a call the fused
-  // kernels do not take.
+  // own tables, so the scratch describes nothing. `narrow` lets a call of at
+  // most MESSAGE_GATE_NARROW_ROWS rows run the narrow gates, which only
+  // Apple7/8 run faster (metal/abi/MessageGate.h). Throws for a call the
+  // fused kernels do not take.
   static PreparedInput add(metal::CommandGraph &graph, const MessageGateBuffers &buffers,
-                           std::span<const MessageGateInput> gates, uint32_t hidden, uint32_t rows);
+                           std::span<const MessageGateInput> gates, uint32_t hidden, uint32_t rows, bool narrow);
   // Throws, saying why, unless the fused kernels take a call of these gates'
   // weights of `hidden` values a row (a target checks its gates at load).
   static void requireWeights(std::span<const MessageGateWeights> gates, uint32_t hidden);

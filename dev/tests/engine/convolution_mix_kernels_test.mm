@@ -953,7 +953,8 @@ struct GateCase {
 // The paths a test call runs: the engine's fused kernels (ops::MessageGate),
 // or the reference path (message_gate_reference.h), whose kernels the
 // production-and-test library holds.
-enum class GatePath : uint8_t { Fused, Reference };
+// Narrow: the fused kernels with the narrow gates allowed (Apple7/8's).
+enum class GatePath : uint8_t { Fused, Narrow, Reference };
 
 // The reference path's gates of `rows` rows: a gate at a time, its rows' and
 // messages' norms and concatenation (message_gate_test_prepare) into
@@ -1006,15 +1007,16 @@ void runGates(MetalBackend &backend, const GateCase &c, const MetalBuffer &x, co
       counters};
   CommandGraph graph;
   if (path == GatePath::Reference) addReferenceGates(graph, buffers, gates, hidden, count);
-  else ops::MessageGate::add(graph, buffers, gates, hidden, count);
+  else ops::MessageGate::add(graph, buffers, gates, hidden, count, path == GatePath::Narrow);
   run(backend, graph);
 }
 
 // The kernels a call of `rows` rows on `path` runs.
 std::string gateKernels(uint32_t rows, GatePath path) {
-  return path == GatePath::Reference              ? "float projections"
-         : rows <= ops::MessageGate::kFusedRows ? "fused"
-                                                : "tiled";
+  return path == GatePath::Reference                                   ? "float projections"
+         : path == GatePath::Narrow && rows <= MESSAGE_GATE_NARROW_ROWS ? "narrow"
+         : rows <= ops::MessageGate::kFusedRows                         ? "fused"
+                                                                        : "tiled";
 }
 
 // Each gate of a call of one or three gates (a layer's FFN gate; its q, k and
@@ -1242,8 +1244,14 @@ int main(int argc, const char *argv[]) {
               mixTest(backend, stack, queries, currentFloat, rows);
         for (const uint32_t rows : {5u, BLOCK_RESIDUAL_MIX_QUERY_ROWS + 3}) mixTest(backend, 0, 1, currentFloat, rows);
       }
-      // 1 and 3 rows: the narrow gates (MESSAGE_GATE_NARROW_ROWS); 6 and 13 the decode step's fused ones.
-      for (const uint32_t rows : {1u, 3u, 6u, 13u, ops::MessageGate::kFusedRows, ops::MessageGate::kFusedRows + 1}) {
+      // 1 and 3 rows: the narrow gates (MESSAGE_GATE_NARROW_ROWS) and, as Apple9+ runs them, the fused ones; 6 and
+      // 13 the decode step's fused ones.
+      for (const uint32_t rows : {1u, 3u})
+        for (const GatePath path : {GatePath::Narrow, GatePath::Fused}) {
+          gateTest(backend, rows, 1, true, path);
+          gateTest(backend, rows, 3, false, path);
+        }
+      for (const uint32_t rows : {6u, 13u, ops::MessageGate::kFusedRows, ops::MessageGate::kFusedRows + 1}) {
         gateTest(backend, rows, 1, true);
         gateTest(backend, rows, 3, false);
       }
