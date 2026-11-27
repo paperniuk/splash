@@ -190,12 +190,8 @@ constant constexpr uint kQueries = BLOCK_RESIDUAL_MIX_MAXIMUM_QUERIES;
 static_assert(kStates * (1 + kQueries) <= kChunkSums, "a chunk's squares and dots fit its sums");
 
 // The chunk's sums into sums[row][chunk]: state s's squares at s, query q's dot with state s at kStates (1 + q) + s,
-// and, Gram (the norm variant's, of at most kNorms queries), each pair s < t of states' dot from kGram on
-// (gram_index), each a value's products by simd_sum then over the simdgroups in order.
-constant constexpr uint kGram = kStates * (1 + kNorms);
-static_assert(kGram + kStates * (kStates - 1) / 2 <= kChunkSums, "the norm variant's pair dots fit its sums");
-inline uint gram_index(uint s, uint t) { return kGram + t * (t - 1) / 2 + s; }
-template <class Current, bool Gram>
+// each a value's products by simd_sum then over the simdgroups in order.
+template <class Current>
 [[max_total_threads_per_threadgroup(BLOCK_RESIDUAL_MIX_CHUNK)]]
 kernel void block_residual_mix_sums(device const bfloat *stack [[buffer(0)]], device const Current *current [[buffer(1)]],
                                     device const float *queries [[buffer(2)]], device float *sums [[buffer(3)]],
@@ -221,16 +217,9 @@ kernel void block_residual_mix_sums(device const bfloat *stack [[buffer(0)]], de
     float sum = simd_sum(x * x);
     if (lane == 0) partials[sg][s] = sum;
 #pragma unroll
-    for (uint k = 0; k < (Gram ? kNorms : kQueries); ++k) {
+    for (uint k = 0; k < kQueries; ++k) {
       sum = simd_sum(x * (k < p.queries ? q[k] : 0.0f));
       if (lane == 0) partials[sg][kStates * (1 + k) + s] = sum;
-    }
-    if constexpr (Gram) {
-#pragma unroll
-      for (uint t = s + 1; t < kStates; ++t) {
-        sum = simd_sum(x * (live && t < states ? v[t] : 0.0f));
-        if (lane == 0) partials[sg][gram_index(s, t)] = sum;
-      }
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -286,67 +275,6 @@ kernel void block_residual_mix_chunks(device const bfloat *stack [[buffer(0)]],
   }
 }
 
-// The norm variant's chunks (block_residual_mix_norm's outputs): each query's output through its weighted RMS norm
-// into its own bf16 rows, the output's squares over the row from the chunks' sums, ||sum_s c_s x_s||^2 =
-// sum_{s,t} c_s c_t <x_s, x_t>, so that the chunks need no third pass. A one-row Inkling-2-Mini decode step's 47
-// norm mixes took 1.25 ms on an M1 Max against 1.35 ms at a threadgroup a row and query (the step 35.67 -> 35.46 ms).
-template <class Current>
-[[max_total_threads_per_threadgroup(BLOCK_RESIDUAL_MIX_CHUNK)]]
-kernel void block_residual_mix_norm_chunks(device const bfloat *stack [[buffer(0)]],
-                                           device const Current *current [[buffer(1)]],
-                                           device const float *sums [[buffer(2)]],
-                                           device const float *norm0 [[buffer(3)]],
-                                           device const float *norm1 [[buffer(4)]],
-                                           device const float *norm2 [[buffer(5)]],
-                                           device bfloat *output0 [[buffer(6)]], device bfloat *output1 [[buffer(7)]],
-                                           device bfloat *output2 [[buffer(8)]],
-                                           constant BlockResidualMixParams &p [[buffer(9)]],
-                                           uint2 group [[threadgroup_position_in_grid]],
-                                           uint tid [[thread_index_in_threadgroup]]) {
-  threadgroup float totals[kChunkSums];
-  const uint row = group.y, chunk = group.x, chunks = (p.hidden + kChunk - 1) / kChunk;
-  if (row >= p.rows) return;
-  const BlockResidualMixRow<Current> mix{stack + ulong(row) * p.hidden, current + ulong(row) * p.hidden, p.stack,
-                                         p.stack_plane};
-  const uint states = mix.states(), d = chunk * kChunk + tid, at = min(d, p.hidden - 1);
-  float v[kStates], w[kNorms];
-#pragma unroll
-  for (uint s = 0; s < kStates; ++s) v[s] = mix.state(min(s, states - 1), at);
-#pragma unroll
-  for (uint k = 0; k < kNorms; ++k) w[k] = (k == 0 ? norm0 : k == 1 ? norm1 : norm2)[at];
-  if (tid < kChunkSums) {
-    device const float *row_sums = sums + ulong(row) * chunks * kChunkSums + tid;
-    float total = 0.0f;
-    for (uint c = 0; c < chunks; ++c) total += row_sums[c * kChunkSums];
-    totals[tid] = total;
-  }
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  if (d >= p.hidden) return;
-  float inverse[kStates];
-  for (uint s = 0; s < states; ++s) inverse[s] = rsqrt(totals[s] / p.hidden + kRmsEpsilon);
-  for (uint k = 0; k < p.queries && k < kNorms; ++k) {
-    float c[kStates], maximum = -INFINITY, total = 0.0f;
-    for (uint s = 0; s < states; ++s) {
-      c[s] = totals[kStates * (1 + k) + s] * inverse[s] * p.scale;
-      maximum = max(maximum, c[s]);
-    }
-    for (uint s = 0; s < states; ++s) {
-      c[s] = exp(c[s] - maximum);
-      total += c[s];
-    }
-    float value = 0.0f, squares = 0.0f;
-    for (uint s = 0; s < states; ++s) {
-      c[s] = c[s] / total * inverse[s];
-      value += c[s] * v[s];
-      squares += c[s] * c[s] * totals[s];
-      for (uint t = 0; t < s; ++t) squares += 2.0f * c[s] * c[t] * totals[gram_index(t, s)];
-    }
-    const float output_inverse = rsqrt(max(squares, 0.0f) / p.hidden + kRmsEpsilon);
-    device bfloat *out = k == 0 ? output0 : k == 1 ? output1 : output2;
-    out[ulong(row) * p.hidden + d] = bfloat((value * output_inverse) * w[k]);
-  }
-}
-
 // The instances: bf16 current rows (a layer's input), and fp32 (_f32, the
 // residual inside a layer).
 #define BLOCK_RESIDUAL_MIX_INSTANCES(Current, suffix)                                                          \
@@ -361,17 +289,9 @@ kernel void block_residual_mix_norm_chunks(device const bfloat *stack [[buffer(0
       block_residual_mix<Current>;                                                                                    \
   template [[host_name("block_residual_mix_norm" suffix)]] kernel BlockResidualMixNormKernel##Current               \
       block_residual_mix_norm<Current>;                                                                               \
-  template [[host_name("block_residual_mix_sums" suffix)]] kernel void block_residual_mix_sums<Current, false>(       \
+  template [[host_name("block_residual_mix_sums" suffix)]] kernel void block_residual_mix_sums<Current>(              \
       device const bfloat *, device const Current *, device const float *, device float *,                           \
       constant BlockResidualMixParams &, uint2, uint, uint, uint);                                                    \
-  template [[host_name("block_residual_mix_norm_sums" suffix)]] kernel void block_residual_mix_sums<Current, true>(   \
-      device const bfloat *, device const Current *, device const float *, device float *,                           \
-      constant BlockResidualMixParams &, uint2, uint, uint, uint);                                                    \
-  template [[host_name("block_residual_mix_norm_chunks" suffix)]] kernel void                                        \
-  block_residual_mix_norm_chunks<Current>(device const bfloat *, device const Current *, device const float *,        \
-                                          device const float *, device const float *, device const float *,          \
-                                          device bfloat *, device bfloat *, device bfloat *,                         \
-                                          constant BlockResidualMixParams &, uint2, uint);                           \
   template [[host_name("block_residual_mix_chunks" suffix)]] kernel void block_residual_mix_chunks<Current>(          \
       device const bfloat *, device const Current *, device const float *, device float *,                           \
       constant BlockResidualMixParams &, uint2, uint);

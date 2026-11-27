@@ -92,7 +92,7 @@ void BlockResidualMix::addMix(metal::CommandGraph &graph, const BlockResidualSta
 PreparedInput BlockResidualMix::addMixNorm(metal::CommandGraph &graph, const BlockResidualStates &states,
                                            metal::MetalBuffer queries, std::span<const NormWeights> norms,
                                            std::span<const metal::MetalBuffer> outputs, BlockResidualShape shape,
-                                           uint32_t rows, const metal::MetalBuffer &sums) {
+                                           uint32_t rows) {
   requireShape(shape, states, rows);
   if (shape.queries > BLOCK_RESIDUAL_MIX_MAXIMUM_NORMS || norms.size() != shape.queries ||
       outputs.size() != shape.queries)
@@ -112,19 +112,6 @@ PreparedInput BlockResidualMix::addMixNorm(metal::CommandGraph &graph, const Blo
     const metal::MetalBuffer &out = outputs[q < shape.queries ? q : 0];
     requireBytes(out, uint64_t{rows} * shape.hidden * sizeof(uint16_t), "block residual mix normalized");
     bindings.push_back(out);
-  }
-  if (sums && rows <= BLOCK_RESIDUAL_MIX_QUERY_ROWS) {
-    // The chunks' kernels: the norm variant's sums (with the states' pair dots), then each chunk's normalized rows.
-    requireBytes(sums, sumsBytes(shape.hidden, rows), "block residual mix sums");
-    const uint32_t chunks = (shape.hidden + BLOCK_RESIDUAL_MIX_CHUNK - 1) / BLOCK_RESIDUAL_MIX_CHUNK;
-    const std::string suffix = states.currentFloat ? "_f32" : "";
-    const BlockResidualMixParams params = mixParams(states, shape, rows);
-    graph.add("block_residual_mix_norm_sums" + suffix, {bindings[0], bindings[1], bindings[2], sums}, params,
-              {chunks, rows, 1}, {BLOCK_RESIDUAL_MIX_CHUNK, 1, 1});
-    bindings[2] = sums;
-    graph.add("block_residual_mix_norm_chunks" + suffix, std::move(bindings), params, {chunks, rows, 1},
-              {BLOCK_RESIDUAL_MIX_CHUNK, 1, 1});
-    return {};
   }
   const MixLaunch mix = launch(shape, rows);
   graph.add(instance("block_residual_mix_norm", mix, states), std::move(bindings), mixParams(states, shape, rows),

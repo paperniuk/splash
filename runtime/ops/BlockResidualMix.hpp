@@ -52,13 +52,12 @@ struct BlockResidualMix final {
   [[nodiscard]] static uint64_t sumsBytes(uint32_t hidden, uint32_t rows) noexcept;
   // Each query's output through its own weighted RMS norm (F32, as a GGUF
   // stores norms) into its own bf16 rows [rows][hidden], one norm and output
-  // a query (at most BLOCK_RESIDUAL_MIX_MAXIMUM_NORMS); with `sums`, as
-  // addMix, on the chunks' kernels. The projections
+  // a query (at most BLOCK_RESIDUAL_MIX_MAXIMUM_NORMS). The projections
   // reading them prepare their own tables, so the scratch describes nothing.
   static PreparedInput addMixNorm(metal::CommandGraph &graph, const BlockResidualStates &states,
                                   metal::MetalBuffer queries, std::span<const NormWeights> norms,
                                   std::span<const metal::MetalBuffer> outputs, BlockResidualShape shape,
-                                  uint32_t rows, const metal::MetalBuffer &sums = {});
+                                  uint32_t rows);
 };
 
 } // namespace splash::ops
