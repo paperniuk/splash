@@ -180,6 +180,8 @@ struct RelativeAttentionLane {
   uint depth;
 };
 
+constant float kRelativeAttentionLog2E = 1.4426950408889634f;
+
 inline void relative_attention_add_bias(thread float *score, uint first_key, RelativeAttentionLane lane) {
   static_assert(SPLASH_RELATIVE_ATTENTION_STATES == 16, "four float4 states a row");
 #pragma unroll
@@ -190,8 +192,8 @@ inline void relative_attention_add_bias(thread float *score, uint first_key, Rel
                           : lane.position - key;
     if (distance < SPLASH_RELATIVE_ATTENTION_EXTENT) {
       device const float4 *bias = lane.table + ulong(distance) * 4;
-      score[j] += dot(lane.state[0], bias[0]) + dot(lane.state[1], bias[1]) + dot(lane.state[2], bias[2]) +
-                  dot(lane.state[3], bias[3]);
+      score[j] += kRelativeAttentionLog2E * (dot(lane.state[0], bias[0]) + dot(lane.state[1], bias[1]) +
+                                             dot(lane.state[2], bias[2]) + dot(lane.state[3], bias[3]));
     }
   }
 }
@@ -222,6 +224,15 @@ inline void relative_attention_page_softmax(
     return;
   const uint fused_row = thread_index / LanesPerRow;
   const uint column = thread_index % LanesPerRow * TokensPerLane;
+  threadgroup bfloat4 *probabilities4 = reinterpret_cast<threadgroup bfloat4 *>(
+      probabilities + fused_row * N + column);
+  if (fused_row / QueryHeadsPerKVHead >= active_rows) {
+    if (column == 0)
+      previous_scale[fused_row] = 1.0f;
+    probabilities4[0] = bfloat4(bfloat(0.0f));
+    probabilities4[1] = bfloat4(bfloat(0.0f));
+    return;
+  }
   bool seen[TokensPerLane];
   if constexpr (Masked) {
     const uint query_row = fused_row / QueryHeadsPerKVHead;
@@ -277,7 +288,7 @@ inline void relative_attention_page_softmax(
   float local_sum = 0.0f;
 #pragma unroll
   for (uint j = 0; j < TokensPerLane; ++j) {
-    probability[j] = seen[j] ? fast::exp(score[j] - next_max) : 0.0f;
+    probability[j] = seen[j] ? fast::exp2(score[j] - next_max) : 0.0f;
     local_sum += probability[j];
   }
   local_sum += simd_shuffle_xor(local_sum, 1);
@@ -285,7 +296,7 @@ inline void relative_attention_page_softmax(
   if (column == 0) {
     const float scale = next_max == -INFINITY || next_max == previous_max
                             ? 1.0f
-                            : fast::exp(previous_max - next_max);
+                            : fast::exp2(previous_max - next_max);
     previous_scale[fused_row] = scale;
     row_sum[fused_row] = row_sum[fused_row] * scale + local_sum;
     row_max[fused_row] = next_max;
@@ -305,8 +316,6 @@ inline void relative_attention_page_softmax(
                     seen[5] ? probability[5] * high_scales.y : 0.0f,
                     seen[6] ? probability[6] * high_scales.z : 0.0f,
                     seen[7] ? probability[7] * high_scales.w : 0.0f);
-  threadgroup bfloat4 *probabilities4 = reinterpret_cast<threadgroup bfloat4 *>(
-      probabilities + fused_row * N + column);
   probabilities4[0] = bfloat4(low);
   probabilities4[1] = bfloat4(high);
 }
@@ -411,6 +420,7 @@ inline void relative_attention_page_loop(
   } else {
     queries = tile_queries;
   }
+  score_scale *= kRelativeAttentionLog2E;
   if (thread_index < M) {
     row_max[thread_index] = -INFINITY;
     row_sum[thread_index] = 0.0f;
@@ -486,8 +496,10 @@ inline void relative_attention_page_loop(
   static_assert(!RegisterTile || (M == 48 && N == 32 && D == 128 && Quantized && !Int8Queries));
   float2 queryParts[3][D / 8];
   if constexpr (RegisterTile) {
+#pragma unroll
     for (ushort tile = 0; tile < 3; ++tile) {
       const uint row = ((sg + 8 * tile) / 4) * 8 + coord.fm;
+#pragma unroll
       for (ushort k = 0; k < D / 8; ++k)
         queryParts[tile][k] = float2(*reinterpret_cast<device const bfloat2 *>(tile_queries + row * D + 8 * k + coord.fn));
     }
@@ -504,12 +516,15 @@ inline void relative_attention_page_loop(
     if constexpr (RegisterTile) {
       const uint col = (sg % 4) * 8 + coord.fn;
       float2 acc[3] = {};
+#pragma unroll
       for (ushort k = 0; k < D / 8; ++k) {
         const uint dim = 8 * k + coord.fm;
         const half2 key(tensors.keys[col * D + dim], tensors.keys[(col + 1) * D + dim]);
+#pragma unroll
         for (ushort tile = 0; tile < 3; ++tile)
           sgmatrix::mma_mixed(acc[tile], queryParts[tile][k], key);
       }
+#pragma unroll
       for (ushort tile = 0; tile < 3; ++tile) {
         const uint row = ((sg + 8 * tile) / 4) * 8 + coord.fm;
         *reinterpret_cast<threadgroup float2 *>(scores + row * N + col) = acc[tile];
@@ -546,16 +561,20 @@ inline void relative_attention_page_loop(
       }
     }
     if constexpr (RegisterTile) {
+#pragma unroll
       for (ushort k = 0; k < N / 8; ++k) {
         half2 v[2];
+#pragma unroll
         for (ushort c = 0; c < 2; ++c) {
           const uint col = sg * 8 + c * 64 + coord.fn;
           const uint tok = 8 * k + coord.fm;
           v[c] = half2(tensors.values[col * N + tok], tensors.values[(col + 1) * N + tok]);
         }
+#pragma unroll
         for (ushort r = 0; r < 6; ++r) {
           const uint offset = (r * 8 + coord.fm) * N + 8 * k + coord.fn;
           const float2 prob = float2(*reinterpret_cast<threadgroup const bfloat2 *>(probabilities + offset));
+#pragma unroll
           for (ushort c = 0; c < 2; ++c)
             sgmatrix::mma_mixed(running.values[2 * r + c], prob, v[c]);
         }
@@ -592,15 +611,15 @@ inline void relative_attention_page_loop(
 // `row_maximum`.
 __attribute__((always_inline)) inline float relative_attention_split_weight(float maximum, float row_maximum) {
 #pragma clang fp contract(off)
-  return fast::exp(maximum - row_maximum);
+  return fast::exp2(maximum - row_maximum);
 }
 
 // A row's denominator: its splits' weighted sums, `splits`, then its sink's
-// term.
+// term (already scaled by kRelativeAttentionLog2E).
 __attribute__((always_inline)) inline float relative_attention_denominator(float splits, float sink,
                                                                            float row_maximum) {
 #pragma clang fp contract(off)
-  return splits + fast::exp(sink - row_maximum);
+  return splits + fast::exp2(sink - row_maximum);
 }
 
 // An element's gated output: its value as the combine rounds it, `value`,
@@ -629,7 +648,8 @@ inline bfloat relative_attention_combine_splits(
   if (lane == 0) group_values[sg] = group_maximum;
   threadgroup_barrier(mem_flags::mem_threadgroup);
   const float split_maximum = simd_max(lane < D / 32 ? group_values[lane] : -INFINITY);
-  const float row_maximum = max(split_maximum, sink);
+  const float sink_log2 = sink * kRelativeAttentionLog2E;
+  const float row_maximum = max(split_maximum, sink_log2);
   if (thread_index < written)
     weights[thread_index] = relative_attention_split_weight(maximum, row_maximum);
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -642,7 +662,7 @@ inline bfloat relative_attention_combine_splits(
         partials[((head_slot + split) * M + fused_row) * D + thread_index];
     denominator += weight * statistics[stat + 1];
   }
-  denominator = relative_attention_denominator(denominator, sink, row_maximum);
+  denominator = relative_attention_denominator(denominator, sink_log2, row_maximum);
   return bfloat(denominator > 0.0f ? numerator / denominator : 0.0f);
 }
 
@@ -805,7 +825,8 @@ inline void relative_attention_combine_weights(device coherent(device) const flo
                                                ulong head_slot, uint fused_row, float sink, threadgroup float *weights,
                                                threadgroup float *denominators) {
   constexpr uint M = RowsPerTile * QueryHeadsPerKVHead;
-  float maximum = sink;
+  const float sink_log2 = sink * kRelativeAttentionLog2E;
+  float maximum = sink_log2;
   for (uint split = 0; split < written; ++split)
     maximum = max(maximum, statistics[((head_slot + split) * M + fused_row) * 2]);
   float denominator = 0.0f;
@@ -815,7 +836,7 @@ inline void relative_attention_combine_weights(device coherent(device) const flo
     weights[fused_row * written + split] = weight;
     denominator += weight * statistics[stat + 1];
   }
-  denominators[fused_row] = relative_attention_denominator(denominator, sink, maximum);
+  denominators[fused_row] = relative_attention_denominator(denominator, sink_log2, maximum);
 }
 
 template <uint QueryHeadsPerKVHead, uint RowsPerTile, uint HeadDim>
