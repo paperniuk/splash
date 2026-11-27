@@ -2650,17 +2650,24 @@ MetalBuffer MetalBackend::view(const MetalBuffer &base,
     if (base.impl_->allocation->accounting.get() != impl_->accounting.get()) {
         throw MetalBackendError("Metal buffer belongs to another backend");
     }
-    if (!lengthBytes || offsetBytes > base.impl_->lengthBytes ||
-        lengthBytes > base.impl_->lengthBytes - offsetBytes) {
+    return base.view(offsetBytes, lengthBytes);
+}
+
+MetalBuffer MetalBuffer::view(uint64_t offsetBytes, uint64_t lengthBytes) const {
+    if (!impl_) {
+        throw MetalBackendError("cannot view an empty Metal buffer");
+    }
+    if (!lengthBytes || offsetBytes > impl_->lengthBytes ||
+        lengthBytes > impl_->lengthBytes - offsetBytes) {
         std::ostringstream message;
         message << "Metal buffer view is out of range: offset=" << offsetBytes
                 << " length=" << lengthBytes
-                << " base_length=" << base.impl_->lengthBytes;
+                << " base_length=" << impl_->lengthBytes;
         throw MetalBackendError(message.str());
     }
-    auto result = std::make_shared<MetalBuffer::Impl>();
-    result->allocation = base.impl_->allocation;
-    result->offsetBytes = base.impl_->offsetBytes + offsetBytes;
+    auto result = std::make_shared<Impl>();
+    result->allocation = impl_->allocation;
+    result->offsetBytes = impl_->offsetBytes + offsetBytes;
     result->lengthBytes = lengthBytes;
     return MetalBuffer(std::move(result));
 }

@@ -772,7 +772,7 @@ void sideBySidePlans(MetalBackend &backend) {
       device.appleGpuFamily = family;
       device.gpuCoreCount = cores;
       const Linear linear(device, Int8Activations::On, StepKind::Decode);
-      for (const uint32_t rows : {1u, 2u, 8u, 16u, 24u, 32u, 48u, 64u, 96u, 128u}) {
+      for (const uint32_t rows : {1u, 2u, 8u, 16u, 24u, 32u, 40u, 48u, 64u, 96u, 128u}) {
         const LinearPlan plan = linear.plan(*both, rows);
         const std::string label = std::string(fmtName(f)) + " side by side, family " + std::to_string(family) + ", " +
                                   std::to_string(cores) + " cores, " + std::to_string(rows) + " rows";
@@ -783,7 +783,9 @@ void sideBySidePlans(MetalBackend &backend) {
         uint32_t offset = 0;
         for (const Projection *part : parts) {
           const LinearPlan own = linear.plan(*part, rows);
-          if (own.configuration() != plan.configuration() || own.storageRows() != plan.storageRows()) {
+          if (own.configuration() != plan.configuration() || own.storageRows() != plan.storageRows() ||
+              own.passes().size() != plan.passes().size() ||
+              (!own.passes().empty() && own.passes().back().configuration() != plan.passes().back().configuration())) {
             fail(label + ": not its tensors' own configuration");
             break;
           }
@@ -834,8 +836,8 @@ void gateUpPairs(MetalBackend &backend, const Linear &linear, LinearTile tile) {
           " gate and up format pairs at N 256 and 4 at N 1024, 1-4 lanes, within fp64");
 }
 
-// Gate/up of 33 to 64 rows on the tile the policy picks (Linear::plan), as a short prefill or three or four lanes'
-// 16-row trees run it: on Apple7/8 the 64-row MMA prefill tile, whose up pass reads the gate its own pass writes
+// Gate/up of 33 to 64 rows on the tile the policy picks (Linear::plan) for a short prefill chunk (a decode step's of
+// 33 to 56 rows: decodePasses): on Apple7/8 the 64-row MMA prefill tile, whose up pass reads the gate its own pass writes
 // first, not a stale gate scratch (here NaN).
 void policyGateUp(MetalBackend &backend, const Linear &linear) {
   constexpr uint32_t K = 1024, N = 256;
@@ -857,8 +859,8 @@ void policyGateUp(MetalBackend &backend, const Linear &linear) {
   section("gate/up of 33-64 rows on the policy's tile, within fp64");
 }
 
-// Plain fp32 destination (the logits head) of 33 to 64 rows on the tile the policy picks (Linear::plan), as three or
-// four lanes' 16-row decode steps run it: on Apple7/8 the 64-row MMA prefill tile, both split (narrow grid) and
+// Plain fp32 destination (the logits head) of 33 to 64 rows on the tile the policy picks (Linear::plan) for a prefill
+// chunk, as four lanes' 16-row decode steps run it (three lanes': decodePasses): on Apple7/8 the 64-row MMA prefill tile, both split (narrow grid) and
 // unsplit (wide grid, as the 248320-column vocabulary head runs).
 void policyFloatOutput(MetalBackend &backend, const Linear &linear) {
   const auto check = [&](Fmt f, uint32_t N, uint32_t K, std::span<const uint32_t> rowCounts, bool expectUnsplit) {
@@ -889,6 +891,227 @@ void policyFloatOutput(MetalBackend &backend, const Linear &linear) {
   check(Q6K, 20480, 256, rows, true);
   check(Q5K, 20480, 256, rows, true);
   section("fp32 destination of 33-64 rows on the policy's tile (split and unsplit), within fp64");
+}
+
+// Apple7/8's decode steps of 33 to 56 rows run two plans where decodePassRows takes the unit (LinearPlan::passes):
+// the register tile's of 32 rows, then the plan of the rest's rows, the column tile at one or two (8-row register tile
+// for a two-format gate/up pair). Checks residual, one- and two-format gate/up (including 40-row storage at 33/34),
+// fp32 head across 33-56 and 64-row chunked 97-120 rows, mixed quantized + F32 plain projection (27B GDN input shape)
+// at 33/34/40 rows, sideBySide at 40 rows, and refused cases (same- and mixed-format segmented BF16 residual, and a
+// float-only projection) staying on one plan and matching fp64.
+void decodePasses(MetalBackend &backend, const Linear &steps) {
+  constexpr uint32_t K = 1024, N = 256;
+  const uint32_t columns = N + kPadding;
+  const Tensor q4 = tensor(backend, Q4K, N, K), q4Gate = tensor(backend, Q4K, N, K), q5 = tensor(backend, Q5K, N, K),
+               q6 = tensor(backend, Q6K, N, K);
+  const Projection down = projection({&q4}, columns), gate = projection({&q4Gate}, columns),
+                   up = projection({&q5}, columns), head = projection({&q6}, columns);
+  Projection logits = head;
+  logits.destination = FloatOutput::Float32;
+  // Rows [first, first + count) of `values` of `width` columns.
+  const auto part = [](const std::vector<float> &values, uint32_t width, uint32_t first, uint32_t count) {
+    return std::vector<float>(values.begin() + uint64_t{first} * width,
+                              values.begin() + uint64_t{first + count} * width);
+  };
+  for (const uint32_t rows : {33u, 34u, 40u, 41u, 48u, 49u, 56u}) {
+    const std::vector<float> x = activations(Inputs::Dense, rows, K), residual = residuals(rows, columns);
+    const auto check = [&](const Projection &p, LinearEpilogue epilogue, const Projection *pair,
+                           const std::vector<const Tensor *> &weights, const Tensor *gateWeights,
+                           const std::string &what) {
+      const LinearWorkload wl{{columns, K}, rows, epilogue};
+      const LinearPlan plan = steps.plan(wl, p, pair);
+      const std::span<const LinearPlan> passes = plan.passes();
+      const std::string label = "decode passes " + what + " " + std::to_string(rows) + " rows";
+      const uint32_t rest = rows - kMaximumRegisterRows;
+      const bool expectColumn = rest <= GGUF_COLUMN_ROWS && (epilogue != LinearEpilogue::GateUp || &p == &down);
+      if (passes.size() != 2 || passes[0].configuration().tile != LinearTile::GgufRegister ||
+          passes[0].workload().rows != kMaximumRegisterRows || passes[1].workload().rows != rest ||
+          expectColumn != (passes[1].configuration().tile == LinearTile::GgufColumn) ||
+          plan.storageRows() > steps.storageRows(rows, p.shape()) ||
+          (&p == &up && epilogue == LinearEpilogue::GateUp && rows <= 40 && plan.storageRows() != 40)) {
+        fail(label + ": not the register tile's 32-row plan and the rest's");
+        return Outcome{};
+      }
+      const std::vector<uint16_t> aux = storageRows(residual, columns, rows, plan.storageRows());
+      const Outcome out =
+          run(backend, steps, plan, p, pair, storageRows(x, K, rows, plan.storageRows()), aux, kPoisonNaN, N, label);
+      // A one-pass pair writes no gate rows to check its outputs against: its passes alone are checked by their own
+      // sections (registerOneGateUpPass, columnTile), and bitwise below.
+      if (epilogue != LinearEpilogue::GateUp || !out.gate.empty())
+        checkValues(out, within(products(weights, columns, x, rows), false),
+                    gateWeights ? within(products({gateWeights}, columns, x, rows), false) : Want{}, aux, wl, rows, N,
+                    label);
+      uint32_t first = 0;
+      for (const LinearPlan &pass : passes) {
+        const uint32_t count = pass.workload().rows;
+        const Outcome alone =
+            run(backend, steps, pass, p, pair, storageRows(part(x, K, first, count), K, count, pass.storageRows()),
+                storageRows(part(residual, columns, first, count), columns, count, pass.storageRows()), kPoisonNaN, N,
+                label + " pass of " + std::to_string(count) + " rows alone");
+        if (!sameRows(out.output, first, alone.output, 0, count, columns) ||
+            (!alone.gate.empty() && !sameRows(out.gate, first, alone.gate, 0, count, columns)))
+          fail(label + ": the rows from " + std::to_string(first) + " differ from their pass alone");
+        first += count;
+      }
+      return out;
+    };
+    check(down, LinearEpilogue::Residual, nullptr, {&q4}, nullptr, "Q4_K residual");
+    check(down, LinearEpilogue::GateUp, &gate, {&q4}, &q4Gate, "Q4_K gate/up");
+    check(up, LinearEpilogue::GateUp, &gate, {&q5}, &q4Gate, "Q4_K gate Q5_K up");
+    const Outcome bf16 = check(head, LinearEpilogue::None, nullptr, {&q6}, nullptr, "Q6_K head");
+    const LinearPlan f32 = steps.plan(logits, rows);
+    if (!bf16.output.empty())
+      floatOutput(backend, steps, f32, logits, storageRows(x, K, rows, f32.storageRows()), bf16,
+                  within(products({&q6}, columns, x, rows), false), N,
+                  "decode passes Q6_K fp32 head " + std::to_string(rows) + " rows");
+  }
+  // Segmented BF16 residual (same-format Q4_K+Q4_K and mixed-format Q4_K+Q5_K) at 40 rows stays on one MMA prefill
+  // plan, applies the residual, and matches fp64.
+  {
+    constexpr uint32_t kRows = 40;
+    const uint32_t segCols = 2 * N + kPadding;
+    const std::vector<float> x = activations(Inputs::Dense, kRows, K), residual = residuals(kRows, segCols);
+    for (const auto &[parts, what] : {std::pair{std::vector<const Tensor *>{&q4, &q4Gate}, "Q4_K+Q4_K residual"},
+                                      std::pair{std::vector<const Tensor *>{&q4, &q5}, "Q4_K+Q5_K residual"}}) {
+      const Projection p = projection(parts, segCols);
+      const LinearWorkload wl{{segCols, K}, kRows, LinearEpilogue::Residual};
+      const LinearPlan plan = steps.plan(wl, p);
+      const std::string label = std::string("decode passes refused ") + what + " 40 rows";
+      if (!plan.passes().empty() || plan.configuration().tile != LinearTile::GgufPrefill ||
+          !plan.configuration().mmaPrefill) {
+        fail(label + ": segmented residual did not stay on the MMA prefill tile");
+        continue;
+      }
+      const std::vector<uint16_t> aux = storageRows(residual, segCols, kRows, plan.storageRows());
+      const Outcome out =
+          run(backend, steps, plan, p, nullptr, storageRows(x, K, kRows, plan.storageRows()), aux, kPoisonNaN, 2 * N,
+              label);
+      checkValues(out, within(products(parts, segCols, x, kRows), true), {}, aux, wl, kRows, 2 * N, label);
+    }
+  }
+  // Float-only projection at 40 rows stays on one plan and matches fp64; plain mixed quantized + F32 projection (27B
+  // GDN input: Q4_K + Q4_K + F32) at 33, 34 and 40 rows splits (column tile + F32 on the 33-34 tail), within fp64 and
+  // bitwise each pass alone.
+  {
+    constexpr uint32_t kFloatCols = 64;
+    const std::vector<float> fw = activations(Inputs::Dense, kFloatCols, K);
+    std::vector<uint8_t> fbytes(fw.size() * sizeof(float));
+    std::memcpy(fbytes.data(), fw.data(), fbytes.size());
+    const MetalBuffer fbuf = upload(backend, fbytes);
+    const auto floatDots = [&](const std::vector<float> &x, uint32_t rows, uint32_t stride, uint32_t offset,
+                               std::vector<Dot> &dots) {
+      for (uint32_t r = 0; r < rows; ++r)
+        for (uint32_t c = 0; c < kFloatCols; ++c)
+          dots[uint64_t{r} * stride + offset + c] = dot(x.data() + uint64_t{r} * K, fw.data() + uint64_t{c} * K, K);
+    };
+    {
+      constexpr uint32_t kRows = 40;
+      const Projection floatOnly(kFloatCols, K, BlockWeights{{QuantizedSegment::floats(kFloatCols, K, fbuf)}});
+      const LinearWorkload wl{{kFloatCols, K}, kRows, LinearEpilogue::None};
+      const LinearPlan plan = steps.plan(wl, floatOnly);
+      if (!plan.passes().empty()) fail("decode passes float-only 40 rows: split into passes");
+      const std::vector<float> x = activations(Inputs::Dense, kRows, K);
+      const Outcome out = run(backend, steps, plan, floatOnly, nullptr, storageRows(x, K, kRows, plan.storageRows()),
+                              {}, kPoisonNaN, kFloatCols, "decode passes float-only 40 rows");
+      std::vector<Dot> dots(uint64_t{kRows} * kFloatCols);
+      floatDots(x, kRows, kFloatCols, 0, dots);
+      checkValues(out, within(dots, false), {}, {}, wl, kRows, kFloatCols, "decode passes float-only 40 rows");
+    }
+    {
+      // Two quantized + two F32 segments (four segments total, two quantized): addGguf dispatches the float segments
+      // before entering the column/register tile, so all 33/34/40 rows split and match fp64 and each pass alone.
+      const uint32_t gdnCols = 2 * N + 2 * kFloatCols + kPadding;
+      BlockWeights weights;
+      QuantizedSegment s0 = q4.segment, s1 = q4Gate.segment, s2 = QuantizedSegment::floats(kFloatCols, K, fbuf),
+                       s3 = QuantizedSegment::floats(kFloatCols, K, fbuf);
+      s0.columnOffset = 0;
+      s1.columnOffset = N;
+      s2.columnOffset = 2 * N;
+      s3.columnOffset = 2 * N + kFloatCols;
+      weights.segments = {s0, s1, s2, s3};
+      const Projection gdn(gdnCols, K, std::move(weights));
+      for (const uint32_t rows : {33u, 34u, 40u}) {
+        const LinearWorkload wl{{gdnCols, K}, rows, LinearEpilogue::None};
+        const LinearPlan plan = steps.plan(wl, gdn);
+        const std::span<const LinearPlan> passes = plan.passes();
+        const std::string label = "decode passes q4k+q4k+f32+f32 " + std::to_string(rows) + " rows";
+        const uint32_t rest = rows - kMaximumRegisterRows;
+        if (passes.size() != 2 || (rest <= GGUF_COLUMN_ROWS) != (passes[1].configuration().tile == LinearTile::GgufColumn)) {
+          fail(label + ": unexpected passes");
+          continue;
+        }
+        const std::vector<float> x = activations(Inputs::Dense, rows, K);
+        const Outcome out = run(backend, steps, plan, gdn, nullptr, storageRows(x, K, rows, plan.storageRows()), {},
+                                kPoisonNaN, 2 * N + 2 * kFloatCols, label);
+        std::vector<Dot> dots = products({&q4, &q4Gate}, gdnCols, x, rows);
+        floatDots(x, rows, gdnCols, 2 * N, dots);
+        floatDots(x, rows, gdnCols, 2 * N + kFloatCols, dots);
+        checkValues(out, within(dots, false), {}, {}, wl, rows, 2 * N + 2 * kFloatCols, label);
+        uint32_t first = 0;
+        for (const LinearPlan &pass : passes) {
+          const uint32_t count = pass.workload().rows;
+          const Outcome alone =
+              run(backend, steps, pass, gdn, nullptr, storageRows(part(x, K, first, count), K, count, pass.storageRows()),
+                  {}, kPoisonNaN, 2 * N + 2 * kFloatCols, label + " pass of " + std::to_string(count) + " rows alone");
+          if (!sameRows(out.output, first, alone.output, 0, count, gdnCols))
+            fail(label + ": the rows from " + std::to_string(first) + " differ from their pass alone");
+          first += count;
+        }
+      }
+    }
+  }
+  // Side-by-side projection (two same-format tensors, planOutputs = N) at 40 rows: two passes, each tensor's columns
+  // bitwise equal to its own 40-row plan.
+  {
+    constexpr uint32_t kRows = 40;
+    const Projection a = projection({&q4}, N), b = projection({&q4Gate}, N);
+    const std::array<const Projection *, 2> parts{&a, &b};
+    const std::optional<Projection> both = Projection::sideBySide(parts);
+    if (!both) {
+      fail("decode passes sideBySide: Projection::sideBySide returned nullopt");
+    } else {
+      const LinearPlan plan = steps.plan(*both, kRows);
+      if (plan.passes().size() != 2) fail("decode passes sideBySide 40 rows: did not split into 2 passes");
+      const std::vector<float> x = activations(Inputs::Dense, kRows, K);
+      const std::vector<uint16_t> input = storageRows(x, K, kRows, plan.storageRows());
+      const Outcome out = run(backend, steps, plan, *both, nullptr, input, {}, kPoisonNaN, 2 * N,
+                              "decode passes sideBySide 40 rows");
+      uint32_t offset = 0;
+      for (const Projection *p : parts) {
+        const LinearPlan own = steps.plan(*p, kRows);
+        const Outcome alone = run(backend, steps, own, *p, nullptr, input, {}, kPoisonNaN, N,
+                                  "decode passes sideBySide 40 rows alone");
+        for (uint32_t r = 0; r < kRows; ++r)
+          if (!std::equal(alone.output.begin() + uint64_t{r} * N, alone.output.begin() + uint64_t{r + 1} * N,
+                          out.output.begin() + uint64_t{r} * 2 * N + offset)) {
+            fail("decode passes sideBySide 40 rows: a tensor's columns differ from its own plan");
+            break;
+          }
+        offset += N;
+      }
+    }
+  }
+  // Head 64-row chunking at 97-120 rows: chunk 0 (64 rows) stays on MMA prefill; chunk 1 (33-56 rows) splits into two
+  // passes, within fp64 and bitwise each pass alone.
+  for (const uint32_t total : {97u, 98u, 104u, 112u, 120u}) {
+    const uint32_t tailRows = total - kMaximumDecodeTileRows;
+    const LinearPlan firstChunk = steps.plan(logits, kMaximumDecodeTileRows);
+    const LinearPlan tailF32 = steps.plan(logits, tailRows), tailBf16 = steps.plan(head, tailRows);
+    const std::string label = "decode passes head " + std::to_string(total) + " rows (tail " +
+                              std::to_string(tailRows) + ")";
+    if (!firstChunk.passes().empty() || tailF32.passes().size() != 2 || tailBf16.passes().size() != 2) {
+      fail(label + ": unexpected chunk passes");
+      continue;
+    }
+    const std::vector<float> x = activations(Inputs::Dense, tailRows, K);
+    const std::vector<uint16_t> stored = storageRows(x, K, tailRows, tailBf16.storageRows());
+    const Outcome bf16 = run(backend, steps, tailBf16, head, nullptr, stored, {}, kPoisonNaN, N, label + " bf16");
+    floatOutput(backend, steps, tailF32, logits, stored, bf16, within(products({&q6}, columns, x, tailRows), false), N,
+                label);
+  }
+  section("decode passes (Apple7/8): steps of 33-56 rows, residual, one- and two-format gate/up (40-row storage at "
+          "33/34), fp32 head (33-56 and 97-120 chunked), q4k+q4k+f32 plain (33/34/40), sideBySide (40), and refused "
+          "segmented residual / float-only (40), within fp64 and bitwise each pass alone");
 }
 
 // Gate/up in one pass (LinearConfig::oneGateUpPass) on the staged tile, gate and up in each format ([768, K]), and in
@@ -1201,11 +1424,12 @@ void prefillSplit(MetalBackend &backend, const Linear &linear) {
           "unwritten tail rows, counters reset to 0");
 }
 
-// The vocabulary head runs on the MMA prefill tiles past 32 rows. Check
-// both stores through the production planner with a segmented projection.
+// The vocabulary head runs on the MMA prefill tiles past 56 rows of a decode
+// step (decodePasses below them). Check both stores through the production
+// planner with a segmented projection.
 void mmaFloatOutput(MetalBackend &backend) {
   const Linear linear(backend.capabilities(), Int8Activations::Off, StepKind::Decode);
-  constexpr uint32_t kInputs = 4096, kRows = 48;
+  constexpr uint32_t kInputs = 4096, kRows = 60;
   const Tensor a = tensor(backend, Q4K, 256, kInputs), b = tensor(backend, Fmt(GGUF_FMT_AF4G64), 256, kInputs);
   const std::vector<const Tensor *> parts{&a, &b};
   const uint32_t covered = segmentColumns(parts);
@@ -2407,6 +2631,15 @@ int main(int argc, char **argv) {
       prefill(backend, linear, 1024, tileFormats(LinearTile::GgufStaged));
       policyGateUp(backend, linear);
       policyFloatOutput(backend, linear);
+      {
+        // Apple7/8's register and column instances run on any later GPU too.
+        DeviceCapabilities apple7 = backend.capabilities();
+        apple7.appleGpuFamily = std::min(apple7.appleGpuFamily, 8u);
+        const bool table = fp32RegisterTable;
+        fp32RegisterTable = true;
+        decodePasses(backend, Linear(apple7, Int8Activations::On, StepKind::Decode));
+        fp32RegisterTable = table;
+      }
       if (backend.capabilities().appleGpuFamily < 9) {
         prefillSplit(backend, linear);
         mmaFloatOutput(backend);
