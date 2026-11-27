@@ -119,11 +119,18 @@ PreparedInput MessageGate::add(metal::CommandGraph &graph, const MessageGateBuff
   requireBytes(buffers.gain, uint64_t{count} * groups * slices * MESSAGE_GATE_GROUP_ROWS * sizeof(float),
                "message gate partial sums");
   requireBytes(buffers.counters, uint64_t{count} * groups * sizeof(uint32_t), "message gate counters");
-  graph.add("message_gate_normalize", {buffers.x, buffers.message, buffers.forget}, p, {rows, 1, count}, threads);
-  graph.add("message_gate_down" + suffix,
-            {buffers.forget, slot(0).weights.down.plane0, slot(1).weights.down.plane0, slot(2).weights.down.plane0,
-             buffers.low},
-            p, {(rank + MESSAGE_GATE_DOWN_OUTPUTS - 1) / MESSAGE_GATE_DOWN_OUTPUTS, groups, count}, threads);
+  if (rows == 1) {
+    graph.add("message_gate_down_fused" + suffix,
+              {buffers.x, buffers.message, slot(0).weights.down.plane0, slot(1).weights.down.plane0,
+               slot(2).weights.down.plane0, buffers.low},
+              p, {(rank + MESSAGE_GATE_DOWN_OUTPUTS - 1) / MESSAGE_GATE_DOWN_OUTPUTS, 1, count}, threads);
+  } else {
+    graph.add("message_gate_normalize", {buffers.x, buffers.message, buffers.forget}, p, {rows, 1, count}, threads);
+    graph.add("message_gate_down" + suffix,
+              {buffers.forget, slot(0).weights.down.plane0, slot(1).weights.down.plane0, slot(2).weights.down.plane0,
+               buffers.low},
+              p, {(rank + MESSAGE_GATE_DOWN_OUTPUTS - 1) / MESSAGE_GATE_DOWN_OUTPUTS, groups, count}, threads);
+  }
   graph.add("message_gate_apply" + suffix,
             {buffers.x, buffers.message, slot(0).weights.forget.plane0, slot(1).weights.forget.plane0,
              slot(2).weights.forget.plane0, slot(0).weights.gain.plane0, slot(1).weights.gain.plane0,

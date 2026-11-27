@@ -1225,11 +1225,13 @@ int main(int argc, const char *argv[]) {
               mixTest(backend, stack, queries, currentFloat, rows);
         for (const uint32_t rows : {5u, BLOCK_RESIDUAL_MIX_QUERY_ROWS + 3}) mixTest(backend, 0, 1, currentFloat, rows);
       }
-      for (const uint32_t rows : {6u, 13u, ops::MessageGate::kFusedRows, ops::MessageGate::kFusedRows + 1}) {
+      for (const uint32_t rows : {1u, 6u, 13u, ops::MessageGate::kFusedRows, ops::MessageGate::kFusedRows + 1}) {
         gateTest(backend, rows, 1, true);
         gateTest(backend, rows, 3, false);
       }
-      for (const uint32_t rows : {13u, ops::MessageGate::kFusedRows + 1}) gateTest(backend, rows, 3, true);
+      gateTest(backend, 1u, 1, true, GatePath::Fused, 4160, 24);
+      gateTest(backend, 1u, 3, false, GatePath::Fused, 4160, 24);
+      for (const uint32_t rows : {1u, 13u, ops::MessageGate::kFusedRows + 1}) gateTest(backend, rows, 3, true);
       for (const uint32_t rows : {13u, ops::MessageGate::kFusedRows + 1})
         gateTest(backend, rows, 3, false, GatePath::Reference);
       // The tiled kernel at other shapes: three 64-value steps a half at its

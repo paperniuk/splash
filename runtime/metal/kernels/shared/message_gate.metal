@@ -179,6 +179,97 @@ kernel void message_gate_down(device const bfloat *concat [[buffer(0)]], device 
                            partials);
 }
 
+// Single-row fused normalize + down projection for decode (rows == 1):
+// computes unit-RMS inverse scales for x and message inline, keeping them in
+// registers when hidden <= 4096, eliminating the separate
+// message_gate_normalize launch and intermediate bf16 concat roundtrip.
+template <typename Weight>
+kernel void message_gate_down_fused(device const float *x [[buffer(0)]], device const float *message [[buffer(1)]],
+                                    device const Weight *down0 [[buffer(2)]],
+                                    device const Weight *down1 [[buffer(3)]],
+                                    device const Weight *down2 [[buffer(4)]], device bfloat *low [[buffer(5)]],
+                                    constant MessageGateFusedParams &p [[buffer(6)]],
+                                    uint3 group [[threadgroup_position_in_grid]],
+                                    uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                                    uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup MessageGateNormalizeShared shared;
+  const uint g = group.z, k0 = group.x * kDownOutputs;
+  if (p.rows != 1 || g >= p.gates) return;
+  device const float4 *xr = reinterpret_cast<device const float4 *>(x + p.x_columns[g]);
+  device const float4 *mr = reinterpret_cast<device const float4 *>(message + p.message_columns[g]);
+  device const Weight *down = message_gate_pick(g, down0, down1, down2);
+  const uint half_quads = p.hidden / 4;
+  float sums[kDownOutputs];
+  for (uint o = 0; o < kDownOutputs; ++o) sums[o] = 0.0f;
+  if (half_quads <= 4 * kGateThreads) {
+    float4 xv[4], mv[4];
+    float ax = 0.0f, am = 0.0f;
+    for (uint s = 0; s < 4; ++s) {
+      const uint d = s * kGateThreads + tid;
+      if (d < half_quads) {
+        const float4 xw = xr[d], mw = mr[d];
+        xv[s] = xw;
+        mv[s] = mw;
+        ax += xw.x * xw.x + xw.y * xw.y + xw.z * xw.z + xw.w * xw.w;
+        am += mw.x * mw.x + mw.y * mw.y + mw.z * mw.z + mw.w * mw.w;
+      }
+    }
+    ax = simd_sum(ax);
+    am = simd_sum(am);
+    if (lane == 0) {
+      shared.partials[sg] = ax;
+      shared.partials[kGateSimdgroups + sg] = am;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < 2) {
+      float total = 0.0f;
+      for (uint s = 0; s < kGateSimdgroups; ++s) total += shared.partials[tid * kGateSimdgroups + s];
+      shared.scales[tid] = rsqrt(total / p.hidden + kRmsEpsilon);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float inv_x = shared.scales[0], inv_m = shared.scales[1];
+    for (uint s = 0; s < 4; ++s) {
+      const uint d = s * kGateThreads + tid;
+      if (d < half_quads) {
+        const float4 nx = float4(bfloat4(xv[s] * inv_x));
+        const float4 nm = float4(bfloat4(mv[s] * inv_m));
+        for (uint o = 0; o < kDownOutputs; ++o) {
+          if (k0 + o < p.rank) {
+            device const Weight *row_w = down + ulong(k0 + o) * 2 * p.hidden;
+            sums[o] += dot(message_gate_quad(row_w, d), nx);
+            sums[o] += dot(message_gate_quad(row_w, half_quads + d), nm);
+          }
+        }
+      }
+    }
+  } else {
+    message_gate_normalize_scales(xr, mr, p.hidden, tid, lane, sg, shared);
+    const float inv_x = shared.scales[0], inv_m = shared.scales[1];
+    for (uint d = tid; d < half_quads; d += kGateThreads) {
+      const float4 nx = float4(bfloat4(xr[d] * inv_x));
+      const float4 nm = float4(bfloat4(mr[d] * inv_m));
+      for (uint o = 0; o < kDownOutputs; ++o) {
+        if (k0 + o < p.rank) {
+          device const Weight *row_w = down + ulong(k0 + o) * 2 * p.hidden;
+          sums[o] += dot(message_gate_quad(row_w, d), nx);
+          sums[o] += dot(message_gate_quad(row_w, half_quads + d), nm);
+        }
+      }
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (uint o = 0; o < kDownOutputs; ++o) {
+    const float sum = simd_sum(sums[o]);
+    if (lane == 0) shared.partials[o * kGateSimdgroups + sg] = sum;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid < kDownOutputs && k0 + tid < p.rank) {
+    float total = 0.0f;
+    for (uint s = 0; s < kGateSimdgroups; ++s) total += shared.partials[tid * kGateSimdgroups + s];
+    low[ulong(g) * p.rank + k0 + tid] = bfloat(total);
+  }
+}
+
 // What message_gate_apply's phases share: the group's rank values (zero past
 // its rows), a partial a simdgroup of each row's squares, the arrival of
 // split_arrive_last, and the last slice's inverse RMS of each row.
@@ -644,6 +735,9 @@ kernel void message_gate_rows(device const float *x [[buffer(0)]], device const 
   template [[host_name("message_gate_down" suffix)]] kernel void message_gate_down<Weight>(                       \
       device const bfloat *, device const Weight *, device const Weight *, device const Weight *, device bfloat *, \
       constant MessageGateFusedParams &, uint3, uint, uint, uint);                                                \
+  template [[host_name("message_gate_down_fused" suffix)]] kernel void message_gate_down_fused<Weight>(           \
+      device const float *, device const float *, device const Weight *, device const Weight *,                   \
+      device const Weight *, device bfloat *, constant MessageGateFusedParams &, uint3, uint, uint, uint);        \
   template [[host_name("message_gate_apply" suffix)]] kernel void message_gate_apply<Weight>(                     \
       device const float *, device const float *, device const Weight *, device const Weight *,                   \
       device const Weight *, device const Weight *, device const Weight *, device const Weight *,                 \
