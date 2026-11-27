@@ -1,0 +1,51 @@
+name: M1 fork CI
+
+# The fork's own checks on GitHub's hosted Apple Silicon runners. Upstream's
+# ci.yml runs on Blacksmith and self-hosted Macs this fork has no access to,
+# so none of its jobs ever starts here. Hosted runners have no GPU the Metal
+# tests support: test-engine-metal, the sanitizers' Metal runs and the
+# real-model gates stay on a contributor's Mac, as each PR reports them.
+
+on:
+  pull_request:
+    branches: ["apple7-m1-*", "m1"]
+  push:
+    branches: ["apple7-m1-*"]
+  workflow_dispatch:
+
+concurrency:
+  group: m1-ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  HOMEBREW_NO_INSTALL_CLEANUP: "1"
+
+jobs:
+  check:
+    name: Source, CPU runtime, Python and native builds
+    runs-on: macos-26
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Homebrew/actions/setup-homebrew@d482da0e602890d3160aade42e72c8556103bf04
+      - name: Select the newest released Xcode
+        run: |
+          xcode=$(ls -d /Applications/Xcode_[0-9]*.app | grep -viE 'beta|rc|release_candidate' | sort -V | tail -n 1)
+          sudo xcode-select -s "$xcode"
+          xcodebuild -version
+          sw_vers
+          sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
+      - name: Install the Metal toolchain
+        run: xcodebuild -downloadComponent MetalToolchain
+      - name: Install Python 3.13 and fish for the completion tests
+        run: brew install python@3.13 fish
+      - name: Architecture rules, whitespace, production build, CPU runtime tests
+        run: make check-source check-native-cpu PYTHON_CANDIDATES="$(brew --prefix python@3.13)/bin/python3.13"
+      - name: Python tests, compile, ruff check and ruff format
+        run: make check-python PYTHON_CANDIDATES="$(brew --prefix python@3.13)/bin/python3.13"
+      - name: Build every native test, benchmark and tool
+        run: make check-native-build
