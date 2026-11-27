@@ -39,11 +39,6 @@ constant constexpr uint kGateSimdgroups = kGateThreads / 32;
 constant constexpr uint kGroupRows = MESSAGE_GATE_GROUP_ROWS;
 constant constexpr uint kDownOutputs = MESSAGE_GATE_DOWN_OUTPUTS;
 
-// The gated value's tanh: Metal's fast form, well inside the bf16 rounding the gated rows reach through their norm
-// (the tests hold every path within it of fp64). precise::tanh took a four-row Inkling-2-Mini decode step's narrow
-// up kernel 25.5 us a call against 19.9 on an M1 Max, and an eight-row step 65.96 ms against 64.17.
-inline float message_gate_tanh(float x) { return fast::tanh(x); }
-
 // Quad i of a row of weights, in fp32.
 inline float4 message_gate_quad(device const float *row, uint i) {
   return reinterpret_cast<device const float4 *>(row)[i];
@@ -227,7 +222,7 @@ __attribute__((noinline)) void message_gate_apply_values(device const float *x, 
     if (active && r < count) {
       const float xv = x[ulong(first + r) * p.x_stride + p.x_columns[g] + d];
       const float mv = message[ulong(first + r) * p.message_stride + p.message_columns[g] + d];
-      const float v = (1.0f - message_gate_tanh(f[r])) * xv + message_gate_tanh(e[r]) * mv;
+      const float v = (1.0f - precise::tanh(f[r])) * xv + precise::tanh(e[r]) * mv;
       values[ulong(first + r) * p.hidden + d] = v;
       squares = v * v;
     }
@@ -474,7 +469,7 @@ kernel void message_gate_narrow_up(device const float *x [[buffer(0)]], device c
   for (uint r = 0; r < MESSAGE_GATE_NARROW_ROWS; ++r)
     if (r < count)
       values[(ulong(g) * p.rows + first + r) * p.hidden + d] =
-          (1.0f - message_gate_tanh(f[r])) * xv[r] + message_gate_tanh(e[r]) * mv[r];
+          (1.0f - precise::tanh(f[r])) * xv[r] + precise::tanh(e[r]) * mv[r];
 }
 
 // Each gated row through the gate's weighted RMS norm into bf16, as message_gate_test_norm writes each value: a
@@ -776,8 +771,8 @@ __attribute__((noinline)) void message_gate_rows_gated(device const float *x, de
         const ulong row = first + r;
         const float2 xv = xs[f], mv = ms[f];
         float2 v;
-        v.x = (1.0f - message_gate_tanh(forgets[f].x)) * xv.x + message_gate_tanh(gains[f].x) * mv.x;
-        v.y = (1.0f - message_gate_tanh(forgets[f].y)) * xv.y + message_gate_tanh(gains[f].y) * mv.y;
+        v.x = (1.0f - precise::tanh(forgets[f].x)) * xv.x + precise::tanh(gains[f].x) * mv.x;
+        v.y = (1.0f - precise::tanh(forgets[f].y)) * xv.y + precise::tanh(gains[f].y) * mv.y;
         *reinterpret_cast<device float2 *>(gated + row * p.hidden + column) = v;
         squares[f] += v.x * v.x;
         squares[f] += v.y * v.y;
