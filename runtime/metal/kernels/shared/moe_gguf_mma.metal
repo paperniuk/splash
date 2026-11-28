@@ -96,6 +96,30 @@ template <ushort Rows, uint Count, class Body> inline void moe_mma_grid_column(u
   });
 }
 
+// Whether a pass's formats (function constants 0 to Count - 1) are all a split format (moe_mma_split_format): its
+// grid holds MOE_MMA_SPLIT times its column tiles.
+template <ushort Rows, uint Count> inline bool moe_mma_split_pass() {
+  bool all = moe_mma_split_format(kMmaMoeFormat0, Rows) && moe_mma_split_format(kMmaMoeFormat1, Rows);
+  if constexpr (Count > 2)
+    all = all && moe_mma_split_format(kMmaMoeFormat2, Rows) && moe_mma_split_format(kMmaMoeFormat3, Rows);
+  return all;
+}
+// A split pass's column tile: lane l sums column `column + l % W` (W = 32 / MOE_MMA_SPLIT) over part l / W of K's
+// groups, and the lanes add the other parts' down to the first W, which hold the W columns' sums.
+constant constexpr uint kSplitWidth = 32 / MOE_MMA_SPLIT;
+template <ushort Rows, uint Count, class RowInput>
+inline void moe_mma_split_column(uint format, RowInput row_input, uint rows, uint K, MoeGgufSegment s, uint column,
+                                 uint lane, threadgroup half2 *table, thread float (&sums)[GGUF_COLUMN_ROWS]) {
+  const uint groups = K / 32, which = lane / kSplitWidth;
+  moe_mma_grid_column<Rows, Count>(format, [&](auto f) {
+    column_dot_rows<decltype(f), GGUF_COLUMN_ROWS, true>(row_input, rows, K, s.w0, s.w1, s.meta,
+                                                        column + lane % kSplitWidth, which * groups / MOE_MMA_SPLIT,
+                                                        (which + 1) * groups / MOE_MMA_SPLIT, table, sums);
+  });
+  for (uint r = 0; r < GGUF_COLUMN_ROWS; ++r)
+    for (uint width = 16; width >= kSplitWidth; width /= 2) sums[r] += simd_shuffle_down(sums[r], width);
+}
+
 // Runs body(integral_constant<uint, FM>) with the fewest 8-row fragments that hold a tile's live rows.
 template <ushort Rows, class Body> inline void moe_mma_live_rows(uint rows, Body body) {
   if constexpr (Rows == 8) body(integral_constant<uint, 1>{});
@@ -146,11 +170,14 @@ kernel void moe_expert_gguf_mma_down(device bfloat *input [[buffer(0)]], device 
   }
   if (moe_mma_grid_column_pass<Rows, 2>() && moe_column_tile(tiles, t) &&
       moe_mma_grid_column_format<Rows>(s.format)) {
-    // The grid formats (moe_mma_grid_column_pass), whose grids are constant tables.
+    // The column formats but Q2_0 (moe_mma_grid_column_pass): the grids' constant tables, or NVFP4's pair table,
+    // which every thread fills first.
     float sums[GGUF_COLUMN_ROWS];
     moe_mma_grid_column<Rows, 2>(s.format, [&](auto f) {
-      column_dot<decltype(f), GGUF_COLUMN_ROWS>(x, tile.rows, p.input_size, s.w0, s.w1, s.meta,
-                                                    origin + simd_lane, 0, p.input_size / 32, tl, sums);
+      quant_pair_table<decltype(f)>(tl, thread_index, GGUF_STAGED_THREADS);
+      column_dot_rows<decltype(f), GGUF_COLUMN_ROWS, true>([&](uint r) { return x + ulong(r) * p.input_size; },
+                                                           tile.rows, p.input_size, s.w0, s.w1, s.meta,
+                                                           origin + simd_lane, 0, p.input_size / 32, tl, sums);
     });
     for (uint row = 0; row < tile.rows; ++row)
       output[out + ulong(row) * p.output_size + origin + simd_lane] = bfloat(sums[row] * scale);
@@ -232,10 +259,24 @@ kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
   static_assert(!Routes || (Rows == 8 && Shared == 0), "direct input uses one routed fragment");
   device bfloat *x = Routes ? input : input + ulong(tile.first_row) * K;
   const ulong out = ulong(tile.first_row) * N;
-  const uint origin = group.x * kColumns, thread_index = simd_group * 32 + simd_lane;
+  // A split pass's MOE_MMA_SPLIT threadgroups (moe_mma_split_format): the first runs an MMA tile, and of a column
+  // tile each takes its part of the 32 columns.
+  const bool split = moe_mma_split_pass<Rows, 4>();
+  const uint tile_x = split ? group.x / MOE_MMA_SPLIT : group.x, part = split ? group.x % MOE_MMA_SPLIT : 0;
+  const uint origin = tile_x * kColumns, thread_index = simd_group * 32 + simd_lane;
   const bool up = simd_group == 1;
   threadgroup bfloat *gate = reinterpret_cast<threadgroup bfloat *>(stage);
-  const bool column = !Routes && moe_column_tile(tiles, t);
+  // A column tile reads its rows where they are: ungrouped (Routes) through the tile's grouped routes. Ungrouped
+  // tiles take the column tile only where both projections' formats run it on the grid path.
+  const auto row_input = [&](uint r) -> device const bfloat * {
+    if constexpr (Routes)
+      return input + ulong(reinterpret_cast<device const uint *>(gsw0)[tile.first_row + r] / Routes) * K;
+    else
+      return x + ulong(r) * K;
+  };
+  const bool column = moe_column_tile(tiles, t) &&
+                      (!Routes || (moe_mma_grid_column_format<Rows>(gs.format) &&
+                                   moe_mma_grid_column_format<Rows>(us.format)));
   const bool gate_column = column && gs.format == FmtQ20::Id, up_column = column && us.format == FmtQ20::Id;
   const bool grid = moe_mma_grid_column_pass<Rows, 4>() && column;
   const bool gate_grid = grid && moe_mma_grid_column_format<Rows>(gs.format);
@@ -276,6 +317,20 @@ kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
   threadgroup half *my = stage + simd_group * kSimdgroupStage;
   const sgmatrix::Lane l = sgmatrix::lane_map(simd_lane);
   static_assert(Rows * kColumns * sizeof(bfloat) <= kSimdgroupStage * sizeof(half), "the gate fits a stage");
+  if (split && column) {
+    // Each simdgroup its projection's columns of the threadgroup's part; the gate parks bf16(gate) for the up.
+    float sums[GGUF_COLUMN_ROWS];
+    const uint first = origin + part * kSplitWidth;
+    moe_mma_split_column<Rows, 4>(s.format, row_input, tile.rows, K, s, first, simd_lane, table, sums);
+    if (!up && simd_lane < kSplitWidth)
+      for (uint row = 0; row < tile.rows; ++row) gate[row * kColumns + simd_lane] = bfloat(sums[row] * scale);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (up && simd_lane < kSplitWidth)
+      for (uint row = 0; row < tile.rows; ++row)
+        output[out + ulong(row) * N + first + simd_lane] = product(sums[row] * scale, gate[row * kColumns + simd_lane]);
+    return;
+  }
+  if (split && part) return;
   if (column) {
     // At most GGUF_COLUMN_ROWS live rows, one fragment. Each simdgroup sums its projection on its own tile, the
     // gate parks bf16(gate) in its stage, and both meet at the one barrier before the up writes the products: the
@@ -290,8 +345,8 @@ kernel void moe_expert_gguf_mma_gate_up(device bfloat *input [[buffer(0)]],
                                                table, sums);
     } else if (on_grid) {
       moe_mma_grid_column<Rows, 4>(s.format, [&](auto f) {
-        column_dot<decltype(f), GGUF_COLUMN_ROWS>(x, tile.rows, K, s.w0, s.w1, s.meta, origin + simd_lane, 0,
-                                                      K / 32, table, sums);
+        column_dot_rows<decltype(f), GGUF_COLUMN_ROWS, true>(row_input, tile.rows, K, s.w0, s.w1, s.meta,
+                                                             origin + simd_lane, 0, K / 32, table, sums);
       });
     } else {
       zero(acc);

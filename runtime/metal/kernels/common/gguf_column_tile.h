@@ -13,6 +13,15 @@ using namespace metal;
 // most GGUF_COLUMN_ROWS live rows (moe_column_tile, ops::LinearTile::GgufColumn). Includers set
 // `#pragma clang fp reassociate(off)` first.
 
+// NVFP4 and NVFP4_64 with Fp4Raw: the column tile reads each pair of codes' values from the pair table as they are
+// (kFP4Values, twice the E2M1 value, exact in half) and multiplies each 16-group's chain by its scale once, where each
+// weight was scaled and rounded to half: a one-row Inkling-2-Mini expert layer of its GGUF took 0.180 ms instead of
+// 0.182 and an eight-row one 0.886 instead of 0.905 on an M1 Max (gguf-moe-benchmark inkling), and their products are
+// exact. The sums round differently from scaled weights', so only the Apple7/8 MoE column tiles (moe_gguf_mma.metal)
+// opt in; the other callers, Apple9+'s among them, keep scaled weights and their bits.
+template <class F, bool Fp4Raw>
+constant constexpr bool kFp4Raw = Fp4Raw && (F::Id == GGUF_FMT_NVFP4 || F::Id == GGUF_FMT_NVFP464);
+
 // Each row's sum over groups [g_begin, g_end) of K, of its first `rows` rows (at most Rows): per group one fp32 chain
 // of its 32 products in element order, then added to the row's sum. Every row sums alone, so a row's result does not
 // depend on the other rows, on its place among them or on Rows. The chain is written as multiplies and adds, whose
@@ -21,7 +30,7 @@ using namespace metal;
 // step rounds once (and as fast as the fma() chain). Each thread loads the next group's payload while the group's FMAs
 // run, and its meta unit when the next group enters a new one, and reads the activations 16 bytes at a time (their
 // rows of K, a multiple of 64, start 16-byte aligned in page-aligned buffers).
-template <class F, ushort Rows>
+template <class F, ushort Rows, bool Fp4Raw = false>
 inline void column_dot(device const bfloat *x, uint rows, uint input_size, device uchar *w0, device uchar *w1,
                        device uchar *meta, uint column, uint g_begin, uint g_end, threadgroup half2 *tl,
                        thread float (&sums)[Rows]) {
@@ -37,11 +46,22 @@ inline void column_dot(device const bfloat *x, uint rows, uint input_size, devic
   typename F::Meta m = F::loadMeta(tmeta + ulong(g_begin / F::MetaGroups) * QUANT_TILE_ROWS * F::MetaBytes);
   for (uint g = g_begin; g < g_end; ++g) {
     half4 v[8];   // v[i]: elements 4i..4i+3 of the group
-    dequant32_chunks<F>(w, m, ushort(g % F::MetaGroups), tl,
-                        [&](ushort c, half4 lo, half4 hi) __attribute__((always_inline)) {
-                          v[c] = lo;
-                          v[4 + c] = hi;
-                        });
+    float2 scale = float2(0.0f);
+    if constexpr (kFp4Raw<F, Fp4Raw>) {
+      scale = F::coef(m, ushort(g % F::MetaGroups)).s;
+#pragma unroll
+      for (ushort c = 0; c < 4; ++c) {
+        const uchar4 b = as_type<uchar4>(F::indices(F::chunk(w, c)));
+        v[c] = half4(tl[b.x], tl[b.y]);
+        v[4 + c] = half4(tl[b.z], tl[b.w]);
+      }
+    } else {
+      dequant32_chunks<F>(w, m, ushort(g % F::MetaGroups), tl,
+                          [&](ushort c, half4 lo, half4 hi) __attribute__((always_inline)) {
+                            v[c] = lo;
+                            v[4 + c] = hi;
+                          });
+    }
     if (g + 1 < g_end) {
       w = F::load(tw0 + ulong(g + 1) * QUANT_TILE_ROWS * F::P0, tw1 + ulong(g + 1) * QUANT_TILE_ROWS * F::P1);
       if ((g + 1) / F::MetaGroups != g / F::MetaGroups)
@@ -51,7 +71,7 @@ inline void column_dot(device const bfloat *x, uint rows, uint input_size, devic
     for (ushort r = 0; r < Rows; ++r) {
       if (r >= rows) break;
       device const uint4 *xr = reinterpret_cast<device const uint4 *>(x + ulong(r) * input_size + g * 32);
-      float sum = 0.0f;
+      float sum = 0.0f, half_sums[2];
 #pragma unroll
       for (ushort i = 0; i < 8; ++i) {
         const uint4 q = xr[i / 2];
@@ -60,9 +80,31 @@ inline void column_dot(device const bfloat *x, uint rows, uint input_size, devic
         sum = sum + wv.y * xv.y;
         sum = sum + wv.z * xv.z;
         sum = sum + wv.w * xv.w;
+        if (kFp4Raw<F, Fp4Raw> && (i == 3 || i == 7)) {
+          half_sums[i / 4] = sum;
+          sum = 0.0f;
+        }
       }
+      if constexpr (kFp4Raw<F, Fp4Raw>) sum = half_sums[0] * scale.x + half_sums[1] * scale.y;
       sums[r] += sum;
     }
+  }
+}
+
+// column_dot of each of the first `rows` rows on its own (at most Rows), a row's sum bitwise column_dot's, its input
+// row_input(r): one row's registers instead of Rows' let more threads run, where a row's second pass reads weights
+// the first just brought into cache, and a pass of ungrouped rows reads each row in place. The MoE column tiles
+// (moe_gguf_mma.metal) run it: an Inkling-2-Mini expert layer of one row took 0.169 ms against 0.193 at two rows'
+// registers on an M1 Max (gguf-moe-benchmark inkling).
+template <class F, ushort Rows, bool Fp4Raw = false, class RowInput>
+inline void column_dot_rows(RowInput row_input, uint rows, uint input_size, device uchar *w0, device uchar *w1,
+                            device uchar *meta, uint column, uint g_begin, uint g_end, threadgroup half2 *tl,
+                            thread float (&sums)[Rows]) {
+  for (ushort r = 0; r < Rows; ++r) {
+    float one[1] = {0.0f};
+    if (r < rows)
+      column_dot<F, 1, Fp4Raw>(row_input(r), 1, input_size, w0, w1, meta, column, g_begin, g_end, tl, one);
+    sums[r] = one[0];
   }
 }
 
