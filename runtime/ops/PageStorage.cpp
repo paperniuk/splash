@@ -71,6 +71,15 @@ bool PageStorage::isAllocated(uint32_t page) const {
     return static_cast<bool>(extents_[extentIndex(page)].buffer);
 }
 
+std::vector<HostExtent> PageStorage::hostExtents() const {
+    std::vector<HostExtent> result;
+    for (const Extent &extent : extents_) {
+        if (extent.address)
+            result.push_back({extent.address, static_cast<const std::byte *>(extent.buffer.contents())});
+    }
+    return result;
+}
+
 metal::AllocationResult PageStorage::allocateExtent(uint32_t extent, PageForm form) {
     return allocateExtent(extent, form, admitAllocation_);
 }

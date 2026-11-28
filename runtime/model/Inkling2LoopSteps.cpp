@@ -4,6 +4,7 @@
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
 #include "ops/BlockResidualMix.hpp"
+#include "ops/CpuRelativeAttention.hpp"
 #include "ops/MessageGate.hpp"
 #include "ops/RelativeAttention.hpp"
 
@@ -94,6 +95,11 @@ std::vector<Tensor> tensors(const QwenTargetGeometry &g, const Inkling2LoopShape
                       bytesFor<float>(stagedLaneRows * relative), false});
     result.push_back({&Inkling2LoopScratch::rowSinks, bytesFor<float>(g.attentionQueryHeads),
                       bytesFor<float>(stagedLaneRows * g.attentionQueryHeads), false});
+    // A chunk's rows at most, 12.6 MB at 2,048 rows.
+    if (ops::CpuRelativeAttention::settings().enabled())
+      result.push_back({&Inkling2LoopScratch::cpuAttention,
+                        bytesFor<uint16_t>(uint64_t{g.attentionQueryHeads} * ops::RelativeAttention::kHeadDimension), 0,
+                        false});
   }
   return result;
 }

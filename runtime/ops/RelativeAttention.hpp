@@ -120,6 +120,10 @@ public:
   // A split's, direct tile's or single pass's threadgroup of `rows` query rows: the register tile's simdgroups, one per
   // eight fused rows, or the matmul2d tile's 256 threads.
   [[nodiscard]] uint32_t threads(uint32_t rows) const noexcept;
+  // Whether it scores INT8 pages with bf16 queries on the register tile
+  // (AttentionCalibration::registerRelative), the queries the CPU reads as
+  // they are.
+  [[nodiscard]] bool registerTile() const noexcept { return registerTile_; }
   // The split's grid, or the single pass's: KV heads, the dispatch's
   // sequences and their most splits.
   [[nodiscard]] metal::DispatchSize splitGroups(const Dispatch &dispatch) const noexcept;
@@ -200,12 +204,17 @@ public:
   // bound, the step's lane cap, with a lane's splits of decodeSplits and the
   // same INT8-query choice, of the variants its single pass is compiled for
   // alone, a full layer's (the whole history, positionScaled) and a sliding
-  // layer's (kWindowTokens, unscaled): another throws.
+  // layer's (kWindowTokens, unscaled): another throws. A prompt chunk of one
+  // sequence may leave its first `skipRows` rows to another reader (the CPU's,
+  // CpuRelativeAttention): its tiles run from there, over the splits the
+  // whole chunk takes, so the rows that run keep their bits. skipRows is a
+  // whole number of direct tiles (SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS) below
+  // the chunk's rows, which addAttention then writes from.
   [[nodiscard]] static RelativeAttentionPlan plan(std::span<const kv::ChunkedPrefillParams> sequences,
                                                   kv::Layout layout, const AttentionCalibration &calibration,
                                                   Int8Activations int8Activations, AttentionWorkspace capacity,
                                                   RelativeAttentionVariant variant = {},
-                                                  StepKind step = StepKind::Prefill);
+                                                  StepKind step = StepKind::Prefill, uint32_t skipRows = 0);
   // The history splits of a decode lane's tile of `laneCap` rows that reads
   // `pages` pages on a GPU of `cores` cores: one per kDecodeCorePages / cores
   // pages, but at least one a page up to a verify block's most, and at most

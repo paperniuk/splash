@@ -97,6 +97,13 @@ public:
   virtual void clearPages(std::span<const uint32_t> pages) = 0;
 };
 
+// An allocated extent as the host reaches it: the GPU address its pages'
+// entries hold and its first byte.
+struct HostExtent final {
+  uint64_t gpuAddress = 0;
+  const std::byte *contents = nullptr;
+};
+
 // Shared cache format and execution limits; model dimensions live in Layout.
 inline constexpr uint32_t kPageTokens = SPLASH_TARGET_KV_BLOCK_TOKENS;
 inline constexpr uint32_t kMaximumLogicalTokens =

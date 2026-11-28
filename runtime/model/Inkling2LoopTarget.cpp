@@ -2,12 +2,17 @@
 
 #include "model/Inkling2Loop.hpp"
 #include "ops/AneFfn.hpp"
+#include "StderrLine.hpp"
 #include "ops/BlockResidualMix.hpp"
+#include "ops/CpuRelativeAttention.hpp"
+#include "ops/PageStorage.hpp"
 #include "ops/MessageGate.hpp"
 #include "ops/Normalization.hpp"
 #include "ops/RowCopy.hpp"
 
 #include <algorithm>
+#include <cstdio>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -82,9 +87,15 @@ std::vector<metal::MetalBuffer> Inkling2LoopTarget::addPrefill(metal::CommandGra
                                                                const kv::PageStorage &kv, SpilledKvReads &spilled,
                                                                QwenPrefillLayers layers, ops::AneFfn *aneFfn) {
   std::vector<PrefillStep> steps = prefillSteps<PrefillStep>(graph, chunks, kv, spilled, layers, aneFfn);
+  // Extents are released between commands only, so one snapshot serves the
+  // command's host steps (kv::PageStorage::hostExtents).
+  std::shared_ptr<const std::vector<kv::HostExtent>> hostExtents;
+  if (ops::CpuRelativeAttention::settings().enabled())
+    hostExtents = std::make_shared<const std::vector<kv::HostExtent>>(kv.hostExtents());
   for (uint32_t index = 0; index < steps.size(); ++index) {
     PrefillStep &step = steps[index];
     step.scratch = step.decode ? steps_.verifyScratch() : steps_.prefillScratch(index);
+    step.hostExtents = hostExtents;
     planRelativeAttention(step);
     if (const QwenTargetDecodeBuffers *d = step.decode) {
       step.layoutRows = {d->step.lanes, d->step.rows, d->step.laneCap};
@@ -110,6 +121,21 @@ void Inkling2LoopTarget::planRelativeAttention(PrefillStep &step) const {
   // them (Inkling2LoopLayout::relativeAttention).
   step.fullAttention.emplace(plan(weights_.layout.fullAttention()));
   step.slidingAttention.emplace(plan(weights_.layout.slidingAttention()));
+  // The CPU takes the first rows of a full layer's attention in a prompt chunk
+  // of one sequence over INT8 pages and bf16 queries, on the Apple7/8 GPUs
+  // whose CPUs have the matrix units (RelativeAttentionPlan::registerTile);
+  // the GPU's plan then starts after them, or, in the shadow, still runs them
+  // all.
+  const ops::CpuRelativeAttention::Settings &cpu = ops::CpuRelativeAttention::settings();
+  if (!cpu.enabled() || step.decode || step.sequences.size() != 1 || !step.hostExtents ||
+      !step.fullAttention->registerTile() || !ops::CpuRelativeAttention::available())
+    return;
+  const kv::ChunkedPrefillParams &chunk = step.attentionSequences().front();
+  step.cpuRows = ops::CpuRelativeAttention::rowsFor(cpu.share, chunk.committed_tokens, chunk.chunk_tokens);
+  if (step.cpuRows && !cpu.shadow)
+    step.cpuAttention.emplace(ops::RelativeAttention::plan(
+        step.attentionSequences(), geometry_.kvLayout, operators_.calibration().attention, linear.int8Activations(),
+        workspace, weights_.layout.fullAttention(), ops::StepKind::Prefill, step.cpuRows));
 }
 
 metal::MetalBuffer Inkling2LoopTarget::rows(const PrefillStep &step, Inkling2LoopRows where) const {
@@ -374,13 +400,106 @@ void Inkling2LoopTarget::addAttention(PrefillStep &step, uint32_t application,
                                {sequence.pageTable, step.kvLayers[kvLayer]});
       histories[index] = {history.kv, history.table, {}};
     }
-    gated = ops::RelativeAttention::addAttention(step.graph, plan, staging, weights, b.attentionPartials,
-                                                 b.attentionStatistics, sequences,
-                                                 std::span(histories).first(sequences.size()), attentionRows, output);
+    const auto attend = [&](const ops::RelativeAttentionPlan &gpuPlan) {
+      return ops::RelativeAttention::addAttention(step.graph, gpuPlan, staging, weights, b.attentionPartials,
+                                                  b.attentionStatistics, sequences,
+                                                  std::span(histories).first(sequences.size()), attentionRows, output);
+    };
+    if (full && cpuTakesRows(step, kvLayer, histories[0], mixer.relativeBias, outputPlan.input()))
+      gated = addCpuAttention(step, application, kvLayer, mixer.relativeBias, attend);
+    else
+      gated = attend(plan);
   }
   linear.add(step.graph,
              {.input = b.attentionHidden, .output = b.attentionOutput, .scratch = b.linearScratch, .prepared = gated},
              mixer.outputProjection, outputPlan);
+}
+
+// Whether the CPU takes the first rows of this full layer's attention
+// (PrefillStep::cpuRows): its sequence reads its own pages in the pool, not a
+// spilled history's staging; the out-projection reads plain rows (the CPU's
+// are copied in whole rows); and the buffers it reads and writes are
+// CPU-visible.
+bool Inkling2LoopTarget::cpuTakesRows(const PrefillStep &step, uint32_t, const ops::AttentionHistory &history,
+                                      const metal::MetalBuffer &bias, ops::LinearInput input) const {
+  const QwenTargetPrefillBuffers &b = step.buffers;
+  const Inkling2LoopScratch &s = step.scratch;
+  const bool visible = b.fullQueries.contents() && s.relativeStates.contents() && s.rowSinks.contents() &&
+                       b.fullPacked.contents() && bias.contents() && s.cpuAttention.contents() &&
+                       step.sequences[0].pageTable.contents() &&
+                       (!ops::CpuRelativeAttention::settings().shadow || b.attentionHidden.contents());
+  return step.cpuRows && visible && input == ops::LinearInput::Plain &&
+         history.pageTable.sameView(step.sequences[0].pageTable);
+}
+
+// The chunk's first rows on the CPU, a host step beside the GPU's attention of
+// the rest (`attend` encodes it from the plan it takes): the CPU reads what the
+// prepare staged and the pages hold into its own rows, which a copy then puts
+// in the attention's output. In the shadow the GPU attends every row and the
+// copy is replaced by a second host step that compares the two and logs.
+ops::PreparedInput Inkling2LoopTarget::addCpuAttention(
+    PrefillStep &step, uint32_t application, uint32_t kvLayer, const metal::MetalBuffer &bias,
+    const std::function<ops::PreparedInput(const ops::RelativeAttentionPlan &)> &attend) const {
+  const ops::CpuRelativeAttention::Settings &cpu = ops::CpuRelativeAttention::settings();
+  const QwenTargetPrefillBuffers &b = step.buffers;
+  const Inkling2LoopScratch &s = step.scratch;
+  const kv::ChunkedPrefillParams &chunk = step.attentionSequences().front();
+  const kv::Layout &layout = geometry_.kvLayout;
+  constexpr uint32_t width = ops::RelativeAttention::kQueryHeads * ops::RelativeAttention::kHeadDimension;
+  ops::CpuRelativeAttention::Rows rows;
+  rows.queries = static_cast<const uint16_t *>(b.fullQueries.contents());
+  rows.states = static_cast<const float *>(s.relativeStates.contents());
+  rows.sinks = static_cast<const float *>(s.rowSinks.contents());
+  rows.stride = chunk.chunk_stride;
+  rows.projection = static_cast<const uint16_t *>(b.fullPacked.contents());
+  rows.projectionStride = ops::RelativeAttention::kProjectionStride;
+  rows.gateColumn = width;
+  rows.bias = static_cast<const float *>(bias.contents());
+  rows.pageTable = static_cast<const SplashKvPage *>(step.sequences[0].pageTable.contents());
+  rows.pageTableEntries = kv::chunkedPrefillRequiredPages(chunk);
+  rows.layer = step.kvLayers[kvLayer];
+  rows.extents = *step.hostExtents;
+  rows.dataBytes = layout.dataBytesPerLayerPage();
+  rows.scaleBytes = layout.scaleBytesPerLayerPage();
+  rows.committed = chunk.committed_tokens;
+  rows.rows = step.cpuRows;
+  rows.hidden = static_cast<uint16_t *>(s.cpuAttention.contents());
+  const auto compute = [rows, extents = step.hostExtents, threads = cpu.threads] {
+    ops::CpuRelativeAttention::run(rows, threads);
+  };
+  std::function<void(const metal::HostStepTiming &)> timed;
+  if (cpu.timing)
+    timed = [application, cpuRows = step.cpuRows, committed = chunk.committed_tokens](const metal::HostStepTiming &t) {
+      char line[160];
+      std::snprintf(line, sizeof line,
+                    "cpu-attention application %u history %u cpu rows %u: pickup %.2f ms, work %.2f ms, resume %.2f ms",
+                    application, committed, cpuRows, t.pickupSeconds * 1e3, t.workSeconds * 1e3,
+                    t.resumeSeconds * 1e3);
+      writeStderrLine(line);
+    };
+  ops::PreparedInput gated;
+  const metal::MetalBuffer cpuRowsBuffer = s.cpuAttention;
+  step.graph.host(compute, timed, metal::HostStepGpu::Idle, {},
+                  [&] { gated = attend(cpu.shadow ? *step.fullAttention : *step.cpuAttention); }, {cpuRowsBuffer});
+  if (!cpu.shadow) {
+    ops::RowCopy::add(step.graph, cpuRowsBuffer, {0, width, 0}, b.attentionHidden, {0, width, 0}, step.cpuRows, width);
+    return gated;
+  }
+  step.graph.host([hidden = b.attentionHidden, cpuRowsBuffer, count = step.cpuRows, application,
+                   committed = chunk.committed_tokens] {
+    const ops::CpuRelativeAttention::Difference difference =
+        ops::CpuRelativeAttention::compare(static_cast<const uint16_t *>(hidden.contents()),
+                                           static_cast<const uint16_t *>(cpuRowsBuffer.contents()),
+                                           uint64_t{count} * width);
+    char line[200];
+    std::snprintf(line, sizeof line,
+                  "cpu-attention shadow application %u history %u cpu rows %u: largest %u bf16 steps, relative L2 %.3g, "
+                  "%.4f%% of elements 2+ steps apart",
+                  application, committed, count, difference.largestSteps, difference.relative,
+                  difference.farShare * 100.0);
+    writeStderrLine(line);
+  });
+  return gated;
 }
 
 // A prompt sequence's state after its rows goes to its auxiliaryOut and a
