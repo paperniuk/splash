@@ -26,6 +26,13 @@ kernel void test_add_constant_u32(device uint *values [[buffer(0)]]) {
     values[0] += kTestIncrement;
 }
 
+// Adds function constant 3, the only one it declares: indices 0-2 are padding,
+// as fused PQ2_0 int8 decode's kInt8RowGroups.
+constant uint kTestIncrementAt3 [[function_constant(3)]];
+kernel void test_add_constant3_u32(device uint *values [[buffer(0)]]) {
+    values[0] += kTestIncrementAt3;
+}
+
 // Row r of the grid writes word x of the buffer at table[r], which no
 // dispatch binds; addressed_check_u32 reads it back the same way.
 kernel void addressed_write_u32(device const ulong *table [[buffer(0)]],

@@ -339,15 +339,45 @@ id<MTLLibrary> loadLibrary(id<MTLDevice> device, const std::string &metallibPath
 // BackendInstrumentation::stageExpertTiles) kMoeStagedOnly true where the
 // function declares it. It touches no backend state, and Metal's device and
 // library are thread-safe, so any thread may create one.
+//
+// The constants are positional, value i at index i, and must reach exactly the
+// function's last required one, all uint: Metal runs a function with a
+// constant left unset, reading it as zero, so a format-switch kernel short of
+// one would decode the wrong format without an error. An index below the last
+// that the function does not declare is padding and must be zero (fused PQ2_0
+// int8 decode declares index 3 alone). Optional constants
+// (is_function_constant_defined, as kMoeStagedOnly) are not counted. The check
+// reads the function's declarations once per pipeline created, never per
+// dispatch.
 id<MTLComputePipelineState> createPipeline(id<MTLDevice> device, id<MTLLibrary> source,
                                            std::string_view name, std::span<const uint32_t> constants,
                                            [[maybe_unused]] bool stagedExpertTiles) {
     NSString *key = checkedNSString(name, "pipeline name");
+    id<MTLFunction> function = [source newFunctionWithName:key];
+    if (!function) throw MetalBackendError("missing Metal function: " + std::string(name));
+    NSDictionary<NSString *, MTLFunctionConstant *> *declared = function.functionConstantsDictionary;
+    size_t span = 0;
+    bool uints = true;
+    std::vector<bool> declares(constants.size());
+    for (MTLFunctionConstant *constant in declared.allValues) {
+        if (!constant.required) continue;
+        span = std::max<size_t>(span, size_t{constant.index} + 1);
+        uints = uints && constant.type == MTLDataTypeUInt;
+        if (constant.index < declares.size()) declares[constant.index] = true;
+    }
+    if (!uints || span != constants.size()) {
+        throw MetalBackendError("pipeline " + std::string(name) + " sets " + std::to_string(constants.size()) +
+                                " uint function constants of the function's " + std::to_string(span));
+    }
+    for (size_t index = 0; index < constants.size(); ++index) {
+        if (!declares[index] && constants[index] != 0) {
+            throw MetalBackendError("pipeline " + std::string(name) + " sets function constant " +
+                                    std::to_string(index) + ", which the function does not declare, to " +
+                                    std::to_string(constants[index]));
+        }
+    }
     NSError *error = nil;
-    id<MTLFunction> function = nil;
-    if (constants.empty()) {
-        function = [source newFunctionWithName:key];
-    } else {
+    if (!constants.empty()) {
         MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
         [values setConstantValues:constants.data() type:MTLDataTypeUInt
                         withRange:NSMakeRange(0, constants.size())];
@@ -358,11 +388,10 @@ id<MTLComputePipelineState> createPipeline(id<MTLDevice> device, id<MTLLibrary> 
         }
 #endif
         function = [source newFunctionWithName:key constantValues:values error:&error];
-    }
-    if (!function) {
-        throw MetalBackendError(
-            "missing Metal function: " + std::string(name) +
-            (error ? ": " + errorDescription(error) : ""));
+        if (!function) {
+            throw MetalBackendError("unable to specialize Metal function " + std::string(name) + ": " +
+                                    errorDescription(error));
+        }
     }
     id<MTLComputePipelineState> result =
         [device newComputePipelineStateWithFunction:function error:&error];
@@ -2621,17 +2650,24 @@ MetalBuffer MetalBackend::view(const MetalBuffer &base,
     if (base.impl_->allocation->accounting.get() != impl_->accounting.get()) {
         throw MetalBackendError("Metal buffer belongs to another backend");
     }
-    if (!lengthBytes || offsetBytes > base.impl_->lengthBytes ||
-        lengthBytes > base.impl_->lengthBytes - offsetBytes) {
+    return base.view(offsetBytes, lengthBytes);
+}
+
+MetalBuffer MetalBuffer::view(uint64_t offsetBytes, uint64_t lengthBytes) const {
+    if (!impl_) {
+        throw MetalBackendError("cannot view an empty Metal buffer");
+    }
+    if (!lengthBytes || offsetBytes > impl_->lengthBytes ||
+        lengthBytes > impl_->lengthBytes - offsetBytes) {
         std::ostringstream message;
         message << "Metal buffer view is out of range: offset=" << offsetBytes
                 << " length=" << lengthBytes
-                << " base_length=" << base.impl_->lengthBytes;
+                << " base_length=" << impl_->lengthBytes;
         throw MetalBackendError(message.str());
     }
-    auto result = std::make_shared<MetalBuffer::Impl>();
-    result->allocation = base.impl_->allocation;
-    result->offsetBytes = base.impl_->offsetBytes + offsetBytes;
+    auto result = std::make_shared<Impl>();
+    result->allocation = impl_->allocation;
+    result->offsetBytes = impl_->offsetBytes + offsetBytes;
     result->lengthBytes = lengthBytes;
     return MetalBuffer(std::move(result));
 }

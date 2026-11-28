@@ -70,6 +70,19 @@ struct SplitChoice final {
 [[nodiscard]] LinearConfig selectProjection(const KernelCalibration &calibration, Int8Activations int8Activations,
                                             StepKind step, LinearWorkload workload, const UnitFormats &unit,
                                             std::span<const UnitFormats> pairTensors = {});
+// The most rows of a decode step that Apple7/8 run as two plans where the
+// register tile takes the unit (decodePassRows).
+inline constexpr uint32_t kApple7DecodePassRows = 56;
+// The rows of the first of the two plans a plan of `workload` of `step`'s work
+// runs as (Linear::plan, LinearPlan::passes), the second's the rest; 0 where
+// one plan computes every row: Apple7/8's decode steps of 33 to
+// kApple7DecodePassRows rows on a quantized unit the register and column tiles
+// take (no leading-input views, no float-only units, no segmented epilogues, no
+// multi-segment or float gate, and at most three bf16 plain quantized
+// segments), as the plans of 32 rows and of the rest.
+[[nodiscard]] uint32_t decodePassRows(const KernelCalibration &calibration, StepKind step, LinearWorkload workload,
+                                      const UnitFormats &unit, const Projection *projection = nullptr,
+                                      const Projection *gate = nullptr) noexcept;
 // Every configuration a decode plan of the workload may take on the device
 // when only a shape's formats are known (arena bounds): whether the register
 // tile takes them, and whether the int8 decode tiles do, which run a staged

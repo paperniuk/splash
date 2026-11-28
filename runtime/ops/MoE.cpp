@@ -212,11 +212,20 @@ namespace {
 // that of a step whose passes run around its load (MoE::add).
 MoeGroupParams groupParams(const MoePlan &plan, const BlockMoeWeights &weights) {
   const MoeShape shape = plan.shape();
+  // Apple7/8's gate/up pass of split formats runs twice the column tiles (moe_mma_split_format), by the formats its
+  // kernel is specialized for (addExperts).
+  const bool mma = plan.configuration().ggufTile == MoeGgufTile::Mma;
+  const uint32_t gf = shape.sharedSlices ? weights.gate.shared.formatId : weights.gate.routed.formatId;
+  const uint32_t uf = shape.sharedSlices ? weights.up.shared.formatId : weights.up.routed.formatId;
+  const std::array formats{weights.gate.routed.formatId, gf, weights.up.routed.formatId, uf};
+  const bool split = mma && std::ranges::all_of(formats, [&](uint32_t f) {
+    return moe_mma_split_format(f, plan.tileRows());
+  });
   return {plan.rows(),
           shape.expertsPerToken,
           plan.tileRows(),
           shape.experts,
-          shape.expertIntermediateSize / GGUF_STAGED_COLUMNS,
+          shape.expertIntermediateSize / GGUF_STAGED_COLUMNS * (split ? MOE_MMA_SPLIT : 1),
           shape.hiddenSize / GGUF_TILE_COLUMNS,
           weights.stream != nullptr,
           0};

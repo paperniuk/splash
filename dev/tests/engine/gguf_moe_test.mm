@@ -1945,12 +1945,12 @@ int laneRowsRoute(MetalBackend &backend, const std::string &name, uint32_t rows,
     if (!std::equal(at(output), at(output) + kHidden, at(allOutput)))
       fail("lane row " + std::to_string(row) + " differs from the all-rows run");
   }
-  // Each lane's first row has an expert of its own, whose tile is a
+  // Each lane's first row has a routed expert of its own, whose tile is a
   // column tile; Apple7/8's MMA passes run one only for an expert of a
-  // moe_mma_column_format projection (columnTile), which this model has none
-  // of.
+  // moe_mma_column_format projection (columnTile): the routed formats', the
+  // first three, whatever the shared expert's.
   const bool columnKinds = moeTile(backend) == MoeGgufTile::Staged ||
-                           std::any_of(m.formats.begin(), m.formats.end(),
+                           std::any_of(m.formats.begin(), m.formats.begin() + 3,
                                        [&](gguf_reference::Fmt f) { return moe_mma_column_format(f, tileRows); });
   const size_t columnRows = columnKinds ? lanes.size() : 0;
   if (compared != expected || column != columnRows)

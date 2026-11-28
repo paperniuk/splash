@@ -190,30 +190,40 @@ inline void store_sums(thread float2 (&acc)[FN][FM], sgmatrix::Lane l, uint spli
   split_release(counter, thread_index);
 }
 
-// The live rows of simdgroup row half `half_m` of a prefill tile whose chunk holds `rows` rows from its first: 32, or
-// fewer in the chunk's last half, or none past it. A simdgroup with fewer than 32 reads and stores its live rows alone,
-// so the input and output hold the chunk's rows and no padding (a decode step of three lanes' 16-row trees runs 48
-// rows here on Apple7/8).
-inline uint prefill_live_rows(uint rows, uint half_m) {
+// The rows simdgroup row half `half_m` of a prefill tile reads and stores, where the tile's chunk holds `rows` rows
+// from its first, so that the input and output hold the chunk's rows and no padding. `live` counts the half's rows
+// in the chunk: 32, fewer in the chunk's last half, or none past it. A half short of 32 in a tile of more than 32 rows
+// (a decode step of three lanes' 16-row trees runs 48 rows here on Apple7/8) reads the 32 rows that end at the
+// chunk's last, from `shift` rows back in the first half's, and stores its last `live` alone: it runs the full tile's
+// loop, where a clamped half's loop cost a 33-63-row decode step 6% over a 64-row one (Qwen3.8-27B MLX 4-bit, M2 Pro).
+// A half short of 32 in a tile of 32 rows or fewer has no rows before it to read and clamps its loads instead
+// (load_live_inputs), with no shift.
+struct PrefillHalf {
+  uint live;
+  uint shift;
+};
+inline PrefillHalf prefill_half(uint rows, uint half_m) {
   const uint first = half_m * kPrefillSimdgroupRows;
-  return first < rows ? min(rows - first, uint(kPrefillSimdgroupRows)) : 0;
+  const uint live = first < rows ? min(rows - first, uint(kPrefillSimdgroupRows)) : 0;
+  return {live, live != 0 && rows > kPrefillSimdgroupRows ? kPrefillSimdgroupRows - live : 0};
 }
-// Writes the elements of `acc` through write(row, column, v), its `live` rows alone; a full half without the guard.
+// Writes the elements of `acc` through write(row, column, v), its rows from `shift` up to `live` of them alone, each
+// at its row less the shift; a full half without the guard.
 template <class Write>
-inline void prefill_store(thread float2 (&acc)[FN][kPrefillSimdgroupRows / 8], sgmatrix::Lane l, uint live,
+inline void prefill_store(thread float2 (&acc)[FN][kPrefillSimdgroupRows / 8], sgmatrix::Lane l, PrefillHalf h,
                           Write write) {
-  if (live == kPrefillSimdgroupRows) {
+  if (h.live == kPrefillSimdgroupRows) {
     elements(acc, l, write);
     return;
   }
   elements(acc, l, [&](uint row, uint col, float v) {
-    if (row < live) write(row, col, v);
+    if (row - h.shift < h.live) write(row - h.shift, col, v);  // a row before the shift wraps past live
   });
 }
 
 // prefill_accumulate's K loop. With Live, a simdgroup with fewer than 32 live rows reads them alone
-// (load_live_inputs); without it every simdgroup reads its 32 rows whole, which only a tile whose chunk holds all 64
-// rows may do.
+// (load_live_inputs); without it every simdgroup reads 32 rows whole, a half short of 32 from its shift back
+// (prefill_half), which only a tile whose chunk holds more than 32 rows may do.
 template <class F, bool Live>
 inline bool prefill_accumulate_rows(device const bfloat *x, device uchar *w0, device uchar *w1, device uchar *meta,
                                     uint input_size, uint origin, uint rows, uint step_begin, uint step_end,
@@ -225,7 +235,8 @@ inline bool prefill_accumulate_rows(device const bfloat *x, device uchar *w0, de
   const uint half_n = simd_group & 1, half_m = simd_group >> 1;
   const bool stages = thread_index < GGUF_TILE_COLUMNS;
   const bool owns = half_m * kPrefillSimdgroupRows < rows;  // uniform per simdgroup
-  const uint live = prefill_live_rows(rows, half_m);
+  const PrefillHalf h = prefill_half(rows, half_m);
+  const uint live = h.live;
   const bool full = live == kPrefillSimdgroupRows;
   zero(acc);
   if (step_begin >= step_end) return owns;
@@ -234,7 +245,7 @@ inline bool prefill_accumulate_rows(device const bfloat *x, device uchar *w0, de
   device uchar *c0 = w0 + (ulong(plane_tile) * groups * QUANT_TILE_ROWS + plane_row) * F::P0;
   device uchar *c1 = w1 + (ulong(plane_tile) * groups * QUANT_TILE_ROWS + plane_row) * F::P1;
   device uchar *cm = meta + (ulong(plane_tile) * units * QUANT_TILE_ROWS + plane_row) * F::MetaBytes;
-  x += ulong(half_m) * kPrefillSimdgroupRows * input_size;
+  x += ulong(half_m * kPrefillSimdgroupRows - h.shift) * input_size;
   typename F::Payload packed;
   typename F::Meta hdr;
   uint unit = step_begin / F::MetaGroups;
@@ -275,14 +286,15 @@ inline bool prefill_accumulate_rows(device const bfloat *x, device uchar *w0, de
 // Accumulates K steps [step_begin, step_end) of a prefill tile (rows [first, first + 64) and columns
 // [origin, origin + 64)) into `acc`. Returns whether this simdgroup holds chunk rows (`half_m * 32 < rows`);
 // simdgroups past them only stage weights. The tile picks its loop once, uniformly for the threadgroup so that both
-// copies' barriers match: a chunk's last tile reads its live rows alone, every other tile reads whole halves without
-// a choice per step (the choice in the loop cost the 27B Q4_0's 2048-row prefill 3.7% on an M2 Max).
+// copies' barriers match: a tile of 32 rows or fewer clamps its live rows' loads, every other tile reads whole halves
+// (a half short of 32 shifted back, prefill_half) without a choice per step (the choice in the loop cost the 27B
+// Q4_0's 2048-row prefill 3.7% on an M2 Max).
 template <class F>
 inline bool prefill_accumulate(device const bfloat *x, device uchar *w0, device uchar *w1, device uchar *meta,
                                uint input_size, uint origin, uint rows, uint step_begin, uint step_end,
                                threadgroup half *stage, threadgroup half2 *tl, uint lane, uint simd_group,
                                thread float2 (&acc)[FN][kPrefillSimdgroupRows / 8]) {
-  if (rows >= kPrefillRows)
+  if (rows > kPrefillSimdgroupRows)
     return prefill_accumulate_rows<F, false>(x, w0, w1, meta, input_size, origin, rows, step_begin, step_end, stage,
                                              tl, lane, simd_group, acc);
   return prefill_accumulate_rows<F, true>(x, w0, w1, meta, input_size, origin, rows, step_begin, step_end, stage, tl,
@@ -292,7 +304,7 @@ inline bool prefill_accumulate(device const bfloat *x, device uchar *w0, device 
 // The prefill tile of chunk rows [first, first + 64) and columns [origin, origin + 64) of one segment: threads 0-63
 // stage one column's group per step into a double-buffered stage, and each simdgroup that holds chunk rows runs its
 // 32 columns by 32 rows. `rows` counts the chunk's rows from the tile's first: a simdgroup past them only stages, and
-// one in the chunk's last half reads and stores its live rows alone (prefill_live_rows).
+// one in the chunk's last half stores its live rows alone (prefill_half).
 template <class F, class Store>
 inline void prefill_tile(device const bfloat *x, device uchar *w0, device uchar *w1, device uchar *meta,
                          uint input_size, uint origin, uint rows, threadgroup half *stage, threadgroup half2 *tl,
@@ -303,7 +315,7 @@ inline void prefill_tile(device const bfloat *x, device uchar *w0, device uchar 
                              simd_group, acc))
     return;
   const uint half_n = simd_group & 1, half_m = simd_group >> 1;
-  prefill_store(acc, sgmatrix::lane_map(lane), prefill_live_rows(rows, half_m), [&](uint row, uint col, float v) {
+  prefill_store(acc, sgmatrix::lane_map(lane), prefill_half(rows, half_m), [&](uint row, uint col, float v) {
     store(half_m * kPrefillSimdgroupRows + row, half_n * kColumns + col, v);
   });
 }
@@ -324,10 +336,10 @@ inline void prefill_tile_split(device const bfloat *x, device uchar *w0, device 
                                           stage, tl, lane, simd_group, acc);
   const sgmatrix::Lane l = sgmatrix::lane_map(lane);
   const uint half_n = simd_group & 1, half_m = simd_group >> 1, thread_index = simd_group * 32 + lane;
-  const uint live = prefill_live_rows(rows, half_m);
+  const PrefillHalf h = prefill_half(rows, half_m);
   if (splits == 1) {
     if (owns) {
-      prefill_store(acc, l, live, [&](uint row, uint col, float v) {
+      prefill_store(acc, l, h, [&](uint row, uint col, float v) {
         store(half_m * kPrefillSimdgroupRows + row, half_n * kColumns + col, v);
       });
     }
@@ -336,15 +348,16 @@ inline void prefill_tile_split(device const bfloat *x, device uchar *w0, device 
   const auto partial_at = [&](uint s, uint row, uint col) -> ulong {
     return (ulong(s) * kPrefillRows + row) * GGUF_TILE_COLUMNS + col;
   };
+  // Partials sit at the tile's rows, so a shifted half's at its stored rows alone.
   if (owns) {
-    elements(acc, l, [&](uint row, uint col, float v) {
+    prefill_store(acc, l, h, [&](uint row, uint col, float v) {
       partials[partial_at(split, half_m * kPrefillSimdgroupRows + row, half_n * kColumns + col)] = v;
     });
   }
   // Every thread in the threadgroup enters the barrier even when half_m == 1 does not own rows.
   if (!split_arrive_last(counter, splits, thread_index, arrival)) return;
   if (owns) {
-    prefill_store(acc, l, live, [&](uint row, uint col, float v) {
+    prefill_store(acc, l, h, [&](uint row, uint col, float v) {
       const uint trow = half_m * kPrefillSimdgroupRows + row, tcol = half_n * kColumns + col;
       store(trow, tcol, split_sum(v, split, splits, [&](uint s) { return partials[partial_at(s, trow, tcol)]; }));
     });

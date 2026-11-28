@@ -114,7 +114,8 @@ std::vector<uint32_t> ExecutionPlans::prefillRowClasses(std::optional<std::pair<
 }
 
 // A step's rows pick its projections' tile and height as a chunk's do
-// (prefillRowClasses); a float projection's tile, which a step's rows move
+// (prefillRowClasses), those of each of its plans' passes (LinearPlan::
+// passes); a float projection's tile, which a step's rows move
 // only at the accelerator tile's fewest rows, as they fill one 64-row tile
 // (selectFloatTile); and a MoE target's expert tile (32-row tiles once its
 // rows' routes outnumber its experts). Its router's tile changes with them
@@ -124,17 +125,23 @@ std::vector<uint32_t> ExecutionPlans::decodeRowClasses(uint32_t mostRows,
   if (mostRows > SPLASH_MAXIMUM_BATCH_WIDTH * SPLASH_TARGET_VERIFY_ROWS)
     throw std::invalid_argument("a decode step holds at most a verify block of each of the most lanes");
   const FloatTileCalibration &floats = calibration().floatTile;
-  std::vector<uint32_t> first;
-  std::tuple<LinearTile, uint32_t, bool, uint32_t> last{};
-  for (uint32_t rows = 1; rows <= mostRows; ++rows) {
-    const LinearPlan plan = decodeLinear_.plan({{GGUF_TILE_COLUMNS, GGUF_TILE_COLUMNS}, rows});
+  // A plan's tile and the height that names its kernels.
+  const auto height = [](const LinearPlan &plan) {
     const LinearTile tile = plan.configuration().tile;
     const bool named = tile == LinearTile::GgufStaged || tile == LinearTile::GgufRegister;
+    return std::pair{tile, named ? plan.storageRows() : 0};
+  };
+  std::vector<uint32_t> first;
+  std::tuple<std::pair<LinearTile, uint32_t>, std::pair<LinearTile, uint32_t>, bool, uint32_t> last{};
+  for (uint32_t rows = 1; rows <= mostRows; ++rows) {
+    const LinearPlan plan = decodeLinear_.plan({{GGUF_TILE_COLUMNS, GGUF_TILE_COLUMNS}, rows});
+    const std::span<const LinearPlan> passes = plan.passes();
     MoeConfig config{};
     if (moe)
       config = selectMoe(calibration(), linear_.int8Activations(), StepKind::Decode, moe->first, moe->second, rows);
-    const std::tuple key{tile, named ? plan.storageRows() : 0, floats.neuralAccelerator && rows >= floats.minimumRows,
-                         uint32_t(config.expertTile)};
+    const std::tuple key{height(passes.empty() ? plan : passes.front()),
+                         passes.empty() ? std::pair{LinearTile{}, 0U} : height(passes.back()),
+                         floats.neuralAccelerator && rows >= floats.minimumRows, uint32_t(config.expertTile)};
     if (first.empty() || key != last) first.push_back(rows);
     last = key;
   }

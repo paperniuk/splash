@@ -127,8 +127,12 @@ private:
     metal::MetalBuffer output;
   };
   // The application's gates `gates` of its mix rows of `queries` queries, one
-  // call (ops::MessageGate::add).
+  // call (ops::MessageGate::add), on the narrow gates on Apple7/8 alone.
   void addGates(const PrefillStep &step, uint32_t application, uint32_t queries, std::span<const Gate> gates) const;
+  // A decode step's sums for the chunked plain mixes on Apple7/8; empty on
+  // Apple9+, whose mixes of a threadgroup a row run faster
+  // (metal/abi/BlockResidualMix.h).
+  [[nodiscard]] metal::MetalBuffer mixSums(const Inkling2LoopScratch &s) const;
   // One of the application's convolutions over the step's rows: its state
   // columns in each lane's matrix, the sequences' states in and out, the
   // states captured inside them, and a decode step's tree and tape.

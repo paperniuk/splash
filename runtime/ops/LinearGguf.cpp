@@ -21,8 +21,6 @@
 namespace splash::ops {
 namespace {
 
-// The segments one fused decode dispatch runs.
-constexpr size_t kFusedSegments = std::extent_v<decltype(GgufDecodeFusedParams::cols)>;
 static_assert(QUANT_TILE_ROWS % GGUF_TILE_COLUMNS == 0, "an int8 prefill column tile lies inside one plane tile");
 
 // Apple7/8 run the staged tiles' dispatches on simdgroup MMA kernels
@@ -212,6 +210,7 @@ void LinearPlan::requireConfiguration() const {
 }
 
 uint32_t LinearPlan::storageRows() const noexcept {
+  if (passes_) return passes_->front().workload_.rows + passes_->back().storageRows();
   if (config_.tile == LinearTile::GgufColumn) return workload_.rows;
   if (config_.tile == LinearTile::GgufRegister) return tableTiles(workload_.rows) * GGUF_TABLE16_ROWS;
   if (config_.mmaPrefill) return workload_.rows;
@@ -221,6 +220,8 @@ uint32_t LinearPlan::storageRows() const noexcept {
 }
 
 LinearScratchSize LinearPlan::scratchSize() const noexcept {
+  // Passes run in turn, each in the scratch from its start.
+  if (passes_) return LinearScratchSize{passes_->front().scratchSize()}.include(passes_->back().scratchSize());
   const auto [n, k] = workload_.matrix;
   // The column tile sums K's parts in its threadgroup alone.
   if (config_.tile == LinearTile::GgufColumn) return {};

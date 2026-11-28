@@ -4,7 +4,7 @@
 // 512, an ungated shared expert of two 512-wide slices) or HxIxExK's (hidden H, intermediate I, E experts, top K,
 // routed as the 35B's), by default in the 35B UD-Q4_K_M's formats (Q4_K gate/up and Q5_K down experts, a Q8_0
 // shared expert) with an F32 router:
-//   gguf-moe-benchmark <metallib> [35b|flash-next|flint|HxIxExK] [rounds] [gate/up format] [down format]
+//   gguf-moe-benchmark <metallib> [35b|flash-next|flint|inkling|HxIxExK] [rounds] [gate/up format] [down format]
 //                      [shared format]
 // - decode steps of one lane of 1, 2 and 4 rows and of one to four lanes of 8 rows on the device's plan, each row
 //   routed to top-k experts drawn at random from all of them (random) or, per lane of 8 rows, from a pool of three
@@ -54,6 +54,7 @@
 #include <numeric>
 #include <random>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -108,14 +109,20 @@ int timing(MetalBackend &backend, const MoeShape &shape, uint32_t rounds, bool i
   // An ungated block's weights carry no scalar gate.
   const QuantizedSegment sharedGateSegment =
       shape.sharedGate ? floatSegment(backend, sharedGate, 1, H) : QuantizedSegment{};
-  const std::vector<float> scales(3 * E, 1.0f);
+  const std::vector<float> scales(3 * E, 1.0f), bias(E, 0.0f);
+  // A block without a shared expert (Inkling's) binds no shared planes: addExperts binds the slot table there.
+  const auto shared = [&](uint32_t rows, uint32_t k) {
+    return shape.sharedSlices ? planes(sharedFormat, shape.sharedSlices * rows, k) : QuantizedSegment{};
+  };
   BlockMoeWeights gguf{routerSegment, sharedGateSegment,
-                       {planes(gateUpFormat, E * I, H), planes(sharedFormat, shape.sharedSlices * I, H)},
-                       {planes(gateUpFormat, E * I, H), planes(sharedFormat, shape.sharedSlices * I, H)},
-                       {planes(downFormat, E * H, I), planes(sharedFormat, shape.sharedSlices * H, I)},
+                       {planes(gateUpFormat, E * I, H), shared(I, H)},
+                       {planes(gateUpFormat, E * I, H), shared(I, H)},
+                       {planes(downFormat, E * H, I), shared(H, I)},
                        upload(backend, scales.data(), scales.size() * sizeof(float), "moe-expert-scales"),
                        splash::model::residentExpertSlots(backend, E), E};
   gguf.chunks = splash::ops::residentExpertChunks(gguf);
+  if (shape.selectionBias)
+    gguf.selectionBias = upload(backend, bias.data(), bias.size() * sizeof(float), "moe-selection-bias");
   const std::array<const BlockMoeWeights *, 1> blocks{&gguf};
   const uint32_t routerFormat = splash::ops::moeRouterFormat(blocks);
   // Rows whose expert e scores 4 x[e]: the first E inputs rank the experts, the row's routes at 1 - 0.05 rank and the
@@ -501,19 +508,22 @@ int main(int argc, const char *argv[]) {
     if (tiles || int8) args.erase(args.begin() + 2);
     const size_t count = args.size();
     const std::string shapeName = count > 2 ? args[2] : "35b";
-    // The int8 passes take MLX affine 4- and 5-bit experts alone (quant_moe_int8_format): int8 runs af4g64
-    // throughout by default.
-    const Fmt mlx = Fmt(GGUF_FMT_AF4G64);
-    const Fmt gateUp = count > 4 ? fmtNamed(args[4]) : int8 ? mlx : Q4K,
-              down = count > 5 ? fmtNamed(args[5]) : int8 ? mlx : Q5K,
-              shared = count > 6 ? fmtNamed(args[6]) : int8 ? mlx : Q80;
     // Or HxIxExK: hidden H, intermediate I, E experts, top K, routed as the 35B's (softmax, a gated shared slice).
     uint32_t custom[4] = {};
     const bool sized = std::sscanf(shapeName.c_str(), "%ux%ux%ux%u", &custom[0], &custom[1], &custom[2], &custom[3]) == 4;
-    if (count < 2 || count > 7 || (shapeName != "35b" && shapeName != "flash-next" && shapeName != "flint" && !sized) ||
+    const bool inkling = shapeName == "inkling";
+    // The int8 passes take MLX affine 4- and 5-bit experts alone (quant_moe_int8_format): int8 runs af4g64
+    // throughout by default. Inkling-2-Mini's GGUF takes NVFP4 gate/up and NVFP4_64 down experts, whose blocks divide
+    // its K of 2304 and 1152 (Q5_K's 256 does not divide 1152).
+    const Fmt mlx = Fmt(GGUF_FMT_AF4G64);
+    const Fmt gateUp = count > 4 ? fmtNamed(args[4]) : int8 ? mlx : inkling ? NVFP4 : Q4K,
+              down = count > 5 ? fmtNamed(args[5]) : int8 ? mlx : inkling ? NVFP464 : Q5K,
+              shared = count > 6 ? fmtNamed(args[6]) : int8 ? mlx : Q80;
+    if (count < 2 || count > 7 ||
+        (shapeName != "35b" && shapeName != "flash-next" && shapeName != "flint" && !inkling && !sized) ||
         gateUp == FMT_COUNT || down == FMT_COUNT || shared == FMT_COUNT) {
-      std::cerr << "usage: gguf-moe-benchmark <metallib> [tiles|int8] [35b|flash-next|flint|HxIxExK] [rounds] "
-                   "[gate/up format] [down format] [shared format]\n";
+      std::cerr << "usage: gguf-moe-benchmark <metallib> [tiles|int8] [35b|flash-next|flint|inkling|HxIxExK] "
+                   "[rounds] [gate/up format] [down format] [shared format]\n";
       return 2;
     }
     const bool flashNext = shapeName == "flash-next", flint = shapeName == "flint";
@@ -524,6 +534,31 @@ int main(int argc, const char *argv[]) {
       shape.sharedSlices = 2;
       shape.sharedGate = false;
     }
+    // Inkling-2-Mini's (model/Inkling2Loop.hpp): 128 experts of 1152, top 8, no shared expert, a selection bias, the
+    // routes scaled by 8, gate and up softcapped at 4 and 25.
+    if (inkling)
+      shape = {.hiddenSize = 2304,
+               .experts = 128,
+               .expertsPerToken = 8,
+               .expertIntermediateSize = 1152,
+               .router = splash::ops::MoeRouter::SigmoidNormalized,
+               .sharedSlices = 0,
+               .sharedGate = false,
+               .selectionBias = true,
+               .routedScale = 8.0F,
+               .gateSoftcap = 4,
+               .upSoftcap = 25};
+    // A format whose block does not divide its projection's K would read past its rows' planes.
+    const auto divides = [](Fmt f, uint32_t k) { return k % kQuantFormats[f].block_elements == 0; };
+    for (const auto &[f, k, name] : {std::tuple{gateUp, shape.hiddenSize, "gate/up"},
+                                     std::tuple{down, shape.expertIntermediateSize, "down"},
+                                     std::tuple{shared, shape.sharedSlices ? shape.hiddenSize : 0u, "shared"},
+                                     std::tuple{shared, shape.sharedSlices ? shape.expertIntermediateSize : 0u, "shared"}})
+      if (!divides(f, k)) {
+        std::cerr << "gguf-moe-benchmark: " << name << " format " << fmtName(f) << "'s blocks of "
+                  << kQuantFormats[f].block_elements << " do not divide K = " << k << '\n';
+        return 2;
+      }
     try {
       MetalBackend backend(args[1]);
       return timing(backend, shape, count > 3 ? std::stoul(args[3]) : 20, int8, gateUp, down, shared, tiles);

@@ -48,7 +48,7 @@ void MessageGate::requireWeights(std::span<const MessageGateWeights> gates, uint
 }
 
 PreparedInput MessageGate::add(metal::CommandGraph &graph, const MessageGateBuffers &buffers,
-                               std::span<const MessageGateInput> gates, uint32_t hidden, uint32_t rows) {
+                               std::span<const MessageGateInput> gates, uint32_t hidden, uint32_t rows, bool narrow) {
   if (gates.empty() || !hidden || !rows || !gates.front().weights.down.outputSize)
     throw std::invalid_argument("invalid message gates");
   if (gates.size() > kMaximumGates)
@@ -109,6 +109,26 @@ PreparedInput MessageGate::add(metal::CommandGraph &graph, const MessageGateBuff
   }
   const metal::DispatchSize threads{MESSAGE_GATE_THREADS, 1, 1};
   const uint32_t groups = (rows + MESSAGE_GATE_GROUP_ROWS - 1) / MESSAGE_GATE_GROUP_ROWS;
+  if (narrow && rows <= MESSAGE_GATE_NARROW_ROWS) {
+    // The narrow gates: rank values, then the gated rows in forget, fp32 [gates][rows][hidden], then their norms.
+    requireBytes(buffers.low, uint64_t{count} * rows * rank * sizeof(uint16_t), "message gate rank values");
+    requireBytes(buffers.forget, uint64_t{count} * rows * hidden * sizeof(float), "message gate gated rows");
+    graph.add("message_gate_narrow_down" + suffix,
+              {buffers.x, buffers.message, slot(0).weights.down.plane0, slot(1).weights.down.plane0,
+               slot(2).weights.down.plane0, buffers.low},
+              p, {(rank + MESSAGE_GATE_NARROW_OUTPUTS - 1) / MESSAGE_GATE_NARROW_OUTPUTS, groups, count}, threads);
+    graph.add("message_gate_narrow_up" + suffix,
+              {buffers.x, buffers.message, slot(0).weights.forget.plane0, slot(1).weights.forget.plane0,
+               slot(2).weights.forget.plane0, slot(0).weights.gain.plane0, slot(1).weights.gain.plane0,
+               slot(2).weights.gain.plane0, buffers.low, buffers.forget},
+              p, {(hidden + MESSAGE_GATE_NARROW_UP_THREADS - 1) / MESSAGE_GATE_NARROW_UP_THREADS, groups, count},
+              {MESSAGE_GATE_NARROW_UP_THREADS, 1, 1});
+    graph.add("message_gate_norm",
+              {buffers.forget, slot(0).norm.buffer, slot(1).norm.buffer, slot(2).norm.buffer, slot(0).output,
+               slot(1).output, slot(2).output},
+              p, {rows, 1, count}, threads);
+    return {};
+  }
   const uint32_t slices = (hidden + MESSAGE_GATE_THREADS - 1) / MESSAGE_GATE_THREADS;
   requireBytes(buffers.low, uint64_t{count} * rows * rank * sizeof(uint16_t), "message gate rank values");
   // The normalized concatenations, bf16 [gates][rows][2 hidden], which the

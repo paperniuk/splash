@@ -61,6 +61,7 @@ struct Inkling2LoopScratch final {
   metal::MetalBuffer gateForget;
   metal::MetalBuffer gateGain;
   metal::MetalBuffer gateCounters;
+  metal::MetalBuffer mixSums;
   metal::MetalBuffer zeros;
   metal::MetalBuffer tape;
   metal::MetalBuffer attentionCounters;
