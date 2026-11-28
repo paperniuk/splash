@@ -104,11 +104,11 @@ on a short prompt. Decode in tok/s, one request / two at once:
 | `unsloth/flint-GGUF:UD-Q4_K_XL` | 77 | 94 |
 | `mlx-community/Qwen3.8-27B-4bit` | 61 | 72 |
 | `unsloth/Qwen3.8-27B-GGUF:UD-Q5_K_M` | 49 | 60 |
-| `unsloth/Inkling-2-Mini-GGUF:UD-Q4_K_M` | 51 | 69 |
+| `unsloth/Inkling-2-Mini-GGUF:UD-Q4_K_M` | 62 | 80 |
 
 Prose is slower than code because the draft model guesses fewer tokens.
 Flint was measured on 1.5.0-m1 with its fork pull request, Inkling-2-Mini on
-1.7.3-m1. Inkling-2-Mini reasons even with reasoning off, so give it room in
+1.7.3-m1.1. Inkling-2-Mini reasons even with reasoning off, so give it room in
 `max_tokens`. With four
 requests at once the 27B MLX decodes 80 tok/s in total.
 
@@ -189,7 +189,7 @@ follows upstream and does not run on M1/M2.
 
 ## Status
 
-- Stable: [1.7.3-m1](https://github.com/paperniuk/splash/releases/latest),
+- Stable: [1.7.3-m1.1](https://github.com/paperniuk/splash/releases/latest),
   upstream 1.7.3 plus the M1/M2 work.
 - Known gaps: the 35B MoE's expert kernels are not tuned for M1/M2 yet;
   Macs below 64 GB are covered by the kernel tests, not run end to end on
