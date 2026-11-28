@@ -23,8 +23,9 @@
 //   uninstrumented), and against fp64;
 // - the mix of 1, 3 and 4 queries over 1 to 5 states (bf16 stack planes, bf16
 //   or fp32 current rows), plain and through its norms, of 5 rows (a
-//   threadgroup a row and query) and of BLOCK_RESIDUAL_MIX_QUERY_ROWS + 3 (a
-//   threadgroup a row);
+//   threadgroup a row and query, and plain the _chunks kernels given scratch
+//   for their sums) and of BLOCK_RESIDUAL_MIX_QUERY_ROWS + 3 (a threadgroup a
+//   row);
 // - the message gate through its norm, its fused kernels' and its reference
 //   path's, and the paths against each other;
 // - the logit finish's softcap and padding rows.
@@ -832,6 +833,22 @@ void mixTest(MetalBackend &backend, uint32_t stack, uint32_t queries, bool curre
     for (size_t i = 0; i < want.size(); ++i) ok &= closeF32(got[size_t{r} * queries * m.hidden + i], want[i]);
   }
   check(ok, scope);
+  if (rows <= BLOCK_RESIDUAL_MIX_QUERY_ROWS) {
+    // The same call given scratch for its sums: the _chunks kernels, a threadgroup a chunk of a row.
+    const MetalBuffer sums = scratch(backend, ops::BlockResidualMix::sumsBytes(m.hidden, m.rows)),
+                      chunked = scratch(backend, size_t{m.rows} * queries * m.hidden * 4);
+    CommandGraph chunks;
+    ops::BlockResidualMix::addMix(chunks, states, queryBuffer, chunked, shape, m.rows, sums);
+    run(backend, chunks);
+    const auto gotChunks = download<float>(chunked, size_t{m.rows} * queries * m.hidden);
+    bool okChunks = true;
+    for (uint32_t r = 0; r < m.rows; ++r) {
+      const auto want = mixReference(m, r);
+      for (size_t i = 0; i < want.size(); ++i)
+        okChunks &= closeF32(gotChunks[size_t{r} * queries * m.hidden + i], want[i]);
+    }
+    check(okChunks, scope + ", its chunks' sums apart");
+  }
   if (queries > BLOCK_RESIDUAL_MIX_MAXIMUM_NORMS) return;
   std::vector<ops::NormWeights> norms;
   std::vector<MetalBuffer> outputs;
@@ -936,7 +953,8 @@ struct GateCase {
 // The paths a test call runs: the engine's fused kernels (ops::MessageGate),
 // or the reference path (message_gate_reference.h), whose kernels the
 // production-and-test library holds.
-enum class GatePath : uint8_t { Fused, Reference };
+// Narrow: the fused kernels with the narrow gates allowed (Apple7/8's).
+enum class GatePath : uint8_t { Fused, Narrow, Reference };
 
 // The reference path's gates of `rows` rows: a gate at a time, its rows' and
 // messages' norms and concatenation (message_gate_test_prepare) into
@@ -989,15 +1007,16 @@ void runGates(MetalBackend &backend, const GateCase &c, const MetalBuffer &x, co
       counters};
   CommandGraph graph;
   if (path == GatePath::Reference) addReferenceGates(graph, buffers, gates, hidden, count);
-  else ops::MessageGate::add(graph, buffers, gates, hidden, count);
+  else ops::MessageGate::add(graph, buffers, gates, hidden, count, path == GatePath::Narrow);
   run(backend, graph);
 }
 
 // The kernels a call of `rows` rows on `path` runs.
 std::string gateKernels(uint32_t rows, GatePath path) {
-  return path == GatePath::Reference              ? "float projections"
-         : rows <= ops::MessageGate::kFusedRows ? "fused"
-                                                : "tiled";
+  return path == GatePath::Reference                                   ? "float projections"
+         : path == GatePath::Narrow && rows <= MESSAGE_GATE_NARROW_ROWS ? "narrow"
+         : rows <= ops::MessageGate::kFusedRows                         ? "fused"
+                                                                        : "tiled";
 }
 
 // Each gate of a call of one or three gates (a layer's FFN gate; its q, k and
@@ -1225,6 +1244,13 @@ int main(int argc, const char *argv[]) {
               mixTest(backend, stack, queries, currentFloat, rows);
         for (const uint32_t rows : {5u, BLOCK_RESIDUAL_MIX_QUERY_ROWS + 3}) mixTest(backend, 0, 1, currentFloat, rows);
       }
+      // 1 and 3 rows: the narrow gates (MESSAGE_GATE_NARROW_ROWS) and, as Apple9+ runs them, the fused ones; 6 and
+      // 13 the decode step's fused ones.
+      for (const uint32_t rows : {1u, 3u})
+        for (const GatePath path : {GatePath::Narrow, GatePath::Fused}) {
+          gateTest(backend, rows, 1, true, path);
+          gateTest(backend, rows, 3, false, path);
+        }
       for (const uint32_t rows : {6u, 13u, ops::MessageGate::kFusedRows, ops::MessageGate::kFusedRows + 1}) {
         gateTest(backend, rows, 1, true);
         gateTest(backend, rows, 3, false);

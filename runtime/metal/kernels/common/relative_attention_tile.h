@@ -7,6 +7,7 @@
 #include "metal/kernels/common/attention_sequence.h"
 #include "metal/kernels/common/attention_store.h"
 #include "metal/kernels/common/gguf_sgmatrix.h"
+#include "metal/kernels/common/paged_attention_sgf.h"
 #include "metal/kernels/common/paged_attention_tile.h"
 #include "metal/kernels/common/rms_inverse.h"
 
@@ -358,19 +359,6 @@ inline RelativeAttentionPages relative_attention_pages(uint first_position, uint
   return {begin, min(pages, begin + per_split), (pages - first_page + per_split - 1) / per_split};
 }
 
-struct RelativeAttentionRegisterOutput {
-  sgmatrix::Lane coord;
-  ushort sg;
-  float2 values[12];
-  static constexpr ushort get_capacity() { return 24; }
-  static bool is_valid_element(ushort) { return true; }
-  uint2 get_multidimensional_index(ushort index) const {
-    uint tile = sg + 8 * (index / 2);
-    return uint2(8 * (tile % 16) + coord.fn + (index & 1), 8 * (tile / 16) + coord.fm);
-  }
-  thread float &operator[](ushort i) thread { return reinterpret_cast<thread float *>(values)[i]; }
-};
-
 // splash_paged_attention_tile with the bias, over a split's nonempty run of
 // pages (relative_attention_pages): the tile's fused rows' relative states
 // (`states`, staged as their queries) and the layer's bias table (`table`).
@@ -384,7 +372,7 @@ struct RelativeAttentionRegisterOutput {
 // running_full says is valid) and their statistics, which row_max and row_sum
 // hold.
 template <uint KVHeads, uint QueryHeadsPerKVHead, uint RowsPerTile, uint HeadDim,
-          uint Window, typename CacheElement, bool Int8Queries, bool RegisterTile = false, class Store>
+          uint Window, typename CacheElement, bool Int8Queries, class Store>
 inline void relative_attention_page_loop(
     device bfloat *tile_queries, device int8_t *query_codes, device const float *states,
     device const float *table, device const SplashKvPage *page_table,
@@ -467,12 +455,7 @@ inline void relative_attention_page_loop(
                           matmul2d_descriptor::mode::multiply_accumulate);
   matmul2d<qk_descriptor, execution_simdgroups<8>> qk;
   matmul2d<pv_descriptor, execution_simdgroups<8>> pv;
-  auto running = [&] {
-    if constexpr (RegisterTile)
-      return RelativeAttentionRegisterOutput{sgmatrix::lane_map(thread_index % 32), ushort(thread_index / 32), {}};
-    else
-      return pv.template get_destination_cooperative_tensor<decltype(p0), decltype(v0), float>();
-  }();
+  auto running = pv.template get_destination_cooperative_tensor<decltype(p0), decltype(v0), float>();
   const bool running_full =
       uint(running.get_capacity()) * (8u * 32u) == uint(M) * D;
 #pragma unroll
@@ -481,17 +464,6 @@ inline void relative_attention_page_loop(
       running[index] = 0.0f;
   }
 
-  const uint sg = thread_index / 32;
-  const auto coord = sgmatrix::lane_map(thread_index % 32);
-  static_assert(!RegisterTile || (M == 48 && N == 32 && D == 128 && Quantized && !Int8Queries));
-  float2 queryParts[3][D / 8];
-  if constexpr (RegisterTile) {
-    for (ushort tile = 0; tile < 3; ++tile) {
-      const uint row = ((sg + 8 * tile) / 4) * 8 + coord.fm;
-      for (ushort k = 0; k < D / 8; ++k)
-        queryParts[tile][k] = float2(*reinterpret_cast<device const bfloat2 *>(tile_queries + row * D + 8 * k + coord.fn));
-    }
-  }
   const SplashAttentionWholePages whole =
       splash_attention_whole_pages<Window>(committed_tokens, active_rows, in_tree, tree.anchor);
   for (uint page = run.begin; page < run.end; ++page) {
@@ -501,26 +473,11 @@ inline void relative_attention_page_loop(
     auto kt = tensor(tensors.keys, dextents<int, 2>{D, N}, array<int, 2>{1, D});
     auto vt = tensor(tensors.values, dextents<int, 2>{N, D}, array<int, 2>{1, N});
 
-    if constexpr (RegisterTile) {
-      const uint col = (sg % 4) * 8 + coord.fn;
-      float2 acc[3] = {};
-      for (ushort k = 0; k < D / 8; ++k) {
-        const uint dim = 8 * k + coord.fm;
-        const half2 key(tensors.keys[col * D + dim], tensors.keys[(col + 1) * D + dim]);
-        for (ushort tile = 0; tile < 3; ++tile)
-          sgmatrix::mma_mixed(acc[tile], queryParts[tile][k], key);
-      }
-      for (ushort tile = 0; tile < 3; ++tile) {
-        const uint row = ((sg + 8 * tile) / 4) * 8 + coord.fm;
-        *reinterpret_cast<threadgroup float2 *>(scores + row * N + col) = acc[tile];
-      }
-    } else {
-      auto page_scores = qk.template get_destination_cooperative_tensor<
-          decltype(q0), decltype(k0), Score>();
-      auto ks = kt.template slice<D, N>(0, 0);
-      qk.run(q0, ks, page_scores);
-      page_scores.store(st.template slice<N, M>(0, 0));
-    }
+    auto page_scores = qk.template get_destination_cooperative_tensor<
+        decltype(q0), decltype(k0), Score>();
+    auto ks = kt.template slice<D, N>(0, 0);
+    qk.run(q0, ks, page_scores);
+    page_scores.store(st.template slice<N, M>(0, 0));
     if (thread_index == 0)
       atomic_store_explicit(rescale, 0u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -545,28 +502,312 @@ inline void relative_attention_page_loop(
         running[index] *= previous_scale[coordinates[1]];
       }
     }
-    if constexpr (RegisterTile) {
-      for (ushort k = 0; k < N / 8; ++k) {
-        half2 v[2];
-        for (ushort c = 0; c < 2; ++c) {
-          const uint col = sg * 8 + c * 64 + coord.fn;
-          const uint tok = 8 * k + coord.fm;
-          v[c] = half2(tensors.values[col * N + tok], tensors.values[(col + 1) * N + tok]);
-        }
-        for (ushort r = 0; r < 6; ++r) {
-          const uint offset = (r * 8 + coord.fm) * N + 8 * k + coord.fn;
-          const float2 prob = float2(*reinterpret_cast<threadgroup const bfloat2 *>(probabilities + offset));
-          for (ushort c = 0; c < 2; ++c)
-            sgmatrix::mma_mixed(running.values[2 * r + c], prob, v[c]);
-        }
-      }
-    } else {
-      auto vs = vt.template slice<N, D>(0, 0);
-      pv.run(p0, vs, running);
-    }
+    auto vs = vt.template slice<N, D>(0, 0);
+    pv.run(p0, vs, running);
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
   store(running, running_full);
+}
+
+// The register tile of the page loop (AttentionCalibration::registerRelative, Apple7/8, whose matmul2d the tensor ops
+// emulate): q8sgf::tile's online softmax (kernels/common/paged_attention_sgf.h) with the bias. A simdgroup owns eight
+// fused rows and runs their scores, softmax and output in registers, with no threadgroup barrier a page; a simdgroup
+// whose rows are all past the tile's active rows runs none. The bias of a page within the extent is one matrix
+// product a simdgroup: its rows' relative states (8 x 16) times the table at the kRelativeBiasSpan backward distances
+// from its lowest row's position less the page's last key, into `stage` (kRelativeBiasSpan floats a fused row), from
+// which each score takes its distance's; a tree's keys of its block, whose distances are their path's, take
+// relative_attention_add_bias's sum. Scores are the matmul2d tile's (key scale, then 1/sqrt(D), then the bias), its
+// probabilities rounded to bf16 after their value scale, so only summation order differs. Then the fused rows'
+// statistics go to row_max and row_sum, and `store` takes the output (RelativeAttentionRegisterOutput) as the page
+// loop's does. On an M1 Max, a one-row Inkling-2-Mini decode step after 8,192 tokens spent 10.8 ms in attention on
+// the matmul2d tile and 6.7 ms here.
+constant constexpr uint kRelativeBiasSpan = 48;
+// The tree keys (a decode step's own rows) whose bias a fused row's table holds before the page loop.
+constant constexpr uint kRelativeTreeKeys = 16;
+// The register loop's page step (relative_attention_register_loop): lean or general.
+template <bool Value> struct RelativeLeanPages {
+  static constant constexpr bool value = Value;
+};
+
+// A simdgroup's output rows of the register tile, as the page loop's cooperative tensor: element i is dimension
+// 8 (i / 2) + fm of fused row sg * 8 + fn + i % 2.
+struct RelativeAttentionRegisterOutput {
+  uint fm;
+  uint row;
+  float2 values[16];
+  static constexpr ushort get_capacity() { return 32; }
+  static bool is_valid_element(ushort) { return true; }
+  uint2 get_multidimensional_index(ushort index) const { return uint2(8 * (index / 2) + fm, row + index % 2); }
+  thread float &operator[](ushort i) thread { return reinterpret_cast<thread float *>(values)[i]; }
+};
+
+template <uint KVHeads, uint QueryHeadsPerKVHead, uint RowsPerTile, uint HeadDim, uint Window, typename CacheElement,
+          class Store>
+inline void relative_attention_register_loop(
+    device const bfloat *tile_queries, device const float *states, device const float *table,
+    device const SplashKvPage *page_table, SplashKvLayer kv, uint kv_head, uint committed_tokens, uint active_rows,
+    RelativeAttentionPages run, threadgroup float *stage, threadgroup float *row_max, threadgroup float *row_sum,
+    SplashAttentionTree tree, uint thread_index, Store store) {
+  constexpr uint G = QueryHeadsPerKVHead, M = RowsPerTile * G, N = SplashKvPageTokens, D = HeadDim;
+  constexpr uint States = SPLASH_RELATIVE_ATTENTION_STATES, Extent = SPLASH_RELATIVE_ATTENTION_EXTENT;
+  constexpr bool Quantized = is_same<CacheElement, int8_t>::value;
+  static_assert(N == 32 && D == 128 && States == 16 && M % 8 == 0 && M <= 64, "eight fused rows a simdgroup");
+  const uint sg = thread_index / 32, lane = thread_index % 32;
+  const sgmatrix::Lane l = sgmatrix::lane_map(lane);
+  const uint fm = l.fm, fn = l.fn;
+  // This lane's fused rows are row and row + 1, the columns of its fragments.
+  const uint row = sg * 8 + fn;
+  RelativeAttentionRegisterOutput output{fm, row, {}};
+  float2 maximum(-INFINITY), denominator(0.0f);
+  if (sg < M / 8 && sg * 8 < active_rows * G) {
+    const bool in_tree = tree.rows != nullptr;
+    const uint visible = committed_tokens + active_rows;
+    const uint2 query_row(min(row / G, active_rows - 1), min((row + 1) / G, active_rows - 1));
+    const uint2 limit(min(visible, committed_tokens + query_row.x + 1),
+                      min(visible, committed_tokens + query_row.y + 1));
+    uint2 ancestors(0), depth(0);
+    if (in_tree) {
+      const SplashTreeRow a = tree.rows[query_row.x], b = tree.rows[query_row.y];
+      ancestors = uint2(a.ancestors, b.ancestors);
+      depth = uint2(a.depth, b.depth);
+    }
+    const uint2 position = in_tree ? tree.anchor + depth : limit - 1;
+    const uint2 window_start(splash_attention_window_start<Window>(position.x),
+                             splash_attention_window_start<Window>(position.y));
+    // Each of this lane's two rows' states, for a key relative_attention_add_bias's sum takes.
+    const uint2 state_row(query_row.x * G + row % G, query_row.y * G + (row + 1) % G);
+    const uint block = in_tree ? tree.anchor : 0xffffffffu;
+    // Q^T fragments for the D / 4 QK steps, bf16 pairs (row, row + 1), in the lane's own words of the stage after
+    // the bias rows (step-major, so lanes never share a bank), out of registers. A partly active simdgroup's rows
+    // past the last active one read that row's queries (state_row's clamped fused rows), whose outputs it discards.
+    threadgroup uint *queries = reinterpret_cast<threadgroup uint *>(stage + M * kRelativeBiasSpan) + sg * 32 * (D / 8);
+    {
+      device const ushort *q0 = reinterpret_cast<device const ushort *>(tile_queries) + state_row.x * D;
+      device const ushort *q1 = reinterpret_cast<device const ushort *>(tile_queries) + state_row.y * D;
+#pragma unroll
+      for (uint b = 0; b < D / 64; ++b)
+#pragma unroll
+        for (uint t = 0; t < 8; ++t) {
+          const uint d = 64 * b + q8sgf::block_dimension(fm, t);
+          queries[(b * 8 + t) * 32 + lane] = uint(q0[d]) | (uint(q1[d]) << 16);
+        }
+    }
+    // The bias product's A: the states of fused row sg * 8 + fm (as clamped), states fn, fn + 1 of each step.
+    const uint a_fused = sg * 8 + fm;
+    device const float *a_states = states + (min(a_fused / G, active_rows - 1) * G + a_fused % G) * States;
+    const float2 bias_a[2] = {*reinterpret_cast<device const float2 *>(a_states + fn),
+                              *reinterpret_cast<device const float2 *>(a_states + 8 + fn)};
+    const uint low = simd_min(min(position.x, position.y)), high = simd_max(max(position.x, position.y));
+    const bool spanned = high - low + N <= kRelativeBiasSpan;
+    threadgroup float *bias_rows = stage + sg * 8 * kRelativeBiasSpan;
+    const uint biased_page = splash_attention_first_page<Extent - 1>(
+        splash_attention_window_position(in_tree, tree.anchor, committed_tokens));
+    const SplashAttentionWholePages whole =
+        splash_attention_whole_pages<Window>(committed_tokens, active_rows, in_tree, tree.anchor);
+    const uint scale_base = q8sgf::page_token(fm, 0);
+    const SplashKvAddressing<KVHeads, D, CacheElement> addressing(kv, kv_head);
+    // Where the rows fit the span and a tree's keys the table, a page takes the lean step: its history keys' bias
+    // from the stage at an index computed once (lean_index), its tree keys' (the step's own rows) from the rows'
+    // table below, computed once a step, and no branch a key. Its tree keys summed key by key in the loop, with the
+    // bounds-checked stage loads, held 50 spilled values a page that the loop reloaded and waited on: a one-row
+    // Inkling-2-Mini decode step's attention took 0.5 ms more of 34.9 on an M1 Max. A tree of more than
+    // kRelativeTreeKeys visible keys (decode trees hold 16 rows; addAttention takes 32) takes the general step.
+    const bool lean_pages = spanned && (!in_tree || visible - tree.anchor <= kRelativeTreeKeys);
+    // The table: each of the simdgroup's fused rows' bias at each tree key, zero past the extent: its distance is
+    // its depth less the ancestors before the key, as the general step computes it.
+    threadgroup float *tree_rows = stage + M * (kRelativeBiasSpan + 64) + sg * 8 * kRelativeTreeKeys;
+    if (in_tree && lean_pages) {
+#pragma unroll
+      for (uint i = 0; i < 8 * kRelativeTreeKeys / 32; ++i) {
+        const uint index = i * 32 + lane, f = index / kRelativeTreeKeys, key = index % kRelativeTreeKeys;
+        const uint fused = sg * 8 + f, query = min(fused / G, active_rows - 1);
+        const SplashTreeRow tree_row = tree.rows[query];
+        const uint distance = tree_row.depth - popcount(tree_row.ancestors & ((1u << min(key, 31u)) - 1u));
+        float bias = 0.0f;
+        if (distance < Extent) {
+          device const float4 *state =
+              reinterpret_cast<device const float4 *>(states + (query * G + fused % G) * States);
+          device const float4 *column = reinterpret_cast<device const float4 *>(table) + ulong(distance) * 4;
+          bias = dot(state[0], column[0]) + dot(state[1], column[1]) + dot(state[2], column[2]) +
+                 dot(state[3], column[3]);
+        }
+        tree_rows[f * kRelativeTreeKeys + key] = bias;
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    // A history key's index in the stage, distance - first_distance: its row's position less the lowest row's plus
+    // its slot's from the page's last key, the same every page; and the position past which a key is within reach.
+    const uint2 lean_index((fn + uint2(0, 1)) * kRelativeBiasSpan + position - low + (N - 1));
+    const int2 lean_far = int2(position) - int(Extent);
+    const auto page_step = [&](uint page, auto lean) {
+      constexpr bool Lean = decltype(lean)::value;
+      const SplashKvPageTensors<CacheElement> tensors = addressing.page(page_table[page]);
+      float key_scale[4] = {1.0f, 1.0f, 1.0f, 1.0f}, value_scale[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+      if constexpr (Quantized) {
+        const float2 k01 = *reinterpret_cast<device const float2 *>(tensors.key_scales + scale_base);
+        const float2 k45 = *reinterpret_cast<device const float2 *>(tensors.key_scales + scale_base + 4);
+        const float2 v01 = *reinterpret_cast<device const float2 *>(tensors.value_scales + scale_base);
+        const float2 v45 = *reinterpret_cast<device const float2 *>(tensors.value_scales + scale_base + 4);
+        key_scale[0] = k01.x, key_scale[1] = k01.y, key_scale[2] = k45.x, key_scale[3] = k45.y;
+        value_scale[0] = v01.x, value_scale[1] = v01.y, value_scale[2] = v45.x, value_scale[3] = v45.y;
+      }
+      // S^T tile s: tokens page_token(fm, s) x rows (row, row + 1).
+      float2 scores[4] = {float2(0.0f), float2(0.0f), float2(0.0f), float2(0.0f)};
+#pragma unroll
+      for (uint b = 0; b < D / 64; ++b)
+#pragma unroll
+        for (uint s = 0; s < 4; ++s) {
+          q8sgf::KeyRun<CacheElement> keys;
+          keys.load(tensors.keys + q8sgf::page_token(fm, s) * D + 64 * b + 8 * fn);
+#pragma unroll
+          for (uint t = 0; t < 8; ++t)
+            q8sgf::mma(scores[s], keys.step(t), q8sgf::bfloat_pair(queries[(b * 8 + t) * 32 + lane]));
+        }
+      const uint token_start = page * N;
+      const bool biased = page >= biased_page, masked = !(page >= whole.begin && page < whole.end);
+      // The span's first distance: the lowest row's from the page's last key.
+      const int first_distance = int(low) - int(token_start + N - 1);
+      if (Lean ? biased : biased && spanned) {
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if constexpr (Lean) {
+          // Every table load first, at clamped distances, then the products with each outside distance's term
+          // zeroed: a branch a load waited for each in turn.
+          float2 operand[kRelativeBiasSpan / 8][2];
+#pragma unroll
+          for (uint tile = 0; tile < kRelativeBiasSpan / 8; ++tile) {
+            const int d = first_distance + int(tile * 8 + fn);
+            const uint d0 = uint(clamp(d, 0, int(Extent) - 1)), d1 = uint(clamp(d + 1, 0, int(Extent) - 1));
+#pragma unroll
+            for (uint step = 0; step < 2; ++step) {
+              device const float *column = table + step * 8 + fm;
+              operand[tile][step] = float2(column[d0 * States], column[d1 * States]);
+            }
+          }
+#pragma unroll
+          for (uint tile = 0; tile < kRelativeBiasSpan / 8; ++tile) {
+            const int d = first_distance + int(tile * 8 + fn);
+            const bool2 inside(d >= 0 && d < int(Extent), d + 1 >= 0 && d + 1 < int(Extent));
+            float2 c(0.0f);
+#pragma unroll
+            for (uint step = 0; step < 2; ++step)
+              q8sgf::mma(c, bias_a[step], select(float2(0.0f), operand[tile][step], inside));
+            *reinterpret_cast<threadgroup float2 *>(bias_rows + fm * kRelativeBiasSpan + tile * 8 + fn) = c;
+          }
+        } else {
+#pragma unroll
+          for (uint tile = 0; tile < kRelativeBiasSpan / 8; ++tile) {
+            const int d = first_distance + int(tile * 8 + fn);
+            float2 c(0.0f);
+#pragma unroll
+            for (uint step = 0; step < 2; ++step) {
+              device const float *column = table + step * 8 + fm;
+              const float2 b(d >= 0 && d < int(Extent) ? column[d * States] : 0.0f,
+                             d + 1 >= 0 && d + 1 < int(Extent) ? column[(d + 1) * States] : 0.0f);
+              q8sgf::mma(c, bias_a[step], b);
+            }
+            *reinterpret_cast<threadgroup float2 *>(bias_rows + fm * kRelativeBiasSpan + tile * 8 + fn) = c;
+          }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+      }
+      bool2 seen[4];
+      float2 local_max(-INFINITY);
+#pragma unroll
+      for (uint s = 0; s < 4; ++s) {
+        const uint token = token_start + q8sgf::page_token(fm, s);
+        seen[s] = masked ? bool2(q8sgf::sees(token, limit.x, window_start.x, in_tree, tree.anchor, ancestors.x),
+                                 q8sgf::sees(token, limit.y, window_start.y, in_tree, tree.anchor, ancestors.y))
+                         : bool2(true);
+        float2 score = scores[s];
+        if constexpr (Quantized)
+          score *= key_scale[s];
+        score *= splash_attention_scale<D>();
+        if (Lean && biased) {
+          // An unseen key's score is replaced below, whatever its index reads.
+#pragma unroll
+          for (uint r = 0; r < 2; ++r) {
+            const float b = token < block ? bias_rows[lean_index[r] - q8sgf::page_token(fm, s)]
+                                          : tree_rows[(fn + r) * kRelativeTreeKeys + min(token - block,
+                                                                                         kRelativeTreeKeys - 1)];
+            score[r] = token >= block || int(token) > lean_far[r] ? score[r] + b : score[r];
+          }
+        } else if (biased) {
+#pragma unroll
+          for (uint r = 0; r < 2; ++r) {
+            if (!seen[s][r])
+              continue;
+            if (spanned && token < block) {
+              const uint distance = position[r] - token;
+              if (distance < Extent)
+                score[r] += bias_rows[(fn + r) * kRelativeBiasSpan + uint(int(distance) - first_distance)];
+            } else {
+              const uint distance =
+                  token >= block ? depth[r] - popcount(ancestors[r] & ((1u << min(token - block, 31u)) - 1u))
+                                 : position[r] - token;
+              if (distance < Extent) {
+                device const float4 *state = reinterpret_cast<device const float4 *>(states + state_row[r] * States);
+                device const float4 *bias = reinterpret_cast<device const float4 *>(table) + ulong(distance) * 4;
+                score[r] += dot(state[0], bias[0]) + dot(state[1], bias[1]) + dot(state[2], bias[2]) +
+                            dot(state[3], bias[3]);
+              }
+            }
+          }
+        }
+        scores[s] = float2(seen[s].x ? score.x : -INFINITY, seen[s].y ? score.y : -INFINITY);
+        local_max = max(local_max, scores[s]);
+      }
+      // Lane bits 1, 2 and 4 select fm: the other 28 tokens of these rows.
+      local_max = max(local_max, simd_shuffle_xor(local_max, 2));
+      local_max = max(local_max, simd_shuffle_xor(local_max, 4));
+      local_max = max(local_max, simd_shuffle_xor(local_max, 16));
+      const float2 next = max(maximum, local_max);
+      float2 probability[4], local_sum(0.0f);
+#pragma unroll
+      for (uint s = 0; s < 4; ++s) {
+        probability[s] = float2(seen[s].x ? fast::exp(scores[s].x - next.x) : 0.0f,
+                                seen[s].y ? fast::exp(scores[s].y - next.y) : 0.0f);
+        local_sum += probability[s];
+      }
+      local_sum += simd_shuffle_xor(local_sum, 2);
+      local_sum += simd_shuffle_xor(local_sum, 4);
+      local_sum += simd_shuffle_xor(local_sum, 16);
+      const float2 scale(next.x == -INFINITY || next.x == maximum.x ? 1.0f : fast::exp(maximum.x - next.x),
+                         next.y == -INFINITY || next.y == maximum.y ? 1.0f : fast::exp(maximum.y - next.y));
+      denominator = denominator * scale + local_sum;
+      maximum = next;
+      if (simd_any(scale.x != 1.0f || scale.y != 1.0f))
+#pragma unroll
+        for (uint d = 0; d < D / 8; ++d)
+          output.values[d] *= scale;
+      // P^T tile s is the score tile's own fragment.
+      float2 weights[4];
+#pragma unroll
+      for (uint s = 0; s < 4; ++s)
+        weights[s] = float2(seen[s].x ? float(bfloat(probability[s].x * value_scale[s])) : 0.0f,
+                            seen[s].y ? float(bfloat(probability[s].y * value_scale[s])) : 0.0f);
+      device const CacheElement *value_row = tensors.values + fm * N + 4 * fn;
+#pragma unroll
+      for (uint d = 0; d < D / 8; ++d) {
+        q8sgf::ValueRun<CacheElement> values;
+        values.load(value_row + d * 8 * N);
+        q8sgf::mma(output.values[d], values.step(0), weights[0]);
+        q8sgf::mma(output.values[d], values.step(1), weights[1]);
+        q8sgf::mma(output.values[d], values.step(2), weights[2]);
+        q8sgf::mma(output.values[d], values.step(3), weights[3]);
+      }
+    };
+    const uint lean_end = lean_pages ? run.end : run.begin;
+    for (uint page = run.begin; page < lean_end; ++page)
+      page_step(page, RelativeLeanPages<true>{});
+    for (uint page = lean_end; page < run.end; ++page)
+      page_step(page, RelativeLeanPages<false>{});
+  }
+  if (sg < M / 8 && fm == 0) {
+    row_max[row] = maximum.x, row_sum[row] = denominator.x;
+    row_max[row + 1] = maximum.y, row_sum[row + 1] = denominator.y;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  store(output, true);
 }
 
 // ---- Reduce ---------------------------------------------------------------

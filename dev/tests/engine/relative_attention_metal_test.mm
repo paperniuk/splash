@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <tuple>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -148,6 +149,10 @@ double clipFactor(std::span<const double> head, double clip) {
 // extents of a pool of two layers, its history written into them directly;
 // with a window, the entries of a lane's table below its first row's window
 // name a page of NaNs.
+// Whether the cases run Apple7/8's register tile (AttentionCalibration::registerRelative), which main sets for a
+// second pass of the INT8 cases with bf16 queries.
+bool gRegisterTile = false;
+
 struct Case final {
   kv::Layout layout;
   ops::RelativeAttentionVariant variant;
@@ -161,11 +166,13 @@ struct Case final {
   std::array<metal::MetalBuffer, SPLASH_MAXIMUM_BATCH_WIDTH> tables;
   uint32_t poisoned = 0;
   ops::RelativeAttentionWeights weights;
+  bool registerTile = gRegisterTile;
 
   [[nodiscard]] uint32_t page(uint32_t lane, uint32_t token) const { return pages[lane][token / kPageTokens]; }
   [[nodiscard]] ops::AttentionCalibration attention() const {
     ops::AttentionCalibration row = test::attentionRow(int8Queries ? 1U : ops::kNever);
     row.cores = kCores;
+    row.registerRelative = registerTile;
     return row;
   }
   [[nodiscard]] double key(uint32_t lane, uint32_t head, uint32_t token, uint32_t dimension) const {
@@ -377,6 +384,19 @@ metal::CommandGraph encode(const Case &data, const Step &step, const ops::Relati
   return graph;
 }
 
+// The threadgroups addAttention and addDecode launch, which the tests' own
+// launches take: a split's of a tile of rows, a direct tile's, and a single
+// pass's of one tile or, for a lane cap past one, two. On the register tile
+// a simdgroup a kernel indexes by its eight fused rows: more threads would
+// stage and write the same rows again.
+uint32_t splitThreads(const ops::RelativeAttentionPlan &plan) { return plan.threads(kv::kAttentionTileRows); }
+uint32_t directThreads(const ops::RelativeAttentionPlan &plan) {
+  return plan.threads(SPLASH_RELATIVE_ATTENTION_DIRECT_ROWS);
+}
+uint32_t decodeThreads(const ops::RelativeAttentionPlan &plan, uint32_t rows) {
+  return plan.threads(rows > kv::kAttentionTileRows ? 2 * kv::kAttentionTileRows : kv::kAttentionTileRows);
+}
+
 void run(metal::MetalBackend &backend, const Case &data, const Step &step, const ops::RelativeAttentionPlan &plan) {
   const metal::MetalBuffer partials = poisoned(backend, plan.workspace().partialsBytes);
   const metal::MetalBuffer statistics = poisoned(backend, plan.workspace().statisticsBytes);
@@ -387,15 +407,18 @@ void run(metal::MetalBackend &backend, const Case &data, const Step &step, const
               "relative_attention_" + format + "_prepare" + (data.variant.positionScaled ? "_scaled" : ""),
           "the prepare names another variant's kernel");
   // A dispatch of one split a sequence runs the direct kernel, any other the
-  // split and the reduce.
+  // split and the reduce, each at the threadgroup splitThreads and
+  // directThreads launch the tests' own dispatches at.
   size_t at = 1;
   for (const ops::RelativeAttentionPlan::Dispatch &dispatch : plan.dispatches()) {
     const bool direct = plan.direct(dispatch);
     require(direct == (dispatch.splits == 1) && dispatches.size() >= at + (direct ? 1 : 2) &&
-                (direct ? dispatches[at].pipelineName == plan.directPipeline()
+                (direct ? dispatches[at].pipelineName == plan.directPipeline() &&
+                              dispatches[at].threadsPerThreadgroup.x == directThreads(plan)
                         : dispatches[at].pipelineName == plan.splitPipeline() &&
+                              dispatches[at].threadsPerThreadgroup.x == splitThreads(plan) &&
                               dispatches[at + 1].threadsPerThreadgroup.x == kHeadDimension),
-            "an attention dispatch runs other kernels than its splits'");
+            "an attention dispatch runs other kernels or threadgroups than its splits'");
     at += direct ? 1 : 2;
   }
   require(dispatches.size() == at, "an attention runs more dispatches than its plan's");
@@ -438,8 +461,9 @@ void runDecode(metal::MetalBackend &backend, const Case &data, const Step &step,
                                {step.layout, data.lanes * step.rows, step.tree}, workspace,
                                {step.inputs.projection, step.output, ops::AttentionOutput::Every, scratch, input});
   require(graph.dispatches().size() == 1 &&
-              graph.dispatches()[0].pipelineName == plan.decodePipeline() + ops::tableSuffix(input),
-          "a single pass runs another kernel than its plan's");
+              graph.dispatches()[0].pipelineName == plan.decodePipeline() + ops::tableSuffix(input) &&
+              graph.dispatches()[0].threadsPerThreadgroup.x == decodeThreads(plan, step.rows),
+          "a single pass runs another kernel or threadgroup than its plan's");
   for (uint32_t lane = 0; lane < data.lanes; ++lane)
     require(plan.sequences()[lane].splits == decodeLaneSplits(data, step, lane), "a lane's splits are not its own");
   static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
@@ -713,7 +737,8 @@ double checkOutput(const Case &data, const Step &step, const std::string &what) 
 }
 
 std::string label(kv::Format format, bool int8Queries) {
-  return std::string(kv::formatName(format)) + (int8Queries ? " with INT8 queries" : "");
+  return std::string(kv::formatName(format)) + (int8Queries ? " with INT8 queries" : "") +
+         (gRegisterTile ? " on the register tile" : "");
 }
 std::string describe(const Case &data, std::string_view phase) {
   std::string text = std::string(phase) + " " + label(data.layout.format, data.int8Queries) +
@@ -761,7 +786,8 @@ bool checkDirectBits(metal::MetalBackend &backend, const Case &data, const Step 
       std::vector<metal::MetalBuffer> split{step.staging.queries, partials, statistics};
       split.insert(split.end(), data.tables.begin(), data.tables.end());
       split.insert(split.end(), {partials, step.layout, step.staging.states, data.weights.bias});
-      graph.add(plan.splitPipeline(), std::move(split), params, {kKvHeads, kv::attentionTiles(step.rows), 1});
+      graph.add(plan.splitPipeline(), std::move(split), params, {kKvHeads, kv::attentionTiles(step.rows), 1},
+                {splitThreads(plan), 1, 1});
       graph.add(plan.reducePipeline(),
                 {partials, statistics, step.inputs.projection, hidden, hidden, hidden, step.layout,
                  step.staging.sinks},
@@ -876,16 +902,17 @@ std::vector<Tree> treesOf(uint32_t lanes, uint32_t rows) {
   return trees;
 }
 
-// A verify of lanes whose blocks of two tiles' rows are trees (treesOf).
+// A verify of lanes whose blocks of `rows` rows are trees (treesOf): a decode
+// block's two tiles, or 32 (the most addAttention takes), whose tiles past
+// the second see more tree keys than the register tile's lean step holds.
 void checkTreeVerify(metal::MetalBackend &backend, kv::Format format, bool int8Queries,
-                     ops::RelativeAttentionVariant variant, std::span<const uint32_t> histories) {
-  constexpr uint32_t kRows = SPLASH_TARGET_VERIFY_ROWS;
-  static_assert(kRows == 2 * kv::kAttentionTileRows, "a block of two tiles");
+                     ops::RelativeAttentionVariant variant, std::span<const uint32_t> histories,
+                     uint32_t rows = SPLASH_TARGET_VERIFY_ROWS) {
   std::array<uint32_t, SPLASH_MAXIMUM_BATCH_WIDTH> lanes{};
   std::copy(histories.begin(), histories.end(), lanes.begin());
   const auto count = uint32_t(histories.size());
-  const Case data = makeCase(backend, format, int8Queries, variant, count, kRows, lanes);
-  const Step step = makeStep(backend, data, 0, kRows, kPageTokens, treesOf(count, kRows));
+  const Case data = makeCase(backend, format, int8Queries, variant, count, rows, lanes);
+  const Step step = makeStep(backend, data, 0, rows, kPageTokens, treesOf(count, rows));
   run(backend, data, step, planOf(data, step));
   const std::string what = describe(data, "tree verify");
   checkPrepare(data, step, what);
@@ -919,7 +946,7 @@ void checkSplitCounts(metal::MetalBackend &backend, kv::Format format, bool int8
     std::vector<metal::MetalBuffer> split{step.staging.queries, partials, statistics};
     split.insert(split.end(), data.tables.begin(), data.tables.end());
     split.insert(split.end(), {partials, step.layout, step.staging.states, data.weights.bias});
-    graph.add(plan.splitPipeline(), std::move(split), params, {kKvHeads, 1, splits});
+    graph.add(plan.splitPipeline(), std::move(split), params, {kKvHeads, 1, splits}, {splitThreads(plan), 1, 1});
     graph.add(plan.reducePipeline(),
               {partials, statistics, step.inputs.projection, step.output, step.output, step.output, step.layout,
                step.staging.sinks},
@@ -1032,7 +1059,10 @@ void runMultiPass(metal::MetalBackend &backend, const Case &data, const Step &st
   std::vector<metal::MetalBuffer> split{step.staging.queries, partials, statistics};
   split.insert(split.end(), data.tables.begin(), data.tables.end());
   split.insert(split.end(), {step.tree ? step.tree : partials, step.layout, step.staging.states, data.weights.bias});
-  graph.add("relative_attention_" + format + "_split" + window, std::move(split), params, {kKvHeads, 1, splits});
+  // The register tile's single pass reads as its split does (relative_attention_register_loop).
+  const std::string tile = decode.decodePipeline().find("_register") != std::string::npos ? "_register" : "";
+  graph.add("relative_attention_" + format + "_split" + tile + window, std::move(split), params,
+            {kKvHeads, 1, splits}, {splitThreads(decode), 1, 1});
   graph.add("relative_attention_reduce" + window,
             {partials, statistics, step.inputs.projection, step.output, step.output, step.output, step.layout,
              step.staging.sinks},
@@ -1096,7 +1126,8 @@ void checkDecodeSplitCounts(metal::MetalBackend &backend, kv::Format format, boo
     bindings.insert(bindings.end(), data.tables.begin(), data.tables.end());
     bindings.insert(bindings.end(), {step.tree, step.layout});
     metal::CommandGraph graph;
-    graph.add(plan.decodePipeline(), std::move(bindings), params, {kKvHeads, 1, splits});
+    graph.add(plan.decodePipeline(), std::move(bindings), params, {kKvHeads, 1, splits},
+              {decodeThreads(plan, bound), 1, 1});
     static_cast<void>(backend.submitCommandAsync(graph.dispatches()).wait());
     const std::string what = describe(data, "tree decode") + " of " + std::to_string(splits) + " splits";
     checkOutput(data, step, what);
@@ -1222,6 +1253,28 @@ void checkPlans() {
                   "a decode plan's INT8 queries score INT8 pages alone");
         }
   }
+  // Apple7/8's register tile: INT8 pages with bf16 queries name its split, direct and decode kernels; INT8 queries
+  // and BF16 pages keep the matmul2d tile's.
+  {
+    ops::AttentionCalibration row = test::attentionRow(ops::kNever);
+    row.registerRelative = true;
+    row.cores = kCores;
+    const kv::Layout int8 = layoutOf(kv::Format::Int8);
+    const ops::RelativeAttentionPlan prompt = RelativeAttention::plan(
+        sequence, int8, row, ops::Int8Activations::On, RelativeAttention::workspace(ops::kAttentionSequenceSplits, int8),
+        kSliding);
+    const ops::RelativeAttentionPlan step =
+        RelativeAttention::plan(lane, int8, row, ops::Int8Activations::On, RelativeAttention::laneWorkspace(int8),
+                                kSliding, ops::StepKind::Decode);
+    const ops::RelativeAttentionPlan bf16 = RelativeAttention::plan(
+        sequence, layoutOf(kv::Format::BFloat16), row, ops::Int8Activations::On,
+        RelativeAttention::workspace(ops::kAttentionSequenceSplits, layoutOf(kv::Format::BFloat16)), kSliding);
+    require(prompt.splitPipeline() == "relative_attention_q8_split_register_w1023" &&
+                prompt.directPipeline() == "relative_attention_q8_direct_register_w1023" &&
+                step.decodePipeline() == "relative_attention_q8_decode_register_w1023" &&
+                bf16.directPipeline() == "relative_attention_bf16_direct_w1023",
+            "the register tile's plans name other kernels");
+  }
   // A lane's splits: one per kDecodeCorePages / cores pages, but one a page
   // up to a verify block's most, at most decodeMostSplits, and as many as the
   // runs of pages they make. On 20 cores (most 12 and 7) 9 pages' 7 splits of
@@ -1325,8 +1378,10 @@ int main(int argc, char **argv) {
     metal::MetalBackend backend(argv[1]);
     checkPlans();
     checkFloatTable(backend);
-    for (const auto &[format, int8Queries] : {std::pair{kv::Format::Int8, false}, std::pair{kv::Format::Int8, true},
-                                              std::pair{kv::Format::BFloat16, false}}) {
+    for (const auto &[format, int8Queries, registerTile] :
+         {std::tuple{kv::Format::Int8, false, false}, std::tuple{kv::Format::Int8, false, true},
+          std::tuple{kv::Format::Int8, true, false}, std::tuple{kv::Format::BFloat16, false, false}}) {
+      gRegisterTile = registerTile;
       // Sliding layers: prompt chunks from position 0 and after cached
       // prefixes on either side of the window (its start's page entries of
       // NaNs), whose windows and extents coincide; a chunk again as several.
@@ -1348,7 +1403,8 @@ int main(int argc, char **argv) {
         constexpr std::array<uint32_t, 4> kHistories{0, 1020, 1031, 9000};
         for (uint32_t lanes = 1; lanes <= 4; ++lanes)
           checkVerify(backend, format, int8Queries, variant, std::span(kHistories).first(lanes));
-        checkTreeVerify(backend, format, int8Queries, variant, std::array<uint32_t, 4>{3, 1015, 2000, 8190});
+        for (const uint32_t rows : {uint32_t{SPLASH_TARGET_VERIFY_ROWS}, 32u})
+          checkTreeVerify(backend, format, int8Queries, variant, std::array<uint32_t, 4>{3, 1015, 2000, 8190}, rows);
         checkSplitCounts(backend, format, int8Queries, variant, 4103);
       }
       // Decode steps' single pass, at the same histories: chains of one to

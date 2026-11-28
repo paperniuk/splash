@@ -42,9 +42,14 @@ struct BlockResidualStates final {
 
 struct BlockResidualMix final {
   // Each query's output of `rows` rows as fp32 rows [rows][queries][hidden];
-  // `queries` the F32 queries [queries][hidden].
+  // `queries` the F32 queries [queries][hidden]. With `sums`, scratch of
+  // sumsBytes(shape, rows), a call of at most BLOCK_RESIDUAL_MIX_QUERY_ROWS
+  // rows runs the _chunks kernels (metal/abi/BlockResidualMix.h).
   static void addMix(metal::CommandGraph &graph, const BlockResidualStates &states, metal::MetalBuffer queries,
-                     metal::MetalBuffer output, BlockResidualShape shape, uint32_t rows);
+                     metal::MetalBuffer output, BlockResidualShape shape, uint32_t rows,
+                     const metal::MetalBuffer &sums = {});
+  // The chunks' sums of a call of `rows` rows of `hidden` values.
+  [[nodiscard]] static uint64_t sumsBytes(uint32_t hidden, uint32_t rows) noexcept;
   // Each query's output through its own weighted RMS norm (F32, as a GGUF
   // stores norms) into its own bf16 rows [rows][hidden], one norm and output
   // a query (at most BLOCK_RESIDUAL_MIX_MAXIMUM_NORMS). The projections

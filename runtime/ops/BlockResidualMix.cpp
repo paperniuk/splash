@@ -60,13 +60,29 @@ std::string instance(const char *name, const MixLaunch &launch, const BlockResid
 
 } // namespace
 
+uint64_t BlockResidualMix::sumsBytes(uint32_t hidden, uint32_t rows) noexcept {
+  return uint64_t{rows} * ((hidden + BLOCK_RESIDUAL_MIX_CHUNK - 1) / BLOCK_RESIDUAL_MIX_CHUNK) *
+         BLOCK_RESIDUAL_MIX_SUMS * sizeof(float);
+}
+
 void BlockResidualMix::addMix(metal::CommandGraph &graph, const BlockResidualStates &states,
                               metal::MetalBuffer queries, metal::MetalBuffer output, BlockResidualShape shape,
-                              uint32_t rows) {
+                              uint32_t rows, const metal::MetalBuffer &sums) {
   requireShape(shape, states, rows);
   requireStates(states, shape, rows);
   requireBytes(queries, uint64_t{shape.queries} * shape.hidden * sizeof(float), "block residual mix queries");
   requireBytes(output, uint64_t{rows} * shape.queries * shape.hidden * sizeof(float), "block residual mix output");
+  if (sums && rows <= BLOCK_RESIDUAL_MIX_QUERY_ROWS) {
+    requireBytes(sums, sumsBytes(shape.hidden, rows), "block residual mix sums");
+    const uint32_t chunks = (shape.hidden + BLOCK_RESIDUAL_MIX_CHUNK - 1) / BLOCK_RESIDUAL_MIX_CHUNK;
+    const std::string suffix = states.currentFloat ? "_f32" : "";
+    const BlockResidualMixParams params = mixParams(states, shape, rows);
+    graph.add("block_residual_mix_sums" + suffix, {stackBinding(states, shape), states.current, queries, sums}, params,
+              {chunks, rows, 1}, {BLOCK_RESIDUAL_MIX_CHUNK, 1, 1});
+    graph.add("block_residual_mix_chunks" + suffix, {stackBinding(states, shape), states.current, sums, output},
+              params, {chunks, rows, 1}, {BLOCK_RESIDUAL_MIX_CHUNK, 1, 1});
+    return;
+  }
   const MixLaunch mix = launch(shape, rows);
   graph.add(instance("block_residual_mix", mix, states),
             {stackBinding(states, shape), states.current, std::move(queries), std::move(output)},

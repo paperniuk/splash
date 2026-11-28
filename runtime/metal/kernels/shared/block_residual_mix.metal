@@ -181,6 +181,104 @@ kernel void block_residual_mix_norm(device const bfloat *stack [[buffer(0)]],
   block_residual_mix_norm_outputs(mix, norm, output + ulong(row) * p.hidden, p, tid, lane, sg, shared);
 }
 
+// The _chunks kernels (metal/abi/BlockResidualMix.h): a threadgroup of BLOCK_RESIDUAL_MIX_CHUNK threads a chunk of a
+// row's values (grid x) and row (grid y), a thread a value. Each loads its value of every state and query first, at a
+// clamped place (a load inside the loop of sums waited for each in turn).
+constant constexpr uint kChunk = BLOCK_RESIDUAL_MIX_CHUNK;
+constant constexpr uint kChunkSums = BLOCK_RESIDUAL_MIX_SUMS;
+constant constexpr uint kQueries = BLOCK_RESIDUAL_MIX_MAXIMUM_QUERIES;
+// The sums a chunk writes; the rest of its kChunkSums are zeros.
+constant constexpr uint kChunkWritten = kStates * (1 + kQueries);
+static_assert(kChunkWritten <= kChunkSums, "a chunk's squares and dots fit its sums");
+
+// The chunk's sums into sums[row][chunk]: state s's squares at s, query q's dot with state s at kStates (1 + q) + s,
+// each a value's products by simd_sum then over the simdgroups in order; zeros past kChunkWritten, whose partials no
+// simdgroup writes.
+template <class Current>
+[[max_total_threads_per_threadgroup(BLOCK_RESIDUAL_MIX_CHUNK)]]
+kernel void block_residual_mix_sums(device const bfloat *stack [[buffer(0)]], device const Current *current [[buffer(1)]],
+                                    device const float *queries [[buffer(2)]], device float *sums [[buffer(3)]],
+                                    constant BlockResidualMixParams &p [[buffer(4)]],
+                                    uint2 group [[threadgroup_position_in_grid]],
+                                    uint tid [[thread_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+                                    uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float partials[kChunk / 32][kChunkSums];
+  const uint row = group.y, chunk = group.x, chunks = (p.hidden + kChunk - 1) / kChunk;
+  if (row >= p.rows) return;
+  const BlockResidualMixRow<Current> mix{stack + ulong(row) * p.hidden, current + ulong(row) * p.hidden, p.stack,
+                                         p.stack_plane};
+  const uint states = mix.states(), d = chunk * kChunk + tid, at = min(d, p.hidden - 1);
+  const bool live = d < p.hidden;
+  float v[kStates], q[kQueries];
+#pragma unroll
+  for (uint s = 0; s < kStates; ++s) v[s] = mix.state(min(s, states - 1), at);
+#pragma unroll
+  for (uint k = 0; k < kQueries; ++k) q[k] = queries[ulong(min(k, p.queries - 1)) * p.hidden + at];
+#pragma unroll
+  for (uint s = 0; s < kStates; ++s) {
+    const float x = live && s < states ? v[s] : 0.0f;
+    float sum = simd_sum(x * x);
+    if (lane == 0) partials[sg][s] = sum;
+#pragma unroll
+    for (uint k = 0; k < kQueries; ++k) {
+      sum = simd_sum(x * (k < p.queries ? q[k] : 0.0f));
+      if (lane == 0) partials[sg][kStates * (1 + k) + s] = sum;
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid < kChunkSums) {
+    float total = 0.0f;
+    if (tid < kChunkWritten)
+      for (uint g = 0; g < kChunk / 32; ++g) total += partials[g][tid];
+    sums[(ulong(row) * chunks + chunk) * kChunkSums + tid] = total;
+  }
+}
+
+// Each query's output of the chunk's values as fp32 rows [rows][queries][hidden], from every chunk's sums
+// (block_residual_mix_sums): their totals in chunk order, then, by every thread, each state's inverse RMS and each
+// query's softmax of its scaled scores, the output the states' weighted sum.
+template <class Current>
+[[max_total_threads_per_threadgroup(BLOCK_RESIDUAL_MIX_CHUNK)]]
+kernel void block_residual_mix_chunks(device const bfloat *stack [[buffer(0)]],
+                                      device const Current *current [[buffer(1)]],
+                                      device const float *sums [[buffer(2)]], device float *output [[buffer(3)]],
+                                      constant BlockResidualMixParams &p [[buffer(4)]],
+                                      uint2 group [[threadgroup_position_in_grid]],
+                                      uint tid [[thread_index_in_threadgroup]]) {
+  threadgroup float totals[kChunkSums];
+  const uint row = group.y, chunk = group.x, chunks = (p.hidden + kChunk - 1) / kChunk;
+  if (row >= p.rows) return;
+  const BlockResidualMixRow<Current> mix{stack + ulong(row) * p.hidden, current + ulong(row) * p.hidden, p.stack,
+                                         p.stack_plane};
+  const uint states = mix.states(), d = chunk * kChunk + tid, at = min(d, p.hidden - 1);
+  float v[kStates];
+#pragma unroll
+  for (uint s = 0; s < kStates; ++s) v[s] = mix.state(min(s, states - 1), at);
+  if (tid < kChunkSums) {
+    device const float *row_sums = sums + ulong(row) * chunks * kChunkSums + tid;
+    float total = 0.0f;
+    for (uint c = 0; c < chunks; ++c) total += row_sums[c * kChunkSums];
+    totals[tid] = total;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (d >= p.hidden) return;
+  float inverse[kStates];
+  for (uint s = 0; s < states; ++s) inverse[s] = rsqrt(totals[s] / p.hidden + kRmsEpsilon);
+  for (uint k = 0; k < p.queries; ++k) {
+    float scores[kStates], maximum = -INFINITY, total = 0.0f, value = 0.0f;
+    for (uint s = 0; s < states; ++s) {
+      scores[s] = totals[kStates * (1 + k) + s] * inverse[s] * p.scale;
+      maximum = max(maximum, scores[s]);
+    }
+    for (uint s = 0; s < states; ++s) {
+      scores[s] = exp(scores[s] - maximum);
+      total += scores[s];
+    }
+    for (uint s = 0; s < states; ++s) value += scores[s] / total * (v[s] * inverse[s]);
+    output[(ulong(row) * p.queries + k) * p.hidden + d] = value;
+  }
+}
+
 // The instances: bf16 current rows (a layer's input), and fp32 (_f32, the
 // residual inside a layer).
 #define BLOCK_RESIDUAL_MIX_INSTANCES(Current, suffix)                                                          \
@@ -194,7 +292,13 @@ kernel void block_residual_mix_norm(device const bfloat *stack [[buffer(0)]],
   template [[host_name("block_residual_mix" suffix)]] kernel BlockResidualMixKernel##Current                         \
       block_residual_mix<Current>;                                                                                    \
   template [[host_name("block_residual_mix_norm" suffix)]] kernel BlockResidualMixNormKernel##Current               \
-      block_residual_mix_norm<Current>;
+      block_residual_mix_norm<Current>;                                                                               \
+  template [[host_name("block_residual_mix_sums" suffix)]] kernel void block_residual_mix_sums<Current>(              \
+      device const bfloat *, device const Current *, device const float *, device float *,                           \
+      constant BlockResidualMixParams &, uint2, uint, uint, uint);                                                    \
+  template [[host_name("block_residual_mix_chunks" suffix)]] kernel void block_residual_mix_chunks<Current>(          \
+      device const bfloat *, device const Current *, device const float *, device float *,                           \
+      constant BlockResidualMixParams &, uint2, uint);
 BLOCK_RESIDUAL_MIX_INSTANCES(bfloat, "")
 BLOCK_RESIDUAL_MIX_INSTANCES(float, "_f32")
 #undef BLOCK_RESIDUAL_MIX_INSTANCES

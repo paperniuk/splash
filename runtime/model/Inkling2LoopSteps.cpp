@@ -3,6 +3,7 @@
 #include "Checked.hpp"
 #include "metal/abi/ExecutionGeometry.h"
 #include "metal/abi/Gguf.h"
+#include "ops/BlockResidualMix.hpp"
 #include "ops/MessageGate.hpp"
 #include "ops/RelativeAttention.hpp"
 
@@ -85,6 +86,7 @@ std::vector<Tensor> tensors(const QwenTargetGeometry &g, const Inkling2LoopShape
   // counters (ops::RelativeAttention::addDecode).
   if (decode) {
     result.push_back({&Inkling2LoopScratch::keyValues, bytesFor<uint16_t>(2 * kv), 0, false});
+    result.push_back({&Inkling2LoopScratch::mixSums, ops::BlockResidualMix::sumsBytes(hidden, 1), 0, false});
     result.push_back({&Inkling2LoopScratch::tape, bytesFor<uint16_t>(schedule.stateColumns()), 0, false});
     result.push_back({&Inkling2LoopScratch::attentionCounters, 0, ops::RelativeAttention::kCountersBytes, false});
   } else {

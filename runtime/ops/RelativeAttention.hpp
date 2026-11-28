@@ -117,6 +117,9 @@ public:
   [[nodiscard]] const std::string &reducePipeline() const noexcept { return reducePipeline_; }
   [[nodiscard]] const std::string &directPipeline() const noexcept { return directPipeline_; }
   [[nodiscard]] const std::string &decodePipeline() const noexcept { return decodePipeline_; }
+  // A split's, direct tile's or single pass's threadgroup of `rows` query rows: the register tile's simdgroups, one per
+  // eight fused rows, or the matmul2d tile's 256 threads.
+  [[nodiscard]] uint32_t threads(uint32_t rows) const noexcept;
   // The split's grid, or the single pass's: KV heads, the dispatch's
   // sequences and their most splits.
   [[nodiscard]] metal::DispatchSize splitGroups(const Dispatch &dispatch) const noexcept;
@@ -144,6 +147,7 @@ private:
   std::string reducePipeline_;
   std::string directPipeline_;
   std::string decodePipeline_;
+  bool registerTile_ = false;
 };
 
 class RelativeAttention final {
